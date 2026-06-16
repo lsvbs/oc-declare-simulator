@@ -7,3 +7,10 @@ __pycache__/
 node_modules/
 .env
 .claude/settings.local.json
+
+# Input/output data files (keep folders via .gitkeep)
+src/Simulation/IO/input/eventlog/*.xml
+src/Simulation/IO/input/eventlog/*.json
+src/Simulation/IO/input/ocdeclare/*.json
+src/Simulation/IO/input/parameters/*.json
+src/Simulation/IO/output/eventlogs/*.json
