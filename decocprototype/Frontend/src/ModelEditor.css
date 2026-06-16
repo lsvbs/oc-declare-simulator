@@ -1,0 +1,801 @@
+/* ── Container ────────────────────────────────────────────────────────────── */
+.model-editor {
+  background: white;
+  border-radius: 12px;
+  border: 2px solid #e2e8f0;
+  overflow: hidden;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+/* ── Header + Tabs ────────────────────────────────────────────────────────── */
+.model-editor-header {
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 0.9rem 1.5rem 0;
+}
+
+.model-editor-header h3 {
+  margin: 0 0 0.65rem;
+  font-size: 1rem;
+  color: #1e293b;
+}
+
+.model-editor-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.model-editor-title-row h3 {
+  margin: 0 0 0.65rem;
+}
+
+/* Foldable Model Editor: clickable title with caret */
+.model-editor-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s;
+}
+.model-editor-toggle:hover { color: #667eea; }
+
+.model-editor-caret {
+  font-size: 0.7rem;
+  color: #94a3b8;
+  width: 0.85rem;
+  display: inline-block;
+}
+.model-editor-toggle:hover .model-editor-caret { color: #667eea; }
+
+/* When collapsed, drop the header's bottom padding so it reads as a single bar */
+.model-editor.collapsed .model-editor-header {
+  padding-bottom: 0.9rem;
+}
+.model-editor.collapsed .model-editor-title-row h3 {
+  margin-bottom: 0;
+}
+
+.model-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.8rem;
+  margin-bottom: 0.65rem;
+  border: 1px solid #c7d2fe;
+  border-radius: 8px;
+  background: #eef2ff;
+  color: #4f46e5;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.model-download-btn:hover {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #fff;
+}
+
+/* ── Header actions: load-parameters picker + download ─────────────────────── */
+.model-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.65rem;
+}
+
+.model-params-loader {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.model-params-select {
+  border: none;
+  background: transparent;
+  font-size: 0.8rem;
+  color: #334155;
+  padding: 0.35rem 0.5rem;
+  max-width: 16rem;
+  cursor: pointer;
+  outline: none;
+}
+
+.model-params-load-btn {
+  border: none;
+  border-left: 1px solid #cbd5e1;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+
+.model-params-load-btn:hover:not(:disabled) {
+  background: #4f46e5;
+  color: #fff;
+}
+
+.model-params-load-btn:disabled {
+  color: #94a3b8;
+  cursor: not-allowed;
+}
+
+/* The download button already has its own margin; neutralise it inside the row */
+.model-editor-actions .model-download-btn {
+  margin-bottom: 0;
+}
+
+.editor-tabs {
+  display: flex;
+  gap: 0;
+}
+
+.editor-tab {
+  padding: 0.45rem 1rem;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  transition: color 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+
+.editor-tab:hover { color: #667eea; }
+
+.editor-tab.active {
+  color: #667eea;
+  border-bottom-color: #667eea;
+  font-weight: 600;
+}
+
+.tab-count {
+  background: #e2e8f0;
+  color: #475569;
+  border-radius: 10px;
+  padding: 0 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  min-width: 18px;
+  text-align: center;
+}
+
+.editor-tab.active .tab-count {
+  background: #ddd6fe;
+  color: #5b21b6;
+}
+
+/* ── Body ─────────────────────────────────────────────────────────────────── */
+.editor-body {
+  padding: 1rem 1.5rem 1.25rem;
+  max-height: 440px;
+  overflow-y: auto;
+}
+
+.empty-notice {
+  color: #94a3b8;
+  font-style: italic;
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+}
+
+/* ── Toolbar (filter row) ─────────────────────────────────────────────────── */
+.toolbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.65rem;
+}
+
+.filter-input {
+  flex: 1;
+  max-width: 280px;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.82rem;
+}
+
+.filter-count {
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+
+/* ── Activities ───────────────────────────────────────────────────────────── */
+.activities-list { display: flex; flex-direction: column; gap: 0.45rem; }
+
+.activity-row {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.activity-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+  background: #f8fafc;
+  user-select: none;
+}
+
+.activity-header:hover { background: #f1f5f9; }
+
+.activity-expand {
+  font-size: 0.65rem;
+  color: #94a3b8;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+
+.activity-expand.open { transform: rotate(90deg); }
+
+.activity-name {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #1e293b;
+  flex: 1;
+}
+
+.activity-binding-count {
+  font-size: 0.75rem;
+  color: #94a3b8;
+}
+
+.activity-bindings {
+  padding: 0.75rem 1rem;
+  border-top: 1px solid #f1f5f9;
+  background: white;
+}
+
+.binding-header-row {
+  display: grid;
+  grid-template-columns: 150px 55px 100px 80px 85px 28px;
+  gap: 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.4rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.binding-row {
+  display: grid;
+  grid-template-columns: 150px 55px 100px 80px 85px 28px;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.82rem;
+}
+
+.binding-type-label { color: #334155; font-weight: 500; }
+
+.binding-num {
+  width: 100%;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+.binding-num:focus { outline: none; border-color: #667eea; }
+
+.binding-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: #64748b;
+  cursor: pointer;
+}
+
+.binding-toggle input { cursor: pointer; accent-color: #667eea; }
+
+/* ── Binding warnings ─────────────────────────────────────────────────────── */
+.binding-warning-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #dc2626;
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  border-radius: 4px;
+  padding: 0.1rem 0.45rem;
+  white-space: nowrap;
+}
+
+.binding-empty-warning {
+  font-size: 0.79rem;
+  color: #dc2626;
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  border-radius: 6px;
+  padding: 0.45rem 0.75rem;
+  margin: 0.2rem 0 0.55rem;
+}
+
+/* ── Binding delete button ─────────────────────────────────────────────────── */
+.binding-delete-btn {
+  margin-left: 0;
+  padding: 0.15rem 0.35rem;
+  font-size: 0.75rem;
+}
+
+/* ── Add binding row ──────────────────────────────────────────────────────── */
+.add-binding-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.55rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed #e2e8f0;
+}
+
+.add-binding-select {
+  padding: 0.28rem 0.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  background: white;
+  min-width: 150px;
+}
+
+.add-binding-select:focus { outline: none; border-color: #667eea; }
+
+.add-binding-btn {
+  padding: 0.28rem 0.75rem;
+  background: #f0fdf4;
+  color: #15803d;
+  border: 1px solid #86efac;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.add-binding-btn:hover { background: #dcfce7; border-color: #4ade80; }
+.add-binding-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ── Shared row delete button ─────────────────────────────────────────────── */
+.row-delete-btn {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.row-delete-btn:hover { background: #fef2f2; }
+
+/* ── Constraints ──────────────────────────────────────────────────────────── */
+.constraints-list { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.75rem; }
+
+.constraint-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.75rem;
+  background: #f8fafc;
+  border-radius: 6px;
+  border: 1px solid #f1f5f9;
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+
+.constraint-type-badge {
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.constraint-type-badge.precedence     { background: #dbeafe; color: #1d4ed8; }
+.constraint-type-badge.response       { background: #dcfce7; color: #15803d; }
+.constraint-type-badge.not_coexistence{ background: #fef2f2; color: #dc2626; }
+
+.constraint-src, .constraint-tgt { font-weight: 500; color: #1e293b; }
+.constraint-arrow { color: #94a3b8; }
+.constraint-scope { color: #64748b; font-style: italic; font-size: 0.75rem; }
+.constraint-card {
+  color: #047857;
+  background: #d1fae5;
+  border-radius: 4px;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* ── O2O Rules ────────────────────────────────────────────────────────────── */
+.o2o-list { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.75rem; }
+
+.o2o-row {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.75rem;
+  background: #f8fafc;
+  border-radius: 6px;
+  border: 1px solid #f1f5f9;
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+
+.o2o-src, .o2o-tgt { font-weight: 500; color: #1e293b; }
+
+.o2o-dir {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.o2o-dir.bi  { color: #8b5cf6; }
+.o2o-dir.uni { color: #64748b; }
+
+.o2o-cardinality { color: #64748b; font-size: 0.78rem; }
+
+/* ── Add Form (shared by Constraints + O2O) ───────────────────────────────── */
+.add-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.7rem 0.9rem;
+  background: #f0f4ff;
+  border-radius: 8px;
+  border: 1px dashed #c7d2fe;
+  margin-top: 0.5rem;
+}
+
+.add-form select,
+.add-form input[type="number"] {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #c7d2fe;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  background: white;
+  min-width: 0;
+}
+
+.add-form select:focus,
+.add-form input:focus { outline: none; border-color: #667eea; }
+
+.add-form-sep { color: #94a3b8; font-weight: 600; }
+
+.card-inputs {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.4rem;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  border-radius: 5px;
+}
+.card-label { color: #047857; font-size: 0.78rem; font-weight: 600; }
+.card-input {
+  width: 3rem;
+  padding: 0.25rem 0.35rem;
+  border: 1px solid #a7f3d0;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  background: white;
+  text-align: center;
+}
+.card-input:focus { outline: none; border-color: #059669; }
+
+.add-form-btn {
+  padding: 0.3rem 0.85rem;
+  background: #667eea;
+  color: white;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.add-form-btn:hover { background: #5a67d8; }
+
+/* ── Probabilities ────────────────────────────────────────────────────────── */
+.prob-hint {
+  font-size: 0.8rem;
+  color: #64748b;
+  margin: 0 0 0.85rem;
+  line-height: 1.5;
+}
+
+.prob-source-block {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 0.45rem;
+  overflow: hidden;
+}
+
+.prob-source-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+  background: #f8fafc;
+  user-select: none;
+}
+
+.prob-source-block.open .prob-source-header { background: #f0f4ff; }
+.prob-source-header:hover { background: #f1f5f9; }
+
+.prob-source-name { font-weight: 600; font-size: 0.88rem; color: #1e293b; flex: 1; }
+
+.prob-row-total {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+}
+
+.prob-row-total.ok   { background: #dcfce7; color: #15803d; }
+.prob-row-total.warn { background: #fef9c3; color: #854d0e; }
+
+.prob-row-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.prob-action-btn {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+  color: #475569;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.prob-action-btn:hover { border-color: #667eea; color: #667eea; }
+
+.prob-targets {
+  padding: 0.6rem 1rem 0.75rem;
+  border-top: 1px solid #e2e8f0;
+  background: white;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.prob-target-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.82rem;
+}
+
+.prob-target-name {
+  width: 175px;
+  color: #475569;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+.prob-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: #e2e8f0;
+  outline: none;
+  cursor: pointer;
+}
+
+.prob-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #667eea;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 0 0 1px #667eea;
+}
+
+.prob-pct-input {
+  width: 60px;
+  padding: 0.25rem 0.35rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
+.prob-pct-input:focus { outline: none; border-color: #667eea; }
+
+.prob-pct-label {
+  color: #94a3b8;
+  font-size: 0.8rem;
+  width: 14px;
+}
+
+/* ── HelpTip ──────────────────────────────────────────────────────────────── */
+.help-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.2rem;
+  vertical-align: middle;
+}
+
+.help-tip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e2e8f0;
+  color: #64748b;
+  font-size: 0.65rem;
+  font-weight: 700;
+  cursor: default;
+  user-select: none;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.help-tip-icon:hover { background: #667eea; color: white; }
+
+.help-tip-popup {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1e293b;
+  color: #f1f5f9;
+  font-size: 0.75rem;
+  font-weight: 400;
+  padding: 0.45rem 0.7rem;
+  border-radius: 6px;
+  white-space: normal;
+  width: 220px;
+  z-index: 100;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  line-height: 1.45;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* ── Max consecutive input in activity header ─────────────────────────────── */
+.max-consec-label {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: #64748b;
+  cursor: default;
+  white-space: nowrap;
+  margin-right: 0.5rem;
+}
+
+.max-consec-input {
+  width: 52px !important;
+}
+
+/* ── Timing tab ───────────────────────────────────────────────────────────── */
+.timing-row {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.65rem 1rem;
+  margin-bottom: 0.45rem;
+  background: #fafbff;
+}
+
+.timing-act-name {
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #1e293b;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.timing-no-data {
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.timing-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1rem;
+  align-items: flex-end;
+}
+
+.timing-field-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.timing-select {
+  padding: 0.28rem 0.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  font-size: 0.82rem;
+  background: white;
+  min-width: 120px;
+}
+
+.timing-select:focus { outline: none; border-color: #667eea; }
+
+.timing-num {
+  width: 80px;
+  padding: 0.25rem 0.4rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
+.timing-num:focus { outline: none; border-color: #667eea; }
+
+.timing-ocpa-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.55rem;
+  margin-top: 0.55rem;
+  padding-top: 0.45rem;
+  border-top: 1px dashed #e2e8f0;
+}
+
+.timing-ocpa-chip {
+  font-size: 0.72rem;
+  color: #475569;
+  background: #f1f5f9;
+  border-radius: 4px;
+  padding: 0.1rem 0.45rem;
+  white-space: nowrap;
+}
+
+.timing-sample-count {
+  background: #dbeafe;
+  color: #1d4ed8;
+}

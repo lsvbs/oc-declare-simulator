@@ -1,0 +1,264 @@
+.flow-chart-container {
+  margin-top: 2rem;
+  background: white;
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* ── Scrollable canvas wrapper ─────────────────────────────────────────────── */
+.flow-canvas-scroll {
+  overflow: auto;
+  max-height: 420px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8f9fa;
+}
+
+.flow-canvas-scroll canvas {
+  display: block;
+  /* Visual size set inline via style prop (zoom); cursor set by JS */
+}
+
+/* ── Legend ────────────────────────────────────────────────────────────────── */
+.flow-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.5rem;
+  margin-bottom: 0.65rem;
+  padding: 0.55rem 0.9rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 0.78rem;
+  color: #475569;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  white-space: nowrap;
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 28px;
+  height: 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.legend-thick {
+  background: linear-gradient(to right, #94a3b8 0%, #94a3b8 40%, #475569 100%);
+  height: 6px;
+}
+
+/* ── Toolbar row above the canvas ──────────────────────────────────────────── */
+.flow-chart-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.flow-toolbar-left  { display: flex; align-items: center; gap: 0.75rem; }
+.flow-toolbar-right { display: flex; align-items: center; gap: 0.5rem; }
+
+.flow-reset-btn {
+  padding: 0.3rem 0.8rem;
+  font-size: 0.82rem;
+  border: 1px solid #667eea;
+  border-radius: 6px;
+  background: #fff;
+  color: #667eea;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.flow-reset-btn:hover { background: #667eea; color: #fff; }
+
+/* DFG toggle button */
+.flow-toggle-btn {
+  padding: 0.3rem 0.75rem;
+  font-size: 0.82rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f8fafc;
+  color: #64748b;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.15s;
+}
+.flow-toggle-btn.active {
+  border-color: #667eea;
+  color: #667eea;
+  background: #eef2ff;
+}
+.flow-toggle-btn:hover { border-color: #667eea; }
+
+/* Zoom controls */
+.flow-zoom-btn {
+  width: 1.6rem;
+  height: 1.6rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1;
+  transition: all 0.15s;
+}
+.flow-zoom-btn:hover { border-color: #667eea; color: #667eea; background: #eef2ff; }
+
+.flow-zoom-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #64748b;
+  min-width: 2.8rem;
+  text-align: center;
+}
+
+/* Overlay-mode segmented control (Aggregate / Per-object) */
+.flow-mode-switch {
+  display: inline-flex;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-right: 0.25rem;
+}
+.flow-mode-btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: none;
+  background: #fff;
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.flow-mode-btn + .flow-mode-btn { border-left: 1px solid #cbd5e1; }
+.flow-mode-btn:hover { background: #f1f5f9; color: #475569; }
+.flow-mode-btn.active { background: #eef2ff; color: #667eea; }
+
+/* "individual / merged" note in the legend */
+.legend-mode {
+  font-style: italic;
+  color: #64748b;
+}
+
+/* "No trace data" hint */
+.flow-no-traces {
+  font-size: 0.8rem;
+  color: #94a3b8;
+  font-style: italic;
+  margin: 0 0 0.75rem;
+}
+
+.flow-hint {
+  font-size: 0.78rem;
+  color: #94a3b8;
+  user-select: none;
+}
+
+/* ── Object-type selector ── */
+.flow-object-selector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 0.75rem;
+  font-size: 0.8rem;
+}
+
+.flow-obj-label {
+  font-weight: 600;
+  color: #475569;
+  margin-right: 0.25rem;
+  align-self: center;
+  white-space: nowrap;
+}
+
+.flow-type-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.flow-type-pill-row {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.flow-type-expand {
+  background: none;
+  border: none;
+  padding: 0 0.2rem;
+  font-size: 0.7rem;
+  color: #94a3b8;
+  cursor: pointer;
+  line-height: 1;
+}
+.flow-type-expand:hover { color: #475569; }
+
+.flow-type-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background: #fff;
+  color: #64748b;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.flow-type-pill:hover { border-color: #94a3b8; }
+.flow-type-pill.active { font-weight: 700; }
+
+.flow-type-count {
+  background: #e2e8f0;
+  border-radius: 8px;
+  padding: 0 0.35rem;
+  font-size: 0.7rem;
+  color: #475569;
+}
+
+.flow-obj-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding-left: 0.25rem;
+  max-height: 6rem;
+  overflow-y: auto;
+}
+
+.flow-obj-pill {
+  padding: 0.1rem 0.45rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
+  color: #64748b;
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.flow-obj-pill:hover { border-color: #94a3b8; }
+.flow-obj-pill.active { font-weight: 600; }
+

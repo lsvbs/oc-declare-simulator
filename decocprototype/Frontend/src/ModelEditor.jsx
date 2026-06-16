@@ -1,0 +1,741 @@
+import React, { useState, useMemo } from 'react';
+import './ModelEditor.css';
+
+// ── HelpTip ──────────────────────────────────────────────────────────────────
+function HelpTip({ text }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <span className="help-tip" onMouseEnter={() => setVisible(true)} onMouseLeave={() => setVisible(false)}>
+      <span className="help-tip-icon">?</span>
+      {visible && <span className="help-tip-popup">{text}</span>}
+    </span>
+  );
+}
+
+const CONSTRAINT_TYPES = ['precedence', 'not_precedence', 'response', 'not_coexistence', 'chain_precedence', 'chain_response'];
+
+const CONSTRAINT_HELP = {
+  precedence:       'B is blocked until A has fired on the same scope object. nmin ≥ 1 (default) enforces this; nmax caps how many A-occurrences may precede B.',
+  not_precedence:   'Once A fires on a scope object, B is permanently blocked for that object. B can still fire freely before A occurs.',
+  response:         'If A fires on an object, B must eventually follow. Use n≤ to cap how many times B may fire per scope object (counted across all B-firings, not per A).',
+  not_coexistence:  'Mutual exclusion per scope object: once A fires, B is blocked; once B fires, A is blocked. At most one of the two activities can ever fire per object.',
+  chain_precedence: 'B must be immediately preceded by A on the scope object — no other event for that object may occur in between. Creating a fresh scope object for B also violates this.',
+  chain_response:   'Once A fires, every other activity is blocked for the scope object until B fires next. The constraint is "armed" by A and disarmed only by B.',
+};
+const SCOPE_KINDS      = ['each', 'global', 'any', 'all'];
+
+// nmin defaults to 1 so a manually added precedence constraint actually enforces
+// "source before target" during simulation. nmin is only meaningful for
+// precedence; the other constraint checks ignore it, so the default is harmless.
+const EMPTY_CONSTRAINT = { constraint_type: 'precedence', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null };
+const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_links: null, bidirectional: true };
+
+export default function ModelEditor({
+  model, probMatrix, onModelChange, onProbMatrixChange,
+  sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
+}) {
+  const [activeTab,      setActiveTab]      = useState('activities');
+  const [collapsed,      setCollapsed]      = useState(true);
+  const [expandedActs,   setExpandedActs]   = useState(new Set());
+  const [selectedParamFile, setSelectedParamFile] = useState('');
+  const [expandedProbs,  setExpandedProbs]  = useState(new Set());
+  const [conFilter,      setConFilter]      = useState('');
+  const [newCon,         setNewCon]         = useState(EMPTY_CONSTRAINT);
+  const [newO2O,         setNewO2O]         = useState(EMPTY_O2O);
+  // Per-activity "add binding" selected type: { [actName]: objectType }
+  const [newBindingTypes, setNewBindingTypes] = useState({});
+
+  if (!model || Array.isArray(model)) return null;
+
+  const activities = model.activities  || [];
+  const constraints = model.constraints || [];
+  const o2oRules   = model.o2o_rules   || [];
+  const objectTypes = useMemo(() => model.object_types || [], [model.object_types]);
+  const actNames    = useMemo(() => activities.map(a => a.name), [activities]);
+
+  // ── Activities helpers ────────────────────────────────────────────────────
+  const toggleAct = (name) => setExpandedActs(prev => {
+    const n = new Set(prev); n.has(name) ? n.delete(name) : n.add(name); return n;
+  });
+
+  const updateBinding = (ai, bi, field, value) => {
+    const newActs = activities.map((a, idx) => idx !== ai ? a : {
+      ...a,
+      bindings: (a.bindings || []).map((b, bidx) => bidx !== bi ? b : { ...b, [field]: value }),
+    });
+    onModelChange({ ...model, activities: newActs });
+  };
+
+  const deleteBinding = (ai, bi) => {
+    const newActs = activities.map((a, idx) => idx !== ai ? a : {
+      ...a,
+      bindings: (a.bindings || []).filter((_, bidx) => bidx !== bi),
+    });
+    onModelChange({ ...model, activities: newActs });
+  };
+
+  const addBinding = (ai, actName) => {
+    const chosen = newBindingTypes[actName] || objectTypes[0];
+    if (!chosen) return;
+    const newActs = activities.map((a, idx) => idx !== ai ? a : {
+      ...a,
+      bindings: [...(a.bindings || []), { object_type: chosen, min_count: 1, max_count: null, creates: false, deactivates: false }],
+    });
+    onModelChange({ ...model, activities: newActs });
+  };
+
+  const updateMaxConsecutive = (actName, rawValue) => {
+    const cur = model.max_consecutive || {};
+    if (rawValue === '' || rawValue === null || rawValue === undefined) {
+      const { [actName]: _removed, ...rest } = cur;
+      onModelChange({ ...model, max_consecutive: rest });
+    } else {
+      const n = parseInt(rawValue);
+      if (!Number.isNaN(n) && n >= 1)
+        onModelChange({ ...model, max_consecutive: { ...cur, [actName]: n } });
+    }
+  };
+
+  // ── Constraint helpers ────────────────────────────────────────────────────
+  const deleteConstraint = (idx) =>
+    onModelChange({ ...model, constraints: constraints.filter((_, i) => i !== idx) });
+
+  const addConstraint = () => {
+    if (!newCon.source_activity || !newCon.target_activity) return;
+    if (newCon.scope.kind !== 'global' && !newCon.scope.object_type) return;
+    onModelChange({ ...model, constraints: [...constraints, { ...newCon, support: 1.0, confidence: 1.0 }] });
+    setNewCon(EMPTY_CONSTRAINT);
+  };
+
+  // ── O2O helpers ───────────────────────────────────────────────────────────
+  const deleteO2O = (idx) =>
+    onModelChange({ ...model, o2o_rules: o2oRules.filter((_, i) => i !== idx) });
+
+  const addO2O = () => {
+    if (!newO2O.source_type || !newO2O.target_type) return;
+    onModelChange({ ...model, o2o_rules: [...o2oRules, { ...newO2O }] });
+    setNewO2O(EMPTY_O2O);
+  };
+
+  // ── Probability helpers ───────────────────────────────────────────────────
+  const toggleProb = (name) => setExpandedProbs(prev => {
+    const n = new Set(prev); n.has(name) ? n.delete(name) : n.add(name); return n;
+  });
+
+  const updateProbLinked = (src, tgt, newPct) => {
+    const newVal = Math.max(0, Math.min(100, Number(newPct))) / 100;
+    const row = { ...(probMatrix[src] || {}) };
+    const oldVal = row[tgt] || 0;
+    const delta = newVal - oldVal;
+    if (Math.abs(delta) < 1e-9) return;
+
+    const others = actNames.filter(a => a !== tgt);
+    const otherSum = others.reduce((s, a) => s + (row[a] || 0), 0);
+    row[tgt] = newVal;
+
+    if (otherSum < 1e-9) {
+      // All others are zero — spread reduction equally (clamped ≥ 0)
+      const share = delta / Math.max(1, others.length);
+      others.forEach(a => { row[a] = Math.max(0, (row[a] || 0) - share); });
+    } else {
+      // Reduce/increase others proportionally to their current weight
+      others.forEach(a => {
+        const proportion = (row[a] || 0) / otherSum;
+        row[a] = Math.max(0, (row[a] || 0) - delta * proportion);
+      });
+    }
+    onProbMatrixChange({ ...probMatrix, [src]: row });
+  };
+
+  const normalizeRow = (src) => {
+    const row = probMatrix[src] || {};
+    const total = Object.values(row).reduce((s, v) => s + v, 0);
+    if (total <= 0) return;
+    onProbMatrixChange({
+      ...probMatrix,
+      [src]: Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v / total])),
+    });
+  };
+
+  const setUniform = (src) => {
+    if (actNames.length === 0) return;
+    const w = 1 / actNames.length;
+    onProbMatrixChange({ ...probMatrix, [src]: Object.fromEntries(actNames.map(a => [a, w])) });
+  };
+
+  // ── Tab definitions ───────────────────────────────────────────────────────
+  const TABS = [
+    { id: 'activities',   label: 'Activities',   count: activities.length },
+    { id: 'constraints',  label: 'Constraints',  count: constraints.length },
+    { id: 'o2o',          label: 'O2O Rules',    count: o2oRules.length },
+    { id: 'probabilities',label: 'Probabilities',count: null },
+    { id: 'timing',       label: 'Timing',       count: null },
+  ];
+
+  const filteredConstraints = constraints.filter(c =>
+    !conFilter ||
+    c.source_activity?.toLowerCase().includes(conFilter.toLowerCase()) ||
+    c.target_activity?.toLowerCase().includes(conFilter.toLowerCase())
+  );
+
+  // ── Timing helpers ────────────────────────────────────────────────────────
+  const DIST_TYPES = ['lognormal', 'normal', 'exponential', 'fixed'];
+  const timingData = model.activity_durations || {};
+
+  const updateTiming = (actName, field, value) => {
+    const cur = timingData[actName] || { dist_type: 'lognormal', mean_seconds: 3600, std_seconds: 600, min_seconds: 0 };
+    const updated = { ...cur, [field]: value === '' ? null : value };
+    onModelChange({ ...model, activity_durations: { ...timingData, [actName]: updated } });
+  };
+
+  const OCPA_FIELDS = [
+    { key: 'sojourn_mean',  label: 'Sojourn (mean)' },
+    { key: 'sojourn_std',   label: 'Sojourn (std)' },
+    { key: 'waiting_mean',  label: 'Waiting (mean)' },
+    { key: 'waiting_std',   label: 'Waiting (std)' },
+    { key: 'sync_mean',     label: 'Sync (mean)' },
+    { key: 'flow_mean',     label: 'Flow (mean)' },
+    { key: 'pooling_mean',  label: 'Pooling (mean)' },
+    { key: 'lagging_mean',  label: 'Lagging (mean)' },
+  ];
+
+  // ── Export / download current parameters ──────────────────────────────────
+  // Bundles everything currently in the editor into one self-contained JSON.
+  // The model fields use the schema the backend parser expects, so the file can
+  // be dropped back into the ocdeclare input folder and reloaded. The edited
+  // transition matrix is embedded under `transition_matrix` (ignored by the
+  // parser on reload, but preserved so no tuned probability is lost).
+  const buildExportObj = () => ({
+    object_types: objectTypes,
+    activities,
+    constraints,
+    o2o_rules: o2oRules,
+    ...(model.activity_durations && Object.keys(model.activity_durations).length
+      ? { activity_durations: model.activity_durations } : {}),
+    ...(model.max_consecutive && Object.keys(model.max_consecutive).length
+      ? { max_consecutive: model.max_consecutive } : {}),
+    ...(probMatrix && Object.keys(probMatrix).length
+      ? { transition_matrix: probMatrix } : {}),
+  });
+
+  // Derive a "parameters_<source>_<timestamp>.json" name, mirroring the
+  // discovery file naming (which is "discovered_<logbase>_<timestamp>.json").
+  // We strip the "discovered_" prefix and the old discovery timestamp from the
+  // source ocdeclare filename, then append a fresh timestamp.
+  const deriveParamFilename = () => {
+    const ts = new Date().toISOString().slice(0, 19).replace('T', '_').replace(/-/g, '').replace(/:/g, '');
+    let base = (sourceFile || '').replace(/\.json$/i, '');
+    base = base.replace(/^discovered_/, '');
+    base = base.replace(/_\d{8}_\d{6}$/, ''); // drop trailing discovery timestamp
+    if (!base) base = 'model';
+    return `parameters_${base}_${ts}.json`;
+  };
+
+  const downloadModel = () => {
+    const exportObj = buildExportObj();
+    const filename = deriveParamFilename();
+
+    const json = JSON.stringify(exportObj, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    // Also persist into the server's parameters folder so it can be reloaded
+    // later via the "Load parameters" picker.
+    onSaveParameters?.(filename, exportObj);
+  };
+
+  const loadSelectedParams = () => {
+    if (selectedParamFile) onLoadParameters?.(selectedParamFile);
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div className={`model-editor ${collapsed ? 'collapsed' : ''}`}>
+      {/* ── Header + Tabs ── */}
+      <div className="model-editor-header">
+        <div className="model-editor-title-row">
+          <h3
+            className="model-editor-toggle"
+            onClick={() => setCollapsed(c => !c)}
+            title={collapsed ? 'Expand the Model Editor' : 'Collapse the Model Editor'}
+          >
+            <span className="model-editor-caret">{collapsed ? '▶' : '▼'}</span>
+            ✏️ Model Editor
+          </h3>
+          <div className="model-editor-actions">
+            {/* Load saved parameters from IO/input/parameters */}
+            <div className="model-params-loader">
+              <select
+                className="model-params-select"
+                value={selectedParamFile}
+                onChange={e => setSelectedParamFile(e.target.value)}
+                title="Saved parameter files in IO/input/parameters"
+              >
+                <option value="">Load parameters…</option>
+                {parameterFiles.map(f => (
+                  <option key={f} value={f}>{f}</option>
+                ))}
+              </select>
+              <button
+                className="model-params-load-btn"
+                onClick={loadSelectedParams}
+                disabled={!selectedParamFile}
+                title="Load the selected parameter file into the editor"
+              >
+                ⬆ Load
+              </button>
+            </div>
+            <button
+              className="model-download-btn"
+              onClick={downloadModel}
+              title="Download the current parameters (activities, bindings, constraints, O2O rules, timing, max-consecutive and edited probabilities) as a JSON file. A copy is also saved to IO/input/parameters so you can reload it later."
+            >
+              ⬇ Download JSON
+            </button>
+          </div>
+        </div>
+        {!collapsed && (
+          <div className="editor-tabs">
+            {TABS.map(t => (
+              <button key={t.id}
+                className={`editor-tab ${activeTab === t.id ? 'active' : ''}`}
+                onClick={() => setActiveTab(t.id)}
+              >
+                {t.label}
+                {t.count !== null && <span className="tab-count">{t.count}</span>}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── Body ── */}
+      {!collapsed && (
+      <div className="editor-body">
+
+        {/* ━━ ACTIVITIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'activities' && (
+          <div className="activities-list">
+            {activities.length === 0 && <p className="empty-notice">No activities defined.</p>}
+            {activities.map((act, ai) => (
+              <div key={act.name} className={`activity-row ${expandedActs.has(act.name) ? 'open' : ''}`}>
+                <div className="activity-header" onClick={() => toggleAct(act.name)}>
+                  <span className={`activity-expand ${expandedActs.has(act.name) ? 'open' : ''}`}>▶</span>
+                  <span className="activity-name">{act.name}</span>
+                  {(act.bindings || []).length === 0 && (
+                    <span className="binding-warning-badge" title="This activity has no object bindings and will never fire.">
+                      ⚠ No bindings
+                    </span>
+                  )}
+                  <label className="max-consec-label" onClick={e => e.stopPropagation()}>
+                    max consec <HelpTip text="Maximum number of back-to-back firings allowed. Leave blank for no limit." />
+                    <input
+                      className="binding-num max-consec-input"
+                      type="number" min={1}
+                      value={(model.max_consecutive || {})[act.name] ?? ''}
+                      placeholder="∞"
+                      onChange={e => updateMaxConsecutive(act.name, e.target.value)}
+                    />
+                  </label>
+                  <span className="activity-binding-count">
+                    {(act.bindings || []).length} binding{(act.bindings || []).length !== 1 ? 's' : ''}
+                  </span>
+                </div>
+                {expandedActs.has(act.name) && (
+                  <div className="activity-bindings">
+                    <div className="binding-header-row">
+                      <span>Object Type</span>
+                      <span>Min <HelpTip text="Minimum objects of this type required to fire the activity." /></span>
+                      <span>Max <HelpTip text="Maximum objects that can participate. Leave blank for no upper limit." /></span>
+                      <span>Creates <HelpTip text="Activity instantiates new objects of this type rather than reusing existing ones." /></span>
+                      <span>Deactivates <HelpTip text="Participating objects are deactivated (removed from simulation) after firing." /></span>
+                      <span></span>
+                    </div>
+                    {(act.bindings || []).length === 0 && (
+                      <p className="binding-empty-warning">⚠ No object bindings — this activity will never be a candidate. Add a binding below.</p>
+                    )}
+                    {(act.bindings || []).map((b, bi) => (
+                      <div key={bi} className="binding-row">
+                        <span className="binding-type-label">{b.object_type}</span>
+                        <input
+                          className="binding-num"
+                          type="number" min={0}
+                          value={b.min_count}
+                          onChange={e => updateBinding(ai, bi, 'min_count', parseInt(e.target.value) || 0)}
+                        />
+                        <input
+                          className="binding-num"
+                          type="number" min={0}
+                          value={b.max_count === null ? '' : b.max_count}
+                          placeholder="∞"
+                          onChange={e => updateBinding(ai, bi, 'max_count',
+                            e.target.value === '' ? null : parseInt(e.target.value) || 0)}
+                        />
+                        <label className="binding-toggle">
+                          <input type="checkbox" checked={!!b.creates}
+                            onChange={e => updateBinding(ai, bi, 'creates', e.target.checked)} />
+                          creates
+                        </label>
+                        <label className="binding-toggle">
+                          <input type="checkbox" checked={!!(b.deactivates ?? b.consumes)}
+                            onChange={e => updateBinding(ai, bi, 'deactivates', e.target.checked)} />
+                          deactivates
+                        </label>
+                        <button className="row-delete-btn binding-delete-btn"
+                          onClick={() => deleteBinding(ai, bi)} title="Remove binding">✕</button>
+                      </div>
+                    ))}
+                    {/* ── Add binding row ── */}
+                    <div className="add-binding-row">
+                      <select
+                        className="add-binding-select"
+                        value={newBindingTypes[act.name] || ''}
+                        onChange={e => setNewBindingTypes(p => ({ ...p, [act.name]: e.target.value }))}
+                      >
+                        <option value="">object type…</option>
+                        {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                      <button className="add-binding-btn"
+                        disabled={!newBindingTypes[act.name] && objectTypes.length === 0}
+                        onClick={() => addBinding(ai, act.name)}>
+                        + Add binding
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ━━ CONSTRAINTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'constraints' && (
+          <div>
+            <div className="toolbar-row">
+              <input
+                className="filter-input"
+                placeholder="Filter by activity name…"
+                value={conFilter}
+                onChange={e => setConFilter(e.target.value)}
+              />
+              <span className="filter-count">{filteredConstraints.length} / {constraints.length}</span>
+            </div>
+
+            <div className="constraints-list">
+              {filteredConstraints.length === 0 && (
+                <p className="empty-notice">No constraints match the filter.</p>
+              )}
+              {filteredConstraints.map((c, idx) => {
+                const realIdx = constraints.indexOf(c);
+                return (
+                  <div key={idx} className="constraint-row">
+                    <span className={`constraint-type-badge ${c.constraint_type}`}>
+                      {c.constraint_type}
+                    </span>
+                    <span className="constraint-src">{c.source_activity}</span>
+                    <span className="constraint-arrow">→</span>
+                    <span className="constraint-tgt">{c.target_activity}</span>
+                    <span className="constraint-scope">
+                      [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
+                    </span>
+                    {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
+                      ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
+                      <span className="constraint-card" title={
+                        c.constraint_type === 'response'
+                          ? 'Cardinality bound: n≤ caps how many times the target may fire per scope object.'
+                          : 'Enforced cardinality: source must precede target (n≥1).'
+                      }>
+                        {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
+                      </span>
+                    )}
+                    <button className="row-delete-btn" onClick={() => deleteConstraint(realIdx)} title="Remove">✕</button>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="add-form">
+              <select value={newCon.constraint_type}
+                onChange={e => setNewCon(p => ({
+                  ...p,
+                  constraint_type: e.target.value,
+                  nmin: e.target.value === 'precedence' ? 1 : 0,
+                  nmax: null,
+                }))}>
+                {CONSTRAINT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              {CONSTRAINT_HELP[newCon.constraint_type] && (
+                <HelpTip text={CONSTRAINT_HELP[newCon.constraint_type]} />
+              )}
+              <select value={newCon.source_activity}
+                onChange={e => setNewCon(p => ({ ...p, source_activity: e.target.value }))}>
+                <option value="">source…</option>
+                {actNames.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+              <span className="add-form-sep">→</span>
+              <select value={newCon.target_activity}
+                onChange={e => setNewCon(p => ({ ...p, target_activity: e.target.value }))}>
+                <option value="">target…</option>
+                {actNames.map(a => <option key={a} value={a}>{a}</option>)}
+              </select>
+              <select value={newCon.scope.kind}
+                onChange={e => setNewCon(p => ({ ...p, scope: { ...p.scope, kind: e.target.value, object_type: e.target.value === 'global' ? '' : p.scope.object_type } }))}>
+                {SCOPE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+              </select>
+              {newCon.scope.kind !== 'global' && (
+                <select value={newCon.scope.object_type}
+                  onChange={e => setNewCon(p => ({ ...p, scope: { ...p.scope, object_type: e.target.value } }))}>
+                  <option value="">scope type…</option>
+                  {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              )}
+              {(newCon.constraint_type === 'precedence' || newCon.constraint_type === 'response') && (
+                <span className="card-inputs" title={
+                  newCon.constraint_type === 'response'
+                    ? 'n≤ caps how many times the target may fire per scope object (blank = no upper bound).'
+                    : 'Cardinality bounds: nmin ≥ 1 enforces "source before target"; nmax optionally caps how many sources may precede the target (blank = no upper bound).'
+                }>
+                  {newCon.constraint_type === 'precedence' && (
+                    <>
+                      <label className="card-label">n≥</label>
+                      <input
+                        className="card-input"
+                        type="number"
+                        min="0"
+                        value={newCon.nmin ?? 0}
+                        onChange={e => setNewCon(p => ({ ...p, nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) }))}
+                      />
+                    </>
+                  )}
+                  <label className="card-label">n≤</label>
+                  <input
+                    className="card-input"
+                    type="number"
+                    min="0"
+                    placeholder="∞"
+                    value={newCon.nmax ?? ''}
+                    onChange={e => setNewCon(p => ({ ...p, nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) }))}
+                  />
+                </span>
+              )}
+              <button className="add-form-btn" onClick={addConstraint}>+ Add</button>
+            </div>
+          </div>
+        )}
+
+        {/* ━━ O2O RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'o2o' && (
+          <div>
+            <div className="o2o-list">
+              {o2oRules.length === 0 && <p className="empty-notice">No O2O rules defined.</p>}
+              {o2oRules.map((r, idx) => (
+                <div key={idx} className="o2o-row">
+                  <span className="o2o-src">{r.source_type}</span>
+                  <span className={`o2o-dir ${r.bidirectional ? 'bi' : 'uni'}`}>
+                    {r.bidirectional ? '↔' : '→'}
+                  </span>
+                  <span className="o2o-tgt">{r.target_type}</span>
+                  <span className="o2o-cardinality">
+                    min={r.min_links} max={r.max_links === null ? '∞' : r.max_links}
+                  </span>
+                  <label className="binding-toggle">
+                    <input type="checkbox" checked={!!r.bidirectional}
+                      onChange={e => {
+                        const updated = o2oRules.map((x, i) =>
+                          i === idx ? { ...x, bidirectional: e.target.checked } : x);
+                        onModelChange({ ...model, o2o_rules: updated });
+                      }} />
+                    bidirectional
+                  </label>
+                  <button className="row-delete-btn" onClick={() => deleteO2O(idx)} title="Remove">✕</button>
+                </div>
+              ))}
+            </div>
+
+            <div className="add-form">
+              <select value={newO2O.source_type}
+                onChange={e => setNewO2O(p => ({ ...p, source_type: e.target.value }))}>
+                <option value="">source type…</option>
+                {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              <select value={newO2O.target_type}
+                onChange={e => setNewO2O(p => ({ ...p, target_type: e.target.value }))}>
+                <option value="">target type…</option>
+                {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              <label className="binding-toggle">
+                <input type="checkbox" checked={newO2O.bidirectional}
+                  onChange={e => setNewO2O(p => ({ ...p, bidirectional: e.target.checked }))} />
+                bidirectional
+              </label>
+              <input className="binding-num" type="number" min={0} value={newO2O.min_links}
+                placeholder="min"
+                onChange={e => setNewO2O(p => ({ ...p, min_links: parseInt(e.target.value) || 0 }))} />
+              <input className="binding-num" type="number" min={0}
+                value={newO2O.max_links === null ? '' : newO2O.max_links}
+                placeholder="max (∞)"
+                onChange={e => setNewO2O(p => ({
+                  ...p, max_links: e.target.value === '' ? null : parseInt(e.target.value) || 0
+                }))} />
+              <button className="add-form-btn" onClick={addO2O}>+ Add</button>
+            </div>
+          </div>
+        )}
+
+        {/* ━━ PROBABILITIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'probabilities' && (
+          <div>
+            <p className="prob-hint">
+              Edit outgoing transition weights (%). Use <strong>Normalise</strong> to make a row sum
+              to 100%, or <strong>Uniform</strong> to spread equally across all activities.
+              The simulation adds a small epsilon to every weight, so 0% transitions are never
+              completely blocked — set them very low rather than exactly 0 to reduce their frequency.
+            </p>
+            {actNames.length === 0 && <p className="empty-notice">No activities defined.</p>}
+            {actNames.map(src => {
+              const row      = probMatrix[src] || {};
+              const rowTotal = actNames.reduce((s, a) => s + (row[a] || 0), 0);
+              const isOpen   = expandedProbs.has(src);
+              return (
+                <div key={src} className={`prob-source-block ${isOpen ? 'open' : ''}`}>
+                  <div className="prob-source-header" onClick={() => toggleProb(src)}>
+                    <span className={`activity-expand ${isOpen ? 'open' : ''}`}>▶</span>
+                    <span className="prob-source-name">{src}</span>
+                    <span className={`prob-row-total ${Math.abs(rowTotal * 100 - 100) < 1 ? 'ok' : 'warn'}`}>
+                      {(rowTotal * 100).toFixed(0)}%
+                    </span>
+                    {isOpen && (
+                      <div className="prob-row-actions" onClick={e => e.stopPropagation()}>
+                        <button className="prob-action-btn" onClick={() => normalizeRow(src)}>
+                          Normalise <HelpTip text="Scale all outgoing weights so they sum to exactly 100%." />
+                        </button>
+                        <button className="prob-action-btn" onClick={() => setUniform(src)}>
+                          Uniform <HelpTip text="Set equal weight for every activity (100% ÷ activity count)." />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {isOpen && (
+                    <div className="prob-targets">
+                      {actNames.map(tgt => {
+                        const val = row[tgt] || 0;
+                        const pct = +(val * 100).toFixed(1);
+                        return (
+                          <div key={tgt} className="prob-target-row">
+                            <span className="prob-target-name">→ {tgt}</span>
+                            <input
+                              type="range" min={0} max={100} step={0.5}
+                              className="prob-slider"
+                              value={pct}
+                              onChange={e => updateProbLinked(src, tgt, e.target.value)}
+                            />
+                            <input
+                              type="number" min={0} max={100} step={0.1}
+                              className="prob-pct-input"
+                              value={pct}
+                              onChange={e => updateProbLinked(src, tgt, e.target.value)}
+                            />
+                            <span className="prob-pct-label">%</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+
+        {/* ━━ TIMING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'timing' && (
+          <div>
+            <p className="prob-hint">
+              Edit per-activity time distributions. <strong>Mean</strong> and <strong>Std</strong> drive
+              timestamp sampling during simulation. Metrics below each row (Sojourn, Waiting, etc.) are
+              discovered reference values — they do not affect simulation directly.
+              Run <em>Discover Time Distributions</em> (Step 2.5) to populate these from the event log.
+            </p>
+            {actNames.length === 0 && <p className="empty-notice">No activities defined.</p>}
+            {actNames.map(act => {
+              const td = timingData[act] || {};
+              const hasData = !!td.mean_seconds;
+              return (
+                <div key={act} className="timing-row">
+                  <div className="timing-act-name">
+                    {act}
+                    {!hasData && <span className="timing-no-data">no timing data</span>}
+                  </div>
+                  <div className="timing-controls">
+                    <label className="timing-field-label">
+                      Type <HelpTip text="Sampling distribution. Lognormal is recommended for durations (always positive, right-skewed)." />
+                      <select
+                        className="timing-select"
+                        value={td.dist_type || 'lognormal'}
+                        onChange={e => updateTiming(act, 'dist_type', e.target.value)}
+                      >
+                        {DIST_TYPES.map(d => <option key={d} value={d}>{d}</option>)}
+                      </select>
+                    </label>
+                    <label className="timing-field-label">
+                      Mean (s) <HelpTip text="Average service duration in seconds." />
+                      <input type="number" min={0} step={1} className="timing-num"
+                        value={td.mean_seconds ?? ''}
+                        placeholder="3600"
+                        onChange={e => updateTiming(act, 'mean_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
+                    </label>
+                    <label className="timing-field-label">
+                      Std (s) <HelpTip text="Standard deviation of service duration in seconds. Not used for exponential or fixed." />
+                      <input type="number" min={0} step={1} className="timing-num"
+                        value={td.std_seconds ?? ''}
+                        placeholder="600"
+                        onChange={e => updateTiming(act, 'std_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
+                    </label>
+                    <label className="timing-field-label">
+                      Min (s) <HelpTip text="Hard lower bound on sampled duration (clamp)." />
+                      <input type="number" min={0} step={1} className="timing-num"
+                        value={td.min_seconds ?? ''}
+                        placeholder="0"
+                        onChange={e => updateTiming(act, 'min_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
+                    </label>
+                    <label className="timing-field-label">
+                      Max (s) <HelpTip text="Hard upper bound on sampled duration. Leave blank for no cap." />
+                      <input type="number" min={0} step={1} className="timing-num"
+                        value={td.max_seconds ?? ''}
+                        placeholder="∞"
+                        onChange={e => updateTiming(act, 'max_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
+                    </label>
+                  </div>
+                  {/* OCPA reference metrics */}
+                  {OCPA_FIELDS.some(f => td[f.key] != null) && (
+                    <div className="timing-ocpa-metrics">
+                      {OCPA_FIELDS.filter(f => td[f.key] != null).map(f => (
+                        <span key={f.key} className="timing-ocpa-chip">
+                          {f.label}: <strong>{Math.round(td[f.key])}s</strong>
+                        </span>
+                      ))}
+                      {td.sample_count != null && td.sample_count > 0 && (
+                        <span className="timing-ocpa-chip timing-sample-count">n={td.sample_count}</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+      </div>
+      )}
+    </div>
+  );
+}
+
