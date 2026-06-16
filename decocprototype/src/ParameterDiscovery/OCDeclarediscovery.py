@@ -1267,6 +1267,64 @@ def discover_ocdeclare_model(
     # Discover ranked start activity candidates
     start_activities_ranked = discover_start_activities(ocel_log)
 
+    # Collect attribute schema and default values from the log.
+    # attribute_schema: { object_type: { attr_name: most_common_value } }
+    # object_type_attr_defs: { object_type: [ {name, type} ] }
+    attribute_schema: Dict[str, Any] = {}
+    object_type_attr_defs: Dict[str, list] = {}
+
+    raw_objects = ocel_log.get("objects", {})
+    raw_object_types_meta = ocel_log.get("objectTypes", []) or []
+
+    for ot_entry in raw_object_types_meta:
+        if not isinstance(ot_entry, dict):
+            continue
+        ot_name = ot_entry.get("name", "")
+        if not ot_name:
+            continue
+        attr_defs = ot_entry.get("attributes", []) or []
+        object_type_attr_defs[ot_name] = [
+            {"name": str(a.get("name", "")), "type": str(a.get("type", "string"))}
+            for a in attr_defs if isinstance(a, dict) and a.get("name")
+        ]
+
+    attr_value_buckets: Dict[str, Dict[str, list]] = {}
+    obj_iter = raw_objects.values() if isinstance(raw_objects, dict) else (raw_objects if isinstance(raw_objects, list) else [])
+    for obj_entry in obj_iter:
+        if not isinstance(obj_entry, dict):
+            continue
+        ot = obj_entry.get("type", "")
+        attrs = obj_entry.get("attributes", []) or []
+        if isinstance(attrs, list):
+            for a in attrs:
+                if not isinstance(a, dict):
+                    continue
+                name = a.get("name")
+                value = a.get("value")
+                if name is not None and value is not None:
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+        elif isinstance(attrs, dict):
+            for name, value in attrs.items():
+                if value is not None:
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+
+    for ot, attr_map in attr_value_buckets.items():
+        defaults = {}
+        for attr_name, values in attr_map.items():
+            counter = Counter(str(v) for v in values)
+            most_common_str, _ = counter.most_common(1)[0]
+            original = next((v for v in values if str(v) == most_common_str), most_common_str)
+            defaults[attr_name] = original
+        attribute_schema[ot] = defaults
+
+    # Build object_types list: strings for backward compat, but enrich with attr defs
+    object_types_with_attrs = []
+    for ot_name in object_types:
+        entry: Dict[str, Any] = {"name": ot_name}
+        if ot_name in object_type_attr_defs:
+            entry["attributes"] = object_type_attr_defs[ot_name]
+        object_types_with_attrs.append(entry)
+
     # Build activity structures with bindings
     activity_structures = []
     for activity in activities:
@@ -1280,19 +1338,20 @@ def discover_ocdeclare_model(
                     'creates': binding_info['creates'],
                     'deactivates': binding_info['deactivates']
                 })
-        
+
         activity_structures.append({
             'name': activity,
             'bindings': bindings_list
         })
-    
+
     # Build discovered model
     discovered_model = {
-        'object_types': object_types,
+        'object_types': object_types_with_attrs,
         'activities': activity_structures,
         'constraints': all_constraints,
         'o2o_rules': o2o_rules,
-        'resource_types': resource_types
+        'resource_types': resource_types,
+        'attribute_schema': attribute_schema,
     }
     
     # Save to file if requested

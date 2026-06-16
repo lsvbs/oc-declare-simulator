@@ -453,8 +453,11 @@ class Simulator:
     def _apply_candidate(self, candidate: Candidate, state: SimulationState) -> None:
         created_object_ids: list[str] = []
 
+        attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
+
         for object_type in candidate.object_types_to_create:
-            obj = state.add_object(object_type=object_type)
+            defaults = attribute_defaults.get(object_type, {})
+            obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
 
         # Delegate automatic link creation to the centralized link policy.

@@ -51,6 +51,7 @@ export default function ModelEditor({
   const constraints = model.constraints || [];
   const o2oRules   = model.o2o_rules   || [];
   const objectTypes = useMemo(() => model.object_types || [], [model.object_types]);
+  const otNames     = useMemo(() => objectTypes.map(t => typeof t === 'string' ? t : t.name), [objectTypes]);
   const actNames    = useMemo(() => activities.map(a => a.name), [activities]);
 
   // ── Activities helpers ────────────────────────────────────────────────────
@@ -75,7 +76,7 @@ export default function ModelEditor({
   };
 
   const addBinding = (ai, actName) => {
-    const chosen = newBindingTypes[actName] || objectTypes[0];
+    const chosen = newBindingTypes[actName] || otNames[0];
     if (!chosen) return;
     const newActs = activities.map((a, idx) => idx !== ai ? a : {
       ...a,
@@ -168,6 +169,7 @@ export default function ModelEditor({
     { id: 'activities',   label: 'Activities',   count: activities.length },
     { id: 'constraints',  label: 'Constraints',  count: constraints.length },
     { id: 'o2o',          label: 'O2O Rules',    count: o2oRules.length },
+    { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
   ];
@@ -210,6 +212,8 @@ export default function ModelEditor({
     activities,
     constraints,
     o2o_rules: o2oRules,
+    ...(model.attribute_schema && Object.keys(model.attribute_schema).length
+      ? { attribute_schema: model.attribute_schema } : {}),
     ...(model.activity_durations && Object.keys(model.activity_durations).length
       ? { activity_durations: model.activity_durations } : {}),
     ...(model.max_consecutive && Object.keys(model.max_consecutive).length
@@ -400,10 +404,10 @@ export default function ModelEditor({
                         onChange={e => setNewBindingTypes(p => ({ ...p, [act.name]: e.target.value }))}
                       >
                         <option value="">object type…</option>
-                        {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                        {otNames.map(t => <option key={t} value={t}>{t}</option>)}
                       </select>
                       <button className="add-binding-btn"
-                        disabled={!newBindingTypes[act.name] && objectTypes.length === 0}
+                        disabled={!newBindingTypes[act.name] && otNames.length === 0}
                         onClick={() => addBinding(ai, act.name)}>
                         + Add binding
                       </button>
@@ -493,7 +497,7 @@ export default function ModelEditor({
                 <select value={newCon.scope.object_type}
                   onChange={e => setNewCon(p => ({ ...p, scope: { ...p.scope, object_type: e.target.value } }))}>
                   <option value="">scope type…</option>
-                  {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                  {otNames.map(t => <option key={t} value={t}>{t}</option>)}
                 </select>
               )}
               {(newCon.constraint_type === 'precedence' || newCon.constraint_type === 'response') && (
@@ -563,12 +567,12 @@ export default function ModelEditor({
               <select value={newO2O.source_type}
                 onChange={e => setNewO2O(p => ({ ...p, source_type: e.target.value }))}>
                 <option value="">source type…</option>
-                {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                {otNames.map(t => <option key={t} value={t}>{t}</option>)}
               </select>
               <select value={newO2O.target_type}
                 onChange={e => setNewO2O(p => ({ ...p, target_type: e.target.value }))}>
                 <option value="">target type…</option>
-                {objectTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                {otNames.map(t => <option key={t} value={t}>{t}</option>)}
               </select>
               <label className="binding-toggle">
                 <input type="checkbox" checked={newO2O.bidirectional}
@@ -654,6 +658,84 @@ export default function ModelEditor({
           </div>
         )}
 
+
+        {/* ━━ ATTRIBUTES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'attributes' && (
+          <div>
+            <p className="prob-hint">
+              Attribute definitions and default values per object type. Definitions come from the
+              input event log. Default values are the most common value observed in the log and are
+              assigned to every newly created object of that type during simulation.
+            </p>
+            {objectTypes.length === 0 && <p className="empty-notice">No object types defined.</p>}
+            {objectTypes.map((ot) => {
+              const otName = typeof ot === 'string' ? ot : ot.name;
+              const attrDefs = (typeof ot === 'object' ? ot.attributes : null) || [];
+              const schema = (model.attribute_schema || {})[otName] || {};
+
+              const updateDefault = (attrName, value) => {
+                const newSchema = {
+                  ...(model.attribute_schema || {}),
+                  [otName]: { ...schema, [attrName]: value },
+                };
+                onModelChange({ ...model, attribute_schema: newSchema });
+              };
+
+              const addAttrDef = () => {
+                const name = prompt('Attribute name:');
+                if (!name) return;
+                const type = prompt('Attribute type (string / float / integer / boolean):', 'string') || 'string';
+                const newAttrDefs = [...attrDefs, { name, type }];
+                const newOts = objectTypes.map(o => {
+                  const n = typeof o === 'string' ? o : o.name;
+                  if (n !== otName) return o;
+                  return typeof o === 'string' ? { name: o, attributes: newAttrDefs } : { ...o, attributes: newAttrDefs };
+                });
+                onModelChange({ ...model, object_types: newOts });
+              };
+
+              const removeAttrDef = (attrName) => {
+                const newAttrDefs = attrDefs.filter(a => a.name !== attrName);
+                const newOts = objectTypes.map(o => {
+                  const n = typeof o === 'string' ? o : o.name;
+                  if (n !== otName) return o;
+                  return typeof o === 'string' ? { name: o, attributes: newAttrDefs } : { ...o, attributes: newAttrDefs };
+                });
+                // Also remove from schema defaults
+                const newSchema = { ...(model.attribute_schema || {}) };
+                if (newSchema[otName]) {
+                  const { [attrName]: _, ...rest } = newSchema[otName];
+                  newSchema[otName] = rest;
+                }
+                onModelChange({ ...model, object_types: newOts, attribute_schema: newSchema });
+              };
+
+              return (
+                <div key={otName} className="timing-row">
+                  <div className="timing-act-name">{otName}</div>
+                  {attrDefs.length === 0 && (
+                    <span className="timing-no-data">no attributes defined</span>
+                  )}
+                  {attrDefs.map(ad => (
+                    <div key={ad.name} className="attr-row">
+                      <span className="attr-name">{ad.name}</span>
+                      <span className="attr-type">({ad.type})</span>
+                      <input
+                        className="attr-default-input"
+                        title={`Default value for ${ad.name}`}
+                        value={schema[ad.name] ?? ''}
+                        onChange={e => updateDefault(ad.name, e.target.value)}
+                        placeholder="default value"
+                      />
+                      <button className="del-btn" title="Remove attribute" onClick={() => removeAttrDef(ad.name)}>✕</button>
+                    </div>
+                  ))}
+                  <button className="add-btn" onClick={addAttrDef}>+ Add attribute</button>
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {/* ━━ TIMING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
         {activeTab === 'timing' && (

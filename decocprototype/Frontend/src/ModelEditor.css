@@ -799,3 +799,37 @@
   background: #dbeafe;
   color: #1d4ed8;
 }
+
+/* ── Attributes tab ─────────────────────────────────────────────────────── */
+.attr-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.25rem 0 0.25rem 0.5rem;
+}
+
+.attr-name {
+  font-weight: 500;
+  font-size: 0.82rem;
+  min-width: 8rem;
+  color: #1e293b;
+}
+
+.attr-type {
+  font-size: 0.75rem;
+  color: #64748b;
+  min-width: 5rem;
+}
+
+.attr-default-input {
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.82rem;
+  width: 10rem;
+}
+
+.attr-default-input:focus {
+  outline: none;
+  border-color: #6366f1;
+}

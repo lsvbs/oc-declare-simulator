@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Optional, Any
 
 
 # Adapters from Models should convert OC-Declare or other notations
@@ -35,8 +35,15 @@ class Activity:
 
 
 @dataclass(frozen=True)
+class AttributeDefinition:
+    name: str
+    type: str = "string"  # "string" | "float" | "integer" | "boolean"
+
+
+@dataclass(frozen=True)
 class ObjectType:
     name: str
+    attributes: tuple = ()  # tuple[AttributeDefinition, ...]
 
 
 @dataclass(frozen=True)
@@ -112,19 +119,13 @@ class StaticModel:
     object_types: list[ObjectType] = field(default_factory=list)
     constraints: list[Constraint] = field(default_factory=list)
     o2o_rules: list[O2ORule] = field(default_factory=list)
-    # Object types classified as reusable resources (e.g. Forklift, Truck).
-    # Resource objects are never deactivated by the simulation engine and are
-    # selected globally rather than by link-preference, because they participate
-    # across many unrelated case chains and have no meaningful per-case binding.
     resource_types: list[str] = field(default_factory=list)
-    # Per-activity cap on consecutive (back-to-back) firings.
-    # e.g. {"pick item": 3} means pick item may fire at most 3 times in a row
-    # before some other activity must intervene.  None / missing = no cap.
     max_consecutive: dict[str, int] = field(default_factory=dict)
-    # Per-activity time distribution parameters (for DistributionTimePolicy).
-    # Keyed by activity name.  Empty dict = use DefaultTimePolicy (fixed delta).
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
-    #should these be immutable? switch to tuples later?
+    # Per-object-type default attribute values sampled from the input log.
+    # Maps object_type_name -> {attr_name: default_value}.
+    # Used by the simulator to initialize attributes on newly created objects.
+    attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 model = StaticModel(

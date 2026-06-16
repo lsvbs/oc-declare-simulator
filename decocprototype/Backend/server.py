@@ -519,7 +519,7 @@ def run_simulation():
         ]
         
         # Save output
-        output_file = write_ocel2_json(final_state)
+        output_file = write_ocel2_json(final_state, static_model=static_model)
         output_filename = os.path.basename(output_file)
         
         return jsonify({

@@ -6,9 +6,9 @@ structure. It avoids mixing multiple JSON variants in one file.
 Notes for compatibility with OCPQ / OCEL 2.0 readers:
 - Top-level collections are emitted as lists, not dictionaries.
 - Events must carry a `time` field.
-- Object attribute entries in OCEL 2.0 are time-dependent records in many
-  readers. Since the simulator does not yet model object-attribute change
-  history explicitly, we export object `attributes` as an empty list.
+- Object attributes are exported as time-stamped records using the simulation
+  start time as the timestamp (attributes are static — initialized once and
+  not modified during simulation).
 """
 
 from __future__ import annotations
@@ -24,27 +24,32 @@ from src.Simulation.Domain.state import SimulationState
 def _isoformat_or_none(ts: Optional[datetime]) -> Optional[str]:
     if ts is None:
         return None
-
-    # Make timezone-naive datetimes explicit UTC to avoid ambiguous timestamps.
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-
     return ts.isoformat()
 
 
-def _build_object_type_definitions(state: SimulationState) -> list[dict[str, Any]]:
+def _build_object_type_definitions(state: SimulationState, static_model: Any = None) -> list[dict[str, Any]]:
     object_type_names = sorted({obj.object_type for obj in state.objects.values()})
 
-    return [
-        {
-            "name": object_type_name,
-            "attributes": [
-                {"name": "status", "type": "string"},
-                {"name": "active", "type": "boolean"},
-            ],
-        }
-        for object_type_name in object_type_names
-    ]
+    # Build a lookup from the static model's ObjectType attribute definitions
+    attr_def_lookup: dict[str, list] = {}
+    if static_model is not None:
+        for ot in getattr(static_model, "object_types", []) or []:
+            attr_defs = getattr(ot, "attributes", ()) or ()
+            if attr_defs:
+                attr_def_lookup[ot.name] = [
+                    {"name": a.name, "type": a.type} for a in attr_defs
+                ]
+
+    result = []
+    for ot_name in object_type_names:
+        attrs = attr_def_lookup.get(ot_name, [
+            {"name": "status", "type": "string"},
+            {"name": "active", "type": "boolean"},
+        ])
+        result.append({"name": ot_name, "attributes": attrs})
+    return result
 
 
 def _build_event_type_definitions(state: SimulationState) -> list[dict[str, Any]]:
@@ -59,25 +64,23 @@ def _build_event_type_definitions(state: SimulationState) -> list[dict[str, Any]
     ]
 
 
-def _build_objects(state: SimulationState) -> list[dict[str, Any]]:
-    """Build OCEL 2.0 objects.
-
-    Important:
-    Many OCEL 2.0 readers interpret object attributes as time-stamped value
-    assignments. Since the simulator currently stores only the current object
-    state and not a full attribute history, we export no object attributes yet.
-    """
+def _build_objects(state: SimulationState, ref_timestamp: Optional[datetime] = None) -> list[dict[str, Any]]:
     objects: list[dict[str, Any]] = []
+    ts_str = _isoformat_or_none(ref_timestamp)
 
     for obj_id in sorted(state.objects.keys()):
         obj = state.objects[obj_id]
-        objects.append(
-            {
-                "id": obj_id,
-                "type": obj.object_type,
-                "attributes": [],
-            }
-        )
+        attrs = []
+        for attr_name, attr_value in (obj.attributes or {}).items():
+            entry: dict[str, Any] = {"name": attr_name, "value": attr_value}
+            if ts_str is not None:
+                entry["time"] = ts_str
+            attrs.append(entry)
+        objects.append({
+            "id": obj_id,
+            "type": obj.object_type,
+            "attributes": attrs,
+        })
 
     return objects
 
@@ -148,15 +151,22 @@ def build_ocel2_dict(
     log_id: str = "log",
     include_null_timestamps: bool = False,
     include_debug_metadata: bool = False,
+    static_model: Any = None,
 ) -> dict[str, Any]:
     """Convert a SimulationState into a clean sequence-based OCEL 2.0-style dict."""
+
+    # Use the earliest event timestamp as the reference for attribute time entries.
+    ref_ts = next(
+        (ev.timestamp for ev in state.executed_events if ev.timestamp is not None),
+        None,
+    )
 
     payload: dict[str, Any] = {
         "version": "2.0",
         "ordering": "timestamp",
-        "objectTypes": _build_object_type_definitions(state),
+        "objectTypes": _build_object_type_definitions(state, static_model),
         "eventTypes": _build_event_type_definitions(state),
-        "objects": _build_objects(state),
+        "objects": _build_objects(state, ref_ts),
         "events": _build_events(
             state,
             include_null_timestamps=include_null_timestamps,
@@ -189,6 +199,7 @@ def write_ocel2_json(
     indent: int = 2,
     include_null_timestamps: bool = False,
     include_debug_metadata: bool = False,
+    static_model: Any = None,
 ) -> Path:
     """Write a single OCEL 2.0-style JSON file for this state and return the path."""
 
@@ -204,6 +215,7 @@ def write_ocel2_json(
         log_id=log_id,
         include_null_timestamps=include_null_timestamps,
         include_debug_metadata=include_debug_metadata,
+        static_model=static_model,
     )
 
     file_path = out_path / filename

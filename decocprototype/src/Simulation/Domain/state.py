@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 
 
@@ -9,7 +9,7 @@ class RuntimeObject:
     object_type: str
     status: Optional[str] = None
     active: bool = True
-    # attributes: dict[str, Any] = field(default_factory=dict)  # maybe later
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -59,13 +59,14 @@ class SimulationState:
         self.next_event_counter += 1
         return event_id
 
-    def add_object(self, object_type: str, status: Optional[str] = None) -> RuntimeObject:
+    def add_object(self, object_type: str, status: Optional[str] = None, attributes: Optional[dict] = None) -> RuntimeObject:
         object_id = self.new_object_id(object_type)
         obj = RuntimeObject(
             object_id=object_id,
             object_type=object_type,
             status=status,
             active=True,
+            attributes=dict(attributes) if attributes else {},
         )
         self.objects[object_id] = obj
         return obj

@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from src.Simulation.Domain.ir import (
     StaticModel,
     ObjectType,
+    AttributeDefinition,
     Activity,
     ObjectBinding,
     Constraint,
@@ -126,8 +127,23 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
     """
     # Object types
     object_types = []
+    # attribute_schema: maps object_type_name -> {attr_name: default_value}
+    attribute_schema: Dict[str, Dict[str, Any]] = data.get("attribute_schema") or {}
     for ot in data.get("object_types", []) or []:
-        object_types.append(ObjectType(name=str(ot)))
+        if isinstance(ot, str):
+            name = ot
+            attr_defs_raw = []
+        elif isinstance(ot, dict):
+            name = ot.get("name", "")
+            attr_defs_raw = ot.get("attributes", [])
+        else:
+            continue
+        attr_defs = tuple(
+            AttributeDefinition(name=str(a.get("name", "")), type=str(a.get("type", "string")))
+            for a in attr_defs_raw
+            if isinstance(a, dict) and a.get("name")
+        )
+        object_types.append(ObjectType(name=str(name), attributes=attr_defs))
 
     # Activities
     activities = []
@@ -215,6 +231,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             if v is not None
         },
         activity_durations=_parse_activity_durations(data.get("activity_durations") or {}),
+        attribute_defaults={
+            str(k): dict(v)
+            for k, v in (data.get("attribute_schema") or {}).items()
+            if isinstance(v, dict)
+        },
     )
 
 
