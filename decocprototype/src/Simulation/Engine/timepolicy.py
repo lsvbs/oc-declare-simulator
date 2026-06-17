@@ -90,28 +90,54 @@ def _sample_duration(dur: Any, rng: Any = None) -> float:
 
 @dataclass
 class DistributionTimePolicy:
-	"""Time policy that samples realistic durations from per-activity distributions.
+    """Time policy that samples realistic durations from per-activity distributions.
 
-	Each activity can have a different distribution type and parameters
-	(stored in StaticModel.activity_durations as ActivityDuration objects).
-	Activities without an entry fall back to the default fixed-delta behaviour.
-	"""
+    Clock compression for concurrent activities
+    -------------------------------------------
+    When ``concurrency_probs`` is provided and the previous activity and the
+    current candidate have a stored concurrency probability above
+    ``concurrency_threshold``, the clock is not advanced — the new event is
+    assigned the same timestamp as the previous one, modelling the two
+    activities as firing simultaneously.
 
-	durations: Dict[str, Any]  # activity_name -> ActivityDuration
-	_fallback_delta: timedelta = timedelta(hours=1)
+    The probability is used as a Bernoulli draw: with probability p the clock
+    stays (concurrent), with probability 1-p it advances normally.
+    """
 
-	def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
-		base = (
-			getattr(state, "last_generated_timestamp", None)
-			or (
-				max((e.timestamp for e in getattr(state, "executed_events", []) if getattr(e, "timestamp", None) is not None), default=None)
-			)
-			or config.start_timestamp
-		)
+    durations: Dict[str, Any]  # activity_name -> ActivityDuration
+    _fallback_delta: timedelta = timedelta(hours=1)
+    concurrency_probs: Dict[str, float] = None   # "A|||B" -> float
+    concurrency_threshold: float = 0.3           # minimum p to consider concurrent
 
-		dur = self.durations.get(getattr(candidate, "activity_name", ""))
-		if dur is None:
-			return base + (getattr(config, "default_time_delta", self._fallback_delta))
+    def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
+        import random as _random
 
-		seconds = _sample_duration(dur, rng)
-		return base + timedelta(seconds=max(0.0, seconds))
+        base = (
+            getattr(state, "last_generated_timestamp", None)
+            or (
+                max((e.timestamp for e in getattr(state, "executed_events", []) if getattr(e, "timestamp", None) is not None), default=None)
+            )
+            or config.start_timestamp
+        )
+
+        act = getattr(candidate, "activity_name", "")
+
+        # ── Clock compression check ───────────────────────────────────────────
+        if self.concurrency_probs and state.executed_events:
+            prev_act = state.executed_events[-1].activity_name
+            if prev_act != act:
+                key = f"{prev_act}|||{act}"
+                p = self.concurrency_probs.get(key, 0.0)
+                if p >= self.concurrency_threshold:
+                    # Bernoulli draw: fire concurrently with probability p
+                    _rng = rng if rng is not None else _random.Random()
+                    roll = float(_rng.random()) if hasattr(_rng, "random") else float(_rng.uniform(0, 1))
+                    if roll < p:
+                        return base  # same timestamp — concurrent
+
+        dur = self.durations.get(act)
+        if dur is None:
+            return base + (getattr(config, "default_time_delta", self._fallback_delta))
+
+        seconds = _sample_duration(dur, rng)
+        return base + timedelta(seconds=max(0.0, seconds))

@@ -1628,6 +1628,129 @@ def compute_ocpa_metrics(
     return result
 
 
+
+
+def discover_concurrency_probs(
+    ocel_log: Dict[str, Any],
+    activity_durations: Optional[Dict[str, Any]] = None,
+    window_seconds: Optional[float] = None,
+    min_occurrences: int = 2,
+) -> Dict[str, float]:
+    """Discover pairwise concurrency probabilities from an OCEL 2.0 log.
+
+    Two events are considered concurrent when they share at least one object
+    and their timestamps are within ``window_seconds`` of each other.  If no
+    explicit window is given, the window for a pair (A, B) is
+    ``max(mean_A, mean_B)`` from the provided activity_durations, falling
+    back to 3600 s (1 h) when durations are unavailable.
+
+    Returns a flat dict keyed ``"A|||B"`` (always A < B lexicographically so
+    each unordered pair appears once) with the probability value in [0, 1].
+    The probability is:
+        p(A ∥ B) = (times A and B fired concurrently) / (total firings of A)
+    Both ``"A|||B"`` and ``"B|||A"`` are stored for fast lookup.
+
+    Parameters
+    ----------
+    ocel_log         : OCEL 2.0 dict (from load_ocel2).
+    activity_durations : dict activity_name -> ActivityDuration or plain dict
+                       with a ``mean_seconds`` key.  Used to set the window.
+    window_seconds   : fixed override for the concurrency window (seconds).
+                       When set, activity_durations is ignored for windowing.
+    min_occurrences  : minimum number of concurrent co-occurrences required
+                       before a probability is recorded.  Filters noise pairs.
+    """
+    if isinstance(ocel_log, list):
+        return {}
+
+    events  = ocel_log.get("events",  {})
+    objects = ocel_log.get("objects", {})
+
+    # ── Parse timestamps ──────────────────────────────────────────────────────
+    def _ts(raw) -> Optional[datetime]:
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw
+        try:
+            s = str(raw).replace("Z", "+00:00")
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    # Build a list of (timestamp, activity, event_id, {object_ids}) records
+    ev_records = []
+    for eid, edata in events.items():
+        ts  = _ts(edata.get("timestamp") or edata.get("ocel:timestamp") or edata.get("time"))
+        act = edata.get("activity") or edata.get("ocel:activity")
+        omap = set(edata.get("omap") or edata.get("relationships") or [])
+        if ts and act:
+            ev_records.append((ts, act, eid, omap))
+
+    if not ev_records:
+        return {}
+
+    ev_records.sort(key=lambda x: x[0])
+
+    # ── Default window lookup ─────────────────────────────────────────────────
+    def _mean_s(act: str) -> float:
+        if activity_durations is None:
+            return 3600.0
+        entry = activity_durations.get(act)
+        if entry is None:
+            return 3600.0
+        if isinstance(entry, dict):
+            return float(entry.get("mean_seconds", 3600.0))
+        return float(getattr(entry, "mean_seconds", 3600.0))
+
+    # ── Count co-occurrences ──────────────────────────────────────────────────
+    # For every event E_A, scan forward/backward within the window and find
+    # events E_B that share at least one object with E_A.
+    from datetime import timedelta
+
+    act_total: Dict[str, int] = Counter(r[1] for r in ev_records)
+    pair_count: Dict[str, int] = {}   # "A|||B" -> co-occurrence count (A <= B)
+
+    n = len(ev_records)
+    for i, (ts_a, act_a, _, omap_a) in enumerate(ev_records):
+        win = timedelta(seconds=window_seconds if window_seconds is not None else 3600.0)
+        # scan forward only — symmetric pairs counted once then doubled
+        for j in range(i + 1, n):
+            ts_b, act_b, _, omap_b = ev_records[j]
+            if (ts_b - ts_a) > win:
+                break
+            if act_a == act_b:
+                continue
+            if not omap_a.intersection(omap_b):
+                continue
+            # use max window of the two activities when no fixed override
+            if window_seconds is None:
+                effective_win = timedelta(seconds=max(_mean_s(act_a), _mean_s(act_b)))
+                if (ts_b - ts_a) > effective_win:
+                    continue
+            key = "|||".join(sorted([act_a, act_b]))
+            pair_count[key] = pair_count.get(key, 0) + 1
+
+    # ── Build probability dict ────────────────────────────────────────────────
+    result: Dict[str, float] = {}
+    for key, cnt in pair_count.items():
+        if cnt < min_occurrences:
+            continue
+        a, b = key.split("|||")
+        total_a = act_total.get(a, 0)
+        total_b = act_total.get(b, 0)
+        if total_a == 0 or total_b == 0:
+            continue
+        # p = symmetric: fraction of A-firings with a concurrent B,
+        # averaged with fraction of B-firings with a concurrent A
+        p = 0.5 * (cnt / total_a + cnt / total_b)
+        p = min(1.0, round(p, 4))
+        result[f"{a}|||{b}"] = p
+        result[f"{b}|||{a}"] = p  # both orderings for fast lookup
+
+    return result
+
+
 if __name__ == '__main__':
     # Example usage
     result = discover_ocdeclare_model(

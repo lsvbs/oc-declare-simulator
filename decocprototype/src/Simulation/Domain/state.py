@@ -48,6 +48,11 @@ class SimulationState:
     next_object_counter: dict[str, int] = field(default_factory=dict)
     next_event_counter: int = 1
     last_generated_timestamp: Optional[datetime] = None
+    # activity_name -> timestamp when this activity first appeared in the candidate
+    # pool in the current "availability window" (reset each time it fires).
+    _candidate_first_seen: dict[str, datetime] = field(default_factory=dict)
+    # activity_name -> list of wait durations in seconds (one per firing)
+    candidate_wait_s: dict[str, list[float]] = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1

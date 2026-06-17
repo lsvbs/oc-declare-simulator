@@ -26,9 +26,10 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
+from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
 
 app = Flask(__name__)
 CORS(app)
@@ -39,12 +40,34 @@ OCDECLARE_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'ocdeclare'
 EVENTLOG_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'eventlog'
 PARAMETERS_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'parameters'
 OUTPUT_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'output' / 'eventlogs'
+METRICS_DIR = BASE_DIR / 'metrics'
+HISTORY_FILE = METRICS_DIR / 'run_history.json'
 DISCOVERY_DIR = Path(tempfile.gettempdir()) / 'decocprototype_discovery'
 DISCOVERY_DIR.mkdir(exist_ok=True)
 PARAMETERS_DIR.mkdir(parents=True, exist_ok=True)
+METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Store discovery results in memory (keyed by event_log_file)
 discovery_cache = {}
+
+
+def _load_history() -> list:
+    """Load run history from disk, or return empty list."""
+    try:
+        if HISTORY_FILE.exists():
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_history(history: list) -> None:
+    try:
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history[-200:], f, indent=2)  # cap at 200 entries
+    except Exception:
+        pass
 
 
 @app.route('/api/files', methods=['GET'])
@@ -347,15 +370,20 @@ def run_simulation():
             with open(model_path, 'r') as f:
                 model_data = json.load(f)
 
-        # Merge discovered time distributions into model_data so the parser
-        # can populate StaticModel.activity_durations automatically.
+        # Merge discovered time distributions into model_data
         if time_distributions and isinstance(model_data, dict):
             existing = model_data.get('activity_durations') or {}
-            # Only back-fill activities that have no user-edited entry yet
             merged = {act: metrics for act, metrics in time_distributions.items()
                       if act not in existing}
             merged.update(existing)
             model_data = {**model_data, 'activity_durations': merged}
+
+        # Merge concurrency probabilities into model_data
+        concurrency_probs = cached.get('concurrency_probs', {})
+        if concurrency_probs and isinstance(model_data, dict):
+            existing_cp = model_data.get('concurrency_probs') or {}
+            if not existing_cp:
+                model_data = {**model_data, 'concurrency_probs': concurrency_probs}
         
         # Route to the correct parser based on file format:
         # - list  → hand-crafted arc-list format (Format 1)
@@ -521,6 +549,46 @@ def run_simulation():
         # Save output
         output_file = write_ocel2_json(final_state, static_model=static_model)
         output_filename = os.path.basename(output_file)
+
+        # Compute and save timing metrics
+        metrics = compute_metrics(final_state)
+        metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
+        metrics_filename = os.path.basename(metrics_file)
+
+        # Persist run entry to history
+        from datetime import datetime as _dt
+        run_entry = {
+            'id':             output_filename,   # unique — same as log filename
+            'timestamp':      _dt.now().isoformat(),
+            'event_log_file': event_log_file,
+            'ocdeclare_file': ocdeclare_file or '(editor override)',
+            'max_steps':      max_steps,
+            'seed':           seed,
+            'start_activities': start_activities,
+            'steps_executed': final_state.step_count,
+            'events_count':   len(final_state.executed_events),
+            'objects_count':  len(final_state.objects),
+            'output_file':    output_filename,
+            'metrics_file':   metrics_filename,
+            # store config snapshot so re-run can replay it
+            'model_override': model_override,
+            'prob_matrix_override': prob_matrix_override,
+        }
+        history = _load_history()
+        history.append(run_entry)
+        _save_history(history)
+
+        # Build concurrency summary from the cached discovered probs
+        # Only include unique pairs (A <= B) above threshold 0.3, sorted by probability
+        cached_conc = discovery_cache.get(event_log_file, {}).get('concurrency_probs', {})
+        concurrency_pairs = sorted(
+            [
+                {'a': k.split('|||')[0], 'b': k.split('|||')[1], 'p': round(v, 3)}
+                for k, v in cached_conc.items()
+                if '|||' in k and k.split('|||')[0] <= k.split('|||')[1] and v >= 0.3
+            ],
+            key=lambda x: -x['p'],
+        )
         
         return jsonify({
             'success': True,
@@ -533,7 +601,10 @@ def run_simulation():
                 'object_traces': object_traces,
                 'object_types_map': object_types_map,
                 'object_links': object_links,
-                'output_file': output_filename
+                'output_file': output_filename,
+                'metrics_file': metrics_filename,
+                'metrics': metrics,
+                'concurrency_pairs': concurrency_pairs,
             },
             'logs': [
                 f"Loaded model: {ocdeclare_file}",
@@ -563,15 +634,45 @@ def download_file(filename):
         file_path = OUTPUT_DIR / filename
         if not file_path.exists():
             return jsonify({'error': 'File not found'}), 404
-        
-        return send_file(
-            file_path,
-            mimetype='application/json',
-            as_attachment=True,
-            download_name=filename
-        )
+        return send_file(file_path, mimetype='application/json', as_attachment=True, download_name=filename)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download-metrics/<filename>', methods=['GET'])
+def download_metrics(filename):
+    """Download generated metrics file."""
+    try:
+        file_path = METRICS_DIR / filename
+        if not file_path.exists():
+            return jsonify({'error': 'File not found'}), 404
+        return send_file(file_path, mimetype='application/json', as_attachment=True, download_name=filename)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/run-history', methods=['GET'])
+def get_run_history():
+    """Return the persisted run history (newest first)."""
+    history = _load_history()
+    return jsonify({'runs': list(reversed(history))})
+
+
+@app.route('/api/run-history/<run_id>/metrics', methods=['GET'])
+def get_run_metrics(run_id):
+    """Load the metrics JSON for a specific run."""
+    history = _load_history()
+    entry = next((e for e in history if e['id'] == run_id), None)
+    if not entry:
+        return jsonify({'error': 'Run not found'}), 404
+    mf = entry.get('metrics_file')
+    if not mf:
+        return jsonify({'error': 'No metrics file for this run'}), 404
+    path = METRICS_DIR / mf
+    if not path.exists():
+        return jsonify({'error': 'Metrics file missing from disk'}), 404
+    with open(path, 'r', encoding='utf-8') as f:
+        return jsonify(json.load(f))
 
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])
@@ -684,15 +785,21 @@ def discover_timing():
         event_log = load_ocel2(str(log_path))
         metrics = compute_ocpa_metrics(event_log, anchor_activities)
 
-        # Store in the discovery cache so the simulator can use them
+        # Discover concurrency probabilities using the timing distributions as
+        # the window reference (max of each pair's mean_seconds).
+        concurrency = discover_concurrency_probs(event_log, activity_durations=metrics)
+
+        # Store both in the discovery cache so the simulator can use them
         if event_log_file in discovery_cache:
             discovery_cache[event_log_file]['time_distributions'] = metrics
+            discovery_cache[event_log_file]['concurrency_probs'] = concurrency
 
         return jsonify({
             'success': True,
             'metrics': metrics,
             'activity_count': len(metrics),
             'empty': len(metrics) == 0,
+            'concurrency_probs': {k: v for k, v in concurrency.items() if '|||' in k and k.split('|||')[0] <= k.split('|||')[1]},
         })
 
     except Exception as e:

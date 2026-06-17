@@ -415,6 +415,10 @@ function App() {
 
   // ── Session history (current session, not persisted) ─────────────────────
   const [sessionHistory, setSessionHistory] = useState([]);
+  // ── Persisted run history (loaded from server) ────────────────────────────
+  const [runHistory,     setRunHistory]     = useState([]);
+  const [expandedRunId,  setExpandedRunId]  = useState(null);
+  const [runMetrics,     setRunMetrics]     = useState({});  // run_id -> metrics obj
 
   // ── Model warnings (activities with no bindings) ──────────────────────────
   const bindingWarnings = activeModel
@@ -431,6 +435,8 @@ function App() {
   // Load available files on component mount
   useEffect(() => {
     loadAvailableFiles();
+    // Load persisted run history from server
+    axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {});
   }, []);
 
   const loadAvailableFiles = async ({ preserveSelections = false } = {}) => {
@@ -743,6 +749,8 @@ function App() {
           stepsExecuted: response.data.results?.steps_executed,
           edited:        modelEdited,
         }]);
+        // Refresh persisted run history
+        axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {});
       }
       
       if (response.data.error) {
@@ -760,8 +768,37 @@ function App() {
     if (entry.model)      setActiveModel(entry.model);
     if (entry.probMatrix) setActiveProbMatrix(entry.probMatrix);
     setConfig(prev => ({ ...prev, ...entry.config }));
-    // Preserve the edited status of the restored run.
     setModelEdited(entry.edited || false);
+  }, []);
+
+  const loadRunMetrics = useCallback(async (runId) => {
+    if (runMetrics[runId]) {
+      // toggle off if already loaded
+      setExpandedRunId(prev => prev === runId ? null : runId);
+      return;
+    }
+    try {
+      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/metrics`);
+      setRunMetrics(prev => ({ ...prev, [runId]: r.data }));
+      setExpandedRunId(runId);
+    } catch {
+      setExpandedRunId(prev => prev === runId ? null : runId);
+    }
+  }, [runMetrics]);
+
+  const reRunFromHistory = useCallback((entry) => {
+    // Restore config from the persisted entry and trigger simulation
+    if (entry.ocdeclare_file && entry.ocdeclare_file !== '(editor override)') {
+      setConfig(prev => ({
+        ...prev,
+        ocdeclareFile:   entry.ocdeclare_file,
+        maxSteps:        entry.max_steps,
+        seed:            entry.seed,
+        startActivities: entry.start_activities || [],
+      }));
+    }
+    if (entry.model_override)      setActiveModel(entry.model_override);
+    if (entry.prob_matrix_override) setActiveProbMatrix(entry.prob_matrix_override);
   }, []);
 
   // Wraps setActiveModel so any change made through the Model Editor flags the
@@ -808,9 +845,21 @@ function App() {
 
   const downloadEventLog = () => {
     if (!results?.output_file) return;
-    
-    // Trigger download via backend endpoint
     window.open(`/api/download/${results.output_file}`, '_blank');
+  };
+
+  const downloadMetrics = () => {
+    if (!results?.metrics_file) return;
+    window.open(`/api/download-metrics/${results.metrics_file}`, '_blank');
+  };
+
+  // ── Format seconds into a human-readable string ────────────────────────────
+  const fmtSeconds = (s) => {
+    if (s == null) return '—';
+    if (s < 60) return `${s.toFixed(1)}s`;
+    if (s < 3600) return `${(s / 60).toFixed(1)}min`;
+    if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+    return `${(s / 86400).toFixed(1)}d`;
   };
 
   return (
@@ -1425,14 +1474,129 @@ function App() {
                     activitySequence={results.activity_sequence}
                     objectTraces={results.object_traces || {}}
                     objectTypesMap={results.object_types_map || {}}
+                    activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
                   />
                 </div>
               )}
 
               {results.output_file && (
-                <button className="download-button" onClick={downloadEventLog}>
-                  Download Event Log
-                </button>
+                <div className="download-row">
+                  <button className="download-button" onClick={downloadEventLog}>
+                    Download Event Log
+                  </button>
+                  {results.metrics_file && (
+                    <button className="download-button download-button-secondary" onClick={downloadMetrics}>
+                      Download Metrics
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* ── Timing Metrics Panel ── */}
+              {results.metrics && (
+                <>
+                  {/* Per-Activity */}
+                  {results.metrics.activity_metrics && Object.keys(results.metrics.activity_metrics).length > 0 && (
+                    <Collapsible
+                      className="logs-box timing-metrics-box"
+                      title="⏱ Activity Timing"
+                      badge={Object.keys(results.metrics.activity_metrics).length}
+                      defaultOpen={false}
+                    >
+                      {/* ── Concurrency indicator ── */}
+                      {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
+                        <div className="concurrency-summary">
+                          <span className="concurrency-summary-title">⚡ Concurrent activity pairs (from log)</span>
+                          <div className="concurrency-pills">
+                            {results.concurrency_pairs.map(({ a, b, p }) => (
+                              <span key={`${a}|||${b}`} className="concurrency-pill" title={`${a} and ${b} fire concurrently ${Math.round(p * 100)}% of the time`}>
+                                <span className="concurrency-pill-acts">{a} ∥ {b}</span>
+                                <span className="concurrency-pill-p">{Math.round(p * 100)}%</span>
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <table className="metrics-table">
+                        <thead>
+                          <tr>
+                            <th>Activity</th>
+                            <th>Count</th>
+                            <th>Mean duration</th>
+                            <th>Min</th>
+                            <th>Max</th>
+                            <th title="Mean time the activity was in the candidate pool before being chosen">Mean wait in pool</th>
+                            <th title="Longest time the activity was available but not chosen before finally firing">Max wait in pool</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Object.entries(results.metrics.activity_metrics).map(([act, m]) => (
+                            <tr key={act}>
+                              <td className="metrics-act-name">{act}</td>
+                              <td>{m.execution_count}</td>
+                              <td>{fmtSeconds(m.mean_duration_s)}</td>
+                              <td>{fmtSeconds(m.min_duration_s)}</td>
+                              <td>{fmtSeconds(m.max_duration_s)}</td>
+                              <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
+                              <td>{fmtSeconds(m.max_wait_in_pool_s)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </Collapsible>
+                  )}
+
+                  {/* Per-Object */}
+                  {results.metrics.object_metrics && Object.keys(results.metrics.object_metrics).length > 0 && (
+                    <Collapsible
+                      className="logs-box timing-metrics-box"
+                      title="📦 Object Lifetimes"
+                      badge={Object.keys(results.metrics.object_metrics).length}
+                      defaultOpen={false}
+                    >
+                      {(() => {
+                        const byType = {};
+                        Object.entries(results.metrics.object_metrics).forEach(([oid, m]) => {
+                          (byType[m.object_type] = byType[m.object_type] || []).push([oid, m]);
+                        });
+                        return Object.entries(byType).sort().map(([otype, items]) => (
+                          <Collapsible
+                            key={otype}
+                            className="metrics-type-group"
+                            title={otype}
+                            badge={items.length}
+                            defaultOpen={false}
+                          >
+                            <table className="metrics-table">
+                              <thead>
+                                <tr>
+                                  <th>Object</th>
+                                  <th>Events</th>
+                                  <th>Lifetime</th>
+                                  <th>First event</th>
+                                  <th>Last event</th>
+                                  <th>Activities</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {items.map(([oid, m]) => (
+                                  <tr key={oid}>
+                                    <td className="metrics-act-name">{oid}</td>
+                                    <td>{m.event_count}</td>
+                                    <td>{fmtSeconds(m.lifetime_s)}</td>
+                                    <td className="metrics-ts">{m.first_event_time ? m.first_event_time.replace('T', ' ').slice(0, 19) : '—'}</td>
+                                    <td className="metrics-ts">{m.last_event_time  ? m.last_event_time.replace('T', ' ').slice(0, 19)  : '—'}</td>
+                                    <td className="metrics-acts">{m.activities.join(' → ')}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </Collapsible>
+                        ));
+                      })()}
+                    </Collapsible>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -1524,6 +1688,98 @@ function App() {
           )}
         </div>
       </div>
+
+      {/* ── Run History ── */}
+      {runHistory.length > 0 && (
+        <div className="workflow-container run-history-container">
+          <Collapsible
+            className="run-history-panel"
+            title="🕘 Run History"
+            badge={runHistory.length}
+            defaultOpen={false}
+          >
+            <p className="run-history-hint">
+              All simulation runs from this project, persisted across sessions.
+              Click a row to expand timing metrics; use ↩ Restore to reload its settings.
+            </p>
+            <table className="run-history-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Event log</th>
+                  <th>Model</th>
+                  <th>Steps</th>
+                  <th>Events</th>
+                  <th>Objects</th>
+                  <th>Seed</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {runHistory.map(run => (
+                  <React.Fragment key={run.id}>
+                    <tr
+                      className={`run-history-row${expandedRunId === run.id ? ' expanded' : ''}`}
+                      onClick={() => loadRunMetrics(run.id)}
+                      title="Click to view timing metrics"
+                    >
+                      <td className="rh-ts">{new Date(run.timestamp).toLocaleString()}</td>
+                      <td className="rh-file">{run.event_log_file}</td>
+                      <td className="rh-file">{run.ocdeclare_file}</td>
+                      <td>{run.steps_executed}</td>
+                      <td>{run.events_count}</td>
+                      <td>{run.objects_count}</td>
+                      <td>{run.seed}</td>
+                      <td className="rh-actions" onClick={e => e.stopPropagation()}>
+                        <button className="rh-btn" onClick={() => reRunFromHistory(run)} title="Restore these settings into the editor">↩ Restore</button>
+                        {run.output_file && (
+                          <button className="rh-btn" onClick={() => window.open(`/api/download/${run.output_file}`, '_blank')} title="Download event log">⬇ Log</button>
+                        )}
+                        {run.metrics_file && (
+                          <button className="rh-btn" onClick={() => window.open(`/api/download-metrics/${run.metrics_file}`, '_blank')} title="Download metrics">⬇ Metrics</button>
+                        )}
+                      </td>
+                    </tr>
+                    {expandedRunId === run.id && runMetrics[run.id] && (
+                      <tr className="run-history-metrics-row">
+                        <td colSpan={8}>
+                          <div className="rh-metrics-expand">
+                            <strong>Activity timing</strong>
+                            <table className="metrics-table rh-metrics-table">
+                              <thead>
+                                <tr>
+                                  <th>Activity</th>
+                                  <th>Count</th>
+                                  <th>Mean duration</th>
+                                  <th>Min</th>
+                                  <th>Max</th>
+                                  <th>Mean wait in pool</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {Object.entries(runMetrics[run.id].activity_metrics || {}).map(([act, m]) => (
+                                  <tr key={act}>
+                                    <td className="metrics-act-name">{act}</td>
+                                    <td>{m.execution_count}</td>
+                                    <td>{fmtSeconds(m.mean_duration_s)}</td>
+                                    <td>{fmtSeconds(m.min_duration_s)}</td>
+                                    <td>{fmtSeconds(m.max_duration_s)}</td>
+                                    <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </Collapsible>
+        </div>
+      )}
     </div>
   );
 }

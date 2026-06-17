@@ -109,8 +109,12 @@ class Simulator:
 
         from src.Simulation.Engine.timepolicy import DefaultTimePolicy, DistributionTimePolicy
         durations = getattr(static_model, "activity_durations", {}) or {}
+        concurrency_probs = getattr(static_model, "concurrency_probs", {}) or {}
         if durations:
-            self.time_policy = DistributionTimePolicy(durations=durations)
+            self.time_policy = DistributionTimePolicy(
+                durations=durations,
+                concurrency_probs=concurrency_probs or None,
+            )
         else:
             self.time_policy = DefaultTimePolicy()
 
@@ -147,6 +151,20 @@ class Simulator:
                 break
 
             candidates = self._generate_candidates(state)
+
+            # Track "available since": record first time each activity appears
+            # in the candidate pool. Reset the clock when an activity fires.
+            now_ts = state.last_generated_timestamp
+            if now_ts is not None:
+                candidate_names = {c.activity_name for c in candidates}
+                # Mark first appearance for newly available activities
+                for name in candidate_names:
+                    if name not in state._candidate_first_seen:
+                        state._candidate_first_seen[name] = now_ts
+                # Remove activities no longer in the pool (they lost eligibility)
+                gone = set(state._candidate_first_seen) - candidate_names
+                for name in gone:
+                    del state._candidate_first_seen[name]
             # Emit a rich iteration payload so callers can debug candidate
             # generation and object evolution if they enable tracing.
             self._trace(
@@ -185,6 +203,16 @@ class Simulator:
                 break
 
             chosen = self._select_candidate(candidates, state)
+
+            # Record how long this activity was available before being chosen
+            fired_ts = state.last_generated_timestamp
+            first_seen = state._candidate_first_seen.get(chosen.activity_name)
+            if fired_ts is not None and first_seen is not None:
+                wait = (fired_ts - first_seen).total_seconds()
+                if wait >= 0:
+                    state.candidate_wait_s.setdefault(chosen.activity_name, []).append(wait)
+            # Reset availability clock for the fired activity
+            state._candidate_first_seen.pop(chosen.activity_name, None)
             self._trace(
                 "chosen",
                 {

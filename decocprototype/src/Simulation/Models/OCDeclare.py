@@ -236,6 +236,10 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             for k, v in (data.get("attribute_schema") or {}).items()
             if isinstance(v, dict)
         },
+        concurrency_probs={
+            str(k): float(v)
+            for k, v in (data.get("concurrency_probs") or {}).items()
+        },
     )
 
 

@@ -2,13 +2,23 @@ import React, { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import './FlowChart.css';
 
 // ── Layout constants ──────────────────────────────────────────────────────────
-const NODE_W  = 180;
-const NODE_H  = 56;
-const H_GAP   = 110;   // horizontal gap between columns (ranks)
-const ROW_GAP = 40;    // vertical gap between stacked nodes in the same column
+const NODE_W      = 180;
+const NODE_H_BASE = 56;   // height without metric subtitle
+const NODE_H_TALL = 74;   // height with metric subtitle
+const H_GAP   = 110;
+const ROW_GAP = 40;
 const PADDING = 60;
-const LANE_H  = 50;    // height per backward-arc lane above a node
+const LANE_H  = 50;
 const MIN_ZOOM = 0.25, MAX_ZOOM = 2.0;
+
+// Available metric options for the node-label dropdown
+const NODE_METRIC_OPTIONS = [
+  { value: 'off',               label: 'Off' },
+  { value: 'mean_duration',     label: 'Mean duration' },
+  { value: 'mean_wait_in_pool', label: 'Mean wait in pool' },
+  { value: 'max_wait_in_pool',  label: 'Max wait in pool' },
+  { value: 'execution_count',   label: 'Execution count' },
+];
 
 // ── Object-type colour palette (avoid indigo = base DFG colour) ───────────────
 const TYPE_PALETTE = [
@@ -34,7 +44,7 @@ function buildDFG(sequences) {
 // ── Adaptive layered layout (Sugiyama-lite) ──────────────────────────────────
 // Columns (x) follow the flow depth; rows (y) branch out vertically so the graph
 // is not forced onto a single line. Returns { pos, width, height }.
-function computeLayeredLayout(ordered, trans) {
+function computeLayeredLayout(ordered, trans, nodeH = NODE_H_BASE) {
   const idxOf = {};
   ordered.forEach((n, i) => { idxOf[n] = i; });
 
@@ -59,7 +69,7 @@ function computeLayeredLayout(ordered, trans) {
   ordered.forEach(n => { (ranks[rank[n]] = ranks[rank[n]] || []).push(n); });
   const rankKeys = Object.keys(ranks).map(Number).sort((a, b) => a - b);
 
-  const pitch = NODE_H + ROW_GAP;
+  const pitch = nodeH + ROW_GAP;
   const yOf = {};
   rankKeys.forEach(r => {
     const nodes = ranks[r];
@@ -90,9 +100,9 @@ function computeLayeredLayout(ordered, trans) {
   ordered.forEach(n => {
     const x = PADDING + rank[n] * (NODE_W + H_GAP);
     const y = yOf[n] + shift;
-    pos[n] = { x, y, width: NODE_W, height: NODE_H };
+    pos[n] = { x, y, width: NODE_W, height: nodeH };
     maxX = Math.max(maxX, x + NODE_W);
-    maxY = Math.max(maxY, y + NODE_H);
+    maxY = Math.max(maxY, y + nodeH);
   });
 
   return { pos, width: maxX + PADDING, height: maxY + PADDING + 30 };
@@ -100,7 +110,7 @@ function computeLayeredLayout(ordered, trans) {
 
 
 // ── Main component ────────────────────────────────────────────────────────────
-function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} }) {
+function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {}, activityMetrics = null }) {
   const canvasRef = useRef(null);
   const scrollRef = useRef(null);
   const posRef    = useRef({});
@@ -110,6 +120,10 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
   const panRef    = useRef({ x: 0, y: 0 }); // canvas-space pan offset
 
   const [showBase,      setShowBase]      = useState(true);
+  const [showForward,   setShowForward]   = useState(true);
+  const [showBackloop,  setShowBackloop]  = useState(true);
+  const [showSelfloop,  setShowSelfloop]  = useState(true);
+  const [nodeMetric,    setNodeMetric]    = useState('mean_duration');
   const [activeObjIds,  setActiveObjIds]  = useState(new Set());
   const [expandedTypes, setExpandedTypes] = useState(new Set()); // empty = all collapsed
   const [overlayMode,   setOverlayMode]   = useState('aggregate'); // 'aggregate' | 'trace'
@@ -157,7 +171,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
     ctx.translate(panRef.current.x, panRef.current.y);
 
     // Draw arrows: fwdColor for left→right, backColor for arcs above, selfColor for loops
-    const drawSet = (dfgTrans, fwdColor, backColor, selfColor, alpha, wScale) => {
+    const drawSet = (dfgTrans, fwdColor, backColor, selfColor, alpha, wScale, opts = {}) => {
+      const { fwd: doFwd = true, back: doBack = true, self: doSelf = true } = opts;
       const selfLoops = [], fwd = [], back = [];
       Object.entries(dfgTrans).forEach(([key, count]) => {
         const [from, to] = key.split(' → ');
@@ -174,8 +189,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
       ctx.globalAlpha = alpha;
       ctx.font = '11px system-ui, sans-serif';
 
-      // Self-loops: circle above the node
-      selfLoops.forEach(({ from, count }) => {
+      // Self-loops
+      if (doSelf) selfLoops.forEach(({ from, count }) => {
         const fp = pos[from]; if (!fp) return;
         const loopR = 22;
         const cx = fp.x + fp.width / 2, cy = fp.y - loopR - 6;
@@ -186,8 +201,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
         ctx.fillText(`×${count}`, cx, cy - loopR - 4);
       });
 
-      // Forward arrows: smooth left→right curve between column borders
-      fwd.forEach(({ from, to, count }) => {
+      // Forward arrows
+      if (doFwd) fwd.forEach(({ from, to, count }) => {
         const fp = pos[from], tp = pos[to]; if (!fp || !tp) return;
         const sx = fp.x + fp.width, sy = fp.y + fp.height / 2;
         const ex = tp.x,            ey = tp.y  + tp.height / 2;
@@ -201,8 +216,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
         ctx.fillText(`×${count}`, (sx + ex) / 2, (sy + ey) / 2 - 7);
       });
 
-      // Backward arrows: arc above both endpoints
-      back.forEach(({ from, to, count }, lane) => {
+      // Backward arrows
+      if (doBack) back.forEach(({ from, to, count }, lane) => {
         const fp = pos[from], tp = pos[to]; if (!fp || !tp) return;
         const sx = fp.x + fp.width / 2, sy = fp.y;
         const ex = tp.x + tp.width / 2, ey = tp.y;
@@ -290,13 +305,13 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
 
     // Base DFG: forward=indigo, backward=amber, self=violet
     if (showBase) {
-      drawSet(trans, '#667eea', '#f59e0b', '#a78bfa', 1.0, 1.0);
+      drawSet(trans, '#667eea', '#f59e0b', '#a78bfa', 1.0, 1.0,
+        { fwd: showForward, back: showBackloop, self: showSelfloop });
     }
 
     // Per-object overlays
     if (activeObjIds.size > 0) {
       if (overlayMode === 'aggregate') {
-        // One merged DFG per object type (shared colour, counts summed)
         const byType = {};
         activeObjIds.forEach(oid => {
           const otype = objectTypesMap[oid]; if (!otype) return;
@@ -305,7 +320,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
         Object.entries(byType).forEach(([otype, oids]) => {
           const color = typeColor(otype, typeColorMap[otype] ?? 0);
           const dfg   = buildDFG(oids.map(oid => objectTraces[oid] || []));
-          drawSet(dfg, color, color, color, 0.85, 0.65);
+          drawSet(dfg, color, color, color, 0.85, 0.65,
+            { fwd: showForward, back: showBackloop, self: showSelfloop });
         });
       } else {
         // Per-object literal traces, each offset so parallel paths are visible
@@ -319,6 +335,7 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
     }
 
     // Nodes always on top
+    const nodeH = nodeMetric === 'off' ? NODE_H_BASE : NODE_H_TALL;
     list.forEach(name => {
       const p = pos[name]; if (!p) return;
       ctx.shadowColor = 'rgba(102,126,234,0.18)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 3;
@@ -326,13 +343,37 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
       ctx.beginPath(); _roundRect(ctx, p.x, p.y, p.width, p.height, 10);
       ctx.fill(); ctx.stroke();
       ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+
+      // Activity name — shift up when metric subtitle is shown
+      const nameY = nodeMetric === 'off'
+        ? p.y + p.height / 2
+        : p.y + p.height / 2 - 9;
       ctx.fillStyle = '#1e293b'; ctx.font = 'bold 13px system-ui, sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      _wrapText(ctx, name, p.x + p.width / 2, p.y + p.height / 2, p.width - 22, 16);
+      _wrapText(ctx, name, p.x + p.width / 2, nameY, p.width - 22, 15);
+
+      // Metric subtitle
+      if (nodeMetric !== 'off') {
+        const m = activityMetrics && activityMetrics[name];
+        let label = '—';
+        if (m) {
+          if (nodeMetric === 'mean_duration' && m.mean_duration_s != null)
+            label = _fmtSeconds(m.mean_duration_s);
+          else if (nodeMetric === 'mean_wait_in_pool' && m.mean_wait_in_pool_s != null)
+            label = _fmtSeconds(m.mean_wait_in_pool_s);
+          else if (nodeMetric === 'max_wait_in_pool' && m.max_wait_in_pool_s != null)
+            label = _fmtSeconds(m.max_wait_in_pool_s);
+          else if (nodeMetric === 'execution_count' && m.execution_count != null)
+            label = `×${m.execution_count}`;
+        }
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '10px system-ui, sans-serif';
+        ctx.fillText(label, p.x + p.width / 2, p.y + p.height / 2 + 10);
+      }
     });
 
     ctx.restore(); // undo pan translate
-  }, [showBase, activeObjIds, overlayMode, objectTraces, objectTypesMap, typeColorMap]);
+  }, [showBase, showForward, showBackloop, showSelfloop, nodeMetric, activityMetrics, activeObjIds, overlayMode, objectTraces, objectTypesMap, typeColorMap]);
 
   // ── Layout initialisation ─────────────────────────────────────────────────
   // Edges are built from objectTraces so that left→right rank reflects the
@@ -370,7 +411,8 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
 
     listRef.current = ordered; transRef.current = trans;
 
-    const { pos, width, height } = computeLayeredLayout(ordered, trans);
+    const nodeH = nodeMetric === 'off' ? NODE_H_BASE : NODE_H_TALL;
+    const { pos, width, height } = computeLayeredLayout(ordered, trans, nodeH);
     const canvas = canvasRef.current;
     canvas.width  = Math.max(900, width);
     canvas.height = Math.max(220, height);
@@ -378,7 +420,7 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
 
     posRef.current = pos;
     renderCanvas();
-  }, [activitySequence, objectTraces, renderCanvas]);
+  }, [activitySequence, objectTraces, nodeMetric, renderCanvas]);
 
   useEffect(() => { renderCanvas(); }, [renderCanvas]);
 
@@ -469,11 +511,12 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
   // ── Reset to the adaptive layered layout ─────────────────────────────────
   const resetLayout = useCallback(() => {
     const ordered = listRef.current; if (!ordered.length) return;
-    const { pos } = computeLayeredLayout(ordered, transRef.current);
+    const nodeH = nodeMetric === 'off' ? NODE_H_BASE : NODE_H_TALL;
+    const { pos } = computeLayeredLayout(ordered, transRef.current, nodeH);
     posRef.current = pos;
     panRef.current = { x: 0, y: 0 };
     renderCanvas();
-  }, [renderCanvas]);
+  }, [renderCanvas, nodeMetric]);
 
   // ── Object toggle helpers ─────────────────────────────────────────────────
   const toggleObj  = oid  => setActiveObjIds(prev => {
@@ -517,13 +560,51 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
           <button className="flow-zoom-btn" onClick={() => changeZoom(-0.1)} title="Zoom out">−</button>
           <span className="flow-zoom-label">{Math.round(zoom * 100)}%</span>
           <button className="flow-zoom-btn" onClick={() => changeZoom( 0.1)} title="Zoom in">+</button>
-          <button
-            className={`flow-toggle-btn${showBase ? ' active' : ''}`}
-            onClick={() => setShowBase(v => !v)}
-            title="Show / hide the aggregate directly-follows graph"
-          >
-            {showBase ? '◉' : '○'} DFG
-          </button>
+          <div className="flow-arrow-toggles" title="Show/hide arrow types in the DFG">
+            <button
+              className={`flow-toggle-btn${showBase ? ' active' : ''}`}
+              onClick={() => setShowBase(v => !v)}
+              title="Show / hide the aggregate directly-follows graph"
+            >
+              {showBase ? '◉' : '○'} DFG
+            </button>
+            <button
+              className={`flow-toggle-btn${showForward ? ' active' : ''}`}
+              onClick={() => setShowForward(v => !v)}
+              title="Show / hide forward arrows"
+              style={showForward ? { borderColor: '#667eea', color: '#667eea' } : {}}
+            >
+              → Fwd
+            </button>
+            <button
+              className={`flow-toggle-btn${showBackloop ? ' active' : ''}`}
+              onClick={() => setShowBackloop(v => !v)}
+              title="Show / hide back-loop arrows"
+              style={showBackloop ? { borderColor: '#f59e0b', color: '#f59e0b' } : {}}
+            >
+              ↩ Back
+            </button>
+            <button
+              className={`flow-toggle-btn${showSelfloop ? ' active' : ''}`}
+              onClick={() => setShowSelfloop(v => !v)}
+              title="Show / hide self-loop arrows"
+              style={showSelfloop ? { borderColor: '#a78bfa', color: '#a78bfa' } : {}}
+            >
+              ↺ Self
+            </button>
+          </div>
+          <div className="flow-node-metric-wrap" title="Value shown inside each activity node">
+            <label className="flow-node-metric-label">Node label:</label>
+            <select
+              className="flow-node-metric-select"
+              value={nodeMetric}
+              onChange={e => setNodeMetric(e.target.value)}
+            >
+              {NODE_METRIC_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
         </div>
       </div>
 
@@ -631,6 +712,13 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {} })
 }
 
 // ── Drawing helpers ───────────────────────────────────────────────────────────
+function _fmtSeconds(s) {
+  if (s == null) return '—';
+  if (s < 60)    return `${s.toFixed(0)}s`;
+  if (s < 3600)  return `${(s / 60).toFixed(1)}min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
+}
 function _drawHead(ctx, fromX, fromY, toX, toY, color) {
   const len = 11, angle = Math.atan2(toY - fromY, toX - fromX);
   ctx.beginPath();

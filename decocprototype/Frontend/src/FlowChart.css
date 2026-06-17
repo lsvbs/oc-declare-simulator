@@ -262,3 +262,36 @@
 .flow-obj-pill:hover { border-color: #94a3b8; }
 .flow-obj-pill.active { font-weight: 600; }
 
+/* ── Arrow type toggles ───────────────────────────────────────────────────── */
+.flow-arrow-toggles {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+/* ── Node metric dropdown ─────────────────────────────────────────────────── */
+.flow-node-metric-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.5rem;
+}
+.flow-node-metric-label {
+  font-size: 0.78rem;
+  color: #64748b;
+  white-space: nowrap;
+}
+.flow-node-metric-select {
+  font-size: 0.78rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  padding: 0.15rem 0.35rem;
+  background: #f8fafc;
+  color: #1e293b;
+  cursor: pointer;
+}
+.flow-node-metric-select:focus {
+  outline: none;
+  border-color: #667eea;
+}
+

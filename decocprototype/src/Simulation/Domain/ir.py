@@ -122,10 +122,12 @@ class StaticModel:
     resource_types: list[str] = field(default_factory=list)
     max_consecutive: dict[str, int] = field(default_factory=dict)
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
-    # Per-object-type default attribute values sampled from the input log.
-    # Maps object_type_name -> {attr_name: default_value}.
-    # Used by the simulator to initialize attributes on newly created objects.
     attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Concurrency probabilities: (A, B) -> float in [0, 1].
+    # p > 0 means A and B were observed firing concurrently in the log with
+    # that frequency.  Stored as a flat dict with "A|||B" keys (both orderings
+    # map to the same value) so the frozen dataclass can hold it.
+    concurrency_probs: dict[str, float] = field(default_factory=dict)
 
 
 model = StaticModel(
