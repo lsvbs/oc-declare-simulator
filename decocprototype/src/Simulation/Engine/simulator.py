@@ -32,11 +32,8 @@ def apply_conservative_link_policy(static_model, participating_ids, created_obje
     """
 
     def _link_exists(src: str, tgt: str) -> bool:
-        return any(
-            (lnk.source_object_id == src and lnk.target_object_id == tgt)
-            or (lnk.source_object_id == tgt and lnk.target_object_id == src)
-            for lnk in state.links
-        )
+        neighbors = state._links_by_object.get(src)
+        return neighbors is not None and tgt in neighbors
 
     # 1. Link every newly created object to every applicable participating object
     for created_id in created_object_ids:
@@ -136,7 +133,11 @@ class Simulator:
     def run(self, state: Optional[SimulationState] = None) -> SimulationState:
         if state is None:
             state = SimulationState()
-            
+
+        # Seed the start-event counter index so _start_event_count is maintained
+        # correctly by record_event throughout the run.
+        state._start_activity_names = set(self.config.start_policy.start_activity_names)
+        state._resource_types = set(getattr(self.static_model, 'resource_types', []) or [])
 
         while True:
             if self._should_stop(state):
@@ -167,30 +168,33 @@ class Simulator:
                     del state._candidate_first_seen[name]
             # Emit a rich iteration payload so callers can debug candidate
             # generation and object evolution if they enable tracing.
-            self._trace(
-                "iteration",
-                {
-                    "step_count": state.step_count,
-                    "num_candidates": len(candidates),
-                    "candidate_activity_names": [c.activity_name for c in candidates],
-                    "candidates": [
-                        {
-                            "activity_name": c.activity_name,
-                            "participating_object_ids": list(c.participating_object_ids),
-                            "object_types_to_create": list(c.object_types_to_create),
-                        }
-                        for c in candidates
-                    ],
-                    "active_objects": [
-                        {
-                            "id": oid,
-                            "type": obj.object_type,
-                            "active": obj.active,
-                        }
-                        for oid, obj in state.objects.items()
-                    ],
-                },
-            )
+            # Guard with trace_func check to avoid building expensive payloads
+            # on every step when tracing is disabled.
+            if self.trace_func is not None:
+                self._trace(
+                    "iteration",
+                    {
+                        "step_count": state.step_count,
+                        "num_candidates": len(candidates),
+                        "candidate_activity_names": [c.activity_name for c in candidates],
+                        "candidates": [
+                            {
+                                "activity_name": c.activity_name,
+                                "participating_object_ids": list(c.participating_object_ids),
+                                "object_types_to_create": list(c.object_types_to_create),
+                            }
+                            for c in candidates
+                        ],
+                        "active_objects": [
+                            {
+                                "id": oid,
+                                "type": obj.object_type,
+                                "active": obj.active,
+                            }
+                            for oid, obj in state.objects.items()
+                        ],
+                    },
+                )
 
             if not candidates:
                 self._trace(
@@ -300,6 +304,26 @@ class Simulator:
                 if streak >= cap:
                     continue
 
+            # Per-object max-consecutive: skip if the same activity has fired
+            # N times in a row on any of the candidate's participating objects.
+            # A "run" ends when any other activity touches that object.
+            max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
+            if candidate.activity_name in max_consec_obj:
+                cap_obj = max_consec_obj[candidate.activity_name]
+                blocked_by_obj = False
+                for oid in candidate.participating_object_ids:
+                    streak_obj = 0
+                    for ev in reversed(state._events_by_object.get(oid, [])):
+                        if ev.activity_name == candidate.activity_name:
+                            streak_obj += 1
+                        else:
+                            break
+                    if streak_obj >= cap_obj:
+                        blocked_by_obj = True
+                        break
+                if blocked_by_obj:
+                    continue
+
             key = (
                 candidate.activity_name,
                 tuple(sorted(candidate.participating_object_ids)),
@@ -397,12 +421,7 @@ class Simulator:
         return candidates
 
     def _count_started_cases(self, state: SimulationState) -> int:
-        start_names = set(self.config.start_policy.start_activity_names)
-        return sum(
-            1
-            for event in state.executed_events
-            if event.activity_name in start_names
-        )
+        return state._start_event_count
 
     def _is_start_activity_blocked(self, candidate: Candidate, state: SimulationState) -> bool:
         start_names = set(self.config.start_policy.start_activity_names)
@@ -454,21 +473,13 @@ class Simulator:
             if not scope_object_ids:
                 return True
 
-            for executed_event in state.executed_events:
-                if executed_event.activity_name != forbidden_other_activity:
-                    continue
-
-                for scope_object_id in scope_object_ids:
-                    if scope_object_id in executed_event.object_ids:
-                        return False
+            for scope_object_id in scope_object_ids:
+                if state._events_by_act_obj.get((forbidden_other_activity, scope_object_id)):
+                    return False
 
             return True
 
-        for executed_event in state.executed_events:
-            if executed_event.activity_name == forbidden_other_activity:
-                return False
-
-        return True
+        return not bool(state._events_by_activity.get(forbidden_other_activity))
 
     def _select_candidate(
         self,
@@ -493,7 +504,14 @@ class Simulator:
 
         participating_ids = candidate.participating_object_ids + created_object_ids
 
+        pre_fire_ts = state.last_generated_timestamp
         event_timestamp = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
+
+        # Record service time: the sampled clock advance for this firing.
+        if event_timestamp is not None and pre_fire_ts is not None:
+            svc = (event_timestamp - pre_fire_ts).total_seconds()
+            if svc >= 0:
+                state.activity_service_s.setdefault(candidate.activity_name, []).append(svc)
 
         executed_event = state.record_event(
             activity_name=candidate.activity_name,
@@ -524,7 +542,7 @@ class Simulator:
                 continue
 
             if runtime_object.object_type in deactivated_types:
-                runtime_object.active = False
+                state.deactivate_object(object_id)
 
         if executed_event is None and state.executed_events:
             executed_event = state.executed_events[-1]
@@ -537,34 +555,17 @@ class Simulator:
         self._create_response_obligations(executed_event, state)
 
     def _fulfill_response_obligations(self, executed_event, state: SimulationState) -> None:
-        remaining_obligations: list[PendingObligation] = []
-
-        for obligation in state.pending_obligations:
-            if executed_event.activity_name != obligation.target_activity:
-                remaining_obligations.append(obligation)
-                continue
-
-
-            # Support single-id scope tracking as defined in PendingObligation
-            obligation_scope_id = getattr(obligation, "scope_object_id", None)
-
-            # If no scope id, treat as unscoped obligation: fulfilled by any matching target event
-            if obligation_scope_id is None:
-                continue
-
-            # If the obligation's scope id appears in the executed event, obligation is fulfilled
-            if obligation_scope_id in executed_event.object_ids:
-                continue
-
-            remaining_obligations.append(obligation)
-
-        state.pending_obligations = remaining_obligations
+        act = executed_event.activity_name
+        # Discharge unscoped obligations for this target activity
+        state._obligations_count.pop((act, None), None)
+        # Discharge scoped obligations for each scope object in this event
+        for oid in executed_event.object_ids:
+            state._obligations_count.pop((act, oid), None)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
         for constraint in self.static_model.constraints:
             if constraint.constraint_type != "response":
                 continue
-
             if executed_event.activity_name != constraint.source_activity:
                 continue
 
@@ -574,22 +575,12 @@ class Simulator:
                     state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
-
                 for scope_object_id in scope_object_ids:
-                    obligation = PendingObligation(
-                        source_activity=constraint.source_activity,
-                        target_activity=constraint.target_activity,
-                        scope_object_id=scope_object_id,
-                    )
-                    state.pending_obligations.append(obligation)
+                    key = (constraint.target_activity, scope_object_id)
+                    state._obligations_count[key] = state._obligations_count.get(key, 0) + 1
             else:
-                state.pending_obligations.append(
-                    PendingObligation(
-                            source_activity=constraint.source_activity,
-                            target_activity=constraint.target_activity,
-                            scope_object_id=None,
-                        )
-                )
+                key = (constraint.target_activity, None)
+                state._obligations_count[key] = state._obligations_count.get(key, 0) + 1
 
     def _get_event_scope_object_ids(
         self,

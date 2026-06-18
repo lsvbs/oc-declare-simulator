@@ -3,14 +3,19 @@
 Two metric classes are produced:
 
 Activity metrics  (per unique activity name)
-  - execution_count   : how many times the activity fired
-  - timestamps        : list of ISO timestamps when it fired
-  - durations_s       : list of durations in seconds (gap to the *next* event
-                        on any shared object — the most meaningful "how long did
-                        this step take" we can derive from timestamps alone)
-  - mean_duration_s   : mean of durations_s  (None if no durations)
-  - min_duration_s    : min of durations_s   (None if no durations)
-  - max_duration_s    : max of durations_s   (None if no durations)
+  - execution_count    : how many times the activity fired
+  - timestamps         : list of ISO timestamps when it fired
+  - service_s          : list of service durations in seconds (sampled clock advance
+                         at each firing — what the time policy actually produced)
+  - mean_service_s     : mean of service_s  (None if no data)
+  - min_service_s      : min  of service_s  (None if no data)
+  - max_service_s      : max  of service_s  (None if no data)
+  - wait_in_pool_s     : list of pool-wait durations (how long eligible before chosen)
+  - mean_wait_in_pool_s: mean of wait_in_pool_s
+  - max_wait_in_pool_s : max  of wait_in_pool_s
+  - sojourn_s          : per-firing sojourn = service + wait (paired where both exist)
+  - mean_sojourn_s     : mean sojourn
+  - max_sojourn_s      : max  sojourn
 
 Object metrics  (per object id)
   - object_type       : type string
@@ -47,48 +52,41 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
     for ev in state.executed_events:
         act_events.setdefault(ev.activity_name, []).append(ev)
 
-    # For each object build its ordered event timeline so we can compute
-    # inter-event durations per object.
-    obj_timeline: dict[str, list] = {}  # object_id -> [(timestamp, activity)]
+    activity_metrics: dict[str, Any] = {}
+    for act_name, events in sorted(act_events.items()):
+        svc_s  = state.activity_service_s.get(act_name, [])
+        wait_s = state.candidate_wait_s.get(act_name, [])
+
+        # Sojourn = service + wait, paired by index.  We zip the two lists so
+        # only firings where both values exist contribute (first firing typically
+        # has no pre-fire base so service list may be one shorter than wait list).
+        n_paired = min(len(svc_s), len(wait_s))
+        sojourn_s = [svc_s[i] + wait_s[i] for i in range(n_paired)]
+
+        activity_metrics[act_name] = {
+            "execution_count":   len(events),
+            "timestamps":        [_iso(ev.timestamp) for ev in events],
+            # Service time (sampled clock advance at each firing)
+            "service_s":         svc_s,
+            "mean_service_s":    round(statistics.mean(svc_s), 3)  if svc_s    else None,
+            "min_service_s":     round(min(svc_s), 3)              if svc_s    else None,
+            "max_service_s":     round(max(svc_s), 3)              if svc_s    else None,
+            # Pool-wait time (eligible but not yet chosen)
+            "wait_in_pool_s":    wait_s,
+            "mean_wait_in_pool_s": round(statistics.mean(wait_s), 3) if wait_s else None,
+            "max_wait_in_pool_s":  round(max(wait_s), 3)             if wait_s else None,
+            # Sojourn = service + wait (paired)
+            "sojourn_s":         sojourn_s,
+            "mean_sojourn_s":    round(statistics.mean(sojourn_s), 3) if sojourn_s else None,
+            "max_sojourn_s":     round(max(sojourn_s), 3)             if sojourn_s else None,
+        }
+
+    # ── Object metrics ────────────────────────────────────────────────────────
+    obj_timeline: dict[str, list] = {}
     for ev in state.executed_events:
         for oid in ev.object_ids:
             obj_timeline.setdefault(oid, []).append((ev.timestamp, ev.activity_name))
 
-    # Per-activity durations: the global inter-event gap (time between this
-    # event and the previous one in the simulation timeline). This directly
-    # reflects what the time policy sampled — it is the actual simulated
-    # clock advance, uncontaminated by resource objects or waiting time.
-    act_durations: dict[str, list[float]] = {}
-    sorted_events = sorted(
-        (ev for ev in state.executed_events if ev.timestamp is not None),
-        key=lambda e: e.timestamp,
-    )
-    for i, ev in enumerate(sorted_events):
-        if i == 0:
-            continue
-        prev_ts = sorted_events[i - 1].timestamp
-        dur = (ev.timestamp - prev_ts).total_seconds()
-        if dur >= 0:
-            act_durations.setdefault(ev.activity_name, []).append(dur)
-
-    activity_metrics: dict[str, Any] = {}
-    for act_name, events in sorted(act_events.items()):
-        durs = act_durations.get(act_name, [])
-        wait_s = state.candidate_wait_s.get(act_name, [])
-        activity_metrics[act_name] = {
-            "execution_count": len(events),
-            "timestamps": [_iso(ev.timestamp) for ev in events],
-            "durations_s": durs,
-            "mean_duration_s": round(statistics.mean(durs), 3) if durs else None,
-            "min_duration_s":  round(min(durs), 3) if durs else None,
-            "max_duration_s":  round(max(durs), 3) if durs else None,
-            # "available since" stats: how long the activity waited in the pool
-            "wait_in_pool_s": wait_s,
-            "mean_wait_in_pool_s": round(statistics.mean(wait_s), 3) if wait_s else None,
-            "max_wait_in_pool_s":  round(max(wait_s), 3) if wait_s else None,
-        }
-
-    # ── Object metrics ────────────────────────────────────────────────────────
     object_metrics: dict[str, Any] = {}
     for oid, obj in sorted(state.objects.items()):
         timeline = obj_timeline.get(oid, [])

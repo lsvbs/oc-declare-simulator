@@ -230,6 +230,7 @@
 .activity-header {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.55rem;
   padding: 0.55rem 1rem;
   cursor: pointer;
@@ -252,7 +253,8 @@
   font-weight: 600;
   font-size: 0.88rem;
   color: #1e293b;
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 8rem;
 }
 
 .activity-binding-count {
@@ -323,6 +325,56 @@
   border-radius: 4px;
   padding: 0.1rem 0.45rem;
   white-space: nowrap;
+}
+
+/* Per-activity repeat stats from the log */
+.act-repeat-stats {
+  display: inline-flex;
+  align-items: center;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.72rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.act-repeat-label {
+  color: #0369a1;
+  font-weight: 700;
+}
+
+/* Repeat stats row inside expanded activity body */
+.act-repeat-row {
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.6rem;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+.act-repeat-row-label {
+  color: #0369a1;
+  font-weight: 600;
+  flex: 1;
+}
+.act-repeat-stat-item {
+  color: #075985;
+  font-variant-numeric: tabular-nums;
+}
+.act-repeat-stat-mean {
+  font-weight: 700;
+  color: #0284c7;
+}
+.act-repeat-stat-key {
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  color: #7dd3fc;
+  margin-right: 0.2rem;
+  letter-spacing: 0.04em;
 }
 
 .binding-empty-warning {

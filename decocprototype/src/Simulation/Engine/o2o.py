@@ -23,32 +23,17 @@ class TransitiveType:
 
 
 def neighbors_by_type(state: SimulationState, start_object_id: str) -> dict[str, list[str]]:
-    """Return 1-hop neighbors of `start_object_id` grouped by object_type.
-
-    This is a generalization of the earlier private helper in candidategeneration.
-    The result includes the start object itself under its own type when it is active.
-    """
-
-    from src.Simulation.Domain.state import ObjectLink  # local import to avoid cycles
-
+    """Return 1-hop neighbors of `start_object_id` grouped by object_type — O(degree)."""
     result: dict[str, list[str]] = {}
 
     start_obj = state.objects.get(start_object_id)
     if start_obj is not None and start_obj.active:
         result.setdefault(start_obj.object_type, []).append(start_object_id)
 
-    for link in state.links:
-        if link.source_object_id == start_object_id:
-            other_id = link.target_object_id
-        elif link.target_object_id == start_object_id:
-            other_id = link.source_object_id
-        else:
-            continue
-
+    for other_id in state._links_by_object.get(start_object_id, ()):
         other = state.objects.get(other_id)
         if other is None or not other.active:
             continue
-
         result.setdefault(other.object_type, []).append(other_id)
 
     return result
@@ -105,14 +90,8 @@ def obj_L_transitive(
     later if you want to restrict the radius.
     """
 
-    # Build adjacency on the fly using runtime links and the O2O schema.
-    # We identify which directions are legal for traversal based on O2ORule.
-
-    # Index links per endpoint for quick neighbor lookup
-    links_by_object: dict[str, list[tuple[str, str]]] = {}
-    for link in state.links:
-        links_by_object.setdefault(link.source_object_id, []).append((link.source_object_id, link.target_object_id))
-        links_by_object.setdefault(link.target_object_id, []).append((link.source_object_id, link.target_object_id))
+    # Use the pre-built index from state instead of rebuilding it each call
+    links_by_object = state._links_by_object
 
     # Helper to decide if we may traverse from `cur_id` to `nbr_id` given desired
     # logical direction and the types of the two runtime objects.
@@ -167,8 +146,7 @@ def obj_L_transitive(
         if cur_obj.object_type == ttype.to_type and cur_id not in start_ids:
             reached_to_type.add(cur_id)
 
-        for (src, tgt) in links_by_object.get(cur_id, []):
-            neighbor_id = tgt if src == cur_id else src
+        for neighbor_id in links_by_object.get(cur_id, ()):
             if neighbor_id in visited:
                 continue
             if not _can_traverse(cur_id, neighbor_id):

@@ -180,17 +180,19 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         scope_object_type = scope.get("object_type")
         if not ctype or not source or not target:
             continue
-        # Cardinality bounds (OC-DECLARE). These give precedence/response their
-        # "teeth": a precedence constraint only enforces "A before B" on existing
-        # scope objects when nmin >= 1. Discovered models usually omit these keys,
-        # so they default to nmin=0 (permissive) for backward compatibility; the
-        # model editor emits nmin=1 for manually added precedence constraints.
+        # Cardinality bounds (OC-DECLARE). For precedence/chain_precedence/
+        # chain_response, nmin=1 is the correct DECLARE default — it means
+        # "the source must have occurred at least once before the target".
+        # nmin=0 would mean the source is never required, making the constraint
+        # a no-op. Existing saved models that omit nmin get the right default.
         nmin_raw = c.get("nmin")
         nmax_raw = c.get("nmax")
+        # Types where nmin=0 is meaningless — default to 1
+        _nmin_default_1 = {"precedence", "chain_precedence", "chain_response"}
         try:
-            nmin = int(nmin_raw) if nmin_raw is not None else 0
+            nmin = int(nmin_raw) if nmin_raw is not None else (1 if ctype in _nmin_default_1 else 0)
         except (TypeError, ValueError):
-            nmin = 0
+            nmin = 1 if ctype in _nmin_default_1 else 0
         try:
             nmax = int(nmax_raw) if nmax_raw is not None else None
         except (TypeError, ValueError):
@@ -228,6 +230,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         max_consecutive={
             str(k): int(v)
             for k, v in (data.get("max_consecutive") or {}).items()
+            if v is not None
+        },
+        max_consecutive_per_object={
+            str(k): int(v)
+            for k, v in (data.get("max_consecutive_per_object") or {}).items()
             if v is not None
         },
         activity_durations=_parse_activity_durations(data.get("activity_durations") or {}),

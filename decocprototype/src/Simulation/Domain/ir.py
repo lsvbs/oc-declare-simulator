@@ -121,6 +121,9 @@ class StaticModel:
     o2o_rules: list[O2ORule] = field(default_factory=list)
     resource_types: list[str] = field(default_factory=list)
     max_consecutive: dict[str, int] = field(default_factory=dict)
+    # Per-object max consecutive: activity may repeat at most N times on the
+    # same object ID before another activity must touch that object.
+    max_consecutive_per_object: dict[str, int] = field(default_factory=dict)
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
     attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Concurrency probabilities: (A, B) -> float in [0, 1].

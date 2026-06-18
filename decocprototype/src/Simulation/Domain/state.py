@@ -45,14 +45,49 @@ class SimulationState:
     links: list[ObjectLink] = field(default_factory=list)
     executed_events: list[ExecutedEvent] = field(default_factory=list)
     pending_obligations: list[PendingObligation] = field(default_factory=list)
+    # Fast index for obligation resolution: (target_activity, scope_object_id|None) -> count
+    # None key is used for unscoped obligations. Kept in sync with pending_obligations.
+    _obligations_count: dict[tuple, int] = field(default_factory=dict)
     next_object_counter: dict[str, int] = field(default_factory=dict)
     next_event_counter: int = 1
     last_generated_timestamp: Optional[datetime] = None
+
+    # ── O(1) lookup indexes (maintained by record_event) ─────────────────────
+    # activity_name -> all events with that activity
+    _events_by_activity: dict[str, list] = field(default_factory=dict)
+    # object_id -> all events involving that object
+    _events_by_object: dict[str, list] = field(default_factory=dict)
+    # (activity_name, object_id) -> all events with that activity involving that object
+    _events_by_act_obj: dict[tuple, list] = field(default_factory=dict)
+    # object_id -> activity_name of the most recent event involving it
+    _last_activity_per_object: dict[str, str] = field(default_factory=dict)
+    # count of start-activity events (maintained via start_activity_names set in record_event)
+    _start_event_count: int = 0
+    # set of start activity names — populated once by the simulator before running
+    _start_activity_names: set = field(default_factory=set)
+    # set of resource type names — populated once by the simulator before running
+    _resource_types: set = field(default_factory=set)
+
+    # ── O(1) link index (maintained by add_link) ──────────────────────────────
+    # object_id -> set of object_ids it is directly linked to (undirected)
+    _links_by_object: dict[str, set] = field(default_factory=dict)
+
+    # ── Active-objects-by-type index (maintained by add_object / deactivate) ──
+    # object_type -> set of object_ids that are currently active
+    _active_by_type: dict[str, set] = field(default_factory=dict)
+    # object_id -> object_type (for O(1) type lookup without hitting .objects)
+    _type_of_object: dict[str, str] = field(default_factory=dict)
+
     # activity_name -> timestamp when this activity first appeared in the candidate
     # pool in the current "availability window" (reset each time it fires).
     _candidate_first_seen: dict[str, datetime] = field(default_factory=dict)
-    # activity_name -> list of wait durations in seconds (one per firing)
+    # activity_name -> list of pool-wait durations in seconds (one per firing):
+    # how long the activity was eligible (all constraints met, all required objects
+    # present) before being chosen.
     candidate_wait_s: dict[str, list[float]] = field(default_factory=dict)
+    # activity_name -> list of service durations in seconds (one per firing):
+    # the clock advance sampled by the time policy when the activity fired.
+    activity_service_s: dict[str, list[float]] = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -74,7 +109,19 @@ class SimulationState:
             attributes=dict(attributes) if attributes else {},
         )
         self.objects[object_id] = obj
+        self._active_by_type.setdefault(object_type, set()).add(object_id)
+        self._type_of_object[object_id] = object_type
         return obj
+
+    def deactivate_object(self, object_id: str) -> None:
+        """Mark an object inactive and update the active-by-type index."""
+        obj = self.objects.get(object_id)
+        if obj is None:
+            return
+        obj.active = False
+        active_set = self._active_by_type.get(obj.object_type)
+        if active_set:
+            active_set.discard(object_id)
 
     def add_link(self, source_object_id: str, target_object_id: str) -> None:
         self.links.append(
@@ -83,6 +130,8 @@ class SimulationState:
                 target_object_id=target_object_id,
             )
         )
+        self._links_by_object.setdefault(source_object_id, set()).add(target_object_id)
+        self._links_by_object.setdefault(target_object_id, set()).add(source_object_id)
 
     def record_event(
         self,
@@ -98,4 +147,16 @@ class SimulationState:
         )
         self.executed_events.append(event)
         self.step_count += 1
-        return event  
+
+        # ── Maintain indexes ──────────────────────────────────────────────────
+        self._events_by_activity.setdefault(activity_name, []).append(event)
+
+        for oid in participating_object_ids:
+            self._events_by_object.setdefault(oid, []).append(event)
+            self._events_by_act_obj.setdefault((activity_name, oid), []).append(event)
+            self._last_activity_per_object[oid] = activity_name
+
+        if activity_name in self._start_activity_names:
+            self._start_event_count += 1
+
+        return event

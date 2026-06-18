@@ -15,7 +15,7 @@ def _move_seen_activities_to_back(pool: list[Any], state: SimulationState) -> li
     appeared in `state.executed_events` are placed first, and candidates for
     activities that already occurred are moved to the back of the list.
     """
-    seen = {e.activity_name for e in getattr(state, "executed_events", [])}
+    seen = set(state._events_by_activity.keys())
     unseen_candidates: list[Any] = []
     seen_candidates: list[Any] = []
 

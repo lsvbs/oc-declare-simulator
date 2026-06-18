@@ -17,12 +17,20 @@ class Candidate:
     object_types_to_create: list[str] = field(default_factory=list)
 
 
-def find_active_objects_of_type(state: SimulationState, object_type: str) -> list[str]:
-    result: list[str] = []
-    for object_id, runtime_object in state.objects.items():
-        if runtime_object.object_type == object_type and runtime_object.active:
-            result.append(object_id)
-    return result
+def find_active_objects_of_type(state: SimulationState, object_type: str, limit: int = 0) -> list[str]:
+    """Return active objects of `object_type`. If `limit` > 0, return at most `limit` items."""
+    active_set = state._active_by_type.get(object_type)
+    if not active_set:
+        return []
+    if limit > 0 and len(active_set) > limit:
+        # Take only what we need — avoid copying thousands of items when 1 will do
+        result = []
+        for oid in active_set:
+            result.append(oid)
+            if len(result) >= limit:
+                break
+        return result
+    return list(active_set)
 
 
 def _find_objects_preferring_linked(
@@ -32,20 +40,9 @@ def _find_objects_preferring_linked(
     count: int,
 ) -> list[str]:
     """Return up to `count` IDs from `existing_ids`, preferring those
-    already linked in state.links to any object in `participating_ids`.
-
-    Once links exist in the state (i.e. after the first activity has fired and
-    created relational structure), only linked objects are used.  Unlinked
-    objects are only accepted as a fallback when no links exist at all yet —
-    which is the normal situation at the very start of simulation before any
-    O2O links have been established.
-
-    This implements inter-object synchronisation: objects from different case
-    chains are kept separate by preferring — and once links exist, enforcing —
-    relational groupings built up during the simulation.
+    already linked to any object in `participating_ids` — O(1) via index.
     """
-    if not participating_ids or not state.links:
-        # No links yet (early simulation) or no anchor — fall back to global
+    if not participating_ids or not state._links_by_object:
         return existing_ids[:count]
 
     participating_set = set(participating_ids)
@@ -53,21 +50,14 @@ def _find_objects_preferring_linked(
     unlinked_ids: list[str] = []
 
     for oid in existing_ids:
-        is_linked = any(
-            (lnk.source_object_id == oid and lnk.target_object_id in participating_set)
-            or (lnk.target_object_id == oid and lnk.source_object_id in participating_set)
-            for lnk in state.links
-        )
-        if is_linked:
+        neighbors = state._links_by_object.get(oid)
+        if neighbors and (neighbors & participating_set):
             linked_ids.append(oid)
         else:
             unlinked_ids.append(oid)
 
     selected = linked_ids[:count]
-    # Hard enforcement: once links exist, only accept unlinked objects if there
-    # are genuinely not enough linked ones (e.g. first event for a new object type).
     if len(selected) < count and not linked_ids:
-        # No linked candidates at all for this type — fall back to unlinked
         selected += unlinked_ids[: count - len(selected)]
     return selected
 
@@ -89,7 +79,19 @@ def build_candidate_for_activity(
     _resource_types = resource_types or set()
 
     for binding in activity.bindings:
-        existing_ids = find_active_objects_of_type(state, binding.object_type)
+        # Determine how many objects to fetch for link-preference selection.
+        # For input (non-creating) bindings we fetch more than max_count so that
+        # link-preference can choose the best-linked object from the pool,
+        # rather than being forced to accept the first one from the set.
+        # A small pool of 8 is enough: linked objects sort to the front so the
+        # correct one will be selected even if many exist globally.
+        if binding.creates:
+            fetch_limit = binding.min_count  # output: only reuse up to min_count
+        elif binding.max_count is not None:
+            fetch_limit = max(binding.max_count * 4, 8)  # widen pool for link-preference
+        else:
+            fetch_limit = 8
+        existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
 
         # Basic validation: if max_count provided but less than min_count, impossible
         if binding.max_count is not None and binding.max_count < binding.min_count:
@@ -116,14 +118,15 @@ def build_candidate_for_activity(
             else:
                 selected_from_existing = min(len(existing_ids), target_count, binding.max_count)
 
-            # Resource types are shared across case chains — select globally.
-            # Case objects prefer objects already linked to current participants.
-            if binding.object_type in _resource_types:
-                selected_ids = existing_ids[:selected_from_existing]
-            else:
-                selected_ids = _find_objects_preferring_linked(
-                    state, existing_ids, participating_object_ids, selected_from_existing
-                )
+            # Resource types and case objects both prefer linked objects.
+            # The distinction: resource types always fall back to any active
+            # object when no linked one exists (they are shared across cases),
+            # whereas case objects are only accepted when linked (once links exist).
+            # _find_objects_preferring_linked already implements this: it falls
+            # back to unlinked only when no linked objects exist at all.
+            selected_ids = _find_objects_preferring_linked(
+                state, existing_ids, participating_object_ids, selected_from_existing
+            )
             if len(selected_ids) < eligibility_count:
                 # Not enough input objects to satisfy this binding
                 return None

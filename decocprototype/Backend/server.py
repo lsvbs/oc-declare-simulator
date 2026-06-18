@@ -112,8 +112,15 @@ def run_discovery():
         if not log_path.exists():
             return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
         
-        # Load event log
+        # Load event log — trace-list format for probability discovery
         event_log = load_event_log(str(log_path))
+
+        # Also load as OCEL 2.0 dict for per-object repeat stats (if the file
+        # supports it — load_ocel2 handles both JSON and XML OCEL formats).
+        try:
+            event_log_ocel = load_ocel2(str(log_path))
+        except Exception:
+            event_log_ocel = None
         
         # Discover transition probabilities
         prob_matrix = discover_transition_matrix(event_log)
@@ -138,17 +145,83 @@ def run_discovery():
             first_activity = event_log[0][0]
         
         # Calculate statistics based on event log format
-        if isinstance(event_log, dict):
-            # OCEL 2.0 format
+        # Basic counts from the trace-list format (always available)
+        if isinstance(event_log, list):
+            total_events = sum(len(trace) for trace in event_log)
+            total_objects = 0
+            activity_counts: dict = {}
+            for trace in event_log:
+                for act in trace:
+                    if act:
+                        activity_counts[act] = activity_counts.get(act, 0) + 1
+        elif isinstance(event_log, dict):
             total_events = len(event_log.get('events', []))
             total_objects = len(event_log.get('objects', []))
-        elif isinstance(event_log, list):
-            # Simple list format (list of traces)
-            total_events = sum(len(trace) for trace in event_log)
-            total_objects = 0  # Not available in simple format
+            activity_counts = {}
+            for edata in (event_log.get('events', {}).values() if isinstance(event_log.get('events'), dict) else event_log.get('events', [])):
+                act = edata.get('activity') or edata.get('ocel:activity', '')
+                if act:
+                    activity_counts[act] = activity_counts.get(act, 0) + 1
         else:
             total_events = 0
             total_objects = 0
+            activity_counts = {}
+
+        # Per-activity repeat stats: requires OCEL 2.0 dict with omap per event.
+        # Use event_log_ocel (loaded separately above) so this always works even
+        # when load_event_log returns a trace list.
+        activity_repeat_stats: dict = {}
+        ocel_source = event_log_ocel if event_log_ocel else (event_log if isinstance(event_log, dict) else None)
+        if ocel_source:
+            ocel_events = ocel_source.get('events', {})
+            events_list_raw = list(ocel_events.values() if isinstance(ocel_events, dict) else ocel_events)
+            act_obj_counts: dict = {}
+            for edata in events_list_raw:
+                act = edata.get('activity') or edata.get('ocel:activity', '')
+                if not act:
+                    continue
+                for oid in (edata.get('omap') or edata.get('relationships') or []):
+                    act_obj_counts.setdefault(act, {}).setdefault(oid, 0)
+                    act_obj_counts[act][oid] += 1
+            for act, obj_counts in act_obj_counts.items():
+                counts_list = list(obj_counts.values())
+                if counts_list:
+                    activity_repeat_stats[act] = {
+                        'min':  min(counts_list),
+                        'max':  max(counts_list),
+                        'mean': round(sum(counts_list) / len(counts_list), 2),
+                    }
+
+        # Global consecutive-repeat stats: across the full sorted event timeline,
+        # find every run of consecutive same-activity firings and record its length.
+        # min/mean/max of those run lengths tells you how the activity clusters in
+        # the real log — directly calibrates the max_consecutive setting.
+        activity_consec_stats: dict = {}
+        if ocel_source:
+            sorted_acts = [
+                edata.get('activity') or edata.get('ocel:activity', '')
+                for edata in sorted(
+                    events_list_raw,
+                    key=lambda e: e.get('timestamp') or e.get('ocel:timestamp') or ''
+                )
+                if edata.get('activity') or edata.get('ocel:activity', '')
+            ]
+            # Scan runs
+            act_runs: dict = {}  # activity -> list of run lengths
+            i = 0
+            while i < len(sorted_acts):
+                act = sorted_acts[i]
+                run = 1
+                while i + run < len(sorted_acts) and sorted_acts[i + run] == act:
+                    run += 1
+                act_runs.setdefault(act, []).append(run)
+                i += run
+            for act, runs in act_runs.items():
+                activity_consec_stats[act] = {
+                    'min':  min(runs),
+                    'max':  max(runs),
+                    'mean': round(sum(runs) / len(runs), 2),
+                }
         
         # Calculate transition statistics
         transition_count = sum(len(targets) for targets in prob_matrix.values())
@@ -158,13 +231,19 @@ def run_discovery():
             'prob_matrix': prob_matrix,
             'time_distributions': time_distributions,
             'activities': activities,
+            'activity_counts': activity_counts,
+            'activity_repeat_stats': activity_repeat_stats,
+            'activity_consec_stats': activity_consec_stats,
             'event_log': event_log
         }
-        
+
         return jsonify({
             'success': True,
             'results': {
                 'activities': activities,
+                'activity_counts': activity_counts,
+                'activity_repeat_stats': activity_repeat_stats,
+                'activity_consec_stats': activity_consec_stats,
                 'activity_count': len(activities),
                 'total_events': total_events,
                 'total_objects': total_objects,
@@ -605,6 +684,7 @@ def run_simulation():
                 'metrics_file': metrics_filename,
                 'metrics': metrics,
                 'concurrency_pairs': concurrency_pairs,
+                'resource_types': list(static_model.resource_types or []),
             },
             'logs': [
                 f"Loaded model: {ocdeclare_file}",

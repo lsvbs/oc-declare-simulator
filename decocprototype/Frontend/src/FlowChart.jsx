@@ -14,7 +14,8 @@ const MIN_ZOOM = 0.25, MAX_ZOOM = 2.0;
 // Available metric options for the node-label dropdown
 const NODE_METRIC_OPTIONS = [
   { value: 'off',               label: 'Off' },
-  { value: 'mean_duration',     label: 'Mean duration' },
+  { value: 'mean_service',      label: 'Mean service time' },
+  { value: 'mean_sojourn',      label: 'Mean sojourn (service+wait)' },
   { value: 'mean_wait_in_pool', label: 'Mean wait in pool' },
   { value: 'max_wait_in_pool',  label: 'Max wait in pool' },
   { value: 'execution_count',   label: 'Execution count' },
@@ -123,7 +124,7 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {}, a
   const [showForward,   setShowForward]   = useState(true);
   const [showBackloop,  setShowBackloop]  = useState(true);
   const [showSelfloop,  setShowSelfloop]  = useState(true);
-  const [nodeMetric,    setNodeMetric]    = useState('mean_duration');
+  const [nodeMetric,    setNodeMetric]    = useState('mean_service');
   const [activeObjIds,  setActiveObjIds]  = useState(new Set());
   const [expandedTypes, setExpandedTypes] = useState(new Set()); // empty = all collapsed
   const [overlayMode,   setOverlayMode]   = useState('aggregate'); // 'aggregate' | 'trace'
@@ -357,8 +358,10 @@ function FlowChart({ activitySequence, objectTraces = {}, objectTypesMap = {}, a
         const m = activityMetrics && activityMetrics[name];
         let label = '—';
         if (m) {
-          if (nodeMetric === 'mean_duration' && m.mean_duration_s != null)
-            label = _fmtSeconds(m.mean_duration_s);
+          if (nodeMetric === 'mean_service' && m.mean_service_s != null)
+            label = _fmtSeconds(m.mean_service_s);
+          else if (nodeMetric === 'mean_sojourn' && m.mean_sojourn_s != null)
+            label = _fmtSeconds(m.mean_sojourn_s);
           else if (nodeMetric === 'mean_wait_in_pool' && m.mean_wait_in_pool_s != null)
             label = _fmtSeconds(m.mean_wait_in_pool_s);
           else if (nodeMetric === 'max_wait_in_pool' && m.max_wait_in_pool_s != null)

@@ -401,6 +401,7 @@ def discover_precedence_constraints(
                     'target': target,
                     'source_activity': source,
                     'target_activity': target,
+                    'nmin': 1,
                     'scope': {
                         'kind': 'each',
                         'object_type': object_type
@@ -729,6 +730,7 @@ def discover_chain_precedence_constraints(
                     'target': target,
                     'source_activity': source,
                     'target_activity': target,
+                    'nmin': 1,
                     'scope': {
                         'kind': 'each',
                         'object_type': object_type
@@ -778,6 +780,7 @@ def discover_chain_response_constraints(
                     'target': target,
                     'source_activity': source,
                     'target_activity': target,
+                    'nmin': 1,
                     'scope': {
                         'kind': 'each',
                         'object_type': object_type

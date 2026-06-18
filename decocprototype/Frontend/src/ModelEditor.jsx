@@ -97,6 +97,18 @@ export default function ModelEditor({
     }
   };
 
+  const updateMaxConsecutivePerObject = (actName, rawValue) => {
+    const cur = model.max_consecutive_per_object || {};
+    if (rawValue === '' || rawValue === null || rawValue === undefined) {
+      const { [actName]: _removed, ...rest } = cur;
+      onModelChange({ ...model, max_consecutive_per_object: rest });
+    } else {
+      const n = parseInt(rawValue);
+      if (!Number.isNaN(n) && n >= 1)
+        onModelChange({ ...model, max_consecutive_per_object: { ...cur, [actName]: n } });
+    }
+  };
+
   // ── Constraint helpers ────────────────────────────────────────────────────
   const deleteConstraint = (idx) =>
     onModelChange({ ...model, constraints: constraints.filter((_, i) => i !== idx) });
@@ -218,6 +230,8 @@ export default function ModelEditor({
       ? { activity_durations: model.activity_durations } : {}),
     ...(model.max_consecutive && Object.keys(model.max_consecutive).length
       ? { max_consecutive: model.max_consecutive } : {}),
+    ...(model.max_consecutive_per_object && Object.keys(model.max_consecutive_per_object).length
+      ? { max_consecutive_per_object: model.max_consecutive_per_object } : {}),
     ...(probMatrix && Object.keys(probMatrix).length
       ? { transition_matrix: probMatrix } : {}),
   });
@@ -339,13 +353,23 @@ export default function ModelEditor({
                     </span>
                   )}
                   <label className="max-consec-label" onClick={e => e.stopPropagation()}>
-                    max consec <HelpTip text="Maximum number of back-to-back firings allowed. Leave blank for no limit." />
+                    max consec <HelpTip text="Maximum back-to-back firings globally (regardless of which object). Leave blank for no limit." />
                     <input
                       className="binding-num max-consec-input"
                       type="number" min={1}
                       value={(model.max_consecutive || {})[act.name] ?? ''}
                       placeholder="∞"
                       onChange={e => updateMaxConsecutive(act.name, e.target.value)}
+                    />
+                  </label>
+                  <label className="max-consec-label" onClick={e => e.stopPropagation()}>
+                    max consec/obj <HelpTip text="Maximum back-to-back firings on the same object. The same activity may still fire on a different object. Leave blank for no limit." />
+                    <input
+                      className="binding-num max-consec-input"
+                      type="number" min={1}
+                      value={(model.max_consecutive_per_object || {})[act.name] ?? ''}
+                      placeholder="∞"
+                      onChange={e => updateMaxConsecutivePerObject(act.name, e.target.value)}
                     />
                   </label>
                   <span className="activity-binding-count">

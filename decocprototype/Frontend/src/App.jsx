@@ -42,7 +42,16 @@ const TRACER_TYPE_COLORS = [
   '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#14b8a6',
 ];
 
-function ObjectTracer({ links = [], typesMap = {} }) {
+function _fmtChainTime(s) {
+  if (s == null) return '—';
+  if (s < 3600) return `${(s / 60).toFixed(0)}min`;
+  if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+  return `${(s / 86400).toFixed(1)}d`;
+}
+
+function ObjectTracer({ links = [], typesMap = {}, objectMetrics = {}, resourceTypes = [] }) {
+  const resourceSet = React.useMemo(() => new Set(resourceTypes), [resourceTypes]);
+
   const { childrenOf, roots, typeColor } = React.useMemo(() => {
     const childrenOf = {};
     const sources = new Set();
@@ -52,13 +61,10 @@ function ObjectTracer({ links = [], typesMap = {} }) {
       sources.add(source);
       targets.add(target);
     });
-    // Seed objects = sources that are never a target. Fallback to all sources
-    // (e.g. if every node is part of a cycle) so something is always shown.
     let roots = [...sources].filter(s => !targets.has(s));
     if (roots.length === 0) roots = [...sources];
     roots.sort();
 
-    // Stable colour per object type
     const orderedTypes = [...new Set(Object.values(typesMap))].sort();
     const colorIdx = {};
     orderedTypes.forEach((t, i) => { colorIdx[t] = i; });
@@ -67,6 +73,59 @@ function ObjectTracer({ links = [], typesMap = {} }) {
     return { childrenOf, roots, typeColor };
   }, [links, typesMap]);
 
+  // Collect all object ids in a chain rooted at `id` (BFS, cycle-safe)
+  const collectChain = (id) => {
+    const visited = new Set();
+    const queue = [id];
+    while (queue.length) {
+      const cur = queue.shift();
+      if (visited.has(cur)) continue;
+      visited.add(cur);
+      (childrenOf[cur] || []).forEach(kid => queue.push(kid));
+    }
+    return visited;
+  };
+
+  // Compute chain timing from objectMetrics — resource objects excluded from
+  // timing so they don't span the entire simulation and inflate the numbers.
+  const chainTiming = React.useMemo(() => {
+    if (!objectMetrics || !Object.keys(objectMetrics).length) return {};
+    const result = {};
+    roots.forEach(rootId => {
+      const ids = collectChain(rootId);
+      let minFirst = null, maxLast = null, totalServiceS = 0, caseCount = 0;
+      ids.forEach(oid => {
+        const otype = typesMap[oid];
+        const isResource = resourceSet.has(otype);
+        const m = objectMetrics[oid];
+        if (!m) return;
+        // Only case objects count towards timing
+        if (!isResource) {
+          if (m.first_event_time) {
+            const t = new Date(m.first_event_time).getTime();
+            if (minFirst === null || t < minFirst) minFirst = t;
+          }
+          if (m.last_event_time) {
+            const t = new Date(m.last_event_time).getTime();
+            if (maxLast === null || t > maxLast) maxLast = t;
+          }
+          if (m.lifetime_s != null) totalServiceS += m.lifetime_s;
+          caseCount++;
+        }
+      });
+      const elapsedS = (minFirst !== null && maxLast !== null)
+        ? (maxLast - minFirst) / 1000
+        : null;
+      result[rootId] = {
+        elapsedS,
+        totalServiceS: totalServiceS > 0 ? totalServiceS : null,
+        objectCount: ids.size,
+        caseCount,
+      };
+    });
+    return result;
+  }, [roots, objectMetrics, resourceSet, typesMap]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!links.length) {
     return <p className="tracer-empty">No object-to-object connections were created in this run.</p>;
   }
@@ -74,12 +133,21 @@ function ObjectTracer({ links = [], typesMap = {} }) {
   const Node = ({ id, depth, seen }) => {
     const kids = childrenOf[id] || [];
     const otype = typesMap[id] || '?';
+    const isResource = resourceSet.has(otype);
+    const om = objectMetrics[id];
+    const lifetime = om?.lifetime_s;
     const nextSeen = new Set(seen); nextSeen.add(id);
     return (
       <div className="tracer-node" style={{ marginLeft: depth === 0 ? 0 : 16 }}>
         <span className="tracer-obj">
           <span className="tracer-type-chip" style={{ background: typeColor(otype) }}>{otype}</span>
           <span className="tracer-id">{id}</span>
+          {isResource && <span className="tracer-resource-badge" title="Resource object — excluded from chain timing">resource</span>}
+          {!isResource && lifetime != null && (
+            <span className="tracer-obj-lifetime" title="Service time: first to last event on this object">
+              ⚙ {_fmtChainTime(lifetime)}
+            </span>
+          )}
           {kids.length > 0 && <span className="tracer-fanout">→ {kids.length}</span>}
         </span>
         {kids.map((kid, i) => {
@@ -98,31 +166,48 @@ function ObjectTracer({ links = [], typesMap = {} }) {
 
   return (
     <div className="tracer-forest">
-      {roots.map(rootId => (
-        <Collapsible
-          key={rootId}
-          className="tracer-root"
-          defaultOpen={false}
-          title={
-            <span className="tracer-root-title">
-              <span className="tracer-type-chip" style={{ background: typeColor(typesMap[rootId] || '?') }}>
-                {typesMap[rootId] || '?'}
+      {roots.map(rootId => {
+        const ct = chainTiming[rootId] || {};
+        return (
+          <Collapsible
+            key={rootId}
+            className="tracer-root"
+            defaultOpen={false}
+            title={
+              <span className="tracer-root-title">
+                <span className="tracer-type-chip" style={{ background: typeColor(typesMap[rootId] || '?') }}>
+                  {typesMap[rootId] || '?'}
+                </span>
+                {rootId}
+                {(ct.elapsedS != null || ct.totalServiceS != null) && (
+                  <span className="tracer-chain-timing">
+                    {ct.elapsedS != null && (
+                      <span className="tracer-timing-chip tracer-timing-elapsed" title="Total elapsed time: from first object entering to last object's final event">
+                        ⏱ {_fmtChainTime(ct.elapsedS)} elapsed
+                      </span>
+                    )}
+                    {ct.totalServiceS != null && (
+                      <span className="tracer-timing-chip tracer-timing-service" title="Total service time: sum of individual object lifetimes across the chain">
+                        ⚙ {_fmtChainTime(ct.totalServiceS)} service
+                      </span>
+                    )}
+                  </span>
+                )}
               </span>
-              {rootId}
-            </span>
-          }
-          badge={`${(childrenOf[rootId] || []).length} direct`}
-        >
-          <div className="tracer-tree">
-            {(childrenOf[rootId] || []).length === 0
-              ? <p className="tracer-leaf-note">No linked objects.</p>
-              : (childrenOf[rootId] || []).map((kid, i) => (
-                  <Node key={`${rootId}-${kid}-${i}`} id={kid} depth={1} seen={new Set([rootId])} />
-                ))
             }
-          </div>
-        </Collapsible>
-      ))}
+            badge={`${(childrenOf[rootId] || []).length} direct · ${ct.caseCount ?? ct.objectCount ?? 0} case objects`}
+          >
+            <div className="tracer-tree">
+              {(childrenOf[rootId] || []).length === 0
+                ? <p className="tracer-leaf-note">No linked objects.</p>
+                : (childrenOf[rootId] || []).map((kid, i) => (
+                    <Node key={`${rootId}-${kid}-${i}`} id={kid} depth={1} seen={new Set([rootId])} />
+                  ))
+              }
+            </div>
+          </Collapsible>
+        );
+      })}
     </div>
   );
 }
@@ -941,11 +1026,68 @@ function App() {
                   title="Discovered Activities"
                   badge={discoveryResults.activities.length}
                 >
-                  <div className="activity-badges">
-                    {discoveryResults.activities.map((activity, idx) => (
-                      <span key={idx} className="activity-badge">{activity}</span>
-                    ))}
-                  </div>
+                  {discoveryResults.activity_counts
+                    ? (
+                      <table className="activity-count-table">
+                        <thead>
+                          <tr>
+                            <th>Activity</th>
+                            <th>Occurrences</th>
+                            {discoveryResults.activity_consec_stats && (
+                              <>
+                                <th title="Shortest consecutive run of this activity in the log">Min consec</th>
+                                <th title="Average consecutive run length in the log — use as guide for max consecutive setting">Mean consec</th>
+                                <th title="Longest consecutive run of this activity in the log">Max consec</th>
+                              </>
+                            )}
+                            {discoveryResults.activity_repeat_stats && (
+                              <>
+                                <th title="Fewest times this activity fired on a single object">Min /obj</th>
+                                <th title="Average times this activity fired per object">Mean /obj</th>
+                                <th title="Most times this activity fired on a single object">Max /obj</th>
+                              </>
+                            )}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {discoveryResults.activities
+                            .slice()
+                            .sort((a, b) => (discoveryResults.activity_counts[b] || 0) - (discoveryResults.activity_counts[a] || 0))
+                            .map(activity => {
+                              const cs = discoveryResults.activity_consec_stats?.[activity];
+                              const rs = discoveryResults.activity_repeat_stats?.[activity];
+                              return (
+                                <tr key={activity}>
+                                  <td>{activity}</td>
+                                  <td className="activity-count-num">{discoveryResults.activity_counts[activity] ?? 0}</td>
+                                  {discoveryResults.activity_consec_stats && (
+                                    <>
+                                      <td className="activity-count-num">{cs ? cs.min : '—'}</td>
+                                      <td className="activity-count-num">{cs ? cs.mean : '—'}</td>
+                                      <td className="activity-count-num">{cs ? cs.max : '—'}</td>
+                                    </>
+                                  )}
+                                  {discoveryResults.activity_repeat_stats && (
+                                    <>
+                                      <td className="activity-count-num">{rs ? rs.min : '—'}</td>
+                                      <td className="activity-count-num">{rs ? rs.mean : '—'}</td>
+                                      <td className="activity-count-num">{rs ? rs.max : '—'}</td>
+                                    </>
+                                  )}
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    )
+                    : (
+                      <div className="activity-badges">
+                        {discoveryResults.activities.map((activity, idx) => (
+                          <span key={idx} className="activity-badge">{activity}</span>
+                        ))}
+                      </div>
+                    )
+                  }
                 </Collapsible>
               )}
             </div>
@@ -1283,16 +1425,75 @@ function App() {
 
         {/* ── Model Editor (shown when an editable dict-format model is loaded) ── */}
         {activeModel && !Array.isArray(activeModel) && (
-          <ModelEditor
-            model={activeModel}
-            probMatrix={activeProbMatrix || {}}
-            onModelChange={handleModelEdit}
-            onProbMatrixChange={setActiveProbMatrix}
-            sourceFile={config.ocdeclareFile}
-            parameterFiles={parameterFiles}
-            onLoadParameters={handleLoadParameters}
-            onSaveParameters={handleSaveParameters}
-          />
+          <div className="model-editor-row">
+            <div className="model-editor-col">
+              <ModelEditor
+                model={activeModel}
+                probMatrix={activeProbMatrix || {}}
+                onModelChange={handleModelEdit}
+                onProbMatrixChange={setActiveProbMatrix}
+                sourceFile={config.ocdeclareFile}
+                parameterFiles={parameterFiles}
+                onLoadParameters={handleLoadParameters}
+                onSaveParameters={handleSaveParameters}
+              />
+            </div>
+            <div className="model-editor-warnings-col">
+              {timingDiscoveryResult && (() => {
+                const zeroMin = [], zeroMax = [];
+                Object.entries(timingDiscoveryResult).forEach(([act, m]) => {
+                  if (m.min_seconds === 0 || m.min_seconds == null) zeroMin.push(act);
+                  if (m.max_seconds === 0 || m.max_seconds == null) zeroMax.push(act);
+                });
+                if (!zeroMin.length && !zeroMax.length) return null;
+                return (
+                  <div className="timing-warning-box">
+                    <div className="timing-warning-title">⚠ Discovered time bounds</div>
+                    {zeroMin.length > 0 && (
+                      <div className="timing-warning-group">
+                        <div className="timing-warning-label">Min = 0 s</div>
+                        <ul className="timing-warning-list">
+                          {zeroMin.map(a => <li key={a}>{a}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                    {zeroMax.length > 0 && (
+                      <div className="timing-warning-group">
+                        <div className="timing-warning-label">Max = 0 / unbounded</div>
+                        <ul className="timing-warning-list">
+                          {zeroMax.map(a => <li key={a}>{a}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                    <p className="timing-warning-hint">
+                      Review these in the Model Editor → Timing tab and set explicit bounds if needed.
+                    </p>
+                  </div>
+                );
+              })()}
+              {(() => {
+                const actNames = (activeModel.activities || []).map(a => a.name);
+                const constraints = activeModel.constraints || [];
+                const hasIncoming = new Set(constraints.map(c => c.target_activity || c.target));
+                const unconstrained = actNames.filter(a => !hasIncoming.has(a));
+                if (!unconstrained.length) return null;
+                return (
+                  <div className="timing-warning-box">
+                    <div className="timing-warning-title">⚠ No input constraints</div>
+                    <p className="timing-warning-hint" style={{ marginTop: 0, marginBottom: '0.55rem' }}>
+                      These activities have no constraint where they are the target — nothing prevents them from firing repeatedly without limit.
+                    </p>
+                    <ul className="timing-warning-list">
+                      {unconstrained.map(a => <li key={a}>{a}</li>)}
+                    </ul>
+                    <p className="timing-warning-hint">
+                      Add a precedence or chain_response constraint in the Constraints tab to control when each can fire.
+                    </p>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
         )}
 
         {/* STEP 3: Simulation Section */}
@@ -1522,9 +1723,10 @@ function App() {
                           <tr>
                             <th>Activity</th>
                             <th>Count</th>
-                            <th>Mean duration</th>
-                            <th>Min</th>
-                            <th>Max</th>
+                            <th title="Sampled clock advance at each firing">Mean service</th>
+                            <th>Min service</th>
+                            <th>Max service</th>
+                            <th title="Service + wait in pool (sojourn = how long from becoming eligible to completion)">Mean sojourn</th>
                             <th title="Mean time the activity was in the candidate pool before being chosen">Mean wait in pool</th>
                             <th title="Longest time the activity was available but not chosen before finally firing">Max wait in pool</th>
                           </tr>
@@ -1534,9 +1736,10 @@ function App() {
                             <tr key={act}>
                               <td className="metrics-act-name">{act}</td>
                               <td>{m.execution_count}</td>
-                              <td>{fmtSeconds(m.mean_duration_s)}</td>
-                              <td>{fmtSeconds(m.min_duration_s)}</td>
-                              <td>{fmtSeconds(m.max_duration_s)}</td>
+                              <td>{fmtSeconds(m.mean_service_s)}</td>
+                              <td>{fmtSeconds(m.min_service_s)}</td>
+                              <td>{fmtSeconds(m.max_service_s)}</td>
+                              <td>{fmtSeconds(m.mean_sojourn_s)}</td>
                               <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
                               <td>{fmtSeconds(m.max_wait_in_pool_s)}</td>
                             </tr>
@@ -1626,6 +1829,8 @@ function App() {
               <ObjectTracer
                 links={results.object_links}
                 typesMap={results.object_types_map || {}}
+                objectMetrics={results.metrics && results.metrics.object_metrics ? results.metrics.object_metrics : {}}
+                resourceTypes={results.resource_types || []}
               />
             </Collapsible>
           )}
@@ -1750,9 +1955,10 @@ function App() {
                                 <tr>
                                   <th>Activity</th>
                                   <th>Count</th>
-                                  <th>Mean duration</th>
-                                  <th>Min</th>
-                                  <th>Max</th>
+                                  <th>Mean service</th>
+                                  <th>Min service</th>
+                                  <th>Max service</th>
+                                  <th>Mean sojourn</th>
                                   <th>Mean wait in pool</th>
                                 </tr>
                               </thead>
@@ -1761,9 +1967,10 @@ function App() {
                                   <tr key={act}>
                                     <td className="metrics-act-name">{act}</td>
                                     <td>{m.execution_count}</td>
-                                    <td>{fmtSeconds(m.mean_duration_s)}</td>
-                                    <td>{fmtSeconds(m.min_duration_s)}</td>
-                                    <td>{fmtSeconds(m.max_duration_s)}</td>
+                                    <td>{fmtSeconds(m.mean_service_s)}</td>
+                                    <td>{fmtSeconds(m.min_service_s)}</td>
+                                    <td>{fmtSeconds(m.max_service_s)}</td>
+                                    <td>{fmtSeconds(m.mean_sojourn_s)}</td>
                                     <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
                                   </tr>
                                 ))}
