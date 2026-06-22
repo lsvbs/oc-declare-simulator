@@ -120,6 +120,9 @@ class StaticModel:
     constraints: list[Constraint] = field(default_factory=list)
     o2o_rules: list[O2ORule] = field(default_factory=list)
     resource_types: list[str] = field(default_factory=list)
+    # How many instances of each resource type to pre-populate at sim start.
+    # Defaults to 1 for any resource type not listed here.
+    resource_pool_sizes: dict[str, int] = field(default_factory=dict)
     max_consecutive: dict[str, int] = field(default_factory=dict)
     # Per-object max consecutive: activity may repeat at most N times on the
     # same object ID before another activity must touch that object.

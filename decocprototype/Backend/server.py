@@ -222,6 +222,30 @@ def run_discovery():
                     'max':  max(runs),
                     'mean': round(sum(runs) / len(runs), 2),
                 }
+
+        # Suggested nmax per object: 95th-percentile of per-object repeat counts
+        # from the real log.  Gives the user a data-driven starting point for
+        # max_consecutive_per_object that prevents the simulation from exceeding
+        # realistic repeat counts while still allowing natural variation.
+        activity_nmax_suggestions: dict = {}
+        if ocel_source and act_obj_counts:
+            import math
+            for act, obj_counts in act_obj_counts.items():
+                counts_list = sorted(obj_counts.values())
+                n = len(counts_list)
+                if n == 0:
+                    continue
+                # 95th percentile (nearest-rank)
+                idx_p95 = max(0, math.ceil(0.95 * n) - 1)
+                p95 = counts_list[idx_p95]
+                # p50 for context
+                idx_p50 = max(0, math.ceil(0.50 * n) - 1)
+                p50 = counts_list[idx_p50]
+                activity_nmax_suggestions[act] = {
+                    'p50': int(p50),
+                    'p95': int(p95),
+                    'suggested': int(p95),  # recommended value to plug in
+                }
         
         # Calculate transition statistics
         transition_count = sum(len(targets) for targets in prob_matrix.values())
@@ -234,6 +258,7 @@ def run_discovery():
             'activity_counts': activity_counts,
             'activity_repeat_stats': activity_repeat_stats,
             'activity_consec_stats': activity_consec_stats,
+            'activity_nmax_suggestions': activity_nmax_suggestions,
             'event_log': event_log
         }
 
@@ -244,6 +269,7 @@ def run_discovery():
                 'activity_counts': activity_counts,
                 'activity_repeat_stats': activity_repeat_stats,
                 'activity_consec_stats': activity_consec_stats,
+                'activity_nmax_suggestions': activity_nmax_suggestions,
                 'activity_count': len(activities),
                 'total_events': total_events,
                 'total_objects': total_objects,

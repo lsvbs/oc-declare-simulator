@@ -139,6 +139,19 @@ class Simulator:
         state._start_activity_names = set(self.config.start_policy.start_activity_names)
         state._resource_types = set(getattr(self.static_model, 'resource_types', []) or [])
 
+        # Pre-populate resource pool objects so activities that bind resource
+        # types always find existing instances without needing a creates step.
+        pool_sizes = getattr(self.static_model, 'resource_pool_sizes', {}) or {}
+        for res_type in state._resource_types:
+            n = pool_sizes.get(res_type, 1)
+            for _ in range(n):
+                from src.Simulation.Domain.state import RuntimeObject
+                oid = state.new_object_id(res_type)
+                obj = RuntimeObject(object_id=oid, object_type=res_type, active=True)
+                state.objects[oid] = obj
+                state._active_by_type.setdefault(res_type, set()).add(oid)
+                state._type_of_object[oid] = res_type
+
         while True:
             if self._should_stop(state):
                 self._trace(

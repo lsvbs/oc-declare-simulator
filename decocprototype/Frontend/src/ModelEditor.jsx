@@ -211,6 +211,7 @@ const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_l
 export default function ModelEditor({
   model, probMatrix, onModelChange, onProbMatrixChange,
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
+  nmaxSuggestions = {},
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
@@ -228,9 +229,10 @@ export default function ModelEditor({
   const activities = model.activities  || [];
   const constraints = model.constraints || [];
   const o2oRules   = model.o2o_rules   || [];
-  const objectTypes = useMemo(() => model.object_types || [], [model.object_types]);
-  const otNames     = useMemo(() => objectTypes.map(t => typeof t === 'string' ? t : t.name), [objectTypes]);
-  const actNames    = useMemo(() => activities.map(a => a.name), [activities]);
+  const objectTypes   = useMemo(() => model.object_types || [], [model.object_types]);
+  const otNames       = useMemo(() => objectTypes.map(t => typeof t === 'string' ? t : t.name), [objectTypes]);
+  const actNames      = useMemo(() => activities.map(a => a.name), [activities]);
+  const resourceTypes = useMemo(() => model.resource_types || [], [model.resource_types]);
 
   // ── Activities helpers ────────────────────────────────────────────────────
   const toggleAct = (name) => setExpandedActs(prev => {
@@ -354,12 +356,39 @@ export default function ModelEditor({
     onProbMatrixChange({ ...probMatrix, [src]: Object.fromEntries(actNames.map(a => [a, w])) });
   };
 
+  const toggleResourceType = (typeName) => {
+    const isResource = resourceTypes.includes(typeName);
+    const updated = isResource
+      ? resourceTypes.filter(r => r !== typeName)
+      : [...resourceTypes, typeName];
+    // When disabling, also remove any pool size entry
+    const poolSizes = model.resource_pool_sizes || {};
+    if (isResource) {
+      const { [typeName]: _removed, ...rest } = poolSizes;
+      onModelChange({ ...model, resource_types: updated, resource_pool_sizes: rest });
+    } else {
+      onModelChange({ ...model, resource_types: updated });
+    }
+  };
+
+  const updateResourcePoolSize = (typeName, rawValue) => {
+    const poolSizes = model.resource_pool_sizes || {};
+    const val = parseInt(rawValue, 10);
+    if (!rawValue || isNaN(val) || val < 1) {
+      const { [typeName]: _removed, ...rest } = poolSizes;
+      onModelChange({ ...model, resource_pool_sizes: rest });
+    } else {
+      onModelChange({ ...model, resource_pool_sizes: { ...poolSizes, [typeName]: val } });
+    }
+  };
+
   // ── Tab definitions ───────────────────────────────────────────────────────
   const TABS = [
     { id: 'activities',   label: 'Activities',   count: activities.length },
     { id: 'constraints',  label: 'Constraints',  count: constraints.length },
     { id: 'o2o',          label: 'O2O Rules',    count: o2oRules.length },
     { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
+    { id: 'resources',    label: 'Resources',    count: resourceTypes.length || null },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
   ];
@@ -410,6 +439,10 @@ export default function ModelEditor({
       ? { max_consecutive: model.max_consecutive } : {}),
     ...(model.max_consecutive_per_object && Object.keys(model.max_consecutive_per_object).length
       ? { max_consecutive_per_object: model.max_consecutive_per_object } : {}),
+    ...(resourceTypes.length
+      ? { resource_types: resourceTypes } : {}),
+    ...(model.resource_pool_sizes && Object.keys(model.resource_pool_sizes).length
+      ? { resource_pool_sizes: model.resource_pool_sizes } : {}),
     ...(probMatrix && Object.keys(probMatrix).length
       ? { transition_matrix: probMatrix } : {}),
   });
@@ -549,6 +582,15 @@ export default function ModelEditor({
                       placeholder="∞"
                       onChange={e => updateMaxConsecutivePerObject(act.name, e.target.value)}
                     />
+                    {nmaxSuggestions[act.name] && nmaxSuggestions[act.name].suggested > 1 && (
+                      <button
+                        className="nmax-suggest-btn"
+                        title={`Log suggests max ${nmaxSuggestions[act.name].suggested} (p95). Click to apply.`}
+                        onClick={e => { e.stopPropagation(); updateMaxConsecutivePerObject(act.name, nmaxSuggestions[act.name].suggested); }}
+                      >
+                        p95:{nmaxSuggestions[act.name].suggested}
+                      </button>
+                    )}
                   </label>
                   <span className="activity-binding-count">
                     {(act.bindings || []).length} binding{(act.bindings || []).length !== 1 ? 's' : ''}
@@ -969,6 +1011,54 @@ export default function ModelEditor({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* ━━ RESOURCES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'resources' && (
+          <div>
+            <p className="prob-hint">
+              Resource object types are <strong>permanently active</strong> and never deactivated — they
+              represent shared infrastructure (employees, forklifts, trucks) reused across cases.
+              Set a <strong>pool size</strong> to pre-populate N instances at simulation start, so
+              activities that bind this type always find objects without a preceding <em>creates</em> step.
+            </p>
+            {otNames.length === 0 && <p className="empty-notice">No object types defined.</p>}
+            <div className="resource-type-list">
+              {otNames.map(typeName => {
+                const isResource = resourceTypes.includes(typeName);
+                const poolSize   = (model.resource_pool_sizes || {})[typeName] ?? '';
+                return (
+                  <div key={typeName} className={`resource-type-row ${isResource ? 'resource-active' : ''}`}>
+                    <label className="resource-check-label">
+                      <input
+                        type="checkbox"
+                        checked={isResource}
+                        onChange={() => toggleResourceType(typeName)}
+                      />
+                      <span className="resource-type-name">{typeName}</span>
+                    </label>
+                    {isResource && (
+                      <>
+                        <span className="resource-badge">resource</span>
+                        <label className="resource-pool-label">
+                          pool size
+                          <input
+                            type="number"
+                            min={1}
+                            step={1}
+                            className="resource-pool-input"
+                            value={poolSize}
+                            placeholder="1"
+                            onChange={e => updateResourcePoolSize(typeName, e.target.value)}
+                          />
+                        </label>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 

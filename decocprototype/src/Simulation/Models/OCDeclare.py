@@ -227,6 +227,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         constraints=constraints,
         o2o_rules=o2o_rules,
         resource_types=[str(r) for r in data.get("resource_types", []) or []],
+        resource_pool_sizes={
+            str(k): int(v)
+            for k, v in (data.get("resource_pool_sizes") or {}).items()
+            if v is not None and int(v) >= 1
+        },
         max_consecutive={
             str(k): int(v)
             for k, v in (data.get("max_consecutive") or {}).items()

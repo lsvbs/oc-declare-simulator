@@ -1030,6 +1030,28 @@ function App() {
                 >
                   {discoveryResults.activity_counts
                     ? (
+                      <>
+                      {discoveryResults.activity_nmax_suggestions && Object.keys(discoveryResults.activity_nmax_suggestions).length > 0 && (
+                        <div className="nmax-hint-bar">
+                          <span>Suggested <code>max consec/obj</code> values from log (p95 repeats per object).</span>
+                          <button
+                            className="nmax-apply-btn"
+                            title="Apply all p95 suggestions as max_consecutive_per_object in the Model Editor"
+                            onClick={() => {
+                              if (!activeModel || Array.isArray(activeModel)) return;
+                              const suggestions = discoveryResults.activity_nmax_suggestions;
+                              const cur = activeModel.max_consecutive_per_object || {};
+                              const updated = { ...cur };
+                              Object.entries(suggestions).forEach(([act, s]) => {
+                                if (s.suggested > 1) updated[act] = s.suggested;
+                              });
+                              handleModelEdit({ ...activeModel, max_consecutive_per_object: updated });
+                            }}
+                          >
+                            ⬆ Apply all to Model Editor
+                          </button>
+                        </div>
+                      )}
                       <table className="activity-count-table">
                         <thead>
                           <tr>
@@ -1049,6 +1071,9 @@ function App() {
                                 <th title="Most times this activity fired on a single object">Max /obj</th>
                               </>
                             )}
+                            {discoveryResults.activity_nmax_suggestions && (
+                              <th title="Suggested max_consecutive_per_object (95th percentile repeats per object in the log). Click ⬆ to apply to the Model Editor.">Sugg. max/obj (p95)</th>
+                            )}
                           </tr>
                         </thead>
                         <tbody>
@@ -1058,6 +1083,7 @@ function App() {
                             .map(activity => {
                               const cs = discoveryResults.activity_consec_stats?.[activity];
                               const rs = discoveryResults.activity_repeat_stats?.[activity];
+                              const ns = discoveryResults.activity_nmax_suggestions?.[activity];
                               return (
                                 <tr key={activity}>
                                   <td>{activity}</td>
@@ -1076,11 +1102,29 @@ function App() {
                                       <td className="activity-count-num">{rs ? rs.max : '—'}</td>
                                     </>
                                   )}
+                                  {discoveryResults.activity_nmax_suggestions && (
+                                    <td className="activity-count-num">
+                                      {ns && ns.suggested > 1 ? (
+                                        <button
+                                          className="nmax-cell-btn"
+                                          title={`p50=${ns.p50}  p95=${ns.p95} — click to set in Model Editor`}
+                                          onClick={() => {
+                                            if (!activeModel || Array.isArray(activeModel)) return;
+                                            const cur = activeModel.max_consecutive_per_object || {};
+                                            handleModelEdit({ ...activeModel, max_consecutive_per_object: { ...cur, [activity]: ns.suggested } });
+                                          }}
+                                        >
+                                          {ns.suggested}
+                                        </button>
+                                      ) : '—'}
+                                    </td>
+                                  )}
                                 </tr>
                               );
                             })}
                         </tbody>
                       </table>
+                      </>
                     )
                     : (
                       <div className="activity-badges">
@@ -1438,6 +1482,7 @@ function App() {
                 parameterFiles={parameterFiles}
                 onLoadParameters={handleLoadParameters}
                 onSaveParameters={handleSaveParameters}
+                nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
               />
             </div>
             <div className="model-editor-warnings-col">
@@ -1678,6 +1723,89 @@ function App() {
                   </>
                 );
               })()}
+
+              {/* ── Activity distribution comparison: simulation vs log ── */}
+              {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
+                <Collapsible
+                  className="logs-box sim-compare-box"
+                  title="📊 Activity Distribution vs Log"
+                  badge={null}
+                  defaultOpen={false}
+                >
+                  {(() => {
+                    const simMetrics = results.metrics.activity_metrics;
+                    const logCounts = discoveryResults.activity_counts || {};
+                    const logRepeat = discoveryResults.activity_repeat_stats || {};
+                    const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+                    const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+                    // Order by first-appearance in the simulation sequence (= process flow order).
+                    // Falls back to alphabetical for activities that never fired.
+                    const actSeq = results.metrics?.activity_sequence || [];
+                    const flowRank = {};
+                    actSeq.forEach((a, i) => { if (!(a in flowRank)) flowRank[a] = i; });
+                    const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
+                      .sort((a, b) => {
+                        const ra = a in flowRank ? flowRank[a] : 999999;
+                        const rb = b in flowRank ? flowRank[b] : 999999;
+                        return ra !== rb ? ra - rb : a.localeCompare(b);
+                      });
+                    return (
+                      <>
+                        <p className="sim-compare-hint">
+                          Proportional share of total events (simulation vs log). Identical proportions would mean
+                          perfect routing fidelity. Difference column shows sim − log in percentage points.
+                        </p>
+                        <table className="metrics-table sim-compare-table">
+                          <thead>
+                            <tr>
+                              <th>Activity</th>
+                              <th title="Times fired in this simulation run">Sim count</th>
+                              <th title="Times fired in the input event log">Log count</th>
+                              <th title="Share of all simulated events">Sim %</th>
+                              <th title="Share of all log events">Log %</th>
+                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
+                              <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
+                              <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allActs.map(act => {
+                              const simCount = simMetrics[act]?.execution_count ?? 0;
+                              const logCount = logCounts[act] ?? 0;
+                              const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                              const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                              const diff = simPct - logPct;
+                              const logMeanObj = logRepeat[act]?.mean ?? null;
+                              const simObjEvents = results.metrics.object_metrics
+                                ? Object.values(results.metrics.object_metrics).filter(m =>
+                                    m.activities && m.activities.includes(act)
+                                  ).length
+                                : null;
+                              const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                              const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
+                                : diff > 0 ? 'cmp-over' : 'cmp-under';
+                              return (
+                                <tr key={act}>
+                                  <td className="metrics-act-name">{act}</td>
+                                  <td>{simCount || '—'}</td>
+                                  <td>{logCount || '—'}</td>
+                                  <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                                  <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                                  <td className={`cmp-diff ${diffClass}`}>
+                                    {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
+                                  </td>
+                                  <td>{logMeanObj ?? '—'}</td>
+                                  <td>{simMeanObj ?? '—'}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </>
+                    );
+                  })()}
+                </Collapsible>
+              )}
 
               {results.object_types && (
                 <Collapsible

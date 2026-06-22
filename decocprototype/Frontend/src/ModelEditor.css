@@ -763,6 +763,76 @@
   width: 52px !important;
 }
 
+/* ── Resources tab ────────────────────────────────────────────────────────── */
+.resource-type-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.resource-type-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: default;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.resource-type-row:hover {
+  background: var(--hover);
+}
+
+.resource-type-row.resource-active {
+  border-color: #10b981;
+  background: #f0fdf4;
+}
+
+.resource-check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  flex: 1;
+}
+
+.resource-type-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.resource-badge {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #059669;
+  background: #d1fae5;
+  border-radius: 10px;
+  padding: 1px 8px;
+  letter-spacing: 0.02em;
+}
+
+.resource-pool-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.resource-pool-input {
+  width: 56px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.82rem;
+  text-align: right;
+}
+
 /* ── Timing tab ───────────────────────────────────────────────────────────── */
 .timing-row {
   border: 1px solid #e2e8f0;
