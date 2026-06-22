@@ -1,5 +1,183 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import './ModelEditor.css';
+
+// ── O2O UML Diagram ───────────────────────────────────────────────────────────
+const NODE_R   = 34;
+const O2O_PALETTE = ['#667eea','#10b981','#f59e0b','#ef4444','#8b5cf6',
+                     '#ec4899','#06b6d4','#84cc16','#f97316','#14b8a6'];
+
+function O2ODiagram({ rules, otNames }) {
+  const [hovered, setHovered] = useState(null);
+  const [positions, setPositions] = useState({});  // type -> {x, y}
+  const dragging = useRef(null); // { type, startX, startY, origX, origY, svgRect }
+  const svgRef = useRef(null);
+
+  const types = useMemo(() => {
+    const seen = new Set();
+    rules.forEach(r => { seen.add(r.source_type); seen.add(r.target_type); });
+    return otNames.filter(t => seen.has(t));
+  }, [rules, otNames]);
+
+  const n = types.length;
+
+  const W = 620, H = Math.max(260, Math.min(420, 90 * Math.ceil(n / 2)));
+  const cx = W / 2, cy = H / 2;
+  const rx = Math.min(cx - NODE_R - 10, 230);
+  const ry = Math.min(cy - NODE_R - 10, 160);
+
+  // Seed initial positions from ellipse — only when the type list changes
+  useEffect(() => {
+    if (n === 0) return;
+    setPositions(prev => {
+      const next = {};
+      types.forEach((t, i) => {
+        if (prev[t]) {
+          next[t] = prev[t]; // preserve manually dragged positions
+        } else {
+          const angle = (2 * Math.PI * i) / n - Math.PI / 2;
+          next[t] = { x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) };
+        }
+      });
+      return next;
+    });
+  }, [types.join(','), n, cx, cy, rx, ry]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const pos = positions;
+  const colorOf = t => O2O_PALETTE[types.indexOf(t) % O2O_PALETTE.length];
+
+  const pairCount = {};
+  rules.forEach((r, i) => {
+    const key = [r.source_type, r.target_type].sort().join('|||');
+    if (!pairCount[key]) pairCount[key] = [];
+    pairCount[key].push(i);
+  });
+
+  // ── Drag handlers ────────────────────────────────────────────────────────
+  const onNodePointerDown = useCallback((e, type) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    const scaleY = H / rect.height;
+    dragging.current = {
+      type,
+      startX: e.clientX,
+      startY: e.clientY,
+      origX: pos[type]?.x ?? cx,
+      origY: pos[type]?.y ?? cy,
+      scaleX,
+      scaleY,
+    };
+    svg.setPointerCapture(e.pointerId);
+  }, [pos, cx, cy, W, H]);
+
+  const onSvgPointerMove = useCallback((e) => {
+    if (!dragging.current) return;
+    const { type, startX, startY, origX, origY, scaleX, scaleY } = dragging.current;
+    const nx = Math.max(NODE_R, Math.min(W - NODE_R, origX + (e.clientX - startX) * scaleX));
+    const ny = Math.max(NODE_R, Math.min(H - NODE_R, origY + (e.clientY - startY) * scaleY));
+    setPositions(prev => ({ ...prev, [type]: { x: nx, y: ny } }));
+  }, [W, H]);
+
+  const onSvgPointerUp = useCallback(() => {
+    dragging.current = null;
+  }, []);
+
+  // ── Edge rendering ────────────────────────────────────────────────────────
+  const renderEdge = (r, idx) => {
+    const src = pos[r.source_type];
+    const tgt = pos[r.target_type];
+    if (!src || !tgt) return null;
+
+    const isSelf = r.source_type === r.target_type;
+    const key = [r.source_type, r.target_type].sort().join('|||');
+    const siblings = pairCount[key] || [idx];
+    const sibling_i = siblings.indexOf(idx);
+    const isHov = hovered === idx;
+    const stroke = isHov ? '#1e293b' : '#94a3b8';
+    const strokeW = isHov ? 2 : 1.5;
+    const label = `${r.min_links ?? 0}..${r.max_links ?? '*'}`;
+
+    if (isSelf) {
+      const lx = src.x, ly = src.y - NODE_R;
+      const d = `M ${lx-16} ${ly} C ${lx-30} ${ly-40} ${lx+30} ${ly-40} ${lx+16} ${ly}`;
+      return (
+        <g key={idx} onMouseEnter={() => setHovered(idx)} onMouseLeave={() => setHovered(null)}>
+          <path d={d} stroke={stroke} strokeWidth={strokeW} fill="none"
+            markerEnd={r.bidirectional ? undefined : 'url(#o2o-arrow)'} />
+          {r.bidirectional && <path d={d} stroke={stroke} strokeWidth={strokeW} fill="none"
+            markerStart="url(#o2o-arrow-rev)" />}
+          <text x={lx} y={ly-30} textAnchor="middle" fontSize="10"
+            fill={isHov ? '#1e293b' : '#64748b'} fontWeight={isHov ? 700 : 400}>{label}</text>
+        </g>
+      );
+    }
+
+    const offset = (sibling_i - (siblings.length - 1) / 2) * 28;
+    const dx = tgt.x - src.x, dy = tgt.y - src.y;
+    const len = Math.sqrt(dx*dx + dy*dy) || 1;
+    const mx = (src.x+tgt.x)/2 + (-dy/len)*offset;
+    const my = (src.y+tgt.y)/2 + (dx/len)*offset;
+    const srcA = Math.atan2(my-src.y, mx-src.x);
+    const tgtA = Math.atan2(my-tgt.y, mx-tgt.x);
+    const x1 = src.x + NODE_R*Math.cos(srcA), y1 = src.y + NODE_R*Math.sin(srcA);
+    const x2 = tgt.x + NODE_R*Math.cos(tgtA), y2 = tgt.y + NODE_R*Math.sin(tgtA);
+    const d = `M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`;
+    const lmx = (x1+x2)/2 + (-dy/len)*offset*0.55;
+    const lmy = (y1+y2)/2 + (dx/len)*offset*0.55;
+
+    return (
+      <g key={idx} onMouseEnter={() => setHovered(idx)} onMouseLeave={() => setHovered(null)}>
+        <path d={d} stroke={stroke} strokeWidth={strokeW} fill="none"
+          markerEnd="url(#o2o-arrow)"
+          markerStart={r.bidirectional ? 'url(#o2o-arrow-rev)' : undefined} />
+        <text x={lmx} y={lmy-4} textAnchor="middle" fontSize="10"
+          fill={isHov ? '#1e293b' : '#64748b'} fontWeight={isHov ? 700 : 400}
+          stroke="white" strokeWidth="3" paintOrder="stroke">{label}</text>
+      </g>
+    );
+  };
+
+  if (n === 0) return null;
+
+  return (
+    <svg ref={svgRef} width="100%" viewBox={`0 0 ${W} ${H}`}
+      style={{ display: 'block', maxHeight: H, cursor: dragging.current ? 'grabbing' : 'default' }}
+      onPointerMove={onSvgPointerMove}
+      onPointerUp={onSvgPointerUp}
+      onPointerLeave={onSvgPointerUp}
+    >
+      <defs>
+        <marker id="o2o-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+          <polygon points="0 0, 7 3.5, 0 7" fill="#94a3b8" />
+        </marker>
+        <marker id="o2o-arrow-rev" markerWidth="7" markerHeight="7" refX="1" refY="3.5" orient="auto-start-reverse">
+          <polygon points="0 0, 7 3.5, 0 7" fill="#94a3b8" />
+        </marker>
+      </defs>
+
+      {rules.map((r, i) => renderEdge(r, i))}
+
+      {types.map(t => {
+        const p = pos[t];
+        if (!p) return null;
+        const color = colorOf(t);
+        const label = t.length > 12 ? t.slice(0, 11) + '…' : t;
+        return (
+          <g key={t} style={{ cursor: 'grab' }}
+            onPointerDown={e => onNodePointerDown(e, t)}>
+            <circle cx={p.x} cy={p.y} r={NODE_R} fill={color} fillOpacity={0.15}
+              stroke={color} strokeWidth={2} />
+            <text x={p.x} y={p.y+4} textAnchor="middle" fontSize="11" fill={color}
+              fontWeight="700" style={{ userSelect: 'none', pointerEvents: 'none' }}>{label}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
 
 // ── HelpTip ──────────────────────────────────────────────────────────────────
 function HelpTip({ text }) {
@@ -614,6 +792,39 @@ export default function ModelEditor({
                 }))} />
               <button className="add-form-btn" onClick={addO2O}>+ Add</button>
             </div>
+
+            {o2oRules.length > 0 && (
+              <div className="o2o-diagram-wrap">
+                <O2ODiagram rules={o2oRules} otNames={otNames} />
+              </div>
+            )}
+
+            {o2oRules.length > 0 && (
+              <table className="o2o-preview-table">
+                <thead>
+                  <tr>
+                    <th>Source type</th>
+                    <th></th>
+                    <th>Target type</th>
+                    <th title="Minimum links between objects of these types">Min links</th>
+                    <th title="Maximum links enforced during simulation">Max links</th>
+                    <th title="Whether the link is navigable in both directions">Dir</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {o2oRules.map((r, i) => (
+                    <tr key={i}>
+                      <td className="o2o-type">{r.source_type}</td>
+                      <td className="o2o-arrow">{r.bidirectional ? '↔' : '→'}</td>
+                      <td className="o2o-type">{r.target_type}</td>
+                      <td className="o2o-num">{r.min_links ?? '—'}</td>
+                      <td className="o2o-num">{r.max_links ?? '∞'}</td>
+                      <td className="o2o-dir">{r.bidirectional ? 'bi' : 'uni'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         )}
 

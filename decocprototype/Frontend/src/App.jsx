@@ -515,7 +515,8 @@ function App() {
   const [timingAnchors,       setTimingAnchors]       = useState({}); // actName → {mean_seconds,std_seconds,min_seconds,max_seconds}
   const [isDiscoveringTiming, setIsDiscoveringTiming] = useState(false);
   const [timingDiscoveryResult, setTimingDiscoveryResult] = useState(null);
-  const [timingError,         setTimingError]         = useState(null);
+  const [timingDiscoveryFile,   setTimingDiscoveryFile]   = useState(null);
+  const [timingError,           setTimingError]           = useState(null);
 
   // Load available files on component mount
   useEffect(() => {
@@ -763,6 +764,7 @@ function App() {
       });
       const metrics = resp.data.metrics || {};
       setTimingDiscoveryResult(metrics);
+      setTimingDiscoveryFile(discoveryConfig.eventLogFile);
 
       if (Object.keys(metrics).length === 0) {
         setTimingError(
@@ -1448,7 +1450,12 @@ function App() {
                 if (!zeroMin.length && !zeroMax.length) return null;
                 return (
                   <div className="timing-warning-box">
-                    <div className="timing-warning-title">⚠ Discovered time bounds</div>
+                    <div className="timing-warning-title">
+                      ⚠ Discovered time bounds
+                      {timingDiscoveryFile && (
+                        <span className="timing-warning-file"> for {timingDiscoveryFile}</span>
+                      )}
+                    </div>
                     {zeroMin.length > 0 && (
                       <div className="timing-warning-group">
                         <div className="timing-warning-label">Min = 0 s</div>
@@ -1621,21 +1628,56 @@ function App() {
           {results && !isSimulating && (
             <div className="results-box">
               <h3>Simulation Complete</h3>
-              
-              <div className="stat-grid">
-                <div className="stat-card">
-                  <div className="stat-value">{results.steps_executed}</div>
-                  <div className="stat-label">Steps Executed</div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-value">{results.events_count}</div>
-                  <div className="stat-label">Events Generated</div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-value">{results.objects_count}</div>
-                  <div className="stat-label">Objects Created</div>
-                </div>
-              </div>
+
+              {(() => {
+                const firedTypes = results.activity_sequence
+                  ? [...new Set(results.activity_sequence)]
+                  : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
+                const discoveredTypes = discoveryResults?.activities || [];
+                const missingTypes = discoveredTypes.filter(a => !firedTypes.includes(a));
+                const totalEvents = results.events_count;
+                const coverage = discoveredTypes.length > 0
+                  ? firedTypes.filter(a => discoveredTypes.includes(a)).length
+                  : firedTypes.length;
+
+                return (
+                  <>
+                    <div className="stat-grid">
+                      <div className="stat-card">
+                        <div className="stat-value">{results.steps_executed}</div>
+                        <div className="stat-label">Steps Executed</div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-value">{totalEvents}</div>
+                        <div className="stat-label">Events Fired</div>
+                      </div>
+                      <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
+                        <div className="stat-value">
+                          {coverage}
+                          {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
+                        </div>
+                        <div className="stat-label">Activity Types Fired</div>
+                      </div>
+                      <div className="stat-card">
+                        <div className="stat-value">{results.objects_count}</div>
+                        <div className="stat-label">Objects Created</div>
+                      </div>
+                    </div>
+                    {missingTypes.length > 0 && (
+                      <Collapsible
+                        className="sim-coverage-warning"
+                        title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
+                        badge={null}
+                        defaultOpen={false}
+                      >
+                        <ul className="sim-coverage-missing-list">
+                          {missingTypes.map(a => <li key={a}>{a}</li>)}
+                        </ul>
+                      </Collapsible>
+                    )}
+                  </>
+                );
+              })()}
 
               {results.object_types && (
                 <Collapsible
