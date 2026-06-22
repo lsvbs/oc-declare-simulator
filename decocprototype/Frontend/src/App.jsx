@@ -484,6 +484,8 @@ function App() {
   });
   const [isSimulating, setIsSimulating] = useState(false);
   const [results, setResults] = useState(null);
+  const [healthResult, setHealthResult] = useState(null);
+  const [isCheckingHealth, setIsCheckingHealth] = useState(false);
   const [iterationLogs, setIterationLogs] = useState([]);
   const [iterationLogsOpen, setIterationLogsOpen] = useState(false);
   const [error, setError] = useState(null);
@@ -848,6 +850,24 @@ function App() {
       console.error('Simulation error:', err);
     } finally {
       setIsSimulating(false);
+    }
+  };
+
+  const runHealthCheck = async () => {
+    setIsCheckingHealth(true);
+    setHealthResult(null);
+    try {
+      const payload = {
+        ...config,
+        eventLogFile: discoveryConfig.eventLogFile,
+        ...(activeModel ? { modelOverride: activeModel } : {}),
+      };
+      const res = await axios.post('/api/constraint-health', payload);
+      setHealthResult(res.data);
+    } catch (err) {
+      setHealthResult({ error: err.response?.data?.error || 'Health check failed.' });
+    } finally {
+      setIsCheckingHealth(false);
     }
   };
 
@@ -1639,7 +1659,111 @@ function App() {
               </div>
             </div>
 
-            <button 
+            <button
+              className="health-check-button"
+              onClick={runHealthCheck}
+              disabled={isCheckingHealth || isSimulating || !discoveryResults || !config.ocdeclareFile || config.startActivities.length === 0}
+            >
+              {isCheckingHealth ? '⏳ Checking...' : '🩺 Run Health Check'}
+            </button>
+
+            {healthResult && !healthResult.error && (() => {
+              const s = healthResult.summary || {};
+              const hasErrors   = s.errors > 0;
+              const hasWarnings = s.warnings > 0;
+              const badge = `${s.errors} error${s.errors !== 1 ? 's' : ''}, ${s.warnings} warning${s.warnings !== 1 ? 's' : ''}`;
+              const titleClass = hasErrors ? 'health-title-error' : hasWarnings ? 'health-title-warn' : 'health-title-ok';
+              return (
+                <Collapsible
+                  className="health-report-box"
+                  title={<span className={titleClass}>🩺 Constraint Health Report</span>}
+                  badge={badge}
+                  defaultOpen={hasErrors || hasWarnings}
+                >
+                  {/* Cycles */}
+                  {healthResult.cycles?.length > 0 && (
+                    <div className="health-section health-error">
+                      <div className="health-section-title">🔴 Dependency cycles (deadlock)</div>
+                      {healthResult.cycles.map((cy, i) => (
+                        <div key={i} className="health-item">
+                          <span className="health-badge-error">CYCLE</span>
+                          {cy.description}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Permanently blocked */}
+                  {healthResult.permanently_blocked?.length > 0 && (
+                    <div className="health-section health-error">
+                      <div className="health-section-title">🔴 Activities never reaching the pool</div>
+                      {healthResult.permanently_blocked.map((b, i) => (
+                        <div key={i} className="health-item">
+                          <span className="health-badge-error">BLOCKED</span>
+                          <strong>{b.activity}</strong>
+                          {b.top_blocker && b.top_blocker !== 'never attempted' && (
+                            <span className="health-reason"> ← {b.top_blocker}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Chain constraint warnings */}
+                  {healthResult.top_blocking_constraints?.filter(c => c.is_chain).length > 0 && (
+                    <div className="health-section health-warn">
+                      <div className="health-section-title">⚠ Chain constraints (common deadlock source)</div>
+                      {healthResult.top_blocking_constraints.filter(c => c.is_chain).map((c, i) => (
+                        <div key={i} className="health-item">
+                          <span className="health-badge-warn">{c.count}×</span>
+                          <code className="health-constraint-label">{c.label}</code>
+                          <span className="health-reason"> blocks: {c.blocks.join(', ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Weak precedences */}
+                  {healthResult.weak_precedences?.length > 0 && (
+                    <div className="health-section health-warn">
+                      <div className="health-section-title">⚠ Weak precedences (alternative paths in log)</div>
+                      {healthResult.weak_precedences.map((wp, i) => (
+                        <div key={i} className="health-item">
+                          <span className="health-badge-warn">{wp.co_occurrence_pct}%</span>
+                          <code className="health-constraint-label">precedence({wp.source}→{wp.target}) each {wp.scope_type}</code>
+                          <span className="health-reason"> {wp.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Other top blockers */}
+                  {healthResult.top_blocking_constraints?.filter(c => !c.is_chain).length > 0 && (
+                    <div className="health-section health-info">
+                      <div className="health-section-title">ℹ Top non-chain blocking constraints</div>
+                      {healthResult.top_blocking_constraints.filter(c => !c.is_chain).slice(0, 8).map((c, i) => (
+                        <div key={i} className="health-item">
+                          <span className="health-badge-info">{c.count}×</span>
+                          <code className="health-constraint-label">{c.label}</code>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {!hasErrors && !hasWarnings && (
+                    <div className="health-ok-msg">✓ No issues detected — model looks healthy.</div>
+                  )}
+                </Collapsible>
+              );
+            })()}
+
+            {healthResult?.error && (
+              <div className="error-box" style={{ marginTop: '0.5rem' }}>
+                <p>Health check error: {healthResult.error}</p>
+              </div>
+            )}
+
+            <button
               className="simulate-button"
               onClick={runSimulation}
               disabled={isSimulating || !discoveryResults || !config.ocdeclareFile || config.startActivities.length === 0 || hasModelWarnings}

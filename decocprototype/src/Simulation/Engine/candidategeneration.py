@@ -18,19 +18,22 @@ class Candidate:
 
 
 def find_active_objects_of_type(state: SimulationState, object_type: str, limit: int = 0) -> list[str]:
-    """Return active objects of `object_type`. If `limit` > 0, return at most `limit` items."""
+    """Return active, non-busy objects of `object_type`. If `limit` > 0, return at most `limit` items."""
     active_set = state._active_by_type.get(object_type)
     if not active_set:
         return []
-    if limit > 0 and len(active_set) > limit:
-        # Take only what we need — avoid copying thousands of items when 1 will do
-        result = []
-        for oid in active_set:
-            result.append(oid)
-            if len(result) >= limit:
-                break
-        return result
-    return list(active_set)
+    current_time = getattr(state, 'current_time', None)
+    is_resource = object_type in getattr(state, '_resource_types', set())
+    result = []
+    for oid in active_set:
+        if is_resource and current_time is not None:
+            obj = state.objects.get(oid)
+            if obj and obj.busy_until is not None and obj.busy_until > current_time:
+                continue  # resource occupied — skip
+        result.append(oid)
+        if limit > 0 and len(result) >= limit:
+            break
+    return result
 
 
 def _find_objects_preferring_linked(

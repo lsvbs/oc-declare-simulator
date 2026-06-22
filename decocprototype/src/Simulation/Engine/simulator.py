@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass, field
 from typing import Optional
 
 from src.Simulation.Domain.ir import StaticModel, Activity
-from src.Simulation.Domain.state import SimulationState, PendingObligation
+from src.Simulation.Domain.state import SimulationState, PendingObligation, InProgressActivity, WaitingCandidate
 from src.Simulation.Domain.config import SimulationConfig
 from src.Simulation.Engine.selection import select_candidate as default_select_candidate
 from src.Simulation.Engine.candidategeneration import (
@@ -17,23 +18,41 @@ from src.Simulation.Engine.candidategeneration import (
  
 
 def apply_conservative_link_policy(static_model, participating_ids, created_object_ids, state):
-    """Create ALL applicable O2O links after an activity fires.
+    """Create O2O links after an activity fires.
 
-    Previous version stopped after the first matching rule per created object,
-    leaving many required links unwritten.  This version iterates every
-    (created, participating) pair and every applicable O2O rule, creating every
-    link that is structurally required and does not already exist.
+    Only writes a link between two objects if:
+      1. An O2O rule covers their types, AND
+      2. The link does not already exist, AND
+      3. Neither object would exceed the rule's max_links by adding this link.
 
-    Additionally, participating objects are linked to each other when an O2O
-    rule applies between their types — ensuring that co-participants in the
-    same event are connected in the link graph even if neither was newly
-    created.  This is the foundation for link-preference object selection in
-    subsequent steps.
+    This prevents pre-existing objects from other cases being spuriously linked
+    to newly created objects, which would saturate O2O caps and block future
+    activities on those objects.
     """
 
     def _link_exists(src: str, tgt: str) -> bool:
         neighbors = state._links_by_object.get(src)
         return neighbors is not None and tgt in neighbors
+
+    def _count_links(oid: str, other_type: str) -> int:
+        count = 0
+        for neighbor_id in state._links_by_object.get(oid, ()):
+            obj = state.objects.get(neighbor_id)
+            if obj and obj.object_type == other_type:
+                count += 1
+        return count
+
+    def _can_link(id_a: str, type_a: str, id_b: str, type_b: str, rule) -> bool:
+        """True if adding this link would not exceed max_links on either side."""
+        if rule.max_links is None:
+            return True
+        if rule.source_type == type_a and rule.target_type == type_b:
+            return (_count_links(id_a, type_b) < rule.max_links and
+                    _count_links(id_b, type_a) < rule.max_links)
+        if rule.source_type == type_b and rule.target_type == type_a:
+            return (_count_links(id_b, type_a) < rule.max_links and
+                    _count_links(id_a, type_b) < rule.max_links)
+        return True
 
     # 1. Link every newly created object to every applicable participating object
     for created_id in created_object_ids:
@@ -50,10 +69,10 @@ def apply_conservative_link_policy(static_model, participating_ids, created_obje
 
             for rule in static_model.o2o_rules:
                 if rule.source_type == p_type and rule.target_type == created_type:
-                    if not _link_exists(pid, created_id):
+                    if not _link_exists(pid, created_id) and _can_link(pid, p_type, created_id, created_type, rule):
                         state.add_link(source_object_id=pid, target_object_id=created_id)
                 elif rule.source_type == created_type and rule.target_type == p_type:
-                    if not _link_exists(created_id, pid):
+                    if not _link_exists(created_id, pid) and _can_link(created_id, created_type, pid, p_type, rule):
                         state.add_link(source_object_id=created_id, target_object_id=pid)
 
     # 2. Also link participating objects to each other where an O2O rule applies
@@ -67,10 +86,10 @@ def apply_conservative_link_policy(static_model, participating_ids, created_obje
                 continue
             for rule in static_model.o2o_rules:
                 if rule.source_type == p1_obj.object_type and rule.target_type == p2_obj.object_type:
-                    if not _link_exists(pid1, pid2):
+                    if not _link_exists(pid1, pid2) and _can_link(pid1, p1_obj.object_type, pid2, p2_obj.object_type, rule):
                         state.add_link(source_object_id=pid1, target_object_id=pid2)
                 elif rule.source_type == p2_obj.object_type and rule.target_type == p1_obj.object_type:
-                    if not _link_exists(pid2, pid1):
+                    if not _link_exists(pid2, pid1) and _can_link(pid2, p2_obj.object_type, pid1, p1_obj.object_type, rule):
                         state.add_link(source_object_id=pid2, target_object_id=pid1)
 
 
@@ -131,6 +150,13 @@ class Simulator:
             # Tracing should never break the simulation.
             return
     def run(self, state: Optional[SimulationState] = None) -> SimulationState:
+        # Auto-select DES mode when resource types are configured and timing durations exist.
+        # This gives contention-aware simulation without any change to calling code.
+        resource_types = getattr(self.static_model, 'resource_types', []) or []
+        has_durations = bool(getattr(self.static_model, 'activity_durations', {}))
+        if resource_types and has_durations:
+            return self.run_des(state)
+
         if state is None:
             state = SimulationState()
 
@@ -263,6 +289,99 @@ class Simulator:
     def _should_stop(self, state: SimulationState) -> bool:
         return state.step_count >= self.config.max_steps
         # later add: no more candidates, all obligations fulfilled, end state reached, etc.
+
+    def _generate_candidates_des(self, state: SimulationState) -> list[Candidate]:
+        """Generate one candidate per (activity, non-resource object) combination for DES mode.
+
+        Unlike the global generator which produces one candidate per activity,
+        this expands across non-resource objects so that each case object (e.g.
+        each order) gets its own candidate entry. Multiple candidates for the
+        same activity can then compete for the same resource and queue when it
+        is occupied.
+        """
+        import itertools
+        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        is_simulation_start = len(state.executed_events) == 0 and not state.in_progress
+        start_activity_names = set(self.config.start_policy.start_activity_names)
+        candidates: list[Candidate] = []
+        seen_keys: set[tuple] = set()
+
+        max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
+        max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
+
+        for activity in self.static_model.activities:
+            if is_simulation_start and activity.name not in start_activity_names:
+                continue
+
+            # Find the primary non-resource input binding (first creates=False, non-resource type)
+            primary_bindings = [
+                b for b in activity.bindings
+                if not b.creates and b.object_type not in resource_types
+            ]
+
+            if not primary_bindings:
+                # Activity only creates or only uses resources — generate once globally
+                candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
+                if candidate and is_candidate_semantically_allowed(self.static_model, candidate, state):
+                    key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
+                           tuple(sorted(candidate.object_types_to_create)))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        candidates.append(candidate)
+                continue
+
+            # Expand: one candidate per active object of the primary binding type
+            primary_type = primary_bindings[0].object_type
+            active_ids = list(state._active_by_type.get(primary_type, set()))
+
+            for oid in active_ids:
+                # Temporarily restrict the active pool for this type to only this object
+                # so build_candidate_for_activity picks it specifically.
+                original_active = state._active_by_type.get(primary_type, set())
+                state._active_by_type[primary_type] = {oid}
+                try:
+                    candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
+                finally:
+                    state._active_by_type[primary_type] = original_active
+
+                if candidate is None:
+                    continue
+                if not is_candidate_semantically_allowed(self.static_model, candidate, state):
+                    continue
+
+                # max_consecutive checks
+                if activity.name in max_consec:
+                    cap = max_consec[activity.name]
+                    streak = sum(1 for _ in itertools.takewhile(
+                        lambda e: e.activity_name == activity.name,
+                        reversed(state.executed_events)
+                    ))
+                    if streak >= cap:
+                        continue
+
+                if activity.name in max_consec_obj:
+                    cap_obj = max_consec_obj[activity.name]
+                    blocked = False
+                    for pid in candidate.participating_object_ids:
+                        streak_obj = 0
+                        for ev in reversed(state._events_by_object.get(pid, [])):
+                            if ev.activity_name == activity.name:
+                                streak_obj += 1
+                            else:
+                                break
+                        if streak_obj >= cap_obj:
+                            blocked = True
+                            break
+                    if blocked:
+                        continue
+
+                key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
+                       tuple(sorted(candidate.object_types_to_create)))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    candidates.append(candidate)
+
+        return candidates
 
     def _generate_candidates(self, state: SimulationState) -> list[Candidate]:
         """Generate candidates globally using all active objects.
@@ -614,6 +733,8 @@ class Simulator:
 
         return scope_ids
 
+        return scope_ids
+
     def _get_activity_by_name(self, activity_name: str) -> Optional[Activity]:
         for activity in self.static_model.activities:
             if activity.name == activity_name:
@@ -638,3 +759,267 @@ class Simulator:
                 scope_ids.append(object_id)
 
         return scope_ids
+
+    # ── DES (Discrete Event Simulation) methods ───────────────────────────────
+
+    def _des_resources_available(self, candidate: Candidate, state: SimulationState) -> tuple[bool, list[str]]:
+        """Check if all resource objects required by this candidate are free.
+        Returns (available, held_resource_ids).
+        held_resource_ids are the specific resource object IDs that will be locked.
+        """
+        resource_types = state._resource_types
+        held: list[str] = []
+        current_time = state.current_time
+
+        for oid in candidate.participating_object_ids:
+            obj = state.objects.get(oid)
+            if obj is None:
+                continue
+            if obj.object_type not in resource_types:
+                continue
+            # Resource object — check if busy
+            if obj.busy_until is not None and current_time is not None and obj.busy_until > current_time:
+                return False, []
+            held.append(oid)
+
+        return True, held
+
+    def _des_lock_resources(self, held_resource_ids: list[str], activity_name: str,
+                             complete_at, state: SimulationState) -> None:
+        """Mark resource objects as busy until complete_at."""
+        for oid in held_resource_ids:
+            obj = state.objects.get(oid)
+            if obj:
+                obj.busy_until = complete_at
+                obj.busy_by = activity_name
+
+    def _des_release_resources(self, held_resource_ids: list[str], state: SimulationState) -> None:
+        """Release resource objects after activity completes."""
+        for oid in held_resource_ids:
+            obj = state.objects.get(oid)
+            if obj:
+                obj.busy_until = None
+                obj.busy_by = None
+
+    def _des_start_activity(self, candidate: Candidate, state: SimulationState,
+                             held_resource_ids: list[str]) -> InProgressActivity:
+        """Create objects-to-create, apply links, lock resources, push to heap."""
+        created_object_ids: list[str] = []
+        attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
+
+        for object_type in candidate.object_types_to_create:
+            defaults = attribute_defaults.get(object_type, {})
+            obj = state.add_object(object_type=object_type, attributes=defaults)
+            created_object_ids.append(obj.object_id)
+
+        apply_conservative_link_policy(
+            self.static_model,
+            candidate.participating_object_ids,
+            created_object_ids,
+            state,
+        )
+
+        started_at = state.current_time
+        complete_at = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
+        state.last_generated_timestamp = complete_at
+
+        self._des_lock_resources(held_resource_ids, candidate.activity_name, complete_at, state)
+
+        in_prog = InProgressActivity(
+            candidate_activity_name=candidate.activity_name,
+            participating_object_ids=candidate.participating_object_ids + created_object_ids,
+            object_types_to_create=candidate.object_types_to_create,
+            started_at=started_at,
+            complete_at=complete_at,
+            held_resource_ids=held_resource_ids,
+            created_object_ids=created_object_ids,
+        )
+        heapq.heappush(state.in_progress, in_prog)
+
+        if started_at is not None and complete_at is not None:
+            svc = (complete_at - started_at).total_seconds()
+            if svc >= 0:
+                state.activity_service_s.setdefault(candidate.activity_name, []).append(svc)
+
+        self._trace("des_started", {
+            "activity_name": candidate.activity_name,
+            "started_at": started_at.isoformat() if started_at else None,
+            "complete_at": complete_at.isoformat() if complete_at else None,
+            "participating_object_ids": in_prog.participating_object_ids,
+            "held_resource_ids": held_resource_ids,
+        })
+
+        return in_prog
+
+    def _des_complete_activity(self, in_prog: InProgressActivity, state: SimulationState) -> None:
+        """Write the ExecutedEvent, update indexes, release resources."""
+        self._des_release_resources(in_prog.held_resource_ids, state)
+
+        activity = self._get_activity_by_name(in_prog.candidate_activity_name)
+        resource_types = state._resource_types
+
+        if activity:
+            deactivated_types = {
+                binding.object_type
+                for binding in activity.bindings
+                if getattr(binding, "deactivates", False)
+                and binding.object_type not in resource_types
+            }
+            for oid in in_prog.participating_object_ids:
+                obj = state.objects.get(oid)
+                if obj and obj.object_type in deactivated_types:
+                    state.deactivate_object(oid)
+
+        executed_event = state.record_event(
+            activity_name=in_prog.candidate_activity_name,
+            participating_object_ids=in_prog.participating_object_ids,
+            timestamp=in_prog.complete_at,
+        )
+        state.current_time = in_prog.complete_at
+
+        self._update_obligations_after_event(executed_event, state)
+
+        self._trace("applied", {
+            "event_id": executed_event.event_id,
+            "activity_name": executed_event.activity_name,
+            "timestamp": executed_event.timestamp.isoformat() if executed_event.timestamp else None,
+            "object_ids": list(executed_event.object_ids),
+            "step_count": state.step_count,
+        })
+
+    def _des_try_start_waiting(self, state: SimulationState) -> None:
+        """After a resource is released, try to start any waiting candidates."""
+        if not state.waiting_queue:
+            return
+        still_waiting: list[WaitingCandidate] = []
+        for wc in state.waiting_queue:
+            cand = Candidate(
+                activity_name=wc.candidate_activity_name,
+                participating_object_ids=wc.participating_object_ids,
+                object_types_to_create=wc.object_types_to_create,
+            )
+            available, held = self._des_resources_available(cand, state)
+            if available:
+                if state.current_time is not None and wc.arrived_at is not None:
+                    wait = (state.current_time - wc.arrived_at).total_seconds()
+                    if wait >= 0:
+                        state.resource_wait_s.setdefault(wc.candidate_activity_name, []).append(wait)
+                self._des_start_activity(cand, state, held)
+            else:
+                still_waiting.append(wc)
+        state.waiting_queue = still_waiting
+
+    def run_des(self, state: Optional[SimulationState] = None) -> SimulationState:
+        """DES simulation loop. Activated when resource types are configured.
+
+        Activities start immediately when inputs and resources are available.
+        Multiple activities can be in-flight simultaneously. Clock advances to
+        the next completion. Resource objects are locked for the duration and
+        released on completion, allowing waiting activities to start.
+        """
+        if state is None:
+            state = SimulationState()
+
+        state._start_activity_names = set(self.config.start_policy.start_activity_names)
+        state._resource_types = set(getattr(self.static_model, 'resource_types', []) or [])
+        state.current_time = self.config.start_timestamp
+        state.last_generated_timestamp = self.config.start_timestamp
+
+        from src.Simulation.Domain.state import RuntimeObject
+        pool_sizes = getattr(self.static_model, 'resource_pool_sizes', {}) or {}
+        for res_type in state._resource_types:
+            n = pool_sizes.get(res_type, 1)
+            for _ in range(n):
+                oid = state.new_object_id(res_type)
+                obj = RuntimeObject(object_id=oid, object_type=res_type, active=True)
+                state.objects[oid] = obj
+                state._active_by_type.setdefault(res_type, set()).add(oid)
+                state._type_of_object[oid] = res_type
+
+        start_activity_names = set(self.config.start_policy.start_activity_names)
+
+        while state.step_count < self.config.max_steps:
+            # ── Complete all activities due at or before current_time ──────────
+            while state.in_progress and state.in_progress[0].complete_at <= state.current_time:
+                finishing = heapq.heappop(state.in_progress)
+                self._des_complete_activity(finishing, state)
+                self._des_try_start_waiting(state)
+                if state.step_count >= self.config.max_steps:
+                    break
+
+            if state.step_count >= self.config.max_steps:
+                break
+
+            # ── Generate candidates at current_time ───────────────────────────
+            candidates = self._generate_candidates_des(state)
+
+            if self.trace_func is not None:
+                self._trace("iteration", {
+                    "step_count": state.step_count,
+                    "num_candidates": len(candidates),
+                    "candidate_activity_names": [c.activity_name for c in candidates],
+                    "candidates": [
+                        {
+                            "activity_name": c.activity_name,
+                            "participating_object_ids": list(c.participating_object_ids),
+                            "object_types_to_create": list(c.object_types_to_create),
+                        }
+                        for c in candidates
+                    ],
+                    "in_progress_count": len(state.in_progress),
+                    "waiting_count": len(state.waiting_queue),
+                })
+
+            # ── Try to start each feasible candidate (greedy, probabilistic order)
+            is_simulation_start = len(state.executed_events) == 0 and not state.in_progress
+
+            # Order by transition probability so highest-probability activity starts first
+            ordered = list(candidates)
+            if len(ordered) > 1:
+                try:
+                    top = self._select_candidate(ordered, state)
+                    ordered = [top] + [c for c in ordered if c is not top]
+                except Exception:
+                    pass
+
+            for cand in ordered:
+                if is_simulation_start and cand.activity_name not in start_activity_names:
+                    continue
+                if self._is_start_activity_blocked(cand, state):
+                    continue
+
+                available, held = self._des_resources_available(cand, state)
+                if available:
+                    self._des_start_activity(cand, state, held)
+                else:
+                    key = (cand.activity_name, tuple(sorted(cand.participating_object_ids)))
+                    already_waiting = any(
+                        (wc.candidate_activity_name, tuple(sorted(wc.participating_object_ids))) == key
+                        for wc in state.waiting_queue
+                    )
+                    if not already_waiting:
+                        blocked_type = ""
+                        for oid in cand.participating_object_ids:
+                            obj = state.objects.get(oid)
+                            if obj and obj.object_type in state._resource_types:
+                                if obj.busy_until and obj.busy_until > state.current_time:
+                                    blocked_type = obj.object_type
+                                    break
+                        state.waiting_queue.append(WaitingCandidate(
+                            candidate_activity_name=cand.activity_name,
+                            participating_object_ids=cand.participating_object_ids,
+                            object_types_to_create=cand.object_types_to_create,
+                            arrived_at=state.current_time,
+                            blocked_resource_type=blocked_type,
+                        ))
+
+            # ── Advance clock to next completion ──────────────────────────────
+            if not state.in_progress:
+                self._trace("stop", {"reason": "no_candidates", "step_count": state.step_count})
+                break
+
+            state.current_time = state.in_progress[0].complete_at
+
+        self._trace("stop", {"reason": "max_steps", "step_count": state.step_count,
+                              "max_steps": self.config.max_steps})
+        return state

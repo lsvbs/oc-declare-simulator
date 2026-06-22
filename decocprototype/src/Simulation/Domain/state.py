@@ -10,6 +10,35 @@ class RuntimeObject:
     status: Optional[str] = None
     active: bool = True
     attributes: dict[str, Any] = field(default_factory=dict)
+    # DES occupancy: set while this resource is held by an in-progress activity
+    busy_until: Optional[datetime] = None
+    busy_by: Optional[str] = None   # activity_name holding this resource
+
+
+@dataclass
+class InProgressActivity:
+    """An activity that has started but not yet completed (DES mode)."""
+    candidate_activity_name: str
+    participating_object_ids: list[str]
+    object_types_to_create: list[str]
+    started_at: datetime
+    complete_at: datetime          # when this activity finishes
+    held_resource_ids: list[str]   # resource objects locked for this activity
+    created_object_ids: list[str] = field(default_factory=list)
+
+    # Make sortable by complete_at for heapq
+    def __lt__(self, other: "InProgressActivity") -> bool:
+        return self.complete_at < other.complete_at
+
+
+@dataclass
+class WaitingCandidate:
+    """A candidate that could not start because a resource was unavailable."""
+    candidate_activity_name: str
+    participating_object_ids: list[str]
+    object_types_to_create: list[str]
+    arrived_at: datetime           # when it first tried to start
+    blocked_resource_type: str     # which resource type caused the wait
 
 
 @dataclass
@@ -88,6 +117,16 @@ class SimulationState:
     # activity_name -> list of service durations in seconds (one per firing):
     # the clock advance sampled by the time policy when the activity fired.
     activity_service_s: dict[str, list[float]] = field(default_factory=dict)
+
+    # ── DES (Discrete Event Simulation) fields ────────────────────────────────
+    # Current simulation clock — advances to the next completion timestamp in DES mode
+    current_time: Optional[datetime] = None
+    # Min-heap of in-progress activities sorted by complete_at (use heapq)
+    in_progress: list = field(default_factory=list)
+    # Activities waiting for a resource to become free
+    waiting_queue: list = field(default_factory=list)
+    # activity_name -> list of resource-wait durations in seconds
+    resource_wait_s: dict[str, list[float]] = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1

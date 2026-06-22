@@ -861,6 +861,66 @@ def run_ocdeclare_discovery():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/constraint-health', methods=['POST'])
+def constraint_health():
+    """Run the constraint health check and return structured results.
+
+    Accepts the same body as /api/simulate:
+      eventLogFile, ocdeclareFile, modelOverride, startActivities, startActivity
+    """
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from constraint_health_report import run_health_check
+
+        data = request.json or {}
+        ocdeclare_file  = data.get('ocdeclareFile')
+        event_log_file  = data.get('eventLogFile')
+        model_override  = data.get('modelOverride')
+        start_activities = data.get('startActivities') or (
+            [data['startActivity']] if data.get('startActivity') else []
+        )
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not ocdeclare_file and not model_override:
+            return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
+
+        # Build model dict
+        if model_override:
+            model_dict = model_override
+        else:
+            model_path = OCDECLARE_DIR / ocdeclare_file
+            if not model_path.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(model_path) as f:
+                model_dict = json.load(f)
+
+        # Load event log from discovery cache or file
+        event_log = None
+        if event_log_file:
+            if event_log_file in discovery_cache:
+                pass  # cache doesn't store the raw log, load from file
+            log_path = EVENTLOG_DIR / event_log_file
+            if log_path.exists():
+                try:
+                    event_log = load_ocel2(str(log_path))
+                except Exception:
+                    pass
+
+        result = run_health_check(
+            model_dict=model_dict,
+            start_activities=start_activities,
+            event_log=event_log,
+            steps=20,
+        )
+        return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 @app.route('/api/discover-timing', methods=['POST'])
 def discover_timing():
     """Compute OCPA time metrics from an OCEL log + optional anchor service times.

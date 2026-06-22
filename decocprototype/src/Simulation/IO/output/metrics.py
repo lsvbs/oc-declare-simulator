@@ -54,8 +54,9 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
 
     activity_metrics: dict[str, Any] = {}
     for act_name, events in sorted(act_events.items()):
-        svc_s  = state.activity_service_s.get(act_name, [])
-        wait_s = state.candidate_wait_s.get(act_name, [])
+        svc_s      = state.activity_service_s.get(act_name, [])
+        wait_s     = state.candidate_wait_s.get(act_name, [])
+        res_wait_s = getattr(state, 'resource_wait_s', {}).get(act_name, [])
 
         # Sojourn = service + wait, paired by index.  We zip the two lists so
         # only firings where both values exist contribute (first firing typically
@@ -79,6 +80,10 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
             "sojourn_s":         sojourn_s,
             "mean_sojourn_s":    round(statistics.mean(sojourn_s), 3) if sojourn_s else None,
             "max_sojourn_s":     round(max(sojourn_s), 3)             if sojourn_s else None,
+            # Resource-contention wait (DES mode only — time spent in waiting queue)
+            "resource_wait_s":          res_wait_s,
+            "mean_resource_wait_s":     round(statistics.mean(res_wait_s), 3) if res_wait_s else None,
+            "max_resource_wait_s":      round(max(res_wait_s), 3)             if res_wait_s else None,
         }
 
     # ── Object metrics ────────────────────────────────────────────────────────
