@@ -121,15 +121,44 @@ def run_discovery():
             event_log_ocel = load_ocel2(str(log_path))
         except Exception:
             event_log_ocel = None
-        
-        # Discover transition probabilities
-        prob_matrix = discover_transition_matrix(event_log)
-        
+
+        # Discover transition probabilities — use object-centric aggregation when
+        # the log is OCEL 2.0 (eliminates spurious cross-case transitions and
+        # includes trace-end probabilities in the denominator).
+        from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix_object_centric
+        trace_end_prob = {}
+        start_counts = {}
+        end_counts = {}
+        total_traces = 0
+        if event_log_ocel and isinstance(event_log_ocel, dict):
+            oc_result = discover_transition_matrix_object_centric(event_log_ocel)
+            prob_matrix    = oc_result['prob_matrix']
+            trace_end_prob = oc_result['trace_end_prob']
+            start_counts   = oc_result['start_counts']
+            end_counts     = oc_result['end_counts']
+            total_traces   = oc_result['total_traces']
+            # Fill in any activity seen globally but absent from object-centric matrix
+            global_matrix = discover_transition_matrix(event_log)
+            for act, tgts in global_matrix.items():
+                if act not in prob_matrix:
+                    prob_matrix[act] = tgts
+        else:
+            prob_matrix = discover_transition_matrix(event_log)
+
         # Time distributions discovery (optional, for future use)
         time_distributions = {}  # Placeholder for now
-        
+
         # Extract activities from probability matrix
-        activities = sorted(set(prob_matrix.keys()))
+        activities = sorted(set(prob_matrix.keys()) | set(start_counts.keys()) | set(end_counts.keys()))
+
+        # Derive likely start/end activity lists from object-centric counts
+        # Start: activities that begin traces; top candidates sorted by count
+        likely_start = sorted(start_counts, key=lambda a: -start_counts[a]) if start_counts else []
+        # End: activities with high trace-end probability (> 0.3 of the time they fire = last)
+        likely_end   = sorted(
+            [a for a, p in trace_end_prob.items() if p >= 0.3],
+            key=lambda a: -trace_end_prob[a]
+        ) if trace_end_prob else []
 
         # Find the first activity that actually appears in the log (chronologically)
         first_activity = None
@@ -276,6 +305,13 @@ def run_discovery():
                 'transition_count': transition_count,
                 'time_distributions_discovered': len(time_distributions) > 0,
                 'first_activity': first_activity,
+                'likely_start_activities': likely_start,
+                'likely_end_activities':   likely_end,
+                'trace_end_prob':          trace_end_prob,
+                'prob_matrix': {
+                    src: {tgt: round(float(cnt), 4) for tgt, cnt in tgts.items()}
+                    for src, tgts in prob_matrix.items()
+                },
             },
             'logs': [
                 f"Loaded event log: {event_log_file}",
@@ -331,6 +367,58 @@ def get_model_state():
 
         with open(model_path, 'r') as f:
             model_data = json.load(f)
+
+        # External OC-Declare files are raw constraint lists (from/to/arc_type format).
+        # Parse them into the same normalised dict the frontend Model Editor expects.
+        if isinstance(model_data, list):
+            from src.Simulation.Models.OCDeclare import parse_ocdeclare_list
+            static = parse_ocdeclare_list(model_data)
+            model_data = {
+                'object_types': [
+                    {'name': ot.name, 'attributes': list(ot.attributes)}
+                    for ot in static.object_types
+                ],
+                'activities': [
+                    {
+                        'name': a.name,
+                        'bindings': [
+                            {
+                                'object_type': b.object_type,
+                                'min_count': b.min_count,
+                                'max_count': b.max_count,
+                                'creates': b.creates,
+                                'deactivates': b.deactivates,
+                            }
+                            for b in a.bindings
+                        ],
+                    }
+                    for a in static.activities
+                ],
+                'constraints': [
+                    {
+                        'constraint_type': c.constraint_type,
+                        'source_activity': c.source_activity,
+                        'target_activity': c.target_activity,
+                        'scope': {'kind': c.scope.kind, 'object_type': c.scope.object_type},
+                        'nmin': c.nmin,
+                        'nmax': c.nmax,
+                    }
+                    for c in static.constraints
+                ],
+                'o2o_rules': [
+                    {
+                        'source_type': r.source_type,
+                        'target_type': r.target_type,
+                        'min_links': r.min_links,
+                        'max_links': r.max_links,
+                        'bidirectional': r.bidirectional,
+                    }
+                    for r in static.o2o_rules
+                ],
+                'resource_types': [],
+                'resource_pool_sizes': {},
+                'activity_durations': {},
+            }
 
         # Normalise each row of the probability matrix so values are in [0, 1]
         prob_matrix_out = {}
@@ -571,10 +659,18 @@ def run_simulation():
             initial_state.next_object_counter = {'products': 3, 'employees': 3}
         
         # Run simulation
-        iteration_logs = []
+        from collections import deque
+        _LOG_CAP = 500  # only keep last 500 steps in the response to avoid huge payloads
+        iteration_logs = deque(maxlen=_LOG_CAP)
+        _steps_to_skip = max(0, max_steps - _LOG_CAP)  # skip trace building for early steps
+        _trace_step_counter = [0]
 
         def trace_func(event: str, payload: dict):
             if event == "iteration":
+                _trace_step_counter[0] += 1
+                # Skip building the expensive dict for early steps we'll discard anyway
+                if _trace_step_counter[0] <= _steps_to_skip:
+                    return
                 step = payload.get("step_count", "?")
                 candidates = payload.get("candidate_activity_names", [])
                 # Build per-candidate detail: prob + participating object IDs
@@ -599,6 +695,8 @@ def run_simulation():
                     "num_candidates": payload.get("num_candidates", 0),
                 })
             elif event == "chosen":
+                if _trace_step_counter[0] <= _steps_to_skip:
+                    return
                 activity = payload.get("activity_name", "?")
                 objects = payload.get("participating_object_ids", [])
                 creates = payload.get("object_types_to_create", [])
@@ -722,7 +820,7 @@ def run_simulation():
                 f"Created {len(final_state.objects)} objects",
                 f"Output saved to: {output_filename}"
             ],
-            'iteration_logs': iteration_logs
+            'iteration_logs': list(iteration_logs)
         })
         
     except Exception as e:

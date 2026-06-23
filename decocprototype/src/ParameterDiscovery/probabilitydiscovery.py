@@ -131,6 +131,122 @@ def discover_transition_matrix(event_log: List[List[str]]) -> Dict[str, Dict[str
     return prob_matrix
 
 
+def discover_transition_matrix_object_centric(ocel_log: dict) -> dict:
+    """Build a transition probability matrix from per-object traces in an OCEL 2.0 log.
+
+    For each object instance, extract the ordered sequence of activities it
+    participated in (sorted by timestamp). Count A→B pairs within each object
+    trace. The denominator for each activity includes both successor transitions
+    AND trace endings (times the activity fired as the last event in a trace),
+    so probabilities reflect the real chance of continuing vs. stopping.
+
+    Returns a dict with:
+      prob_matrix    – {activity: {next_activity: probability}}
+                       probabilities sum to ≤ 1.0; the remainder is P(trace ends here)
+      trace_end_prob – {activity: probability_of_ending_here}
+      start_counts   – {activity: count_as_first_event_in_trace}
+      end_counts     – {activity: count_as_last_event_in_trace}
+      total_traces   – int, total number of object traces analysed
+    """
+    if not isinstance(ocel_log, dict):
+        return {'prob_matrix': {}, 'trace_end_prob': {}, 'start_counts': {}, 'end_counts': {}, 'total_traces': 0}
+
+    events_raw = ocel_log.get('events', {})
+    objects_raw = ocel_log.get('objects', {})
+
+    if isinstance(objects_raw, list):
+        objects = {o.get('id', str(i)): o for i, o in enumerate(objects_raw)}
+    else:
+        objects = objects_raw
+
+    if isinstance(events_raw, dict):
+        events = []
+        for eid, ev in events_raw.items():
+            omap = ev.get('omap') or []
+            if not omap:
+                rels = ev.get('relationships') or []
+                omap = [r.get('objectId', '') for r in rels if isinstance(r, dict)]
+            events.append({
+                'activity': ev.get('activity') or ev.get('type') or '',
+                'timestamp': ev.get('timestamp') or ev.get('time') or '',
+                'object_ids': omap,
+            })
+    else:
+        events = []
+        for ev in events_raw:
+            rels = ev.get('relationships') or ev.get('omap') or []
+            omap = [r.get('objectId', '') for r in rels] if rels and isinstance(rels[0], dict) else list(rels)
+            events.append({
+                'activity': ev.get('activity') or ev.get('type') or ev.get('ocel:activity') or '',
+                'timestamp': ev.get('timestamp') or ev.get('time') or ev.get('ocel:timestamp') or '',
+                'object_ids': omap,
+            })
+
+    # Build per-object event lists
+    obj_events: Dict[str, list] = defaultdict(list)
+    for ev in events:
+        act = ev['activity']
+        if not act:
+            continue
+        for oid in ev['object_ids']:
+            if oid in objects:
+                obj_events[oid].append((ev['timestamp'], act))
+
+    # Count transitions and trace boundaries
+    transitions: Dict[str, Counter] = defaultdict(Counter)
+    # total_fires: how many times each activity fired across all traces
+    total_fires: Counter = Counter()
+    # end_counts: how many traces ended at each activity
+    end_counts: Counter = Counter()
+    # start_counts: how many traces started with each activity
+    start_counts: Counter = Counter()
+
+    total_traces = 0
+    for oid, evts in obj_events.items():
+        evts.sort(key=lambda x: x[0])
+        trace = [act for _, act in evts]
+        if not trace:
+            continue
+        total_traces += 1
+        start_counts[trace[0]] += 1
+        end_counts[trace[-1]] += 1
+        for act in trace:
+            total_fires[act] += 1
+        for a, b in zip(trace, trace[1:]):
+            if a != b:
+                transitions[a][b] += 1
+
+    # Build probability matrix with trace-ending in the denominator.
+    # For activity A:
+    #   denominator = total_fires[A]
+    #   P(A → B)    = transitions[A][B] / total_fires[A]
+    #   P(ends)     = end_counts[A]     / total_fires[A]
+    # The probabilities for all outgoing transitions + P(ends) sum to ≤ 1.0
+    # (≤ because the last occurrence in a multi-object trace contributes to
+    # end_counts but its predecessors still count transitions).
+    prob_matrix: Dict[str, Dict[str, float]] = {}
+    trace_end_prob: Dict[str, float] = {}
+
+    all_activities = set(total_fires.keys())
+    for act in all_activities:
+        denom = total_fires[act]
+        if not denom:
+            continue
+        out = transitions.get(act, Counter())
+        prob_matrix[act] = {b: round(cnt / denom, 6) for b, cnt in out.items()}
+        ep = round(end_counts.get(act, 0) / denom, 6)
+        if ep > 0:
+            trace_end_prob[act] = ep
+
+    return {
+        'prob_matrix':     prob_matrix,
+        'trace_end_prob':  trace_end_prob,
+        'start_counts':    dict(start_counts),
+        'end_counts':      dict(end_counts),
+        'total_traces':    total_traces,
+    }
+
+
 def main():
     # List available event logs
     logs = [f for f in os.listdir(EVENT_LOG_DIR) if f.endswith('.json') or f.endswith('.xml')]

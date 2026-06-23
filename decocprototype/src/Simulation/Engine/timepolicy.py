@@ -23,11 +23,17 @@ class DefaultTimePolicy:
 
 	def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
 		if getattr(state, "last_generated_timestamp", None) is not None:
-			return state.last_generated_timestamp + config.default_time_delta
+			try:
+				return state.last_generated_timestamp + config.default_time_delta
+			except OverflowError:
+				return state.last_generated_timestamp
 
 		timestamps = [e.timestamp for e in getattr(state, "executed_events", []) if getattr(e, "timestamp", None) is not None]
 		if timestamps:
-			return max(timestamps) + config.default_time_delta
+			try:
+				return max(timestamps) + config.default_time_delta
+			except OverflowError:
+				return max(timestamps)
 
 		return config.start_timestamp
 
@@ -140,4 +146,7 @@ class DistributionTimePolicy:
             return base + (getattr(config, "default_time_delta", self._fallback_delta))
 
         seconds = _sample_duration(dur, rng)
-        return base + timedelta(seconds=max(0.0, seconds))
+        try:
+            return base + timedelta(seconds=max(0.0, seconds))
+        except OverflowError:
+            return base

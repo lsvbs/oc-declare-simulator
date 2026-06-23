@@ -1,8 +1,372 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import axios from 'axios';
 import './App.css';
 import FlowChart from './FlowChart';
 import ModelEditor from './ModelEditor';
+
+// ── TransitionFlowChart ───────────────────────────────────────────────────────
+const TFC_R = 22;
+const TFC_HGAP = 80;
+const TFC_PAD  = 44;
+
+function tfc_layout(matrix, threshold, startSet, endSet) {
+  // ── Edges ──────────────────────────────────────────────────────────────────
+  const edges = [];
+  Object.entries(matrix).forEach(([src, tgts]) => {
+    Object.entries(tgts)
+      .filter(([tgt, p]) => tgt !== src && p >= threshold)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .forEach(([tgt, p]) => edges.push({ src, tgt, p }));
+  });
+
+  const nodeSet = new Set(Object.keys(matrix));
+  edges.forEach(e => { nodeSet.add(e.src); nodeSet.add(e.tgt); });
+  const nodes = [...nodeSet];
+
+  // ── Rank assignment (longest-path, cycle-safe) ────────────────────────────
+  const rankOf = {};
+  nodes.forEach(n => { rankOf[n] = startSet.has(n) ? 0 : -1; });
+  if (![...startSet].some(n => nodes.includes(n))) {
+    const hasIn = new Set(edges.map(e => e.tgt));
+    nodes.forEach(n => { if (!hasIn.has(n)) rankOf[n] = 0; });
+  }
+  nodes.forEach(n => { if (rankOf[n] < 0) rankOf[n] = 0; });
+
+  const maxRank = nodes.length - 1;
+  for (let pass = 0; pass < nodes.length; pass++) {
+    let changed = false;
+    edges.forEach(({ src, tgt }) => {
+      if (endSet.has(src)) return;
+      const next = Math.min(rankOf[src] + 1, maxRank);
+      if (!startSet.has(tgt) && next > rankOf[tgt]) { rankOf[tgt] = next; changed = true; }
+    });
+    if (!changed) break;
+  }
+  endSet.forEach(n => {
+    const preds = edges.filter(e => e.tgt === n && !endSet.has(e.src));
+    rankOf[n] = preds.length ? Math.min(Math.max(...preds.map(e => rankOf[e.src])) + 1, maxRank) : maxRank;
+  });
+
+  const distinctRanks = [...new Set(Object.values(rankOf))].sort((a, b) => a - b);
+  const rankMap = {};
+  distinctRanks.forEach((r, i) => { rankMap[r] = i; });
+  nodes.forEach(n => { rankOf[n] = rankMap[rankOf[n]]; });
+  const numRanks = Math.max(...Object.values(rankOf)) + 1;
+
+  const byRank = Array.from({ length: numRanks }, () => []);
+  nodes.forEach(n => byRank[rankOf[n]].push(n));
+
+  // ── Trace the highest-probability spine ───────────────────────────────────
+  // From each start node, greedily follow the highest-probability edge that
+  // goes to the next rank. These spine nodes are placed at midY (the centre
+  // of their column). The same rule applies recursively from branch nodes.
+  const spineSet = new Set();
+  const seeds = [...startSet].filter(n => nodes.includes(n));
+  if (!seeds.length) seeds.push(...(byRank[0] || []));
+
+  seeds.forEach(start => {
+    spineSet.add(start);
+    let cur = start;
+    for (let r = rankOf[start]; r < numRanks - 1; r++) {
+      const fwd = edges.filter(e => e.src === cur && rankOf[e.tgt] === r + 1)
+                       .sort((a, b) => b.p - a.p);
+      if (!fwd.length) break;
+      cur = fwd[0].tgt;
+      spineSet.add(cur);
+    }
+  });
+
+  // For each branch node: also apply the same rule recursively
+  // (each branch node's best forward edge goes to a node at rank+1)
+  // This is already guaranteed by the rank assignment — nothing extra needed.
+
+  // ── Build best-incoming-prob index ───────────────────────────────────────
+  const bestIn = {};
+  edges.forEach(({ tgt, p }) => { if (!bestIn[tgt] || p > bestIn[tgt]) bestIn[tgt] = p; });
+
+  // ── Adaptive pitch based on tallest column ────────────────────────────────
+  // Target: comfortable vertical spread. Formula scales down for large graphs.
+  const maxColSize = Math.max(...byRank.map(l => l.length), 1);
+  // pitch = distance between node centres (diameter + gap)
+  // Small graphs: generous spacing. Large graphs: compact but readable.
+  const adaptiveGap = Math.max(14, Math.round(120 / Math.max(maxColSize, 1)));
+  const pitch = TFC_R * 2 + adaptiveGap;
+
+  // ── Column-by-column Y placement ─────────────────────────────────────────
+  // Spine node → midY (shared across all columns so the spine is horizontal).
+  // Other nodes → alternate above/below in order of bestIn probability,
+  // so the highest-probability branch is closest to the spine.
+  const midY = TFC_PAD + TFC_R + Math.floor((maxColSize - 1) / 2) * pitch;
+
+  const pos = {};
+  byRank.forEach((layer, r) => {
+    const x = TFC_PAD + TFC_R + r * (TFC_R * 2 + TFC_HGAP);
+
+    // Find the spine node for this column (prefer explicit spine, else highest bestIn)
+    const spineNode = layer.find(n => spineSet.has(n))
+      || layer.sort((a, b) => (bestIn[b] || 0) - (bestIn[a] || 0))[0];
+
+    // Sort non-spine nodes by bestIn prob desc so highest branch is nearest spine
+    const others = layer.filter(n => n !== spineNode)
+      .sort((a, b) => (bestIn[b] || 0) - (bestIn[a] || 0));
+
+    // Build ordered placement: interleave above/below
+    // [above2, above1, spine, below1, below2, ...]
+    const above = [], below = [];
+    others.forEach((n, i) => { if (i % 2 === 0) above.unshift(n); else below.push(n); });
+    const ordered = [...above, spineNode, ...below];
+
+    const spineIdx = ordered.indexOf(spineNode);
+    ordered.forEach((n, i) => {
+      pos[n] = {
+        x,
+        y: midY + (i - spineIdx) * pitch,
+        rank: r,
+        order: i,
+        isSpine: spineSet.has(n),
+      };
+    });
+  });
+
+  // ── Barycenter crossing reduction (2 passes after spine placement) ────────
+  // Operates only on non-spine nodes within each column to reduce edge crossings
+  // without disturbing the spine's horizontal alignment.
+  const posInLayer = {};
+  byRank.forEach(layer => layer.forEach((n, i) => { posInLayer[n] = i; }));
+
+  for (let pass = 0; pass < 2; pass++) {
+    for (let r = 1; r < numRanks; r++) {
+      const free = byRank[r].filter(n => !spineSet.has(n) && !startSet.has(n) && !endSet.has(n));
+      if (!free.length) continue;
+      const bcs = free.map(n => {
+        const nbrs = edges.filter(e => e.tgt === n && rankOf[e.src] < r)
+                          .map(e => ({ pos: posInLayer[e.src], w: e.p }));
+        if (!nbrs.length) return { n, bc: posInLayer[n] };
+        const wSum = nbrs.reduce((s, x) => s + x.w, 0);
+        return { n, bc: nbrs.reduce((s, x) => s + x.pos * x.w, 0) / wSum };
+      });
+      bcs.sort((a, b) => a.bc - b.bc);
+      // Re-place around spine: top-half get above, bottom-half below
+      const spineNode = byRank[r].find(n => spineSet.has(n));
+      const spineIdx = spineNode ? byRank[r].indexOf(spineNode) : Math.floor(byRank[r].length / 2);
+      const freeAbove = bcs.slice(0, Math.ceil(bcs.length / 2)).reverse();
+      const freeBelow = bcs.slice(Math.ceil(bcs.length / 2));
+      const layer = byRank[r].filter(n => spineSet.has(n) || startSet.has(n) || endSet.has(n));
+      // Reinsert free nodes
+      freeAbove.forEach(({ n }) => layer.unshift(n));
+      freeBelow.forEach(({ n }) => layer.push(n));
+      byRank[r] = layer;
+      byRank[r].forEach((n, i) => { posInLayer[n] = i; });
+
+      // Update pixel positions for this column
+      const spN = byRank[r].find(n => spineSet.has(n)) || byRank[r][0];
+      const spI = byRank[r].indexOf(spN);
+      byRank[r].forEach((n, i) => {
+        if (pos[n]) pos[n].y = midY + (i - spI) * pitch;
+      });
+    }
+  }
+
+  const allY = Object.values(pos).map(p => p.y);
+  const minY = Math.min(...allY) - TFC_R - TFC_PAD;
+  const dy = minY < 0 ? -minY : 0;
+  if (dy > 0) Object.values(pos).forEach(p => { p.y += dy; });
+
+  const maxX = Math.max(...Object.values(pos).map(p => p.x)) + TFC_R + TFC_PAD;
+  const maxY = Math.max(...Object.values(pos).map(p => p.y)) + TFC_R + 24 + TFC_PAD;
+  return { pos, edges, width: maxX, height: maxY };
+}
+
+function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities }) {
+  const [threshold, setThreshold] = useState(0.05);
+
+  const { startNodes, endNodes } = useMemo(() => {
+    const starts = new Set((startActivities || []).slice(0, 3));
+    // End nodes: provided likely-end list, or nodes with high trace-end probability, or true sinks
+    const ends = new Set(likelyEndActivities || []);
+    if (!ends.size && traceEndProb) {
+      Object.entries(traceEndProb).forEach(([act, p]) => { if (p >= 0.5) ends.add(act); });
+    }
+    if (!ends.size) {
+      const hasOut = new Set();
+      Object.entries(matrix).forEach(([src, tgts]) =>
+        Object.entries(tgts).forEach(([tgt, p]) => { if (tgt !== src && p >= threshold) hasOut.add(src); })
+      );
+      new Set(Object.keys(matrix)).forEach(n => { if (!hasOut.has(n)) ends.add(n); });
+    }
+    return { startNodes: starts, endNodes: ends };
+  }, [matrix, startActivities, likelyEndActivities, traceEndProb, threshold]);
+
+  const { pos: layoutPos, edges, width: layoutW, height: layoutH } = useMemo(
+    () => tfc_layout(matrix, threshold, startNodes, endNodes),
+    [matrix, threshold, startNodes, endNodes, traceEndProb]
+  );
+
+  // ── Draggable positions ───────────────────────────────────────────────────
+  const [nodeOverrides, setNodeOverrides] = useState({});
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragRef = useRef({ type: null });
+  const svgRef = useRef(null);
+
+  const pos = useMemo(() => {
+    const m = {};
+    Object.entries(layoutPos).forEach(([n, p]) => { m[n] = nodeOverrides[n] ? { ...p, ...nodeOverrides[n] } : p; });
+    return m;
+  }, [layoutPos, nodeOverrides]);
+
+  const { svgW, svgH } = useMemo(() => {
+    const xs = Object.values(pos).map(p => p.x), ys = Object.values(pos).map(p => p.y);
+    return { svgW: Math.max(layoutW, xs.length ? Math.max(...xs) + TFC_R + TFC_PAD : layoutW),
+             svgH: Math.max(layoutH, ys.length ? Math.max(...ys) + TFC_R + TFC_PAD : layoutH) };
+  }, [pos, layoutW, layoutH]);
+
+  const maxProb = useMemo(() => Math.max(...edges.map(e => e.p), 0.01), [edges]);
+
+  if (!Object.keys(matrix).length) return null;
+
+  function getSVGPoint(e) {
+    const svg = svgRef.current; if (!svg) return { x: e.clientX, y: e.clientY };
+    const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+    const ctm = svg.getScreenCTM(); if (!ctm) return { x: e.clientX, y: e.clientY };
+    const tp = pt.matrixTransform(ctm.inverse());
+    return { x: tp.x - pan.x, y: tp.y - pan.y };
+  }
+  function onNodeMouseDown(e, name) {
+    e.stopPropagation();
+    const { x, y } = getSVGPoint(e);
+    const cur = pos[name];
+    dragRef.current = { type: 'node', name, startX: x, startY: y, origX: cur.x, origY: cur.y };
+  }
+  function onSVGMouseDown(e) {
+    if (dragRef.current.type) return;
+    dragRef.current = { type: 'pan', startX: e.clientX, startY: e.clientY, origPanX: pan.x, origPanY: pan.y };
+  }
+  function onMouseMove(e) {
+    const d = dragRef.current; if (!d.type) return;
+    if (d.type === 'node') {
+      const { x, y } = getSVGPoint(e);
+      setNodeOverrides(prev => ({ ...prev, [d.name]: { x: d.origX + x - d.startX, y: d.origY + y - d.startY } }));
+    } else {
+      setPan({ x: d.origPanX + e.clientX - d.startX, y: d.origPanY + e.clientY - d.startY });
+    }
+  }
+  function onMouseUp() { dragRef.current = { type: null }; }
+
+  // Edge path
+  function edgePath(src, tgt, idx, total) {
+    const s = pos[src], t = pos[tgt]; if (!s || !t) return { d: '', lx: 0, ly: 0 };
+    const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx+dy*dy) || 1;
+    const ux = dx/dist, uy = dy/dist, px = -uy, py = ux;
+    const spread = (idx - (total-1)/2) * 7;
+    const ox = px*spread, oy = py*spread;
+    const sx = s.x + ux*TFC_R + ox, sy = s.y + uy*TFC_R + oy;
+    const ex = t.x - ux*TFC_R + ox, ey = t.y - uy*TFC_R + oy;
+    if (t.x < s.x || (t.x === s.x && (t.rank??0) <= (s.rank??0))) {
+      const bow = 55 + Math.abs(s.y-t.y)*0.35 + Math.abs(s.x-t.x)*0.25;
+      return { d: `M ${sx} ${sy} C ${sx} ${sy-bow} ${ex} ${ey-bow} ${ex} ${ey}`,
+               lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
+    }
+    const bendMag = Math.abs(dy)*0.18 + spread*0.4;
+    const midX = (sx+ex)/2 + px*bendMag, midY = (sy+ey)/2 + py*bendMag;
+    const t1 = 0.4;
+    return { d: `M ${sx} ${sy} Q ${midX} ${midY} ${ex} ${ey}`,
+             lx: (1-t1)*(1-t1)*sx + 2*(1-t1)*t1*midX + t1*t1*ex,
+             ly: (1-t1)*(1-t1)*sy + 2*(1-t1)*t1*midY + t1*t1*ey - 5 };
+  }
+
+  const pairGroups = {};
+  edges.forEach(e => { const k=`${e.src}||${e.tgt}`; (pairGroups[k]=pairGroups[k]||[]).push(e); });
+
+  function nodeLabel(name, cx, cy) {
+    const words = name.split(/\s+/), MAX = TFC_R*1.7;
+    if (words.join('').length * 5 <= MAX * 1.3 && name.length <= 12)
+      return <text x={cx} y={cy+3.5} textAnchor="middle" fontSize={8.5} fill="#111"
+        style={{pointerEvents:'none',userSelect:'none'}}>{name}</text>;
+    let best=1, bestDiff=Infinity;
+    for (let i=1;i<words.length;i++) {
+      const d=Math.abs(words.slice(0,i).join(' ').length-words.slice(i).join(' ').length);
+      if(d<bestDiff){bestDiff=d;best=i;}
+    }
+    const trunc = s => s.length*5>MAX ? s.slice(0,Math.floor(MAX/5)-1)+'…' : s;
+    return (<>
+      <text x={cx} y={cy-3} textAnchor="middle" fontSize={8.5} fill="#111"
+        style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(0,best).join(' '))}</text>
+      <text x={cx} y={cy+8} textAnchor="middle" fontSize={8.5} fill="#111"
+        style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(best).join(' '))}</text>
+    </>);
+  }
+
+  return (
+    <div className="tfc-wrap">
+      <div className="tfc-controls">
+        <label className="tfc-threshold-label">
+          Min prob
+          <input type="range" min={0.02} max={0.5} step={0.01} value={threshold}
+            onChange={e => setThreshold(parseFloat(e.target.value))} className="tfc-slider" />
+          <span className="tfc-threshold-val">{(threshold*100).toFixed(0)}%</span>
+        </label>
+        <span className="tfc-edge-count">{edges.length} transitions</span>
+        <button className="tfc-reset-btn" onClick={() => { setNodeOverrides({}); setPan({x:0,y:0}); }}>↺ Reset</button>
+        <span className="tfc-legend">
+          <span style={{color:'#16a34a',fontWeight:700}}>◎</span> start &nbsp;
+          <span style={{color:'#dc2626',fontWeight:700}}>◎</span> end
+        </span>
+      </div>
+      <div className="tfc-scroll" onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
+        <svg ref={svgRef} width={svgW} height={svgH} className="tfc-svg"
+          onMouseDown={onSVGMouseDown} style={{cursor: dragRef.current?.type==='pan' ? 'grabbing' : 'grab'}}>
+          <defs>
+            <marker id="tfc-arr" markerWidth="7" markerHeight="7" refX="6.5" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="#333" />
+            </marker>
+          </defs>
+          <g transform={`translate(${pan.x},${pan.y})`}>
+            {/* Edges */}
+            {edges.map(({ src, tgt, p }) => {
+              const key = `${src}||${tgt}`;
+              const group = pairGroups[key] || [{ p }];
+              const idx = group.findIndex(e => e.p === p);
+              const { d, lx, ly } = edgePath(src, tgt, idx, group.length);
+              const sw = 0.6 + (p / maxProb) * 3.0;
+              return (
+                <g key={`${src}->${tgt}`}>
+                  <path d={d} fill="none" stroke="#333" strokeWidth={sw} markerEnd="url(#tfc-arr)" />
+                  <rect x={lx-10} y={ly-8} width={20} height={11} rx={2} fill="white" opacity={0.85} />
+                  <text x={lx} y={ly} textAnchor="middle" fontSize={8.5} fill="#333"
+                    style={{pointerEvents:'none',userSelect:'none'}}>{p.toFixed(2)}</text>
+                </g>
+              );
+            })}
+            {/* Nodes */}
+            {Object.entries(pos).map(([name, { x, y }]) => {
+              const isStart = startNodes.has(name), isEnd = endNodes.has(name);
+              const ep = traceEndProb?.[name] || 0;
+              return (
+                <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
+                  {(isStart || isEnd) && (
+                    <circle cx={x} cy={y} r={TFC_R+5} fill="none"
+                      stroke={isStart ? '#16a34a' : '#dc2626'} strokeWidth={1.5} />
+                  )}
+                  <circle cx={x} cy={y} r={TFC_R} fill="white" stroke="#333" strokeWidth={1.5} />
+                  {ep > 0 && (
+                    <text x={x} y={y+TFC_R+11} textAnchor="middle" fontSize={8}
+                      fill={ep>=0.7?'#dc2626':ep>=0.3?'#d97706':'#64748b'}
+                      style={{pointerEvents:'none',userSelect:'none'}}>
+                      end {(ep*100).toFixed(0)}%
+                    </text>
+                  )}
+                  {nodeLabel(name, x, y)}
+                </g>
+              );
+            })}
+          </g>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 
 // ── HelpTip (shared with ModelEditor — CSS lives in ModelEditor.css which is
 //    bundled together, so the same class names work here too) ──────────────────
@@ -530,17 +894,20 @@ function App() {
   const loadAvailableFiles = async ({ preserveSelections = false } = {}) => {
     try {
       const response = await axios.get('/api/files');
-      setOcdeclareFiles(response.data.ocdeclare_files || []);
-      setEventLogFiles(response.data.event_log_files || []);
-      setParameterFiles(response.data.parameter_files || []);
-      
+      const ocdeclareFiles = (response.data.ocdeclare_files || []).slice().reverse();
+      const eventLogFiles  = (response.data.event_log_files  || []).slice().reverse();
+      const parameterFiles = (response.data.parameter_files  || []).slice().reverse();
+      setOcdeclareFiles(ocdeclareFiles);
+      setEventLogFiles(eventLogFiles);
+      setParameterFiles(parameterFiles);
+
       // Only set defaults when not preserving current selections
       if (!preserveSelections) {
-        if (response.data.ocdeclare_files?.length > 0) {
-          setConfig(prev => ({ ...prev, ocdeclareFile: response.data.ocdeclare_files[0] }));
+        if (ocdeclareFiles.length > 0) {
+          setConfig(prev => ({ ...prev, ocdeclareFile: ocdeclareFiles[0] }));
         }
-        if (response.data.event_log_files?.length > 0) {
-          setDiscoveryConfig(prev => ({ ...prev, eventLogFile: response.data.event_log_files[0] }));
+        if (eventLogFiles.length > 0) {
+          setDiscoveryConfig(prev => ({ ...prev, eventLogFile: eventLogFiles[0] }));
         }
       }
     } catch (err) {
@@ -632,9 +999,9 @@ function App() {
       if (eventLogFile) params.set('eventLogFile', eventLogFile);
       const res = await axios.get(`/api/model-state?${params}`);
       if (res.data.success) {
-        if (res.data.model && !Array.isArray(res.data.model)) {
-          setActiveModel(res.data.model);
-          // Freshly loaded from file → not yet edited by the user.
+        const model = res.data.model;
+        if (model && !Array.isArray(model)) {
+          setActiveModel(model);
           setModelEdited(false);
         }
         if (res.data.probMatrix && Object.keys(res.data.probMatrix).length > 0) {
@@ -1077,6 +1444,7 @@ function App() {
                           <tr>
                             <th>Activity</th>
                             <th>Occurrences</th>
+                            {discoveryResults.trace_end_prob && <th title="Probability this activity is last in an object trace (higher = more likely end)">P(end)</th>}
                             {discoveryResults.activity_consec_stats && (
                               <>
                                 <th title="Shortest consecutive run of this activity in the log">Min consec</th>
@@ -1104,10 +1472,26 @@ function App() {
                               const cs = discoveryResults.activity_consec_stats?.[activity];
                               const rs = discoveryResults.activity_repeat_stats?.[activity];
                               const ns = discoveryResults.activity_nmax_suggestions?.[activity];
+                              const isLikelyStart = discoveryResults.likely_start_activities?.slice(0,3).includes(activity);
+                              const isLikelyEnd   = discoveryResults.likely_end_activities?.includes(activity);
+                              const endProb       = discoveryResults.trace_end_prob?.[activity];
                               return (
                                 <tr key={activity}>
-                                  <td>{activity}</td>
+                                  <td>
+                                    {isLikelyStart && <span className="act-marker act-marker-start" title="Likely start activity">▶</span>}
+                                    {isLikelyEnd   && <span className="act-marker act-marker-end"   title={`Likely end activity — ends ${(endProb*100).toFixed(0)}% of traces it appears in`}>◼</span>}
+                                    {activity}
+                                  </td>
                                   <td className="activity-count-num">{discoveryResults.activity_counts[activity] ?? 0}</td>
+                                  {discoveryResults.trace_end_prob && (
+                                    <td className="activity-count-num">
+                                      {endProb ? (
+                                        <span className={`end-prob-cell ${endProb >= 0.7 ? 'high' : endProb >= 0.3 ? 'mid' : 'low'}`}>
+                                          {(endProb * 100).toFixed(0)}%
+                                        </span>
+                                      ) : '—'}
+                                    </td>
+                                  )}
                                   {discoveryResults.activity_consec_stats && (
                                     <>
                                       <td className="activity-count-num">{cs ? cs.min : '—'}</td>
@@ -1156,6 +1540,23 @@ function App() {
                   }
                 </Collapsible>
               )}
+
+              {discoveryResults.prob_matrix && Object.keys(discoveryResults.prob_matrix).length > 0 && (
+                <Collapsible
+                  title="Transition Flow Chart"
+                  badge={`${Object.keys(discoveryResults.prob_matrix).length} activities`}
+                  defaultOpen={false}
+                  className="discovery-transition-collapsible"
+                >
+                  <TransitionFlowChart
+                    matrix={discoveryResults.prob_matrix}
+                    activityCounts={discoveryResults.activity_counts || {}}
+                    startActivities={discoveryResults.likely_start_activities || config.startActivities || []}
+                    traceEndProb={discoveryResults.trace_end_prob || {}}
+                    likelyEndActivities={discoveryResults.likely_end_activities || []}
+                  />
+                </Collapsible>
+              )}
             </div>
           )}
 
@@ -1169,6 +1570,26 @@ function App() {
               </div>
             </div>
           )}
+
+          {/* Timing Discovery — lives here so it's available for both internal and external models */}
+          {(() => {
+            const timingActivities = discoveryResults?.activities?.length
+              ? discoveryResults.activities
+              : (!Array.isArray(activeModel) ? (activeModel?.activities || []).map(a => a.name) : []);
+            if (!discoveryConfig.eventLogFile || !timingActivities.length) return null;
+            return (
+              <TimingDiscoveryPanel
+                activities={timingActivities}
+                eventLogFile={discoveryConfig.eventLogFile}
+                isDiscovering={isDiscoveringTiming}
+                result={timingDiscoveryResult}
+                error={timingError}
+                onDiscover={runTimingDiscovery}
+                timingAnchors={timingAnchors}
+                setTimingAnchors={setTimingAnchors}
+              />
+            );
+          })()}
         </div>
 
         {/* OC-DECLARE MODEL DISCOVERY SECTION */}
@@ -1431,16 +1852,47 @@ function App() {
               disabled={isSimulating}
             >
               <option value="">Select model...</option>
-              {ocdeclareFiles.map(file => (
-                <option key={file} value={file}>{file}</option>
-              ))}
+              {ocdeclareFiles.map(file => {
+                const isInternal = file.startsWith('discovered_');
+                return (
+                  <option key={file} value={file}>
+                    {isInternal ? '' : '[external] '}{file}
+                  </option>
+                );
+              })}
             </select>
-            {config.ocdeclareFile && (
-              <span className="help-text">
-                Loaded into the Model Editor below. Edits there are used when you run the simulation.
-              </span>
-            )}
+            {(() => {
+              if (!config.ocdeclareFile) return null;
+              const isInternal = config.ocdeclareFile.startsWith('discovered_');
+              const matchesSession = discoveryResults && (
+                config.ocdeclareFile === discoveryResults.ocdeclare_file ||
+                config.ocdeclareFile === (ocdeclareDiscoveryResults?.filename)
+              );
+              if (!isInternal) {
+                return (
+                  <div className="ocdeclare-source-notice ocdeclare-external">
+                    <span className="ocdeclare-source-badge external">external</span>
+                    This file was created by an external tool. Run Step 1 with a matching event log to enable timing discovery and probability matrix. The Model Editor works immediately after loading a parameters file.
+                  </div>
+                );
+              }
+              if (!discoveryResults) {
+                return (
+                  <div className="ocdeclare-source-notice ocdeclare-not-discovered">
+                    <span className="ocdeclare-source-badge not-discovered">not discovered</span>
+                    This model file exists but Step 1 has not been run in this session. Run Step 1 with a matching event log to enable probability matrix, activity stats, and timing discovery.
+                  </div>
+                );
+              }
+              return (
+                <div className="ocdeclare-source-notice ocdeclare-discovered">
+                  <span className="ocdeclare-source-badge discovered">✓ discovered</span>
+                  Matches the current discovery session.
+                </div>
+              );
+            })()}
           </div>
+
         </div>
 
         {/* ── Session History ── */}
@@ -1473,20 +1925,6 @@ function App() {
               ))}
             </div>
           </div>
-        )}
-
-        {/* STEP 2.5: Timing Discovery — shown after OC-Declare discovery, BEFORE model editor */}
-        {config.ocdeclareFile && discoveryConfig.eventLogFile && activeModel && !Array.isArray(activeModel) && (
-          <TimingDiscoveryPanel
-            activities={(activeModel.activities || []).map(a => a.name)}
-            eventLogFile={discoveryConfig.eventLogFile}
-            isDiscovering={isDiscoveringTiming}
-            result={timingDiscoveryResult}
-            error={timingError}
-            onDiscover={runTimingDiscovery}
-            timingAnchors={timingAnchors}
-            setTimingAnchors={setTimingAnchors}
-          />
         )}
 
         {/* ── Model Editor (shown when an editable dict-format model is loaded) ── */}
@@ -1560,6 +1998,51 @@ function App() {
                     </ul>
                     <p className="timing-warning-hint">
                       Add a precedence or chain_response constraint in the Constraints tab to control when each can fire.
+                    </p>
+                  </div>
+                );
+              })()}
+              {(() => {
+                const activities = activeModel.activities || [];
+                const objectTypes = (activeModel.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+                const resourceTypes = new Set(activeModel.resource_types || []);
+
+                // Types deactivated by at least one activity
+                const deactivatedTypes = new Set();
+                for (const act of activities) {
+                  for (const b of (act.bindings || [])) {
+                    if (b.deactivates || b.consumes) deactivatedTypes.add(b.object_type);
+                  }
+                }
+
+                const resources = objectTypes.filter(t => resourceTypes.has(t));
+                const neverDeactivated = objectTypes.filter(t => !resourceTypes.has(t) && !deactivatedTypes.has(t));
+
+                if (!objectTypes.length) return null;
+                return (
+                  <div className="object-info-box">
+                    <div className="object-info-title">ℹ Object Lifecycle</div>
+                    {resources.length > 0 && (
+                      <div className="object-info-group">
+                        <div className="object-info-label">Resources (always active)</div>
+                        <ul className="object-info-list">
+                          {resources.map(t => <li key={t}>{t}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                    {neverDeactivated.length > 0 && (
+                      <div className="object-info-group">
+                        <div className="object-info-label">Never deactivated</div>
+                        <ul className="object-info-list">
+                          {neverDeactivated.map(t => <li key={t}>{t}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                    {resources.length === 0 && neverDeactivated.length === 0 && (
+                      <p className="object-info-hint" style={{ marginTop: 0 }}>All object types are deactivated by at least one activity.</p>
+                    )}
+                    <p className="object-info-hint">
+                      Never-deactivated types accumulate instances over time. Consider adding a deactivates binding in the Activities tab.
                     </p>
                   </div>
                 );

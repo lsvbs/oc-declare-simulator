@@ -221,6 +221,13 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             )
         )
 
+    # Build per-activity constraint index for O(1) lookup in check_all_constraints
+    _constraints_idx: dict = {}
+    for c in constraints:
+        for act in (c.source_activity, c.target_activity):
+            if act:
+                _constraints_idx.setdefault(act, []).append(c)
+
     return StaticModel(
         activities=activities,
         object_types=object_types,
@@ -252,6 +259,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             str(k): float(v)
             for k, v in (data.get("concurrency_probs") or {}).items()
         },
+        _constraints_by_activity=_constraints_idx,
     )
 
 

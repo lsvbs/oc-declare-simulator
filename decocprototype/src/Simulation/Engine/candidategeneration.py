@@ -141,6 +141,20 @@ def build_candidate_for_activity(
             # This ordering is critical: computing reuse_limit BEFORE create_count
             # would cause reuse + created > max_count → spurious None returns
             # (e.g. place order: customers max=1, 1 existing → reuse=1, create=1, 2>1 → None).
+
+            # Resource types never get created — they come from the pre-populated pool.
+            # Treat a creates=True binding on a resource type as a plain input binding.
+            if binding.object_type in _resource_types:
+                eligibility_count = 1
+                target_count = max(binding.min_count, eligibility_count)
+                selected_from_existing = min(len(existing_ids), target_count,
+                                             binding.max_count if binding.max_count is not None else len(existing_ids))
+                selected_ids = existing_ids[:selected_from_existing]
+                if len(selected_ids) < eligibility_count:
+                    return None
+                participating_object_ids.extend(selected_ids)
+                continue
+
             create_count = binding.min_count
 
             if binding.max_count is None:
@@ -152,12 +166,9 @@ def build_candidate_for_activity(
                     return None
                 reuse_limit = min(len(existing_ids), remaining)
 
-            if binding.object_type in _resource_types:
-                selected_ids = existing_ids[:reuse_limit]
-            else:
-                selected_ids = _find_objects_preferring_linked(
-                    state, existing_ids, participating_object_ids, reuse_limit
-                )
+            selected_ids = _find_objects_preferring_linked(
+                state, existing_ids, participating_object_ids, reuse_limit
+            )
             participating_object_ids.extend(selected_ids)
 
             if create_count > 0:

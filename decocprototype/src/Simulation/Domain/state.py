@@ -107,6 +107,16 @@ class SimulationState:
     # object_id -> object_type (for O(1) type lookup without hitting .objects)
     _type_of_object: dict[str, str] = field(default_factory=dict)
 
+    # ── Consecutive-streak caches (maintained by record_event) ───────────────
+    # How many times the most recent global event was the same activity in a row.
+    # Reset to 1 when a different activity fires; incremented when same activity fires.
+    # activity_name -> current global streak length (only the last-fired activity is non-zero)
+    _global_streak: dict[str, int] = field(default_factory=dict)
+    # (activity_name, object_id) -> streak of consecutive firings on that object
+    _object_streak: dict[tuple, int] = field(default_factory=dict)
+    # last activity fired globally (to reset _global_streak on change)
+    _last_global_activity: Optional[str] = None
+
     # activity_name -> timestamp when this activity first appeared in the candidate
     # pool in the current "availability window" (reset each time it fires).
     _candidate_first_seen: dict[str, datetime] = field(default_factory=dict)
@@ -190,6 +200,13 @@ class SimulationState:
         # ── Maintain indexes ──────────────────────────────────────────────────
         self._events_by_activity.setdefault(activity_name, []).append(event)
 
+        # Capture previous activity per object BEFORE updating the index,
+        # so the streak cache can detect activity changes.
+        prev_activity_per_obj = {
+            oid: self._last_activity_per_object.get(oid)
+            for oid in participating_object_ids
+        }
+
         for oid in participating_object_ids:
             self._events_by_object.setdefault(oid, []).append(event)
             self._events_by_act_obj.setdefault((activity_name, oid), []).append(event)
@@ -197,5 +214,22 @@ class SimulationState:
 
         if activity_name in self._start_activity_names:
             self._start_event_count += 1
+
+        # ── Maintain consecutive-streak caches ───────────────────────────────
+        # Global streak: reset when activity changes
+        if self._last_global_activity != activity_name:
+            self._global_streak.clear()
+            self._last_global_activity = activity_name
+        self._global_streak[activity_name] = self._global_streak.get(activity_name, 0) + 1
+
+        # Per-object streak
+        for oid in participating_object_ids:
+            last_for_obj = prev_activity_per_obj.get(oid)
+            if last_for_obj != activity_name:
+                prev_key = (last_for_obj, oid) if last_for_obj else None
+                if prev_key and prev_key in self._object_streak:
+                    del self._object_streak[prev_key]
+            key = (activity_name, oid)
+            self._object_streak[key] = self._object_streak.get(key, 0) + 1
 
         return event

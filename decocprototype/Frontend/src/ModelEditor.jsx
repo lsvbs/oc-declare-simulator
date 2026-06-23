@@ -609,9 +609,14 @@ export default function ModelEditor({
                     {(act.bindings || []).length === 0 && (
                       <p className="binding-empty-warning">⚠ No object bindings — this activity will never be a candidate. Add a binding below.</p>
                     )}
-                    {(act.bindings || []).map((b, bi) => (
+                    {(act.bindings || []).map((b, bi) => {
+                      const isResource = resourceTypes.includes(b.object_type);
+                      return (
                       <div key={bi} className="binding-row">
-                        <span className="binding-type-label">{b.object_type}</span>
+                        <span className="binding-type-label">
+                          {b.object_type}
+                          {isResource && <span className="binding-resource-badge" title="Resource type — pool size is set in the Resources tab">R</span>}
+                        </span>
                         <input
                           className="binding-num"
                           type="number" min={0}
@@ -626,9 +631,11 @@ export default function ModelEditor({
                           onChange={e => updateBinding(ai, bi, 'max_count',
                             e.target.value === '' ? null : parseInt(e.target.value) || 0)}
                         />
-                        <label className="binding-toggle">
-                          <input type="checkbox" checked={!!b.creates}
-                            onChange={e => updateBinding(ai, bi, 'creates', e.target.checked)} />
+                        <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
+                          title={isResource ? 'Resources come from the pre-populated pool — they cannot be created by activities.' : ''}>
+                          <input type="checkbox" checked={isResource ? false : !!b.creates}
+                            disabled={isResource}
+                            onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
                           creates
                         </label>
                         <label className="binding-toggle">
@@ -639,7 +646,8 @@ export default function ModelEditor({
                         <button className="row-delete-btn binding-delete-btn"
                           onClick={() => deleteBinding(ai, bi)} title="Remove binding">✕</button>
                       </div>
-                    ))}
+                      );
+                    })}
                     {/* ── Add binding row ── */}
                     <div className="add-binding-row">
                       <select

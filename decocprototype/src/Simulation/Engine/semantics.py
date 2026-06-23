@@ -249,7 +249,8 @@ def check_constraint(constraint: Any, candidate: Any, state: SimulationState) ->
 
 
 def check_all_constraints(static_model: StaticModel, candidate: Any, state: SimulationState) -> bool:
-    for constraint in static_model.constraints:
+    relevant = static_model.constraints_for_activity(candidate.activity_name)
+    for constraint in relevant:
         if not check_constraint(constraint, candidate, state):
             return False
     return True

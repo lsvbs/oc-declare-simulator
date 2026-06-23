@@ -134,6 +134,18 @@ class StaticModel:
     # that frequency.  Stored as a flat dict with "A|||B" keys (both orderings
     # map to the same value) so the frozen dataclass can hold it.
     concurrency_probs: dict[str, float] = field(default_factory=dict)
+    # Per-activity constraint index: activity_name -> constraints where that
+    # activity is source_activity or target_activity. Built once after parse.
+    # Reduces check_all_constraints from O(all_constraints) to O(relevant).
+    _constraints_by_activity: dict[str, list] = field(default_factory=dict)
+
+    def constraints_for_activity(self, activity_name: str) -> list:
+        """Return only constraints relevant to this activity (O(1) lookup)."""
+        idx = object.__getattribute__(self, '_constraints_by_activity')
+        if idx:
+            return idx.get(activity_name, [])
+        # Fallback: return all (index not built yet)
+        return object.__getattribute__(self, 'constraints')
 
 
 model = StaticModel(

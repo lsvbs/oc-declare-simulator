@@ -125,6 +125,97 @@
   border-radius: 8px;
 }
 
+/* ── Transition Flow Chart ─────────────────────────────────────────────────── */
+.discovery-transition-collapsible {
+  margin-top: 1rem;
+}
+
+.tfc-wrap {
+  padding: 0.4rem 0 0.25rem;
+}
+
+.tfc-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.tfc-threshold-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: #475569;
+  font-weight: 500;
+}
+
+.tfc-slider {
+  width: 90px;
+  accent-color: #6366f1;
+  cursor: pointer;
+}
+
+.tfc-threshold-val {
+  font-weight: 700;
+  color: #6366f1;
+  min-width: 2rem;
+}
+
+.act-marker {
+  display: inline-block;
+  font-size: 0.65rem;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
+.act-marker-start { color: #16a34a; }
+.act-marker-end   { color: #dc2626; }
+
+.end-prob-cell      { font-size: 0.78rem; font-weight: 600; padding: 0.1rem 0.3rem; border-radius: 3px; }
+.end-prob-cell.high { color: #dc2626; background: #fee2e2; }
+.end-prob-cell.mid  { color: #d97706; background: #fef3c7; }
+.end-prob-cell.low  { color: #64748b; }
+
+.tfc-reset-btn {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: white;
+  color: #475569;
+  cursor: pointer;
+}
+.tfc-reset-btn:hover { background: #f1f5f9; }
+
+.tfc-edge-count {
+  font-size: 0.72rem;
+  color: #94a3b8;
+}
+
+.tfc-legend {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.72rem;
+  color: #64748b;
+}
+
+.tfc-legend-start, .tfc-legend-end {
+  opacity: 0.7;
+}
+
+.tfc-scroll {
+  overflow-x: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #fafbff;
+  padding: 0.25rem;
+}
+
+.tfc-svg {
+  display: block;
+}
+
 .discovery-results h3 {
   margin-top: 0;
   color: #4caf50;
@@ -572,19 +663,20 @@
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
 }
 
 .timing-warning-box {
-  flex: 0 0 220px;
-  position: sticky;
-  top: 1rem;
-  align-self: flex-start;
+  flex: 0 0 auto;
   background: #fffbeb;
   border: 1.5px solid #fbbf24;
   border-radius: 10px;
   padding: 0.9rem 1rem;
   font-size: 0.8rem;
   box-shadow: 0 2px 8px rgba(251,191,36,0.15);
+  max-height: 280px;
+  overflow-y: auto;
 }
 
 .timing-warning-title {
@@ -635,6 +727,63 @@
 .timing-warning-hint {
   margin: 0.6rem 0 0;
   color: #92400e;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.object-info-box {
+  flex: 0 0 auto;
+  background: #eff6ff;
+  border: 1.5px solid #93c5fd;
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  font-size: 0.8rem;
+  box-shadow: 0 2px 8px rgba(147,197,253,0.15);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.object-info-title {
+  font-weight: 700;
+  color: #1e40af;
+  font-size: 0.85rem;
+  margin-bottom: 0.65rem;
+}
+
+.object-info-group {
+  margin-bottom: 0.55rem;
+}
+
+.object-info-label {
+  font-weight: 600;
+  color: #1d4ed8;
+  margin-bottom: 0.2rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.object-info-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.object-info-list li {
+  background: #dbeafe;
+  border-radius: 4px;
+  padding: 0.2rem 0.45rem;
+  color: #1e3a8a;
+  font-size: 0.77rem;
+  word-break: break-word;
+}
+
+.object-info-hint {
+  margin: 0.6rem 0 0;
+  color: #1e40af;
   font-size: 0.75rem;
   line-height: 1.4;
 }
@@ -1244,6 +1393,63 @@
   border-radius: 12px;
   padding: 2rem;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+.ocdeclare-source-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+}
+
+.ocdeclare-source-badge {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.ocdeclare-external {
+  background: #eff6ff;
+  color: #1e40af;
+  border: 1px solid #bfdbfe;
+}
+.ocdeclare-source-badge.external {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.ocdeclare-not-discovered {
+  background: #fffbeb;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+.ocdeclare-source-badge.not-discovered {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.ocdeclare-discovered {
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+.ocdeclare-source-badge.discovered {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.external-event-log-group {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e2e8f0;
 }
 
 /* OC-Declare Discovery Section */

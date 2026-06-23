@@ -224,14 +224,6 @@ class Simulator:
                             }
                             for c in candidates
                         ],
-                        "active_objects": [
-                            {
-                                "id": oid,
-                                "type": obj.object_type,
-                                "active": obj.active,
-                            }
-                            for oid, obj in state.objects.items()
-                        ],
                     },
                 )
 
@@ -299,7 +291,6 @@ class Simulator:
         same activity can then compete for the same resource and queue when it
         is occupied.
         """
-        import itertools
         resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
         is_simulation_start = len(state.executed_events) == 0 and not state.in_progress
         start_activity_names = set(self.config.start_policy.start_activity_names)
@@ -330,9 +321,10 @@ class Simulator:
                         candidates.append(candidate)
                 continue
 
-            # Expand: one candidate per active object of the primary binding type
+            # Expand: one candidate per active object of the primary binding type.
+            # Cap at 32 to avoid O(n_objects) work when many objects accumulate.
             primary_type = primary_bindings[0].object_type
-            active_ids = list(state._active_by_type.get(primary_type, set()))
+            active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
 
             for oid in active_ids:
                 # Temporarily restrict the active pool for this type to only this object
@@ -349,13 +341,10 @@ class Simulator:
                 if not is_candidate_semantically_allowed(self.static_model, candidate, state):
                     continue
 
-                # max_consecutive checks
+                # max_consecutive checks (O(1) via cached streaks)
                 if activity.name in max_consec:
                     cap = max_consec[activity.name]
-                    streak = sum(1 for _ in itertools.takewhile(
-                        lambda e: e.activity_name == activity.name,
-                        reversed(state.executed_events)
-                    ))
+                    streak = state._global_streak.get(activity.name, 0)
                     if streak >= cap:
                         continue
 
@@ -363,12 +352,7 @@ class Simulator:
                     cap_obj = max_consec_obj[activity.name]
                     blocked = False
                     for pid in candidate.participating_object_ids:
-                        streak_obj = 0
-                        for ev in reversed(state._events_by_object.get(pid, [])):
-                            if ev.activity_name == activity.name:
-                                streak_obj += 1
-                            else:
-                                break
+                        streak_obj = state._object_streak.get((activity.name, pid), 0)
                         if streak_obj >= cap_obj:
                             blocked = True
                             break
@@ -422,34 +406,21 @@ class Simulator:
             if not is_candidate_semantically_allowed(self.static_model, candidate, state):
                 continue
 
-            # Max-consecutive enforcement: skip if activity has been the last
-            # N events in a row and N >= the configured cap.
+            # Max-consecutive enforcement (O(1) via cached streaks)
             max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
             if candidate.activity_name in max_consec:
                 cap = max_consec[candidate.activity_name]
-                streak = 0
-                for ev in reversed(state.executed_events):
-                    if ev.activity_name == candidate.activity_name:
-                        streak += 1
-                    else:
-                        break
+                streak = state._global_streak.get(candidate.activity_name, 0)
                 if streak >= cap:
                     continue
 
-            # Per-object max-consecutive: skip if the same activity has fired
-            # N times in a row on any of the candidate's participating objects.
-            # A "run" ends when any other activity touches that object.
+            # Per-object max-consecutive (O(1) via cached streaks)
             max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
             if candidate.activity_name in max_consec_obj:
                 cap_obj = max_consec_obj[candidate.activity_name]
                 blocked_by_obj = False
                 for oid in candidate.participating_object_ids:
-                    streak_obj = 0
-                    for ev in reversed(state._events_by_object.get(oid, [])):
-                        if ev.activity_name == candidate.activity_name:
-                            streak_obj += 1
-                        else:
-                            break
+                    streak_obj = state._object_streak.get((candidate.activity_name, oid), 0)
                     if streak_obj >= cap_obj:
                         blocked_by_obj = True
                         break
@@ -625,8 +596,13 @@ class Simulator:
         created_object_ids: list[str] = []
 
         attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
+        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
 
         for object_type in candidate.object_types_to_create:
+            # Resource types are never created by activities — they live in the
+            # pre-populated pool only. Skip silently.
+            if object_type in resource_types:
+                continue
             defaults = attribute_defaults.get(object_type, {})
             obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
@@ -806,8 +782,12 @@ class Simulator:
         """Create objects-to-create, apply links, lock resources, push to heap."""
         created_object_ids: list[str] = []
         attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
+        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
 
         for object_type in candidate.object_types_to_create:
+            # Resource types come from the pre-populated pool only — never created mid-sim.
+            if object_type in resource_types:
+                continue
             defaults = attribute_defaults.get(object_type, {})
             obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
