@@ -127,6 +127,7 @@ def run_discovery():
         # includes trace-end probabilities in the denominator).
         from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix_object_centric
         trace_end_prob = {}
+        trace_position = {}
         start_counts = {}
         end_counts = {}
         total_traces = 0
@@ -137,6 +138,7 @@ def run_discovery():
             start_counts   = oc_result['start_counts']
             end_counts     = oc_result['end_counts']
             total_traces   = oc_result['total_traces']
+            trace_position = oc_result.get('trace_position', {})
             # Fill in any activity seen globally but absent from object-centric matrix
             global_matrix = discover_transition_matrix(event_log)
             for act, tgts in global_matrix.items():
@@ -175,6 +177,8 @@ def run_discovery():
         
         # Calculate statistics based on event log format
         # Basic counts from the trace-list format (always available)
+        object_type_stats = {}  # {type: {count, attributes: [names]}}
+
         if isinstance(event_log, list):
             total_events = sum(len(trace) for trace in event_log)
             total_objects = 0
@@ -185,7 +189,9 @@ def run_discovery():
                         activity_counts[act] = activity_counts.get(act, 0) + 1
         elif isinstance(event_log, dict):
             total_events = len(event_log.get('events', []))
-            total_objects = len(event_log.get('objects', []))
+            objects_raw = event_log.get('objects', {})
+            objs_list = list(objects_raw.values()) if isinstance(objects_raw, dict) else (objects_raw or [])
+            total_objects = len(objs_list)
             activity_counts = {}
             for edata in (event_log.get('events', {}).values() if isinstance(event_log.get('events'), dict) else event_log.get('events', [])):
                 act = edata.get('activity') or edata.get('ocel:activity', '')
@@ -195,6 +201,32 @@ def run_discovery():
             total_events = 0
             total_objects = 0
             activity_counts = {}
+
+        # Build per-type object stats from the OCEL dict (event_log_ocel is always
+        # the raw OCEL dict when available, regardless of load_event_log format).
+        _ocel_src = event_log_ocel if event_log_ocel and isinstance(event_log_ocel, dict) \
+                    else (event_log if isinstance(event_log, dict) else None)
+        if _ocel_src:
+            objects_raw = _ocel_src.get('objects', {})
+            objs_list = list(objects_raw.values()) if isinstance(objects_raw, dict) else (objects_raw or [])
+            if not total_objects:
+                total_objects = len(objs_list)
+            from collections import defaultdict as _dd
+            _type_attrs: dict = _dd(set)
+            _type_counts: dict = _dd(int)
+            for obj in objs_list:
+                ot = obj.get('type') or obj.get('ocel:type', '')
+                if not ot:
+                    continue
+                _type_counts[ot] += 1
+                for attr in (obj.get('attributes') or []):
+                    name = attr.get('name') or attr.get('key', '') if isinstance(attr, dict) else str(attr)
+                    if name:
+                        _type_attrs[ot].add(name)
+            object_type_stats = {
+                ot: {'count': _type_counts[ot], 'attributes': sorted(_type_attrs[ot])}
+                for ot in sorted(_type_counts)
+            }
 
         # Per-activity repeat stats: requires OCEL 2.0 dict with omap per event.
         # Use event_log_ocel (loaded separately above) so this always works even
@@ -302,12 +334,14 @@ def run_discovery():
                 'activity_count': len(activities),
                 'total_events': total_events,
                 'total_objects': total_objects,
+                'object_type_stats': object_type_stats,
                 'transition_count': transition_count,
                 'time_distributions_discovered': len(time_distributions) > 0,
                 'first_activity': first_activity,
                 'likely_start_activities': likely_start,
                 'likely_end_activities':   likely_end,
                 'trace_end_prob':          trace_end_prob,
+                'trace_position':          trace_position,
                 'prob_matrix': {
                     src: {tgt: round(float(cnt), 4) for tgt, cnt in tgts.items()}
                     for src, tgts in prob_matrix.items()
@@ -1064,6 +1098,103 @@ def discover_timing():
             'activity_count': len(metrics),
             'empty': len(metrics) == 0,
             'concurrency_probs': {k: v for k, v in concurrency.items() if '|||' in k and k.split('|||')[0] <= k.split('|||')[1]},
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/derive-lifecycle', methods=['POST'])
+def derive_lifecycle():
+    """Derive creates/deactivates flags for an external OC-Declare file using
+    the arc-direction heuristic (derive_provisional_lifecycle_from_list).
+
+    Body JSON:
+      ocdeclareFile – filename in OCDECLARE_DIR (required)
+
+    Returns the model dict with creates/deactivates flags applied to bindings,
+    ready to be loaded into the Model Editor.
+    """
+    try:
+        data = request.json or {}
+        ocdeclare_file = data.get('ocdeclareFile', '')
+        if not ocdeclare_file:
+            return jsonify({'error': 'Missing ocdeclareFile parameter'}), 400
+
+        model_path = OCDECLARE_DIR / ocdeclare_file
+        if not model_path.exists():
+            return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+
+        with open(model_path, 'r') as f:
+            raw = json.load(f)
+
+        if not isinstance(raw, list):
+            return jsonify({'error': 'Lifecycle derivation only applies to raw OC-Declare arc lists (external files).'}), 400
+
+        from src.Simulation.Models.OCDeclare import (
+            parse_ocdeclare_list,
+            derive_provisional_lifecycle_from_list,
+            apply_lifecycle_from_provisional_info,
+        )
+
+        # Parse without lifecycle, then derive and apply separately
+        base_model = parse_ocdeclare_list(raw)
+        lifecycle_info = derive_provisional_lifecycle_from_list(raw)
+        model_with_lc  = apply_lifecycle_from_provisional_info(base_model, lifecycle_info)
+
+        # Serialise to the same dict shape as /api/model-state
+        model_data = {
+            'object_types': [
+                {'name': ot.name, 'attributes': list(ot.attributes)}
+                for ot in model_with_lc.object_types
+            ],
+            'activities': [
+                {
+                    'name': a.name,
+                    'bindings': [
+                        {
+                            'object_type': b.object_type,
+                            'min_count': b.min_count,
+                            'max_count': b.max_count,
+                            'creates': b.creates,
+                            'deactivates': b.deactivates,
+                        }
+                        for b in a.bindings
+                    ],
+                }
+                for a in model_with_lc.activities
+            ],
+            'constraints': [
+                {
+                    'constraint_type': c.constraint_type,
+                    'source_activity': c.source_activity,
+                    'target_activity': c.target_activity,
+                    'scope': {'kind': c.scope.kind, 'object_type': c.scope.object_type},
+                    'nmin': c.nmin,
+                    'nmax': c.nmax,
+                }
+                for c in model_with_lc.constraints
+            ],
+            'o2o_rules': [],
+            'resource_types': [],
+            'resource_pool_sizes': {},
+            'activity_durations': {},
+        }
+
+        # Report what was inferred
+        entry = lifecycle_info.get('entry', {})
+        exit_ = lifecycle_info.get('exit', {})
+        summary = []
+        for ot, acts in sorted(entry.items()):
+            summary.append(f'{", ".join(sorted(acts))} → creates {ot}')
+        for ot, acts in sorted(exit_.items()):
+            summary.append(f'{", ".join(sorted(acts))} → deactivates {ot}')
+
+        return jsonify({
+            'success': True,
+            'model': model_data,
+            'summary': summary,
         })
 
     except Exception as e:

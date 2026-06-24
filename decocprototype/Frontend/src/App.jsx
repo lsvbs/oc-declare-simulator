@@ -9,7 +9,7 @@ const TFC_R = 22;
 const TFC_HGAP = 80;
 const TFC_PAD  = 44;
 
-function tfc_layout(matrix, threshold, startSet, endSet) {
+function tfc_layout(matrix, threshold, startSet, endSet, tracePosition) {
   // ── Edges ──────────────────────────────────────────────────────────────────
   const edges = [];
   Object.entries(matrix).forEach(([src, tgts]) => {
@@ -25,28 +25,70 @@ function tfc_layout(matrix, threshold, startSet, endSet) {
   const nodes = [...nodeSet];
 
   // ── Rank assignment (longest-path, cycle-safe) ────────────────────────────
+  // ── Rank assignment ───────────────────────────────────────────────────────
+  // When trace positions are available, bucket each activity into a rank column
+  // proportional to its mean normalised position (0=first, 1=last in traces).
+  // This gives columns that reflect the actual process timeline.
+  // Without positions, fall back to longest-path from start nodes.
   const rankOf = {};
-  nodes.forEach(n => { rankOf[n] = startSet.has(n) ? 0 : -1; });
-  if (![...startSet].some(n => nodes.includes(n))) {
-    const hasIn = new Set(edges.map(e => e.tgt));
-    nodes.forEach(n => { if (!hasIn.has(n)) rankOf[n] = 0; });
-  }
-  nodes.forEach(n => { if (rankOf[n] < 0) rankOf[n] = 0; });
+  const hasPositions = tracePosition && Object.keys(tracePosition).length > 0;
 
-  const maxRank = nodes.length - 1;
-  for (let pass = 0; pass < nodes.length; pass++) {
+  if (hasPositions) {
+    // Determine number of columns: use enough buckets to spread nodes without
+    // crowding. Aim for at most ~4 nodes per column on average.
+    const numBuckets = Math.max(3, Math.ceil(nodes.length / 3));
+    nodes.forEach(n => {
+      const p = tracePosition[n];
+      if (p === undefined) {
+        // Unknown position: place in middle
+        rankOf[n] = Math.floor(numBuckets / 2);
+      } else {
+        // Bucket: position 0 → rank 0, position 1 → rank numBuckets-1
+        rankOf[n] = Math.min(numBuckets - 1, Math.floor(p * numBuckets));
+      }
+    });
+  } else {
+    // Fallback: longest-path from start nodes
+    nodes.forEach(n => { rankOf[n] = startSet.has(n) ? 0 : -1; });
+    if (![...startSet].some(n => nodes.includes(n))) {
+      const hasIn = new Set(edges.map(e => e.tgt));
+      nodes.forEach(n => { if (!hasIn.has(n)) rankOf[n] = 0; });
+    }
+    nodes.forEach(n => { if (rankOf[n] < 0) rankOf[n] = 0; });
+    for (let pass = 0; pass < nodes.length * 2; pass++) {
+      let changed = false;
+      edges.forEach(({ src, tgt }) => {
+        if (endSet.has(src)) return;
+        if (!startSet.has(tgt) && rankOf[src] + 1 > rankOf[tgt]) {
+          rankOf[tgt] = rankOf[src] + 1; changed = true;
+        }
+      });
+      if (!changed) break;
+    }
+    endSet.forEach(n => {
+      const preds = edges.filter(e => e.tgt === n && !endSet.has(e.src));
+      rankOf[n] = preds.length ? Math.max(...preds.map(e => rankOf[e.src])) + 1 : rankOf[n];
+    });
+  }
+
+  // ── Enforce "best outgoing edge always goes right" ────────────────────────
+  // Regardless of how ranks were assigned, the highest-probability outgoing
+  // edge from each node must point strictly rightward. Cascade until stable.
+  for (let pass = 0; pass < nodes.length * 2; pass++) {
     let changed = false;
-    edges.forEach(({ src, tgt }) => {
+    nodes.forEach(src => {
       if (endSet.has(src)) return;
-      const next = Math.min(rankOf[src] + 1, maxRank);
-      if (!startSet.has(tgt) && next > rankOf[tgt]) { rankOf[tgt] = next; changed = true; }
+      const outgoing = edges.filter(e => e.src === src).sort((a, b) => b.p - a.p);
+      if (!outgoing.length) return;
+      const tgt = outgoing[0].tgt;
+      if (startSet.has(tgt)) return;
+      if (rankOf[tgt] <= rankOf[src]) {
+        rankOf[tgt] = rankOf[src] + 1;
+        changed = true;
+      }
     });
     if (!changed) break;
   }
-  endSet.forEach(n => {
-    const preds = edges.filter(e => e.tgt === n && !endSet.has(e.src));
-    rankOf[n] = preds.length ? Math.min(Math.max(...preds.map(e => rankOf[e.src])) + 1, maxRank) : maxRank;
-  });
 
   const distinctRanks = [...new Set(Object.values(rankOf))].sort((a, b) => a - b);
   const rankMap = {};
@@ -58,9 +100,6 @@ function tfc_layout(matrix, threshold, startSet, endSet) {
   nodes.forEach(n => byRank[rankOf[n]].push(n));
 
   // ── Trace the highest-probability spine ───────────────────────────────────
-  // From each start node, greedily follow the highest-probability edge that
-  // goes to the next rank. These spine nodes are placed at midY (the centre
-  // of their column). The same rule applies recursively from branch nodes.
   const spineSet = new Set();
   const seeds = [...startSet].filter(n => nodes.includes(n));
   if (!seeds.length) seeds.push(...(byRank[0] || []));
@@ -178,7 +217,7 @@ function tfc_layout(matrix, threshold, startSet, endSet) {
   return { pos, edges, width: maxX, height: maxY };
 }
 
-function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities }) {
+function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities, tracePosition }) {
   const [threshold, setThreshold] = useState(0.05);
 
   const { startNodes, endNodes } = useMemo(() => {
@@ -199,8 +238,8 @@ function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEnd
   }, [matrix, startActivities, likelyEndActivities, traceEndProb, threshold]);
 
   const { pos: layoutPos, edges, width: layoutW, height: layoutH } = useMemo(
-    () => tfc_layout(matrix, threshold, startNodes, endNodes),
-    [matrix, threshold, startNodes, endNodes, traceEndProb]
+    () => tfc_layout(matrix, threshold, startNodes, endNodes, tracePosition || {}),
+    [matrix, threshold, startNodes, endNodes, tracePosition]
   );
 
   // ── Draggable positions ───────────────────────────────────────────────────
@@ -1475,12 +1514,17 @@ function App() {
                               const isLikelyStart = discoveryResults.likely_start_activities?.slice(0,3).includes(activity);
                               const isLikelyEnd   = discoveryResults.likely_end_activities?.includes(activity);
                               const endProb       = discoveryResults.trace_end_prob?.[activity];
+                              const modelConstraints = activeModel?.constraints || [];
+                              const hasIn  = modelConstraints.some(c => (c.target_activity || c.target) === activity);
+                              const hasOut = modelConstraints.some(c => (c.source_activity || c.source) === activity);
+                              const noneAtAll = !hasIn && !hasOut;
+                              const noInput   = !hasIn && hasOut;
                               return (
-                                <tr key={activity}>
+                                <tr key={activity} className={noneAtAll ? 'activity-row-no-constraint' : noInput ? 'activity-row-no-input' : ''}>
                                   <td>
                                     {isLikelyStart && <span className="act-marker act-marker-start" title="Likely start activity">▶</span>}
                                     {isLikelyEnd   && <span className="act-marker act-marker-end"   title={`Likely end activity — ends ${(endProb*100).toFixed(0)}% of traces it appears in`}>◼</span>}
-                                    {activity}
+                                    {activity}{noneAtAll ? <span className="act-no-constraint-label"> / no constraints</span> : ''}
                                   </td>
                                   <td className="activity-count-num">{discoveryResults.activity_counts[activity] ?? 0}</td>
                                   {discoveryResults.trace_end_prob && (
@@ -1532,9 +1576,20 @@ function App() {
                     )
                     : (
                       <div className="activity-badges">
-                        {discoveryResults.activities.map((activity, idx) => (
-                          <span key={idx} className="activity-badge">{activity}</span>
-                        ))}
+                        {discoveryResults.activities.map((activity, idx) => {
+                          const constraints = activeModel?.constraints || [];
+                          const hasIn  = constraints.some(c => (c.target_activity || c.target) === activity);
+                          const hasOut = constraints.some(c => (c.source_activity || c.source) === activity);
+                          const noneAtAll = !hasIn && !hasOut;
+                          const noInput   = !hasIn && hasOut;
+                          return (
+                            <span key={idx}
+                              className={`activity-badge${noneAtAll ? ' activity-badge-no-constraint' : noInput ? ' activity-badge-no-input' : ''}`}
+                              title={noneAtAll ? 'No constraints at all' : noInput ? 'No input constraints' : ''}>
+                              {activity}{noneAtAll ? ' / no constraints' : ''}
+                            </span>
+                          );
+                        })}
                       </div>
                     )
                   }
@@ -1554,7 +1609,42 @@ function App() {
                     startActivities={discoveryResults.likely_start_activities || config.startActivities || []}
                     traceEndProb={discoveryResults.trace_end_prob || {}}
                     likelyEndActivities={discoveryResults.likely_end_activities || []}
+                    tracePosition={discoveryResults.trace_position || {}}
                   />
+                </Collapsible>
+              )}
+
+              {discoveryResults.object_type_stats && Object.keys(discoveryResults.object_type_stats).length > 0 && (
+                <Collapsible
+                  title="Discovered Objects"
+                  badge={`${Object.keys(discoveryResults.object_type_stats).length} types`}
+                  defaultOpen={false}
+                  className="discovery-transition-collapsible"
+                >
+                  <table className="object-type-stats-table">
+                    <thead>
+                      <tr>
+                        <th>Object Type</th>
+                        <th className="octs-num">Instances</th>
+                        <th>Attributes</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(discoveryResults.object_type_stats).map(([type, info]) => (
+                        <tr key={type}>
+                          <td className="octs-type">{type}</td>
+                          <td className="octs-num">{info.count.toLocaleString()}</td>
+                          <td className="octs-attrs">
+                            {info.attributes.length > 0
+                              ? info.attributes.map(a => (
+                                  <span key={a} className="octs-attr-badge">{a}</span>
+                                ))
+                              : <span className="octs-no-attrs">—</span>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </Collapsible>
               )}
             </div>
@@ -1571,25 +1661,6 @@ function App() {
             </div>
           )}
 
-          {/* Timing Discovery — lives here so it's available for both internal and external models */}
-          {(() => {
-            const timingActivities = discoveryResults?.activities?.length
-              ? discoveryResults.activities
-              : (!Array.isArray(activeModel) ? (activeModel?.activities || []).map(a => a.name) : []);
-            if (!discoveryConfig.eventLogFile || !timingActivities.length) return null;
-            return (
-              <TimingDiscoveryPanel
-                activities={timingActivities}
-                eventLogFile={discoveryConfig.eventLogFile}
-                isDiscovering={isDiscoveringTiming}
-                result={timingDiscoveryResult}
-                error={timingError}
-                onDiscover={runTimingDiscovery}
-                timingAnchors={timingAnchors}
-                setTimingAnchors={setTimingAnchors}
-              />
-            );
-          })()}
         </div>
 
         {/* OC-DECLARE MODEL DISCOVERY SECTION */}
@@ -1985,8 +2056,10 @@ function App() {
                 const actNames = (activeModel.activities || []).map(a => a.name);
                 const constraints = activeModel.constraints || [];
                 const hasIncoming = new Set(constraints.map(c => c.target_activity || c.target));
-                const unconstrained = actNames.filter(a => !hasIncoming.has(a));
-                if (!unconstrained.length) return null;
+                const hasOutgoing = new Set(constraints.map(c => c.source_activity || c.source));
+                const noIncoming   = actNames.filter(a => !hasIncoming.has(a));
+                const noConstraints = actNames.filter(a => !hasIncoming.has(a) && !hasOutgoing.has(a));
+                if (!noIncoming.length) return null;
                 return (
                   <div className="timing-warning-box">
                     <div className="timing-warning-title">⚠ No input constraints</div>
@@ -1994,7 +2067,11 @@ function App() {
                       These activities have no constraint where they are the target — nothing prevents them from firing repeatedly without limit.
                     </p>
                     <ul className="timing-warning-list">
-                      {unconstrained.map(a => <li key={a}>{a}</li>)}
+                      {noIncoming.map(a => (
+                        <li key={a} style={noConstraints.includes(a) ? { background: '#fee2e2', color: '#991b1b', fontWeight: 600 } : {}}>
+                          {a}{noConstraints.includes(a) ? ' / no constraints' : ''}
+                        </li>
+                      ))}
                     </ul>
                     <p className="timing-warning-hint">
                       Add a precedence or chain_response constraint in the Constraints tab to control when each can fire.
@@ -2050,6 +2127,26 @@ function App() {
             </div>
           </div>
         )}
+
+        {/* Timing Discovery — after Model Editor */}
+        {(() => {
+          const timingActivities = discoveryResults?.activities?.length
+            ? discoveryResults.activities
+            : (!Array.isArray(activeModel) ? (activeModel?.activities || []).map(a => a.name) : []);
+          if (!discoveryConfig.eventLogFile || !timingActivities.length) return null;
+          return (
+            <TimingDiscoveryPanel
+              activities={timingActivities}
+              eventLogFile={discoveryConfig.eventLogFile}
+              isDiscovering={isDiscoveringTiming}
+              result={timingDiscoveryResult}
+              error={timingError}
+              onDiscover={runTimingDiscovery}
+              timingAnchors={timingAnchors}
+              setTimingAnchors={setTimingAnchors}
+            />
+          );
+        })()}
 
         {/* STEP 3: Simulation Section */}
         <div className={`simulation-section ${!discoveryResults ? 'disabled' : ''}`}>
@@ -2420,14 +2517,49 @@ function App() {
                   title="Object Type Breakdown"
                   badge={Object.keys(results.object_types).length}
                 >
-                  <ul>
-                    {Object.entries(results.object_types).map(([type, count]) => (
-                      <li key={type}>
-                        <span className="type-name">{type}</span>
-                        <span className="type-count">{count}</span>
-                      </li>
-                    ))}
-                  </ul>
+                  {(() => {
+                    const logStats = discoveryResults?.object_type_stats || {};
+                    const hasLogData = Object.keys(logStats).length > 0;
+                    const allTypes = new Set([
+                      ...Object.keys(results.object_types),
+                      ...Object.keys(logStats),
+                    ]);
+                    return (
+                      <table className="object-type-stats-table">
+                        <thead>
+                          <tr>
+                            <th>Object Type</th>
+                            <th className="octs-num">Simulated</th>
+                            {hasLogData && <th className="octs-num">In Log</th>}
+                            {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...allTypes].sort().map(type => {
+                            const simCount = results.object_types[type] || 0;
+                            const logCount = logStats[type]?.count || 0;
+                            const ratio    = logCount > 0 ? simCount / logCount : null;
+                            const ratioClass = ratio === null ? '' :
+                              ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
+                            return (
+                              <tr key={type}>
+                                <td className="octs-type">{type}</td>
+                                <td className="octs-num">{simCount.toLocaleString()}</td>
+                                {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
+                                {hasLogData && (
+                                  <td className="octs-num">
+                                    {ratio !== null
+                                      ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
+                                      : '—'}
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    );
+                  })()}
                 </Collapsible>
               )}
 

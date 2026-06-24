@@ -194,12 +194,11 @@ def discover_transition_matrix_object_centric(ocel_log: dict) -> dict:
 
     # Count transitions and trace boundaries
     transitions: Dict[str, Counter] = defaultdict(Counter)
-    # total_fires: how many times each activity fired across all traces
     total_fires: Counter = Counter()
-    # end_counts: how many traces ended at each activity
     end_counts: Counter = Counter()
-    # start_counts: how many traces started with each activity
     start_counts: Counter = Counter()
+    # Sum of normalised trace position (0=first, 1=last) for each activity
+    pos_sums: Dict[str, float] = defaultdict(float)
 
     total_traces = 0
     for oid, evts in obj_events.items():
@@ -210,20 +209,16 @@ def discover_transition_matrix_object_centric(ocel_log: dict) -> dict:
         total_traces += 1
         start_counts[trace[0]] += 1
         end_counts[trace[-1]] += 1
-        for act in trace:
+        n = len(trace)
+        for i, act in enumerate(trace):
             total_fires[act] += 1
+            # Normalised position: 0 = first in trace, 1 = last
+            pos_sums[act] += i / (n - 1) if n > 1 else 0.0
         for a, b in zip(trace, trace[1:]):
             if a != b:
                 transitions[a][b] += 1
 
     # Build probability matrix with trace-ending in the denominator.
-    # For activity A:
-    #   denominator = total_fires[A]
-    #   P(A → B)    = transitions[A][B] / total_fires[A]
-    #   P(ends)     = end_counts[A]     / total_fires[A]
-    # The probabilities for all outgoing transitions + P(ends) sum to ≤ 1.0
-    # (≤ because the last occurrence in a multi-object trace contributes to
-    # end_counts but its predecessors still count transitions).
     prob_matrix: Dict[str, Dict[str, float]] = {}
     trace_end_prob: Dict[str, float] = {}
 
@@ -238,12 +233,19 @@ def discover_transition_matrix_object_centric(ocel_log: dict) -> dict:
         if ep > 0:
             trace_end_prob[act] = ep
 
+    # Mean normalised trace position per activity (0 = always first, 1 = always last)
+    trace_position: Dict[str, float] = {
+        act: round(pos_sums[act] / total_fires[act], 4)
+        for act in all_activities if total_fires[act]
+    }
+
     return {
         'prob_matrix':     prob_matrix,
         'trace_end_prob':  trace_end_prob,
         'start_counts':    dict(start_counts),
         'end_counts':      dict(end_counts),
         'total_traces':    total_traces,
+        'trace_position':  trace_position,
     }
 
 

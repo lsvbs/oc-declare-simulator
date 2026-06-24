@@ -10,6 +10,47 @@ from src.Simulation.Engine.o2o import neighbors_by_type
 from src.Simulation.Engine.semantics import check_all_constraints, check_o2o_rules
 
 
+def _apply_guard_filter(ids: list, guard: dict, state: SimulationState) -> list:
+    """Filter object ids by a binding attribute guard.
+
+    Objects that do not have the named attribute are excluded (fail-absent).
+    Both sides are cast to numeric types when possible for numeric comparisons.
+    """
+    attr_name = guard.get('attribute', '')
+    op        = guard.get('op', '==')
+    raw_val   = guard.get('value')
+
+    def _coerce(a, b):
+        try:
+            return float(a), float(b)
+        except (TypeError, ValueError):
+            return str(a), str(b)
+
+    result = []
+    for oid in ids:
+        obj = state.objects.get(oid)
+        if obj is None:
+            continue
+        attrs = obj.attributes or {}
+        if attr_name not in attrs:
+            continue  # fail-absent
+        obj_val = attrs[attr_name]
+        a, b = _coerce(obj_val, raw_val)
+        try:
+            if   op == '==': match = a == b
+            elif op == '!=': match = a != b
+            elif op == '>' : match = a >  b
+            elif op == '<' : match = a <  b
+            elif op == '>=': match = a >= b
+            elif op == '<=': match = a <= b
+            else:            match = False
+        except TypeError:
+            match = False
+        if match:
+            result.append(oid)
+    return result
+
+
 @dataclass
 class Candidate:
     activity_name: str
@@ -95,6 +136,11 @@ def build_candidate_for_activity(
         else:
             fetch_limit = 8
         existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
+
+        # Apply attribute guard: filter out objects that don't satisfy the guard.
+        guard = getattr(binding, 'guard', None)
+        if guard:
+            existing_ids = _apply_guard_filter(existing_ids, guard, state)
 
         # Basic validation: if max_count provided but less than min_count, impossible
         if binding.max_count is not None and binding.max_count < binding.min_count:

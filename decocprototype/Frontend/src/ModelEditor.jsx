@@ -216,7 +216,10 @@ export default function ModelEditor({
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
   const [expandedActs,   setExpandedActs]   = useState(new Set());
+  const [expandedGuards, setExpandedGuards] = useState(new Set()); // `${ai}-${bi}`
+  const [expandedEffects,setExpandedEffects]= useState(new Set()); // `${ai}-${bi}`
   const [selectedParamFile, setSelectedParamFile] = useState('');
+  const [lifecycleMsg,   setLifecycleMsg]   = useState(null); // null | {summary, error}
   const [expandedProbs,  setExpandedProbs]  = useState(new Set());
   const [conFilter,      setConFilter]      = useState('');
   const [newCon,         setNewCon]         = useState(EMPTY_CONSTRAINT);
@@ -528,8 +531,44 @@ export default function ModelEditor({
             >
               ⬇ Download JSON
             </button>
+            {sourceFile && !sourceFile.startsWith('discovered_') && (
+              <button
+                className="model-lifecycle-btn"
+                title="Infer creates/deactivates flags from the arc directions in this OC-Declare file. This is a heuristic — review the results in the Activities tab."
+                onClick={async () => {
+                  setLifecycleMsg(null);
+                  try {
+                    const res = await import('axios').then(m => m.default.post('/api/derive-lifecycle', { ocdeclareFile: sourceFile }));
+                    if (res.data.success) {
+                      onModelChange({ ...model, activities: res.data.model.activities });
+                      setLifecycleMsg({ summary: res.data.summary });
+                    } else {
+                      setLifecycleMsg({ error: res.data.error });
+                    }
+                  } catch (e) {
+                    setLifecycleMsg({ error: e.response?.data?.error || e.message });
+                  }
+                }}
+              >
+                ↻ Derive lifecycle
+              </button>
+            )}
           </div>
         </div>
+        {lifecycleMsg && (
+          <div className={`lifecycle-msg ${lifecycleMsg.error ? 'lifecycle-msg-error' : 'lifecycle-msg-ok'}`}>
+            {lifecycleMsg.error
+              ? `Error: ${lifecycleMsg.error}`
+              : (<>
+                  <strong>Lifecycle applied:</strong>
+                  <ul className="lifecycle-summary">
+                    {lifecycleMsg.summary.map((s, i) => <li key={i}>{s}</li>)}
+                  </ul>
+                </>)
+            }
+            <button className="lifecycle-msg-close" onClick={() => setLifecycleMsg(null)}>✕</button>
+          </div>
+        )}
         {!collapsed && (
           <div className="editor-tabs">
             {TABS.map(t => (
@@ -604,6 +643,8 @@ export default function ModelEditor({
                       <span>Max <HelpTip text="Maximum objects that can participate. Leave blank for no upper limit." /></span>
                       <span>Creates <HelpTip text="Activity instantiates new objects of this type rather than reusing existing ones." /></span>
                       <span>Deactivates <HelpTip text="Participating objects are deactivated (removed from simulation) after firing." /></span>
+                      <span title="Attribute guard">[guard]</span>
+                      <span title="Attribute effects">[effects]</span>
                       <span></span>
                     </div>
                     {(act.bindings || []).length === 0 && (
@@ -612,39 +653,143 @@ export default function ModelEditor({
                     {(act.bindings || []).map((b, bi) => {
                       const isResource = resourceTypes.includes(b.object_type);
                       return (
-                      <div key={bi} className="binding-row">
-                        <span className="binding-type-label">
-                          {b.object_type}
-                          {isResource && <span className="binding-resource-badge" title="Resource type — pool size is set in the Resources tab">R</span>}
-                        </span>
-                        <input
-                          className="binding-num"
-                          type="number" min={0}
-                          value={b.min_count}
-                          onChange={e => updateBinding(ai, bi, 'min_count', parseInt(e.target.value) || 0)}
-                        />
-                        <input
-                          className="binding-num"
-                          type="number" min={0}
-                          value={b.max_count === null ? '' : b.max_count}
-                          placeholder="∞"
-                          onChange={e => updateBinding(ai, bi, 'max_count',
-                            e.target.value === '' ? null : parseInt(e.target.value) || 0)}
-                        />
-                        <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
-                          title={isResource ? 'Resources come from the pre-populated pool — they cannot be created by activities.' : ''}>
-                          <input type="checkbox" checked={isResource ? false : !!b.creates}
-                            disabled={isResource}
-                            onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
-                          creates
-                        </label>
-                        <label className="binding-toggle">
-                          <input type="checkbox" checked={!!(b.deactivates ?? b.consumes)}
-                            onChange={e => updateBinding(ai, bi, 'deactivates', e.target.checked)} />
-                          deactivates
-                        </label>
-                        <button className="row-delete-btn binding-delete-btn"
-                          onClick={() => deleteBinding(ai, bi)} title="Remove binding">✕</button>
+                      <div key={bi} className="binding-block">
+                        <div className="binding-row">
+                          <span className="binding-type-label">
+                            {b.object_type}
+                            {isResource && <span className="binding-resource-badge" title="Resource type — pool size is set in the Resources tab">R</span>}
+                          </span>
+                          <input
+                            className="binding-num"
+                            type="number" min={0}
+                            value={b.min_count}
+                            onChange={e => updateBinding(ai, bi, 'min_count', parseInt(e.target.value) || 0)}
+                          />
+                          <input
+                            className="binding-num"
+                            type="number" min={0}
+                            value={b.max_count === null ? '' : b.max_count}
+                            placeholder="∞"
+                            onChange={e => updateBinding(ai, bi, 'max_count',
+                              e.target.value === '' ? null : parseInt(e.target.value) || 0)}
+                          />
+                          <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
+                            title={isResource ? 'Resources come from the pre-populated pool — they cannot be created by activities.' : ''}>
+                            <input type="checkbox" checked={isResource ? false : !!b.creates}
+                              disabled={isResource}
+                              onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
+                            creates
+                          </label>
+                          <label className="binding-toggle">
+                            <input type="checkbox" checked={!!(b.deactivates ?? b.consumes)}
+                              onChange={e => updateBinding(ai, bi, 'deactivates', e.target.checked)} />
+                            deactivates
+                          </label>
+                          <button
+                            className={`binding-guard-btn${b.guard ? ' active' : ''}`}
+                            title="Attribute guard: only pick objects satisfying this condition"
+                            onClick={() => setExpandedGuards(prev => {
+                              const n = new Set(prev); const k = `${ai}-${bi}`;
+                              n.has(k) ? n.delete(k) : n.add(k); return n;
+                            })}>
+                            {b.guard ? '[guard ✓]' : '[guard]'}
+                          </button>
+                          <button
+                            className={`binding-guard-btn${(b.attribute_updates?.length) ? ' active' : ''}`}
+                            title="Effects: attribute updates applied when this activity fires"
+                            onClick={() => setExpandedEffects(prev => {
+                              const n = new Set(prev); const k = `${ai}-${bi}`;
+                              n.has(k) ? n.delete(k) : n.add(k); return n;
+                            })}>
+                            {(b.attribute_updates?.length) ? '[effects ✓]' : '[effects]'}
+                          </button>
+                          <button className="row-delete-btn binding-delete-btn"
+                            onClick={() => deleteBinding(ai, bi)} title="Remove binding">✕</button>
+                        </div>
+
+                        {/* ── Guard sub-row ── */}
+                        {expandedGuards.has(`${ai}-${bi}`) && (
+                          <div className="binding-guard-row">
+                            <span className="binding-guard-label">Guard: if</span>
+                            <input
+                              className="guard-attr-input"
+                              placeholder="attribute"
+                              value={b.guard?.attribute || ''}
+                              onChange={e => updateBinding(ai, bi, 'guard', { ...(b.guard || {attribute:'',op:'==',value:''}), attribute: e.target.value })}
+                            />
+                            <select
+                              className="guard-op-select"
+                              value={b.guard?.op || '=='}
+                              onChange={e => updateBinding(ai, bi, 'guard', { ...(b.guard || {attribute:'',op:'==',value:''}), op: e.target.value })}>
+                              {['==','!=','>','<','>=','<='].map(op => <option key={op} value={op}>{op}</option>)}
+                            </select>
+                            <input
+                              className="guard-value-input"
+                              placeholder="value"
+                              value={b.guard?.value ?? ''}
+                              onChange={e => {
+                                const raw = e.target.value;
+                                const val = raw === '' ? '' : (!isNaN(Number(raw)) ? Number(raw) : raw);
+                                updateBinding(ai, bi, 'guard', { ...(b.guard || {attribute:'',op:'==',value:''}), value: val });
+                              }}
+                            />
+                            <button className="row-delete-btn" title="Remove guard"
+                              onClick={() => updateBinding(ai, bi, 'guard', null)}>✕</button>
+                          </div>
+                        )}
+
+                        {/* ── Effects sub-rows ── */}
+                        {expandedEffects.has(`${ai}-${bi}`) && (
+                          <div className="binding-effects-section">
+                            <span className="binding-guard-label">On fire:</span>
+                            {(b.attribute_updates || []).map((upd, ui) => (
+                              <div key={ui} className="binding-effects-row">
+                                <input
+                                  className="guard-attr-input"
+                                  placeholder="attribute"
+                                  value={upd.attribute || ''}
+                                  onChange={e => {
+                                    const updated = (b.attribute_updates || []).map((u, i) => i === ui ? { ...u, attribute: e.target.value } : u);
+                                    updateBinding(ai, bi, 'attribute_updates', updated);
+                                  }}
+                                />
+                                <select
+                                  className="guard-op-select"
+                                  value={upd.op || 'set'}
+                                  onChange={e => {
+                                    const updated = (b.attribute_updates || []).map((u, i) => i === ui ? { ...u, op: e.target.value } : u);
+                                    updateBinding(ai, bi, 'attribute_updates', updated);
+                                  }}>
+                                  <option value="set">set</option>
+                                  <option value="increment">increment</option>
+                                  <option value="decrement">decrement</option>
+                                </select>
+                                <input
+                                  className="guard-value-input"
+                                  placeholder={upd.op === 'set' ? 'value' : 'by'}
+                                  value={upd.op === 'set' ? (upd.value ?? '') : (upd.by ?? '')}
+                                  onChange={e => {
+                                    const raw = e.target.value;
+                                    const num = raw === '' ? '' : (!isNaN(Number(raw)) ? Number(raw) : raw);
+                                    const key = upd.op === 'set' ? 'value' : 'by';
+                                    const updated = (b.attribute_updates || []).map((u, i) => i === ui ? { ...u, [key]: num } : u);
+                                    updateBinding(ai, bi, 'attribute_updates', updated);
+                                  }}
+                                />
+                                <button className="row-delete-btn" title="Remove effect"
+                                  onClick={() => {
+                                    const updated = (b.attribute_updates || []).filter((_, i) => i !== ui);
+                                    updateBinding(ai, bi, 'attribute_updates', updated);
+                                  }}>✕</button>
+                              </div>
+                            ))}
+                            <button className="add-binding-btn" style={{ marginTop: '0.25rem' }}
+                              onClick={() => {
+                                const updated = [...(b.attribute_updates || []), { attribute: '', op: 'set', value: '' }];
+                                updateBinding(ai, bi, 'attribute_updates', updated);
+                              }}>+ Add effect</button>
+                          </div>
+                        )}
                       </div>
                       );
                     })}

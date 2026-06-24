@@ -27,6 +27,19 @@ class ObjectBinding:
     creates: bool = False
     deactivates: bool = False
 
+    # Attribute guard: object must have this attribute and satisfy the condition.
+    # e.g. {"attribute": "status", "op": "==", "value": "ready"}
+    # If the object does not have the named attribute, it is excluded (fail-absent).
+    # Supported ops: ==, !=, >, <, >=, <=
+    guard: dict | None = None
+
+    # Attribute updates applied to participating objects of this type when the
+    # activity fires (non-DES: immediately; DES: on completion).
+    # Stored as a tuple of dicts to keep the frozen dataclass hashable.
+    # e.g. ({"attribute": "quantity", "op": "decrement", "by": 1},)
+    # Supported ops: set, increment, decrement
+    attribute_updates: tuple = ()
+
 
 @dataclass(frozen=True)
 class Activity:

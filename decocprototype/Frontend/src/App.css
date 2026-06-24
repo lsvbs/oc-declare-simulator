@@ -993,6 +993,83 @@
   font-weight: 500;
 }
 
+.activity-badge-no-constraint {
+  border-color: #dc2626;
+  color: #dc2626;
+  background: #fff1f1;
+}
+
+.activity-badge-no-input {
+  border-color: #f59e0b;
+  color: #b45309;
+  background: #fffbeb;
+}
+
+.activity-row-no-constraint td { background: #fff1f1; }
+.activity-row-no-constraint td:first-child { color: #dc2626; font-weight: 600; }
+.activity-row-no-input td { background: #fffbeb; }
+
+.act-no-constraint-label {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #dc2626;
+  margin-left: 0.25rem;
+  opacity: 0.85;
+}
+
+.object-type-stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  margin-top: 0.5rem;
+}
+
+.object-type-stats-table th {
+  text-align: left;
+  font-weight: 600;
+  color: #64748b;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.3rem 0.5rem 0.4rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.object-type-stats-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: middle;
+}
+
+.object-type-stats-table tr:last-child td { border-bottom: none; }
+.object-type-stats-table tr:hover td { background: #fafbff; }
+
+.octs-type { font-weight: 600; color: #1e293b; }
+.octs-num  { text-align: right; font-variant-numeric: tabular-nums; color: #475569; width: 80px; }
+
+.octs-attrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.octs-attr-badge {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+
+.octs-no-attrs { color: #94a3b8; font-size: 0.78rem; }
+
+.obj-ratio { font-weight: 600; font-size: 0.78rem; padding: 0.1rem 0.3rem; border-radius: 3px; }
+.obj-ratio.ratio-ok   { color: #166534; background: #dcfce7; }
+.obj-ratio.ratio-high { color: #92400e; background: #fef3c7; }
+.obj-ratio.ratio-low  { color: #1e40af; background: #dbeafe; }
+
 .activity-count-table {
   width: 100%;
   border-collapse: collapse;

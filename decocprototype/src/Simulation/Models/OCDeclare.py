@@ -162,6 +162,8 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                     # Prefer the canonical "deactivates" key. Fall back to the
                     # legacy "consumes" key so older model files still load.
                     deactivates=bool(b.get("deactivates", b.get("consumes", False))),
+                    guard=b.get("guard") or None,
+                    attribute_updates=tuple(b.get("attribute_updates") or ()),
                 )
             )
         activities.append(Activity(name=name, bindings=bindings))

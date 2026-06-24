@@ -15,7 +15,21 @@ from src.Simulation.Engine.candidategeneration import (
     build_candidate_for_object_and_activity,
     is_candidate_semantically_allowed,
 )
- 
+
+
+def _apply_attribute_update(obj, upd: dict) -> None:
+    """Apply a single attribute update dict to a RuntimeObject in-place."""
+    attr = upd.get('attribute', '')
+    op   = upd.get('op', 'set')
+    if not attr:
+        return
+    if op == 'set':
+        obj.attributes[attr] = upd.get('value')
+    elif op == 'increment':
+        obj.attributes[attr] = obj.attributes.get(attr, 0) + upd.get('by', 1)
+    elif op == 'decrement':
+        obj.attributes[attr] = obj.attributes.get(attr, 0) - upd.get('by', 1)
+
 
 def apply_conservative_link_policy(static_model, participating_ids, created_object_ids, state):
     """Create O2O links after an activity fires.
@@ -652,6 +666,17 @@ class Simulator:
             if runtime_object.object_type in deactivated_types:
                 state.deactivate_object(object_id)
 
+        # Apply attribute updates from binding specs
+        for binding in activity.bindings:
+            updates = getattr(binding, 'attribute_updates', ()) or ()
+            if not updates:
+                continue
+            for object_id in participating_ids:
+                obj = state.objects.get(object_id)
+                if obj and obj.object_type == binding.object_type:
+                    for upd in updates:
+                        _apply_attribute_update(obj, upd)
+
         if executed_event is None and state.executed_events:
             executed_event = state.executed_events[-1]
 
@@ -849,6 +874,17 @@ class Simulator:
                 obj = state.objects.get(oid)
                 if obj and obj.object_type in deactivated_types:
                     state.deactivate_object(oid)
+
+            # Apply attribute updates (DES: fires on completion, not on start)
+            for binding in activity.bindings:
+                updates = getattr(binding, 'attribute_updates', ()) or ()
+                if not updates:
+                    continue
+                for oid in in_prog.participating_object_ids:
+                    obj = state.objects.get(oid)
+                    if obj and obj.object_type == binding.object_type:
+                        for upd in updates:
+                            _apply_attribute_update(obj, upd)
 
         executed_event = state.record_event(
             activity_name=in_prog.candidate_activity_name,
