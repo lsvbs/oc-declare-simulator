@@ -211,7 +211,7 @@ const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_l
 export default function ModelEditor({
   model, probMatrix, onModelChange, onProbMatrixChange,
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
-  nmaxSuggestions = {},
+  nmaxSuggestions = {}, eventLogFile = '',
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
@@ -219,7 +219,6 @@ export default function ModelEditor({
   const [expandedGuards, setExpandedGuards] = useState(new Set()); // `${ai}-${bi}`
   const [expandedEffects,setExpandedEffects]= useState(new Set()); // `${ai}-${bi}`
   const [selectedParamFile, setSelectedParamFile] = useState('');
-  const [lifecycleMsg,   setLifecycleMsg]   = useState(null); // null | {summary, error}
   const [expandedProbs,  setExpandedProbs]  = useState(new Set());
   const [conFilter,      setConFilter]      = useState('');
   const [newCon,         setNewCon]         = useState(EMPTY_CONSTRAINT);
@@ -531,44 +530,8 @@ export default function ModelEditor({
             >
               ⬇ Download JSON
             </button>
-            {sourceFile && !sourceFile.startsWith('discovered_') && (
-              <button
-                className="model-lifecycle-btn"
-                title="Infer creates/deactivates flags from the arc directions in this OC-Declare file. This is a heuristic — review the results in the Activities tab."
-                onClick={async () => {
-                  setLifecycleMsg(null);
-                  try {
-                    const res = await import('axios').then(m => m.default.post('/api/derive-lifecycle', { ocdeclareFile: sourceFile }));
-                    if (res.data.success) {
-                      onModelChange({ ...model, activities: res.data.model.activities });
-                      setLifecycleMsg({ summary: res.data.summary });
-                    } else {
-                      setLifecycleMsg({ error: res.data.error });
-                    }
-                  } catch (e) {
-                    setLifecycleMsg({ error: e.response?.data?.error || e.message });
-                  }
-                }}
-              >
-                ↻ Derive lifecycle
-              </button>
-            )}
           </div>
         </div>
-        {lifecycleMsg && (
-          <div className={`lifecycle-msg ${lifecycleMsg.error ? 'lifecycle-msg-error' : 'lifecycle-msg-ok'}`}>
-            {lifecycleMsg.error
-              ? `Error: ${lifecycleMsg.error}`
-              : (<>
-                  <strong>Lifecycle applied:</strong>
-                  <ul className="lifecycle-summary">
-                    {lifecycleMsg.summary.map((s, i) => <li key={i}>{s}</li>)}
-                  </ul>
-                </>)
-            }
-            <button className="lifecycle-msg-close" onClick={() => setLifecycleMsg(null)}>✕</button>
-          </div>
-        )}
         {!collapsed && (
           <div className="editor-tabs">
             {TABS.map(t => (

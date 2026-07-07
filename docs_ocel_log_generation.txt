@@ -1,0 +1,332 @@
+================================================================================
+OCEL 2.0 EVENT LOG GENERATION — HOW IT WORKS IN DECOCPROTOTYPE
+================================================================================
+
+This document explains:
+  1. What an OCEL 2.0 log is and its structure
+  2. How the simulator generates one from a completed simulation run
+  3. How the outputs (log + metrics) are structured and where they are saved
+  4. How external OCEL logs are loaded for discovery
+  5. Which parts of the log are used by which discovery algorithms
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 1 — WHAT IS AN OCEL 2.0 LOG?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OCEL stands for Object-Centric Event Log. Version 2.0 is a standard format for
+process mining that extends classical XES logs by allowing each event to involve
+multiple objects of multiple types simultaneously — matching the reality of
+business processes where one activity (e.g. "Load Truck") involves a Container,
+a Truck, and a Handling Unit at the same time.
+
+A classical (case-centric) log forces every event into exactly one "case", which
+loses information about concurrent objects. OCEL 2.0 eliminates this constraint.
+
+JSON structure of an OCEL 2.0 file:
+
+  {
+    "version": "2.0",
+    "ordering": "timestamp",
+    "objectTypes": [
+      { "name": "Container", "attributes": [{"name": "Status", "type": "string"}] },
+      { "name": "Truck",     "attributes": [] }
+    ],
+    "eventTypes": [
+      { "name": "Load Truck", "attributes": [] }
+    ],
+    "objects": [
+      {
+        "id": "Container_1",
+        "type": "Container",
+        "attributes": [{"name": "Status", "value": "pending", "time": "2024-01-01T08:00:00"}]
+      }
+    ],
+    "events": [
+      {
+        "id": "e1",
+        "type": "Load Truck",
+        "time": "2024-01-01T09:30:00",
+        "relationships": [
+          {"objectId": "Container_1", "qualifier": ""},
+          {"objectId": "Truck_1",     "qualifier": ""}
+        ],
+        "attributes": []
+      }
+    ],
+    "objectRelations": [
+      {"sourceObjectId": "Container_1", "targetObjectId": "Truck_1", "type": "related"}
+    ]
+  }
+
+Key concepts:
+  - objectTypes: schema definition — what types exist and what attributes they have
+  - eventTypes: schema definition — what activities exist
+  - objects: all object instances with their attribute history
+  - events: all fired activities with timestamps and participating object links
+  - objectRelations: direct object-to-object links (from O2O rules)
+  - relationships / qualifier: each event links to participating objects; the
+    qualifier field is currently always empty ("") in generated logs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 2 — HOW THE SIMULATOR GENERATES AN OCEL 2.0 LOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After a simulation run completes, the final SimulationState is passed to the
+OCEL exporter (src/Simulation/IO/output/OCEL2.py → write_ocel2_json).
+
+The SimulationState contains:
+  - objects: dict of RuntimeObject (object_id → type, active, attributes)
+  - executed_events: ordered list of ExecutedEvent (event_id, activity_name,
+                     timestamp, list of participating object_ids)
+  - links: list of ObjectLink (source_object_id → target_object_id)
+
+Exporter pipeline (build_ocel2_dict):
+
+  Step 1 — objectTypes
+    Collect all distinct object types from state.objects.
+    For each type, emit attribute definitions from static_model.object_types
+    (the schema defined in the Attributes tab). If no schema exists, default
+    to [{name: "status", type: "string"}, {name: "active", type: "boolean"}].
+
+  Step 2 — eventTypes
+    Collect all distinct activity names from state.executed_events.
+    Emit one eventType entry per name (with empty attributes list).
+
+  Step 3 — objects (_build_objects)
+    For each object in state.objects (sorted by ID for determinism):
+      - Emit its id, type
+      - Emit its attribute values as a list of {name, value, time} records.
+        The time is set to the earliest event timestamp in the log (attributes
+        are static — set once at creation, not modified in the log export).
+        Note: if attribute_updates fired during simulation, the final attribute
+        value is what gets exported, not the history of changes.
+
+  Step 4 — events (_build_events)
+    For each ExecutedEvent (sorted by timestamp, then by event_id for ties):
+      - Emit id, type (= activity_name), time (ISO format)
+      - Emit relationships: one entry per participating object_id with empty
+        qualifier
+      - Require every event to have a timestamp (raises ValueError otherwise).
+        Non-DES runs with no time policy produce no timestamps → export fails.
+        DES runs always have timestamps from DistributionTimePolicy.
+
+  Step 5 — objectRelations (_build_object_relations)
+    For each ObjectLink in state.links (sorted for determinism):
+      - Emit {sourceObjectId, targetObjectId, type: "related"}
+    These come from apply_conservative_link_policy, which writes O2O links
+    after each activity fires.
+
+Output: JSON written to
+  src/Simulation/IO/output/eventlogs/log_YYYYMMDD_HHMMSS.json
+
+Naming: the filename uses the timestamp at the moment write_ocel2_json is called,
+not the simulation clock. Multiple runs produce separate files with different
+timestamps.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 3 — THE METRICS FILE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Alongside the OCEL log, a metrics JSON is written to
+  metrics/metrics_YYYYMMDD_HHMMSS.json
+
+This is NOT an OCEL file — it is a separate analysis file derived from the
+SimulationState. It contains two sections:
+
+activity_metrics (per activity name):
+  execution_count     — how many times the activity fired
+  timestamps          — ISO timestamp of each firing
+  service_s           — list: duration sampled by DistributionTimePolicy per firing
+                        (the actual time the activity "took" in the simulation clock)
+  mean/min/max_service_s — statistics on service_s
+  wait_in_pool_s      — list: how long (in simulation clock seconds) the activity
+                        was eligible (in the candidate pool) before being chosen.
+                        Computed from state._candidate_first_seen.
+  mean/max_wait_in_pool_s — statistics on wait_in_pool_s
+  sojourn_s           — paired service + wait per firing (when both are available)
+  mean/max_sojourn_s
+  resource_wait_s     — DES only: time spent in the waiting queue because a
+                        resource was occupied. Records the gap between when the
+                        candidate first tried to start and when it actually could.
+  mean/max_resource_wait_s
+
+object_metrics (per object id):
+  object_type
+  first_event_time    — ISO timestamp of first event this object appeared in
+  last_event_time     — ISO timestamp of last event
+  lifetime_s          — last_event_time − first_event_time in seconds
+  activities          — ordered list of activity names this object participated in
+                        (= the object's trace, directly usable for process mining)
+  event_count         — number of events involving this object
+  attributes          — final attribute values at end of simulation
+
+The metrics file is what feeds the "Timing Metrics" table in the results panel
+and the activity distribution chart.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 4 — HOW EXTERNAL OCEL LOGS ARE LOADED FOR DISCOVERY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Two loaders exist, both in src/ParameterDiscovery/OCDeclarediscovery.py:
+
+load_ocel2(filename) — primary loader for discovery
+  Handles both JSON and XML (delegates XML to load_ocel2_xml).
+  Normalises the format on load:
+    - objects: if the file uses a list of {id, type, attributes} instead of
+      a dict keyed by id, converts to dict keyed by id.
+    - events: if the file uses a list of {id, type/activity, time/timestamp,
+      relationships/omap} instead of a dict keyed by id, converts similarly.
+    - relationships: if relationships is a list of dicts {objectId, qualifier},
+      extracts just the objectId into omap. If already a flat list of IDs, kept
+      as-is.
+  Returns: {events: {id → {activity, timestamp, omap: [id,...]}},
+             objects: {id → {type, attributes}}}
+
+load_ocel2_xml(filename) — XML variant
+  Uses the pm4py library's XML parser to read OCEL 2.0 XML format, then
+  normalises to the same internal dict structure as the JSON loader.
+
+load_event_log(filename, mode="global") — used for probability discovery
+  A separate loader that returns a list of traces (list of activity name lists).
+  Modes:
+    "global" (default): all events sorted by timestamp → one flat list of
+      activity names. Used for discover_transition_matrix (the old global
+      approach). Now superseded by discover_transition_matrix_object_centric
+      which uses load_ocel2 directly.
+    "case": per-case_object_type traces. Used when you want one trace per
+      Customer Order (or whatever the primary case object is).
+
+Supported formats:
+  - OCEL 2.0 JSON (most common, produced by this tool and by pm4py/OCPA)
+  - OCEL 2.0 XML (pm4py export format)
+  - Simple trace list JSON: [[act1, act2, ...], [...], ...] (flat, no objects)
+
+File location for discovery:
+  src/Simulation/IO/input/eventlog/
+  Drop any OCEL 2.0 JSON or XML file here and it will appear in the Step 1
+  event log dropdown after refreshing the page.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 5 — WHICH PARTS OF THE LOG ARE USED BY EACH ALGORITHM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Probability discovery (discover_transition_matrix_object_centric):
+  Uses: events (activity + timestamp + omap), objects (id + type)
+  Builds: per-object traces (sort events by timestamp for each object)
+  Reads: omap to know which objects participated in each event
+  Does NOT use: object attributes, objectRelations
+
+OC-Declare discovery (discover_ocdeclare_model):
+  Uses: events (activity + timestamp + omap), objects (id + type + attributes)
+  Builds: per-object traces, per-type object counts, co-occurrence patterns
+  Reads: omap for object participation, object type for scoping constraints
+  Also uses: object attributes for the attribute_schema extraction
+
+Timing discovery (compute_ocpa_metrics):
+  Uses: events (activity + timestamp + omap), objects (id)
+  Builds: per-object timelines sorted by timestamp
+  Reads: timestamps of consecutive events on the same object to measure gaps
+  Requires: every event must have a timestamp. Events without timestamps are
+  skipped (no preceding event → sojourn = 0 for that event).
+  Does NOT use: object attributes, objectRelations, event attributes
+
+Constraint health check (constraint_health_report.py):
+  Uses: the model (static constraints + activities) for static checks
+  For weak-precedence check: uses the event log (same as probability discovery)
+  Does NOT directly use: objectRelations, event attributes
+
+Simulation (input):
+  Does NOT read an OCEL log during simulation — only the model and parameters.
+  The OCEL log is an INPUT to discovery, not to the simulator itself.
+
+Simulation (output):
+  Produces an OCEL 2.0 JSON log that can then be fed back into any of the
+  discovery algorithms above, enabling iterative model refinement:
+    Simulate → Generate log → Re-discover → Adjust model → Simulate again
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 6 — TIMESTAMP HANDLING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The simulation clock and timestamp handling depend on the configured time policy:
+
+DefaultTimePolicy (no durations configured):
+  Advances by a fixed delta (default 1 hour) per step from a start timestamp.
+  Produces monotonically increasing timestamps with equal spacing.
+  Not suitable for generating realistic OCEL logs for timing discovery.
+
+DistributionTimePolicy (Timing tab filled + DES mode or non-DES with durations):
+  Samples a duration from the per-activity distribution (lognormal by default).
+  Advances the clock by that amount. Concurrent activities (concurrency_probs)
+  may share the same timestamp.
+  Produces realistic timestamps suitable for timing discovery on the output log.
+
+Timestamp format in the log:
+  ISO 8601 with UTC timezone: "2024-01-01T09:30:00+00:00"
+  Parsed back by: datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+Overflow protection:
+  If the sampled duration would cause the datetime to exceed Python's datetime
+  range, the timestamp stays at the current clock value (no advance).
+  This can happen in very long simulations with large mean durations.
+  Symptoms: many events share the same timestamp near the end of a long run.
+
+Start timestamp:
+  Set in SimulationConfig (default: 2024-01-01 00:00:00 UTC).
+  All simulation timestamps are relative to this origin.
+  Change it in the config if you need the output log to align with a specific
+  real-world time period for comparison with a real OCEL log.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PART 7 — ITERATIVE MODEL REFINEMENT WORKFLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The generated OCEL log can be used as input to the same discovery pipeline,
+enabling an iterative refinement loop:
+
+  Real OCEL log
+       │
+       ▼
+  [Step 1 Discovery] → probability matrix, activity stats, object types
+       │
+       ▼
+  [OC-Declare Discovery] → constraints, lifecycle, O2O rules
+       │
+       ▼
+  [Model Editor] → review + adjust constraints, timing, resources
+       │
+       ▼
+  [Timing Discovery] → service times derived from real log
+       │
+       ▼
+  [Simulate] → generates synthetic OCEL log
+       │
+       ├── Compare object type breakdown (Simulated vs In Log ratio)
+       │   → adjust max_links, deactivates, resource pool sizes
+       │
+       ├── Compare activity distribution
+       │   → adjust constraints, transition probabilities, max_consecutive
+       │
+       └── Feed synthetic log back to Step 1 Discovery
+           → compare discovered probabilities and constraints with real log
+           → tighten or loosen constraints accordingly
+
+The "Object Type Breakdown" comparison in the results panel (Simulated / In Log
+ratio) is the primary diagnostic for this loop:
+  Ratio ≈ 1.0 for all types → simulation scale matches the real process
+  Ratio >> 1.0 for a type  → that type accumulates too fast (missing deactivates
+                              or no max_links cap preventing over-linking)
+  Ratio << 1.0 for a type  → that type is under-created (constraint blocking
+                              the creating activity, or missing creates=True)
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

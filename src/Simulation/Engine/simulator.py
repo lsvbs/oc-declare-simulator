@@ -117,6 +117,7 @@ class Simulator:
         *,
         trace_func: callable | None = None,
         select_func: callable | None = None,
+        stop_event=None,  # threading.Event — set to request early termination
     ):
         """Create a Simulator.
 
@@ -154,6 +155,9 @@ class Simulator:
         # Optional tracing hook (kept generic to avoid coupling the engine to stdout/logging).
         # Signature: trace_func(event: str, payload: dict)
         self.trace_func = trace_func
+
+        # Optional stop signal: caller sets this threading.Event to request early stop.
+        self.stop_event = stop_event
 
     def _trace(self, event: str, payload: dict) -> None:
         if self.trace_func is None:
@@ -955,6 +959,11 @@ class Simulator:
         start_activity_names = set(self.config.start_policy.start_activity_names)
 
         while state.step_count < self.config.max_steps:
+            # Early stop requested by the frontend (Stop button)
+            if self.stop_event is not None and self.stop_event.is_set():
+                self._trace("stop", {"reason": "user_stopped", "step_count": state.step_count})
+                break
+
             # ── Complete all activities due at or before current_time ──────────
             while state.in_progress and state.in_progress[0].complete_at <= state.current_time:
                 finishing = heapq.heappop(state.in_progress)

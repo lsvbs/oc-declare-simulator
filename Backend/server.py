@@ -50,6 +50,10 @@ METRICS_DIR.mkdir(parents=True, exist_ok=True)
 # Store discovery results in memory (keyed by event_log_file)
 discovery_cache = {}
 
+# Active simulation runs: run_id -> {state, stop_event, thread, done}
+import threading
+_active_runs: dict = {}
+
 
 def _load_history() -> list:
     """Load run history from disk, or return empty list."""
@@ -320,7 +324,8 @@ def run_discovery():
             'activity_repeat_stats': activity_repeat_stats,
             'activity_consec_stats': activity_consec_stats,
             'activity_nmax_suggestions': activity_nmax_suggestions,
-            'event_log': event_log
+            'event_log': event_log,
+            'event_log_ocel': event_log_ocel,  # OCEL dict for lifecycle derivation
         }
 
         return jsonify({
@@ -550,15 +555,39 @@ def save_parameter_file():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/simulate/status/<run_id>', methods=['GET'])
+def simulation_status(run_id):
+    run = _active_runs.get(run_id)
+    if not run:
+        return jsonify({'error': 'unknown run_id'}), 404
+    state = run['state']
+    return jsonify({
+        'step_count': state.step_count if state else 0,
+        'events_count': len(state.executed_events) if state else 0,
+        'objects_count': len(state.objects) if state else 0,
+        'done': run['done'],
+    })
+
+
+@app.route('/api/simulate/stop/<run_id>', methods=['POST'])
+def simulation_stop(run_id):
+    run = _active_runs.get(run_id)
+    if not run:
+        return jsonify({'error': 'unknown run_id'}), 404
+    run['stop_event'].set()
+    return jsonify({'ok': True})
+
+
 @app.route('/api/simulate', methods=['POST'])
 def run_simulation():
     """Run simulation with provided configuration using cached discovery results."""
     try:
         data = request.json
-        
+
         # Extract configuration
         ocdeclare_file = data.get('ocdeclareFile')
         event_log_file = data.get('eventLogFile')
+        run_id         = data.get('runId')          # optional: enables live status/stop
         max_steps = int(data.get('maxSteps', 50))
         seed = int(data.get('seed', 42))
         # Accept either startActivities (list, new) or startActivity (string, legacy)
@@ -749,25 +778,52 @@ def run_simulation():
                     "reason": payload.get("reason", "unknown"),
                 })
 
+        stop_event = threading.Event()
         simulator = Simulator(
-            static_model, 
-            config, 
-            rng=None, 
+            static_model,
+            config,
+            rng=None,
             select_func=select_with_matrix,
             trace_func=trace_func,
+            stop_event=stop_event,
         )
-        
-        final_state = simulator.run(state=initial_state)
-        
+
+        # Register run for live status/stop polling
+        if run_id:
+            _active_runs[run_id] = {
+                'state': initial_state,
+                'stop_event': stop_event,
+                'done': False,
+            }
+
+        result_holder = [None]
+        def _run():
+            result_holder[0] = simulator.run_des(state=initial_state)
+            if run_id and run_id in _active_runs:
+                _active_runs[run_id]['done'] = True
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join()  # Flask request stays open until done; frontend polls status in parallel
+        final_state = result_holder[0]
+
+        # Clean up run registry
+        if run_id:
+            _active_runs.pop(run_id, None)
+
         # Generate results
         obj_types = Counter(obj.object_type for obj in final_state.objects.values())
         activity_sequence = [e.activity_name for e in final_state.executed_events]
 
-        # Per-object traces: object_id → ordered list of activity names
+        # Per-object traces — cap at 200 objects to keep the response small.
+        # The full data is in the saved OCEL file; this subset is only used
+        # for the DFG layout and object-tracer visualisation.
+        _TRACE_CAP = 200
         object_traces: dict[str, list[str]] = {}
         for event in final_state.executed_events:
             for oid in event.object_ids:
-                object_traces.setdefault(oid, []).append(event.activity_name)
+                if oid in object_traces or len(object_traces) < _TRACE_CAP:
+                    object_traces.setdefault(oid, []).append(event.activity_name)
 
         # Object-type lookup: object_id → object_type
         object_types_map: dict[str, str] = {
@@ -791,6 +847,10 @@ def run_simulation():
         metrics = compute_metrics(final_state)
         metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
         metrics_filename = os.path.basename(metrics_file)
+
+        # Compute object lifecycle and activity participation audits
+        from src.Simulation.IO.output.metrics import compute_audit
+        audit = compute_audit(final_state, static_model=static_model)
 
         # Persist run entry to history
         from datetime import datetime as _dt
@@ -836,11 +896,23 @@ def run_simulation():
                 'object_types': dict(obj_types),
                 'activity_sequence': activity_sequence,
                 'object_traces': object_traces,
-                'object_types_map': object_types_map,
+                # object_types_map only for the capped trace objects (keeps response small)
+                'object_types_map': {
+                    oid: obj.object_type
+                    for oid, obj in final_state.objects.items()
+                    if oid in object_traces
+                },
                 'object_links': object_links,
                 'output_file': output_filename,
                 'metrics_file': metrics_filename,
-                'metrics': metrics,
+                # metrics intentionally omitted from inline response — can be very large
+                # (hundreds of MB for big runs). Use GET /api/run-history/{id}/metrics
+                # or the Download Metrics button to access the full data.
+                'metrics': {
+                    'activity_metrics': metrics.get('activity_metrics', {}),
+                    # object_metrics omitted — too large; available via metrics file download
+                },
+                'audit': audit,
                 'concurrency_pairs': concurrency_pairs,
                 'resource_types': list(static_model.resource_types or []),
             },
@@ -909,8 +981,14 @@ def get_run_metrics(run_id):
     path = METRICS_DIR / mf
     if not path.exists():
         return jsonify({'error': 'Metrics file missing from disk'}), 404
+    # Return only activity_metrics (small) by default; object_metrics is huge
+    # and is only needed for the Object Lifetimes panel.
+    section = request.args.get('section', 'activity')
     with open(path, 'r', encoding='utf-8') as f:
-        return jsonify(json.load(f))
+        data = json.load(f)
+    if section == 'object':
+        return jsonify({'object_metrics': data.get('object_metrics', {})})
+    return jsonify({'activity_metrics': data.get('activity_metrics', {})})
 
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])
@@ -1046,6 +1124,37 @@ def constraint_health():
             event_log=event_log,
             steps=20,
         )
+
+        # ── Annotate exclusion_detail with lifecycle info ─────────────────────
+        # For each blocked activity, the exclusion_detail entries tell us which
+        # object type was missing. Enrich them with which activity creates that
+        # type and which activity(ies) deactivate it, so the frontend can show
+        # e.g. "no active Container (created by: Order Empty Containers,
+        # deactivated by: Depart, Reschedule Container)".
+        try:
+            from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+            if isinstance(model_dict, list):
+                _sm = parse_ocdeclare_list(model_dict)
+            else:
+                _sm = parse_ocdeclare_dict(model_dict)
+
+            _creators:     dict[str, list[str]] = {}
+            _deactivators: dict[str, list[str]] = {}
+            for _a in _sm.activities:
+                for _b in _a.bindings:
+                    if _b.creates:
+                        _creators.setdefault(_b.object_type, []).append(_a.name)
+                    if _b.deactivates:
+                        _deactivators.setdefault(_b.object_type, []).append(_a.name)
+
+            for _blocked in result.get('permanently_blocked', []):
+                for _det in _blocked.get('exclusion_detail', []):
+                    _ot = _det.get('binding_type', '')
+                    _det['created_by']     = _creators.get(_ot, [])
+                    _det['deactivated_by'] = _deactivators.get(_ot, [])
+        except Exception:
+            pass  # annotation is best-effort — never break the health check
+
         return jsonify({'success': True, **result})
 
     except Exception as e:
@@ -1107,18 +1216,21 @@ def discover_timing():
 
 @app.route('/api/derive-lifecycle', methods=['POST'])
 def derive_lifecycle():
-    """Derive creates/deactivates flags for an external OC-Declare file using
-    the arc-direction heuristic (derive_provisional_lifecycle_from_list).
+    """Derive creates/deactivates flags for an external OC-Declare file.
+
+    Uses the OCEL event log (discover_lifecycle) when available — this is the
+    accurate method. Falls back to the arc-direction heuristic
+    (derive_provisional_lifecycle_from_list) when no OCEL is loaded.
 
     Body JSON:
-      ocdeclareFile – filename in OCDECLARE_DIR (required)
-
-    Returns the model dict with creates/deactivates flags applied to bindings,
-    ready to be loaded into the Model Editor.
+      ocdeclareFile  – filename in OCDECLARE_DIR (required)
+      eventLogFile   – filename in EVENTLOG_DIR (optional, uses OCEL-based discovery)
     """
     try:
         data = request.json or {}
         ocdeclare_file = data.get('ocdeclareFile', '')
+        event_log_file = data.get('eventLogFile', '')
+
         if not ocdeclare_file:
             return jsonify({'error': 'Missing ocdeclareFile parameter'}), 400
 
@@ -1129,19 +1241,60 @@ def derive_lifecycle():
         with open(model_path, 'r') as f:
             raw = json.load(f)
 
-        if not isinstance(raw, list):
-            return jsonify({'error': 'Lifecycle derivation only applies to raw OC-Declare arc lists (external files).'}), 400
-
         from src.Simulation.Models.OCDeclare import (
             parse_ocdeclare_list,
+            parse_ocdeclare_dict,
             derive_provisional_lifecycle_from_list,
             apply_lifecycle_from_provisional_info,
         )
 
-        # Parse without lifecycle, then derive and apply separately
-        base_model = parse_ocdeclare_list(raw)
-        lifecycle_info = derive_provisional_lifecycle_from_list(raw)
-        model_with_lc  = apply_lifecycle_from_provisional_info(base_model, lifecycle_info)
+        # Support both arc-list (external) and discovered dict formats.
+        # Dict files already have bindings — we re-derive lifecycle on top of them.
+        if isinstance(raw, list):
+            base_model = parse_ocdeclare_list(raw)
+        else:
+            base_model = parse_ocdeclare_dict(raw)
+        method_used = 'arc_heuristic'
+
+
+        ocel_log = None
+        if event_log_file:
+            # Prefer cached OCEL dict (avoids re-reading disk if Step 1 was run)
+            if event_log_file in discovery_cache:
+                ocel_log = discovery_cache[event_log_file].get('event_log_ocel')
+            # Fall back to loading from disk
+            if not (ocel_log and isinstance(ocel_log, dict) and 'objects' in ocel_log):
+                log_path = EVENTLOG_DIR / event_log_file
+                if log_path.exists():
+                    try:
+                        from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2
+                        ocel_log = load_ocel2(str(log_path))
+                    except Exception:
+                        ocel_log = None
+
+        if ocel_log and isinstance(ocel_log, dict) and 'objects' in ocel_log:
+            from src.ParameterDiscovery.OCDeclarediscovery import discover_lifecycle
+            entry: dict = {}
+            exit_: dict = {}
+            objects_raw = ocel_log['objects']
+            object_types = sorted({
+                o.get('type', '')
+                for o in (objects_raw.values() if isinstance(objects_raw, dict) else objects_raw)
+                if o.get('type')
+            })
+            for ot in object_types:
+                creating_acts, terminating_acts = discover_lifecycle(ocel_log, ot, lifecycle_threshold=0.5)
+                if creating_acts:
+                    entry[ot] = creating_acts
+                if terminating_acts:
+                    exit_[ot] = terminating_acts
+            lifecycle_info = {'entry': entry, 'exit': exit_}
+            method_used = 'ocel'
+        else:
+            # Fallback: arc-direction heuristic from the constraint file itself
+            lifecycle_info = derive_provisional_lifecycle_from_list(raw)
+
+        model_with_lc = apply_lifecycle_from_provisional_info(base_model, lifecycle_info)
 
         # Serialise to the same dict shape as /api/model-state
         model_data = {
@@ -1176,25 +1329,35 @@ def derive_lifecycle():
                 }
                 for c in model_with_lc.constraints
             ],
-            'o2o_rules': [],
+            'o2o_rules': [
+                {
+                    'source_type': r.source_type,
+                    'target_type': r.target_type,
+                    'min_links': r.min_links,
+                    'max_links': r.max_links,
+                    'bidirectional': r.bidirectional,
+                }
+                for r in model_with_lc.o2o_rules
+            ],
             'resource_types': [],
             'resource_pool_sizes': {},
             'activity_durations': {},
         }
 
         # Report what was inferred
-        entry = lifecycle_info.get('entry', {})
-        exit_ = lifecycle_info.get('exit', {})
-        summary = []
-        for ot, acts in sorted(entry.items()):
+        entry_info = lifecycle_info.get('entry', {})
+        exit_info  = lifecycle_info.get('exit', {})
+        summary = [f'Source: {"OCEL event log" if method_used == "ocel" else "arc-direction heuristic"}']
+        for ot, acts in sorted(entry_info.items()):
             summary.append(f'{", ".join(sorted(acts))} → creates {ot}')
-        for ot, acts in sorted(exit_.items()):
+        for ot, acts in sorted(exit_info.items()):
             summary.append(f'{", ".join(sorted(acts))} → deactivates {ot}')
 
         return jsonify({
             'success': True,
             'model': model_data,
             'summary': summary,
+            'method': method_used,
         })
 
     except Exception as e:

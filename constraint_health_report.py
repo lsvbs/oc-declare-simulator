@@ -185,7 +185,8 @@ def _weak_precedence_check(constraints: list, event_log: dict, threshold: float 
 
 
 def _run_simulation_checks(static_model, start_activities: list, steps: int = 20):
-    """Run N steps with instrumented constraint checking. Returns rejection log and step pools."""
+    """Run N steps with instrumented constraint checking. Returns rejection log, step pools,
+    and exclusion_log recording why activities were skipped before constraint checking."""
     import src.Simulation.Engine.semantics as _sem
     import src.Simulation.Engine.candidategeneration as _cgen
     from src.Simulation.Engine.simulator import Simulator
@@ -194,6 +195,12 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 20
     rejection_log: list[tuple] = []
     pre_step:      list        = []
     current_step:  list[int]   = [0]
+
+    # exclusion_log records why build_candidate_for_activity returned None
+    # entries: (step, activity_name, binding_type, reason)
+    # reason: "no_objects" | "guard_filtered" | "o2o_saturated"
+    exclusion_pre_step: list = []
+    exclusion_log: list[tuple] = []
 
     orig_check = _sem.check_constraint
     orig_o2o   = _sem.check_o2o_rules
@@ -213,6 +220,35 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 20
             objs = ",".join(getattr(candidate, "participating_object_ids", []) or [])
             pre_step.append((candidate.activity_name, objs, "O2O_rule_violation", "O2O"))
         return result
+
+    # Wrap build_candidate_for_activity to record exclusion reasons.
+    # Must patch both the candidategeneration module AND the simulator module
+    # (which imports it directly at load time as a local name).
+    import src.Simulation.Engine.simulator as _sim_mod
+    orig_build = _cgen.build_candidate_for_activity
+    orig_build_sim = getattr(_sim_mod, 'build_candidate_for_activity', None)
+
+    def _inst_build(activity, state, resource_types=None):
+        from src.Simulation.Engine.candidategeneration import find_active_objects_of_type, _apply_guard_filter
+        for binding in activity.bindings:
+            if binding.creates:
+                continue
+            fetch_limit = max(binding.max_count * 4, 8) if binding.max_count is not None else 8
+            existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
+            if not existing_ids:
+                exclusion_pre_step.append((activity.name, binding.object_type, "no_objects"))
+                break
+            guard = getattr(binding, 'guard', None)
+            if guard:
+                filtered = _apply_guard_filter(existing_ids, guard, state)
+                if not filtered:
+                    exclusion_pre_step.append((activity.name, binding.object_type, "guard_filtered"))
+                    break
+        return orig_build(activity, state, resource_types=resource_types)
+
+    _cgen.build_candidate_for_activity = _inst_build
+    if orig_build_sim is not None:
+        _sim_mod.build_candidate_for_activity = _inst_build
 
     _sem.check_constraint = _inst_check
     _sem.check_o2o_rules  = _inst_o2o
@@ -236,6 +272,9 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 20
             for entry in pre_step:
                 rejection_log.append((step,) + entry)
             pre_step.clear()
+            for entry in exclusion_pre_step:
+                exclusion_log.append((step,) + entry)
+            exclusion_pre_step.clear()
         elif event == "applied":
             step_chosen[current_step[0]] = payload.get("activity_name", "?")
 
@@ -255,8 +294,11 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 20
             orig_check(c, cand, st) for c in sm.constraints
         )
         _cgen.check_o2o_rules = orig_o2o
+        _cgen.build_candidate_for_activity = orig_build
+        if orig_build_sim is not None:
+            _sim_mod.build_candidate_for_activity = orig_build_sim
 
-    return rejection_log, step_pool, step_chosen
+    return rejection_log, step_pool, step_chosen, exclusion_log
 
 
 # ── Main health check function (library entry point) ─────────────────────────
@@ -283,6 +325,7 @@ def run_health_check(
             "top_blocking_constraints": [...],
             "cycles": [...],
             "weak_precedences": [...],
+            "exclusion_reasons": {activity: [{binding_type, reason, count}]},
             "summary": {"errors": N, "warnings": M}
         }
     """
@@ -293,7 +336,7 @@ def run_health_check(
     all_act_names = [a.name for a in static_model.activities]
 
     # ── Check A+B: run simulation ─────────────────────────────────────────────
-    rejection_log, step_pool, step_chosen = _run_simulation_checks(
+    rejection_log, step_pool, step_chosen, exclusion_log = _run_simulation_checks(
         static_model, start_activities, steps=steps
     )
 
@@ -302,6 +345,23 @@ def run_health_check(
     for pool in step_pool.values():
         for act_name, _ in pool:
             seen_in_pool.add(act_name)
+
+    # ── Build exclusion_reasons: per-activity dominant reason for not entering pool ──
+    # Count (activity, binding_type, reason) occurrences across all steps
+    excl_counts: dict = defaultdict(lambda: defaultdict(int))
+    for step, act_name, binding_type, reason in exclusion_log:
+        excl_counts[act_name][(binding_type, reason)] += 1
+
+    exclusion_reasons: dict[str, list] = {}
+    for act_name, counts in excl_counts.items():
+        if act_name in seen_in_pool:
+            continue  # only report for activities that never entered the pool
+        reasons_list = [
+            {"binding_type": bt, "reason": reason, "count": cnt}
+            for (bt, reason), cnt in sorted(counts.items(), key=lambda x: -x[1])
+        ]
+        if reasons_list:
+            exclusion_reasons[act_name] = reasons_list
 
     # Permanently blocked = defined in model but never reached the pool
     permanently_blocked: list[dict] = []
@@ -315,10 +375,19 @@ def run_health_check(
                     top_count += 1
                     if top_reason is None:
                         top_reason = label
+            # Enrich with exclusion reason if no constraint rejection was found
+            excl = exclusion_reasons.get(act_name, [])
+            dominant_excl = excl[0]["reason"] if excl else None
             permanently_blocked.append({
-                "activity":    act_name,
-                "top_blocker": top_reason or "never attempted",
-                "block_count": top_count,
+                "activity":         act_name,
+                "top_blocker":      top_reason or (
+                    f"no_objects:{excl[0]['binding_type']}" if dominant_excl == "no_objects" else
+                    f"guard_filtered:{excl[0]['binding_type']}" if dominant_excl == "guard_filtered" else
+                    "never attempted"
+                ),
+                "block_count":      top_count,
+                "exclusion_reason": dominant_excl,
+                "exclusion_detail": excl,
             })
 
     # Top blocking constraints with affected activities
@@ -349,11 +418,12 @@ def run_health_check(
     warnings = len([c for c in top_blocking if c["is_chain"]]) + len(weak_precedences)
 
     return {
-        "permanently_blocked":     permanently_blocked,
+        "permanently_blocked":      permanently_blocked,
         "top_blocking_constraints": top_blocking,
-        "cycles":                  cycles,
-        "weak_precedences":        weak_precedences,
-        "summary":                 {"errors": errors, "warnings": warnings},
+        "cycles":                   cycles,
+        "weak_precedences":         weak_precedences,
+        "exclusion_reasons":        exclusion_reasons,
+        "summary":                  {"errors": errors, "warnings": warnings},
     }
 
 

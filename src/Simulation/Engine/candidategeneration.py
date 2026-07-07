@@ -182,14 +182,20 @@ def build_candidate_for_activity(
 
             participating_object_ids.extend(selected_ids)
         else:
-            # Output binding: always create min_count new objects first, then
-            # optionally reuse existing ones up to the remaining capacity.
-            # This ordering is critical: computing reuse_limit BEFORE create_count
-            # would cause reuse + created > max_count → spurious None returns
-            # (e.g. place order: customers max=1, 1 existing → reuse=1, create=1, 2>1 → None).
-
-            # Resource types never get created — they come from the pre-populated pool.
-            # Treat a creates=True binding on a resource type as a plain input binding.
+            # Output binding: this activity instantiates a new object of this type.
+            #
+            # Creation count is always exactly 1 per firing — regardless of
+            # min_count. min_count comes from log-discovery and represents the
+            # average NUMBER OF OBJECTS THAT PARTICIPATED in events of this
+            # activity (including existing ones), not how many new ones to
+            # create on each firing. Using it directly causes an explosion
+            # (e.g. min_count=50 containers → 50 new objects every step).
+            #
+            # Reuse: if max_count is set, fill up to (max_count - 1) slots
+            # with existing linked objects. If max_count is None, no reuse —
+            # the newly created object is the sole participant of this type.
+            #
+            # Resource types come from the pre-populated pool only.
             if binding.object_type in _resource_types:
                 eligibility_count = 1
                 target_count = max(binding.min_count, eligibility_count)
@@ -201,24 +207,19 @@ def build_candidate_for_activity(
                 participating_object_ids.extend(selected_ids)
                 continue
 
-            create_count = binding.min_count
+            create_count = 1  # always create exactly one new instance
 
-            if binding.max_count is None:
-                reuse_limit = len(existing_ids)
+            if binding.max_count is not None:
+                reuse_limit = min(len(existing_ids), max(0, binding.max_count - create_count))
             else:
-                remaining = binding.max_count - create_count
-                if remaining < 0:
-                    # min_count alone exceeds max_count — model inconsistency, skip
-                    return None
-                reuse_limit = min(len(existing_ids), remaining)
+                reuse_limit = 0  # no reuse when unbounded — created object is the sole participant
 
             selected_ids = _find_objects_preferring_linked(
                 state, existing_ids, participating_object_ids, reuse_limit
             )
             participating_object_ids.extend(selected_ids)
 
-            if create_count > 0:
-                object_types_to_create.extend([binding.object_type] * create_count)
+            object_types_to_create.extend([binding.object_type] * create_count)
 
     return Candidate(
         activity_name=activity.name,
@@ -280,30 +281,19 @@ def build_candidate_for_object_and_activity(
             participating_ids.extend(selected_ids)
             available_for_type[binding.object_type] = existing_ids[selected_from_existing:]
         else:
-            # Output binding: this activity may create objects of this type.
-            # Creation is governed only by the lifecycle flags on the binding
-            # ("creates" / "deactivates") and multiplicities; there is no
-            # additional restriction based on anchors or start activities.
-
-            # Optionally reuse existing objects as participants, but they are
-            # not required for outputs.
-            if binding.max_count is None:
-                reuse_limit = len(existing_ids)
+            # Output binding: always create exactly 1 new object, optionally
+            # reusing existing neighbors to fill up to max_count - 1 slots.
+            create_count = 1
+            if binding.max_count is not None:
+                reuse_limit = min(len(existing_ids), max(0, binding.max_count - create_count))
             else:
-                reuse_limit = min(len(existing_ids), binding.max_count)
+                reuse_limit = 0
 
             selected_ids = existing_ids[:reuse_limit]
             participating_ids.extend(selected_ids)
             available_for_type[binding.object_type] = existing_ids[reuse_limit:]
 
-            # Create as many new objects as min_count requests, while
-            # respecting max_count when combined with any reused objects.
-            create_count = binding.min_count
-            if binding.max_count is not None and len(selected_ids) + create_count > binding.max_count:
-                return None
-
-            if create_count > 0:
-                object_types_to_create.extend([binding.object_type] * create_count)
+            object_types_to_create.extend([binding.object_type] * create_count)
 
     return Candidate(
         activity_name=activity.name,
