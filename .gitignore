@@ -14,3 +14,9 @@ src/Simulation/IO/input/eventlog/*.json
 src/Simulation/IO/input/ocdeclare/*.json
 src/Simulation/IO/input/parameters/*.json
 src/Simulation/IO/output/eventlogs/*.json
+
+# Simulation metrics output (can be very large — regenerated on each run)
+metrics/*.json
+
+# Frontend build output
+Frontend/dist/
