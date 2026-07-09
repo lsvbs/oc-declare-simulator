@@ -26,7 +26,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -257,6 +257,41 @@ def run_discovery():
                         'mean': round(sum(counts_list) / len(counts_list), 2),
                     }
 
+            # Per-object max reuse: for each object, find the activity that used it
+            # the most times, then aggregate those per-object maxima by object type.
+            # Requires the object→type map built earlier (_ocel_src).
+            if _ocel_src and object_type_stats:
+                objects_raw = _ocel_src.get('objects', {})
+                objs_list_typed = list(objects_raw.values()) if isinstance(objects_raw, dict) else (objects_raw or [])
+                _oid_to_type: dict = {}
+                for obj in objs_list_typed:
+                    oid_key = obj.get('id') or obj.get('ocel:id', '')
+                    ot = obj.get('type') or obj.get('ocel:type', '')
+                    if oid_key and ot:
+                        _oid_to_type[oid_key] = ot
+
+                # Transpose act_obj_counts to obj_act_counts: {oid: {act: count}}
+                obj_act_counts: dict = {}
+                for act, obj_counts in act_obj_counts.items():
+                    for oid, cnt in obj_counts.items():
+                        obj_act_counts.setdefault(oid, {})[act] = cnt
+
+                # For each object: max reuse = highest count across all activities
+                from collections import defaultdict as _dd2
+                _type_max_reuse: dict = _dd2(list)
+                for oid, act_counts in obj_act_counts.items():
+                    ot = _oid_to_type.get(oid)
+                    if not ot:
+                        continue
+                    _type_max_reuse[ot].append(max(act_counts.values()))
+
+                for ot, max_reuse_list in _type_max_reuse.items():
+                    if ot in object_type_stats and max_reuse_list:
+                        object_type_stats[ot]['max_reuse'] = max(max_reuse_list)
+                        object_type_stats[ot]['mean_max_reuse'] = round(
+                            sum(max_reuse_list) / len(max_reuse_list), 2
+                        )
+
         # Global consecutive-repeat stats: across the full sorted event timeline,
         # find every run of consecutive same-activity firings and record its length.
         # min/mean/max of those run lengths tells you how the activity clusters in
@@ -324,6 +359,7 @@ def run_discovery():
             'activity_repeat_stats': activity_repeat_stats,
             'activity_consec_stats': activity_consec_stats,
             'activity_nmax_suggestions': activity_nmax_suggestions,
+            'start_counts': start_counts,
             'event_log': event_log,
             'event_log_ocel': event_log_ocel,  # OCEL dict for lifecycle derivation
         }
@@ -454,12 +490,11 @@ def get_model_state():
                     }
                     for r in static.o2o_rules
                 ],
-                'resource_types': [],
-                'resource_pool_sizes': {},
+                'resource_types': list(static.resource_types or []),
+                'resource_pool_sizes': dict(static.resource_pool_sizes or {}),
                 'activity_durations': {},
             }
 
-        # Normalise each row of the probability matrix so values are in [0, 1]
         prob_matrix_out = {}
         if event_log_file and event_log_file in discovery_cache:
             raw = discovery_cache[event_log_file]['prob_matrix']
@@ -481,7 +516,7 @@ def get_model_state():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
-def _safe_parameters_path(filename: str) -> Path | None:
+def _safe_parameters_path(filename: str) -> "Path | None":
     """Resolve `filename` inside PARAMETERS_DIR, rejecting traversal attempts."""
     if not filename or not filename.endswith('.json'):
         return None
@@ -786,6 +821,8 @@ def run_simulation():
             select_func=select_with_matrix,
             trace_func=trace_func,
             stop_event=stop_event,
+            transition_matrix=prob_matrix,
+            start_counts=cached.get('start_counts', {}),
         )
 
         # Register run for live status/stop polling
@@ -850,7 +887,7 @@ def run_simulation():
 
         # Compute object lifecycle and activity participation audits
         from src.Simulation.IO.output.metrics import compute_audit
-        audit = compute_audit(final_state, static_model=static_model)
+        audit = compute_audit(final_state, static_model=static_model, prob_matrix=prob_matrix)
 
         # Persist run entry to history
         from datetime import datetime as _dt
@@ -1339,8 +1376,8 @@ def derive_lifecycle():
                 }
                 for r in model_with_lc.o2o_rules
             ],
-            'resource_types': [],
-            'resource_pool_sizes': {},
+            'resource_types': list(model_with_lc.resource_types or []),
+            'resource_pool_sizes': dict(model_with_lc.resource_pool_sizes or {}),
             'activity_durations': {},
         }
 
@@ -1360,6 +1397,38 @@ def derive_lifecycle():
             'method': method_used,
         })
 
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/discover-o2o', methods=['POST'])
+def discover_o2o():
+    """Discover O2O rules from an OCEL event log.
+
+    Body JSON:
+      eventLogFile – filename in EVENTLOG_DIR (required)
+
+    Returns the discovered rules in the same shape the Model Editor expects.
+    """
+    try:
+        data = request.json or {}
+        event_log_file = data.get('eventLogFile')
+        if not event_log_file:
+            return jsonify({'error': 'Missing eventLogFile parameter'}), 400
+
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
+
+        event_log = load_ocel2(str(log_path))
+        rules = discover_o2o_rules(event_log)
+
+        return jsonify({
+            'success': True,
+            'o2o_rules': rules,
+            'count': len(rules),
+        })
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500

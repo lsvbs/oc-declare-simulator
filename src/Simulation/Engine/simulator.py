@@ -118,6 +118,8 @@ class Simulator:
         trace_func: callable | None = None,
         select_func: callable | None = None,
         stop_event=None,  # threading.Event — set to request early termination
+        transition_matrix: dict | None = None,
+        start_counts: dict | None = None,  # {activity: count} from OC discovery, used as fallback weights
     ):
         """Create a Simulator.
 
@@ -158,6 +160,13 @@ class Simulator:
 
         # Optional stop signal: caller sets this threading.Event to request early stop.
         self.stop_event = stop_event
+
+        # Transition matrix used to probabilistically gate no-input start activities
+        # in DES mode (prevents them from firing every single step unconditionally).
+        self.transition_matrix = transition_matrix or {}
+        # Trace-start counts from OC discovery: used as fallback weights for start
+        # activities that don't appear in the last row of the transition matrix.
+        self.start_counts = start_counts or {}
 
     def _trace(self, event: str, payload: dict) -> None:
         if self.trace_func is None:
@@ -329,7 +338,34 @@ class Simulator:
             ]
 
             if not primary_bindings:
-                # Activity only creates or only uses resources — generate once globally
+                # Activity only creates or only uses resources — generate once globally.
+                # For start activities with no input objects, gate by transition probability
+                # so they don't fire unconditionally every step in DES mode.
+                # All no-input start activities share the same normalised pool: each gets
+                # weight = row[activity] (or epsilon if absent). Dividing by the total of
+                # ALL row weights (plus epsilon per start activity) preserves the relative
+                # ratios between existing targets while giving start activities their fair share.
+                if self.transition_matrix and activity.name in start_activity_names and state.executed_events:
+                    last_act = state.executed_events[-1].activity_name
+                    row = self.transition_matrix.get(last_act, {})
+                    epsilon = 1e-6
+                    # For start activities absent from the row, use their trace-start
+                    # count as a fallback weight so they fire at their real log frequency
+                    # rather than near-zero epsilon.
+                    all_keys = set(row) | start_activity_names
+                    raw = {}
+                    for a in all_keys:
+                        if a in row:
+                            raw[a] = row[a] + epsilon
+                        elif a in start_activity_names and self.start_counts:
+                            raw[a] = self.start_counts.get(a, 0.0) + epsilon
+                        else:
+                            raw[a] = epsilon
+                    total = sum(raw.values())
+                    prob = raw[activity.name] / total if total > 0 else epsilon
+                    if self.rng.random() > prob:
+                        continue
+
                 candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
                 if candidate and is_candidate_semantically_allowed(self.static_model, candidate, state):
                     key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
@@ -344,7 +380,18 @@ class Simulator:
             primary_type = primary_bindings[0].object_type
             active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
 
+            # Build a set of objects already in-progress for this activity so we
+            # don't start a second concurrent instance on the same object — this
+            # would bypass not_coexistence and similar per-object constraints
+            # because the first firing hasn't been recorded yet.
+            in_progress_objects: set[str] = set()
+            for ip in state.in_progress:
+                if ip.candidate_activity_name == activity.name:
+                    in_progress_objects.update(ip.participating_object_ids)
+
             for oid in active_ids:
+                if oid in in_progress_objects:
+                    continue
                 # Temporarily restrict the active pool for this type to only this object
                 # so build_candidate_for_activity picks it specifically.
                 original_active = state._active_by_type.get(primary_type, set())
@@ -918,6 +965,10 @@ class Simulator:
                 participating_object_ids=wc.participating_object_ids,
                 object_types_to_create=wc.object_types_to_create,
             )
+            # Re-check semantic constraints: state may have changed since the
+            # candidate was queued (e.g. not_coexistence fired in the interim).
+            if not is_candidate_semantically_allowed(self.static_model, cand, state):
+                continue
             available, held = self._des_resources_available(cand, state)
             if available:
                 if state.current_time is not None and wc.arrived_at is not None:

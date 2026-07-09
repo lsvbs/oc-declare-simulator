@@ -977,6 +977,47 @@ function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onMod
   );
 }
 
+// ── O2ODiscoveryPanel ─────────────────────────────────────────────────────────
+function O2ODiscoveryPanel({ eventLogFile, activeModel, onModelChange }) {
+  const [isDiscovering, setIsDiscovering] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+  const [error, setError] = React.useState(null);
+
+  const run = async () => {
+    setIsDiscovering(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await axios.post('/api/discover-o2o', { eventLogFile });
+      if (res.data.success) {
+        onModelChange({ ...activeModel, o2o_rules: res.data.o2o_rules });
+        setResult(res.data.count);
+      } else {
+        setError(res.data.error || 'Discovery failed');
+      }
+    } catch (err) {
+      setError(err.response?.data?.error || err.message);
+    } finally {
+      setIsDiscovering(false);
+    }
+  };
+
+  return (
+    <div className="o2o-discover-bar">
+      <div className="o2o-discover-left">
+        <span className="o2o-discover-label">Object-to-Object relationships</span>
+        {result !== null && (
+          <span className="o2o-discover-result">✓ {result} rule{result !== 1 ? 's' : ''} applied to model</span>
+        )}
+        {error && <span className="o2o-discover-error">{error}</span>}
+      </div>
+      <button className="start-prob-btn" disabled={isDiscovering} onClick={run}>
+        {isDiscovering ? 'Discovering…' : 'Discover O2O relationships'}
+      </button>
+    </div>
+  );
+}
+
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -2361,6 +2402,7 @@ function App() {
                       <tr>
                         <th>Object Type</th>
                         <th className="octs-num">Instances</th>
+                        <th className="octs-num">Max reuse</th>
                         <th>Attributes</th>
                       </tr>
                     </thead>
@@ -2369,6 +2411,9 @@ function App() {
                         <tr key={type}>
                           <td className="octs-type">{type}</td>
                           <td className="octs-num">{info.count.toLocaleString()}</td>
+                          <td className="octs-num" title={info.mean_max_reuse != null ? `Mean max reuse per object: ${info.mean_max_reuse}` : undefined}>
+                            {info.max_reuse != null ? info.max_reuse : '—'}
+                          </td>
                           <td className="octs-attrs">
                             {info.attributes.length > 0
                               ? info.attributes.map(a => (
@@ -2400,8 +2445,8 @@ function App() {
 
         )}
 
-        {/* ── OC-Declare Discovery (internal = full, external-ocel = lifecycle only) ── */}
-        {(workflowMode === 'internal' || workflowMode === 'external-ocel') && (
+        {/* ── OC-Declare Discovery (internal only) ── */}
+        {workflowMode === 'internal' && (
         <div className="ocdeclare-discovery-section">
           <div className="section-header">
             <h2>OC-Declare Model Discovery</h2>
@@ -2926,6 +2971,83 @@ function App() {
           );
         })()}
 
+        {/* ── O2O discovery — external-ocel mode only ────────────────────── */}
+        {workflowMode === 'external-ocel' && discoveryConfig.eventLogFile && activeModel && !Array.isArray(activeModel) && (
+          <O2ODiscoveryPanel
+            eventLogFile={discoveryConfig.eventLogFile}
+            activeModel={activeModel}
+            onModelChange={handleModelEdit}
+          />
+        )}
+        {discoveryResults?.activity_counts && discoveryResults.likely_start_activities?.length > 0 && activeProbMatrix && (
+          (() => {
+            const startCandidates = [
+              ...discoveryResults.likely_start_activities,
+              ...Object.keys(discoveryResults.activity_counts)
+                .filter(a => !discoveryResults.likely_start_activities.includes(a))
+                .sort((a, b) => (discoveryResults.activity_counts[b] || 0) - (discoveryResults.activity_counts[a] || 0)),
+            ];
+            const countTotal = Object.values(discoveryResults.activity_counts).reduce((s, v) => s + v, 0);
+            const selected = new Set(discoveryConfig.startActivityProbSelected ?? [startCandidates[0]]);
+            const toggle = (a) => {
+              const next = new Set(selected);
+              next.has(a) ? next.delete(a) : next.add(a);
+              setDiscoveryConfig(p => ({ ...p, startActivityProbSelected: [...next] }));
+            };
+            return (
+              <div className="start-prob-bar">
+                <span className="start-prob-label">Start activity probability</span>
+                <div className="start-prob-checklist">
+                  {startCandidates.map((a, i) => (
+                    <label key={a} className={`start-prob-check-item${selected.has(a) ? ' spc-checked' : ''}`}>
+                      <input type="checkbox" checked={selected.has(a)} onChange={() => toggle(a)} />
+                      {i === 0 && <span className="sa-top-badge">★</span>}
+                      <span className="spc-name">{a}</span>
+                      <span className="spc-pct">{((discoveryResults.activity_counts[a] || 0) / countTotal * 100).toFixed(1)}%</span>
+                    </label>
+                  ))}
+                </div>
+                <button
+                  className="start-prob-btn"
+                  disabled={selected.size === 0}
+                  title="Inject selected activities' log frequencies as transition target probabilities from every source, preserving relative ratios between existing targets"
+                  onClick={() => {
+                    const counts = discoveryResults.activity_counts;
+                    if (!countTotal || selected.size === 0) return;
+                    // Combined probability reserved for all selected start activities
+                    const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / countTotal;
+                    // Each selected activity's share within the combined block
+                    const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
+                    const newMatrix = {};
+                    Object.entries(activeProbMatrix).forEach(([src, targets]) => {
+                      const tgts = { ...targets };
+                      // Remove all selected activities from existing targets
+                      selected.forEach(a => delete tgts[a]);
+                      const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
+                      const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
+                      const scaled = {};
+                      Object.entries(tgts).forEach(([t, v]) => {
+                        scaled[t] = Math.round(v * scale * 10000) / 10000;
+                      });
+                      // Distribute combined block proportionally among selected activities
+                      selected.forEach(a => {
+                        const share = selectedCountSum > 0
+                          ? combinedProb * (counts[a] || 0) / selectedCountSum
+                          : combinedProb / selected.size;
+                        scaled[a] = Math.round(share * 10000) / 10000;
+                      });
+                      newMatrix[src] = scaled;
+                    });
+                    setActiveProbMatrix(newMatrix);
+                  }}
+                >
+                  Apply to probability matrix
+                </button>
+              </div>
+            );
+          })()
+        )}
+
         </div>{/* end post-processing-section */}
 
         {/* ── Post-Processing Result section ── */}
@@ -2956,17 +3078,63 @@ function App() {
                 badge={badge}
                 defaultOpen={hasErrors || hasWarnings}
               >
+                {healthResult.no_input_activities?.length > 0 && (
+                  <Collapsible
+                    className="health-section health-warn"
+                    title={<span className="health-section-title">⚠ Activities with no input constraints</span>}
+                    badge={healthResult.no_input_activities.length}
+                    defaultOpen={false}
+                  >
+                    {healthResult.no_input_activities.map((a, i) => (
+                      <div key={i} className="health-item health-no-input-item">
+                        <span className={`health-badge-${a.is_pure_start ? 'error' : 'warn'}`}>
+                          {a.is_pure_start ? 'START' : 'NO INPUT'}
+                        </span>
+                        <strong>{a.activity}</strong>
+                        {a.input_bindings.length > 0 ? (
+                          <ul className="health-no-input-bindings">
+                            {a.input_bindings.map((b, j) => (
+                              <li key={j}>
+                                <code>{b.object_type}</code>
+                                {b.is_resource && <span className="health-excl-hint"> (resource)</span>}
+                                {b.created_by.length > 0 && (
+                                  <span className="health-excl-hint"> — created by: <em>{b.created_by.join(', ')}</em></span>
+                                )}
+                                {b.deactivated_by.length > 0 && (
+                                  <span className="health-excl-hint"> · deactivated by: <em>{b.deactivated_by.join(', ')}</em></span>
+                                )}
+                                {b.created_by.length === 0 && !b.is_resource && (
+                                  <span className="health-excl-hint" style={{color:'#b91c1c'}}> — no activity creates this type</span>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span className="health-reason"> — no input bindings (pure start activity)</span>
+                        )}
+                      </div>
+                    ))}
+                  </Collapsible>
+                )}
                 {healthResult.cycles?.length > 0 && (
-                  <div className="health-section health-error">
-                    <div className="health-section-title">🔴 Dependency cycles (deadlock)</div>
+                  <Collapsible
+                    className="health-section health-error"
+                    title={<span className="health-section-title">🔴 Dependency cycles (deadlock)</span>}
+                    badge={healthResult.cycles.length}
+                    defaultOpen={false}
+                  >
                     {healthResult.cycles.map((cy, i) => (
                       <div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>
                     ))}
-                  </div>
+                  </Collapsible>
                 )}
                 {healthResult.permanently_blocked?.length > 0 && (
-                  <div className="health-section health-error">
-                    <div className="health-section-title">🔴 Activities never reaching the pool</div>
+                  <Collapsible
+                    className="health-section health-error"
+                    title={<span className="health-section-title">🔴 Activities never reaching the pool</span>}
+                    badge={healthResult.permanently_blocked.length}
+                    defaultOpen={false}
+                  >
                     {healthResult.permanently_blocked.map((b, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-error">BLOCKED</span>
@@ -3006,11 +3174,15 @@ function App() {
                         )}
                       </div>
                     ))}
-                  </div>
+                  </Collapsible>
                 )}
                 {healthResult.top_blocking_constraints?.filter(c => c.is_chain).length > 0 && (
-                  <div className="health-section health-warn">
-                    <div className="health-section-title">⚠ Chain constraints (common deadlock source)</div>
+                  <Collapsible
+                    className="health-section health-warn"
+                    title={<span className="health-section-title">⚠ Chain constraints (common deadlock source)</span>}
+                    badge={healthResult.top_blocking_constraints.filter(c => c.is_chain).length}
+                    defaultOpen={false}
+                  >
                     {healthResult.top_blocking_constraints.filter(c => c.is_chain).map((c, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-warn">{c.count}×</span>
@@ -3018,11 +3190,15 @@ function App() {
                         <span className="health-reason"> blocks: {c.blocks.join(', ')}</span>
                       </div>
                     ))}
-                  </div>
+                  </Collapsible>
                 )}
                 {healthResult.weak_precedences?.length > 0 && (
-                  <div className="health-section health-warn">
-                    <div className="health-section-title">⚠ Weak precedences (alternative paths in log)</div>
+                  <Collapsible
+                    className="health-section health-warn"
+                    title={<span className="health-section-title">⚠ Weak precedences (alternative paths in log)</span>}
+                    badge={healthResult.weak_precedences.length}
+                    defaultOpen={false}
+                  >
                     {healthResult.weak_precedences.map((wp, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-warn">{wp.co_occurrence_pct}%</span>
@@ -3030,18 +3206,22 @@ function App() {
                         <span className="health-reason"> {wp.message}</span>
                       </div>
                     ))}
-                  </div>
+                  </Collapsible>
                 )}
                 {healthResult.top_blocking_constraints?.filter(c => !c.is_chain).length > 0 && (
-                  <div className="health-section health-info">
-                    <div className="health-section-title">ℹ Top non-chain blocking constraints</div>
+                  <Collapsible
+                    className="health-section health-info"
+                    title={<span className="health-section-title">ℹ Top non-chain blocking constraints</span>}
+                    badge={healthResult.top_blocking_constraints.filter(c => !c.is_chain).length}
+                    defaultOpen={false}
+                  >
                     {healthResult.top_blocking_constraints.filter(c => !c.is_chain).slice(0, 8).map((c, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-info">{c.count}×</span>
                         <code className="health-constraint-label">{c.label}</code>
                       </div>
                     ))}
-                  </div>
+                  </Collapsible>
                 )}
                 {!hasErrors && !hasWarnings && (
                   <div className="health-ok-msg">✓ No issues detected — model looks healthy.</div>
@@ -3457,7 +3637,19 @@ function App() {
                         defaultOpen={false}
                       >
                         <ul className="sim-coverage-missing-list">
-                          {missingTypes.map(a => <li key={a}>{a}</li>)}
+                          {missingTypes.map(a => {
+                            const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
+                            return (
+                              <li key={a}>
+                                <span className="sim-coverage-missing-name">{a}</span>
+                                {reasons.length > 0 && (
+                                  <ul className="sim-coverage-missing-reasons">
+                                    {reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                  </ul>
+                                )}
+                              </li>
+                            );
+                          })}
                         </ul>
                       </Collapsible>
                     )}
@@ -3643,9 +3835,38 @@ function App() {
                     const logRepeat = discoveryResults.activity_repeat_stats || {};
                     const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
                     const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                    const actSeq = results.metrics?.activity_sequence || [];
+
+                    // Replicate FlowChart rank assignment so rows appear in the
+                    // same left-to-right column order as the DFG.
+                    const actSeq = results.activity_sequence
+                      ? [...new Set(results.activity_sequence)]
+                      : Object.keys(simMetrics);
+                    const idxOf = {};
+                    actSeq.forEach((n, i) => { idxOf[n] = i; });
+                    // Build transition counts from object traces (same source as FlowChart)
+                    const trans = {};
+                    Object.values(results.object_traces || {}).forEach(seq => {
+                      seq.forEach((name, i) => {
+                        if (i < seq.length - 1) {
+                          const key = `${name} → ${seq[i + 1]}`;
+                          trans[key] = (trans[key] || 0) + 1;
+                        }
+                      });
+                    });
+                    // Forward predecessors only
+                    const preds = {};
+                    actSeq.forEach(n => { preds[n] = []; });
+                    Object.keys(trans).forEach(key => {
+                      const [f, t] = key.split(' → ');
+                      if (f === t || idxOf[f] === undefined || idxOf[t] === undefined) return;
+                      if (idxOf[f] < idxOf[t]) preds[t].push(f);
+                    });
+                    // rank = longest forward path ending at node
                     const flowRank = {};
-                    actSeq.forEach((a, i) => { if (!(a in flowRank)) flowRank[a] = i; });
+                    actSeq.forEach(n => {
+                      flowRank[n] = preds[n].length ? Math.max(...preds[n].map(p => flowRank[p] + 1)) : 0;
+                    });
+
                     const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
                       .sort((a, b) => {
                         const ra = a in flowRank ? flowRank[a] : 999999;

@@ -413,6 +413,39 @@ def run_health_check(
     # ── Check D: weak precedences ─────────────────────────────────────────────
     weak_precedences = _weak_precedence_check(constraints, event_log, threshold=weak_threshold)
 
+    # ── Check E: activities with no incoming constraints ──────────────────────
+    # For each such activity, list its input bindings and enrich with which
+    # activities create / deactivate each bound object type.
+    target_acts = {c.target_activity for c in constraints}
+    creators:     dict[str, list[str]] = {}
+    deactivators: dict[str, list[str]] = {}
+    for a in static_model.activities:
+        for b in a.bindings:
+            if b.creates:
+                creators.setdefault(b.object_type, []).append(a.name)
+            if b.deactivates:
+                deactivators.setdefault(b.object_type, []).append(a.name)
+
+    no_input_activities = []
+    for a in static_model.activities:
+        if a.name in target_acts:
+            continue
+        input_bindings = [b for b in a.bindings if not b.creates]
+        binding_info = [
+            {
+                "object_type":    b.object_type,
+                "is_resource":    b.object_type in set(static_model.resource_types or []),
+                "created_by":     creators.get(b.object_type, []),
+                "deactivated_by": deactivators.get(b.object_type, []),
+            }
+            for b in input_bindings
+        ]
+        no_input_activities.append({
+            "activity":      a.name,
+            "input_bindings": binding_info,
+            "is_pure_start": len(input_bindings) == 0,
+        })
+
     # ── Summary ───────────────────────────────────────────────────────────────
     errors   = len(cycles) + len(permanently_blocked)
     warnings = len([c for c in top_blocking if c["is_chain"]]) + len(weak_precedences)
@@ -423,6 +456,7 @@ def run_health_check(
         "cycles":                   cycles,
         "weak_precedences":         weak_precedences,
         "exclusion_reasons":        exclusion_reasons,
+        "no_input_activities":      no_input_activities,
         "summary":                  {"errors": errors, "warnings": warnings},
     }
 

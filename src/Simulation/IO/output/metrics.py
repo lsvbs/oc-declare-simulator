@@ -118,7 +118,62 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
     }
 
 
-def compute_audit(state: SimulationState, static_model: Any = None) -> dict[str, Any]:
+def _diagnose_never_fired(act_name: str, static_model: Any, state: "SimulationState", prob_matrix: dict) -> list[str]:
+    """Return a list of human-readable reasons why `act_name` never fired."""
+    reasons = []
+    if static_model is None:
+        return reasons
+
+    fired_acts = {ev.activity_name for ev in state.executed_events}
+    existing_types = {obj.object_type for obj in state.objects.values()}
+
+    # Find the activity definition
+    act_def = next((a for a in static_model.activities if a.name == act_name), None)
+    if act_def is None:
+        return reasons
+
+    # 1. Required object type never created
+    for binding in act_def.bindings:
+        ot = binding.object_type
+        if ot not in existing_types:
+            # Find which activity creates it
+            creator = next(
+                (a.name for a in static_model.activities
+                 for b in a.bindings if b.object_type == ot and b.creates),
+                None
+            )
+            if creator:
+                reasons.append(
+                    f'No active "{ot}" objects — created by "{creator}" which also never fired'
+                    if creator not in fired_acts
+                    else f'No active "{ot}" objects available at the time of evaluation'
+                )
+            else:
+                reasons.append(f'Required object type "{ot}" was never created (no activity has creates=True for it)')
+
+    # 2. Unsatisfied precedence constraints
+    for c in static_model.constraints:
+        if c.target_activity != act_name:
+            continue
+        if c.constraint_type == 'precedence' and c.source_activity not in fired_acts:
+            reasons.append(f'Precedence constraint not met: "{c.source_activity}" must fire first but never did')
+        elif c.constraint_type == 'chain_precedence' and c.source_activity not in fired_acts:
+            reasons.append(f'Chain-precedence constraint not met: "{c.source_activity}" must immediately precede it but never fired')
+
+    # 3. Not reachable from any fired activity in the transition matrix
+    reachable_targets = {tgt for src in fired_acts for tgt in prob_matrix.get(src, {})}
+    if prob_matrix and act_name not in reachable_targets and fired_acts:
+        # Check if it appears anywhere in the matrix at all
+        all_matrix_targets = {tgt for tgts in prob_matrix.values() for tgt in tgts}
+        if act_name not in all_matrix_targets:
+            reasons.append('Not present as a transition target in the discovered probability matrix')
+        else:
+            reasons.append('Low transition probability — never selected by chance during this run')
+
+    return reasons if reasons else ['No specific cause identified — may be a probability/seed issue']
+
+
+def compute_audit(state: SimulationState, static_model: Any = None, prob_matrix: dict | None = None) -> dict[str, Any]:
     """Compute object lifecycle and activity participation audits from a completed run.
 
     Object lifecycle audit — per object type:
@@ -222,6 +277,9 @@ def compute_audit(state: SimulationState, static_model: Any = None) -> dict[str,
         n_firings = len(firings)
 
         if n_firings == 0:
+            never_fired_reasons = _diagnose_never_fired(
+                act_name, static_model, state, prob_matrix or {}
+            )
             activity_participation_audit[act_name] = {
                 'execution_count': 0,
                 'unique_objects': 0,
@@ -229,7 +287,7 @@ def compute_audit(state: SimulationState, static_model: Any = None) -> dict[str,
                 'reuse_rate': None,
                 'dominant_object': None,
                 'classification': 'never_fired',
-                'issues': ['Activity never fired — check constraints and object availability'],
+                'issues': never_fired_reasons,
             }
             continue
 
