@@ -51,13 +51,15 @@ def _last_activity_for_scope_object(state: SimulationState, scope_object_id: str
 # ---------------------------------------------------------------------------
 
 def _get_scope_object_ids_from_candidate(candidate: Any, state: SimulationState, scope_object_type: str) -> list[str]:
+    resource_types = getattr(state, '_resource_types', set()) or set()
     ids: list[str] = []
     for oid in getattr(candidate, "participating_object_ids", []) or []:
         runtime = state.objects.get(oid)
         if runtime is None:
             continue
         if runtime.object_type == scope_object_type:
-            ids.append(oid)
+            if runtime.object_type not in resource_types:
+                ids.append(oid)
     return ids
 
 

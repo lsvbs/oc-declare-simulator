@@ -3,6 +3,7 @@ import axios from 'axios';
 import './App.css';
 import FlowChart from './FlowChart';
 import ModelEditor from './ModelEditor';
+import { O2ODiagram } from './ModelEditor';
 
 // ── TransitionFlowChart ───────────────────────────────────────────────────────
 const TFC_R = 22;
@@ -648,9 +649,9 @@ function TimingDiscoveryPanel({
   activities, eventLogFile,
   isDiscovering, result, error,
   onDiscover, timingAnchors, setTimingAnchors,
+  hideButton = false,
+  mode, setMode, singleActivity, setSingleActivity,
 }) {
-  const [mode, setMode] = useState('single'); // 'single' | 'multi'
-  const [singleActivity, setSingleActivity] = useState('');
 
   const singleAnchor = timingAnchors[singleActivity] || { ...EMPTY_ANCHOR };
 
@@ -696,7 +697,7 @@ function TimingDiscoveryPanel({
   return (
     <div className="timing-discovery-section">
       <div className="section-header">
-        <h2>Step 2.5: Discover Time Distributions</h2>
+        <h2>Discover Time Distributions</h2>
         <p>
           Provide known service-time parameters for one or more <strong>anchor activities</strong>.
           All other activity times are derived from OCEL event timestamps using the OCPA framework
@@ -786,6 +787,7 @@ function TimingDiscoveryPanel({
         </div>
       )}
 
+      {!hideButton && (
       <button
         className="timing-discover-btn"
         onClick={handleDiscover}
@@ -794,6 +796,7 @@ function TimingDiscoveryPanel({
       >
         {isDiscovering ? 'Discovering…' : '⏱ Discover Time Distributions'}
       </button>
+      )}
 
       {error && <div className="error-box" style={{ marginTop: '0.75rem' }}><p>{error}</p></div>}
 
@@ -977,47 +980,6 @@ function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onMod
   );
 }
 
-// ── O2ODiscoveryPanel ─────────────────────────────────────────────────────────
-function O2ODiscoveryPanel({ eventLogFile, activeModel, onModelChange }) {
-  const [isDiscovering, setIsDiscovering] = React.useState(false);
-  const [result, setResult] = React.useState(null);
-  const [error, setError] = React.useState(null);
-
-  const run = async () => {
-    setIsDiscovering(true);
-    setError(null);
-    setResult(null);
-    try {
-      const res = await axios.post('/api/discover-o2o', { eventLogFile });
-      if (res.data.success) {
-        onModelChange({ ...activeModel, o2o_rules: res.data.o2o_rules });
-        setResult(res.data.count);
-      } else {
-        setError(res.data.error || 'Discovery failed');
-      }
-    } catch (err) {
-      setError(err.response?.data?.error || err.message);
-    } finally {
-      setIsDiscovering(false);
-    }
-  };
-
-  return (
-    <div className="o2o-discover-bar">
-      <div className="o2o-discover-left">
-        <span className="o2o-discover-label">Object-to-Object relationships</span>
-        {result !== null && (
-          <span className="o2o-discover-result">✓ {result} rule{result !== 1 ? 's' : ''} applied to model</span>
-        )}
-        {error && <span className="o2o-discover-error">{error}</span>}
-      </div>
-      <button className="start-prob-btn" disabled={isDiscovering} onClick={run}>
-        {isDiscovering ? 'Discovering…' : 'Discover O2O relationships'}
-      </button>
-    </div>
-  );
-}
-
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -1153,7 +1115,9 @@ function App() {
   const hasModelWarnings = bindingWarnings.length > 0;
 
   // ── Step 2.5: Timing discovery state ─────────────────────────────────────
-  const [timingAnchors,       setTimingAnchors]       = useState({}); // actName → {mean_seconds,std_seconds,min_seconds,max_seconds}
+  const [timingAnchors,       setTimingAnchors]       = useState({});
+  const [timingMode,          setTimingMode]          = useState('single');
+  const [timingSingleAct,     setTimingSingleAct]     = useState(''); // actName → {mean_seconds,std_seconds,min_seconds,max_seconds}
   const [isDiscoveringTiming, setIsDiscoveringTiming] = useState(false);
   const [timingDiscoveryResult, setTimingDiscoveryResult] = useState(null);
   const [timingDiscoveryFile,   setTimingDiscoveryFile]   = useState(null);
@@ -1165,6 +1129,22 @@ function App() {
   const [paramDiscoveryEnabled, setParamDiscoveryEnabled] = useState({
     probability: true, lifecycle: true, time: true,
   });
+
+  // ── External OC-Declare + OCEL tab state ──────────────────────────────────
+  const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'simulation'
+  const [discoveryChecks, setDiscoveryChecks] = useState({
+    lifecycle: true, timing: true, resources: true, o2o: true, startProb: true,
+  });
+  const [activeDiscoveryTab, setActiveDiscoveryTab] = useState('lifecycle');
+  const [isRunningDiscoveries, setIsRunningDiscoveries] = useState(false);
+  const [startProbApplied, setStartProbApplied] = useState(false);
+  const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
+  const [lifecycleError, setLifecycleError] = useState(null);
+  const [resourceResult, setResourceResult] = useState(null);     // [{type, instance_count}]
+  const [resourceError, setResourceError] = useState(null);
+  const [o2oResult, setO2oResult] = useState(null);               // {count}
+  const [o2oError, setO2oError] = useState(null);
+  const [resourceThreshold, setResourceThreshold] = useState(50);
 
   // ── Automated post-processing state ───────────────────────────────────────
   const [autoConfig, setAutoConfig] = useState({
@@ -1321,11 +1301,13 @@ function App() {
 
   // Keep editor/timing data available whenever a simulation model is selected,
   // even if Step 1 discovery was not run immediately beforehand.
+  // Skip reload if the user has already applied discoveries (modelEdited = true) —
+  // we don't want to overwrite lifecycle/resources/o2o/timing results.
   useEffect(() => {
-    if (config.ocdeclareFile) {
+    if (config.ocdeclareFile && !modelEdited) {
       loadModelState(config.ocdeclareFile, discoveryConfig.eventLogFile);
     }
-  }, [config.ocdeclareFile, discoveryConfig.eventLogFile, loadModelState]);
+  }, [config.ocdeclareFile, discoveryConfig.eventLogFile, loadModelState, modelEdited]);
 
   const runOcdeclareDiscovery = async () => {
     setIsOcdeclareDiscovering(true);
@@ -1450,31 +1432,147 @@ function App() {
       }
 
       // Merge into activeModel.activity_durations so the Timing tab is pre-filled.
-      // Match metric keys (from the log) to model activity names case-insensitively
-      // so minor casing differences still populate the editor.
-      if (activeModel && !Array.isArray(activeModel)) {
-        const existing = activeModel.activity_durations || {};
-        const modelActs = (activeModel.activities || []).map(a => a.name);
+      // Use functional updater so we always work on the latest state, not a stale closure.
+      setActiveModel(prev => {
+        if (!prev || Array.isArray(prev)) return prev;
+        const existing = prev.activity_durations || {};
+        const modelActs = (prev.activities || []).map(a => a.name);
         const lowerToModel = {};
         modelActs.forEach(n => { lowerToModel[n.toLowerCase()] = n; });
-
         const merged = { ...existing };
         Object.entries(metrics).forEach(([metricKey, val]) => {
-          // Prefer exact model-name match; else case-insensitive; else keep metric key
           const targetName = modelActs.includes(metricKey)
             ? metricKey
             : (lowerToModel[metricKey.toLowerCase()] || metricKey);
-          // User-edited entries take priority — don't clobber existing
           if (!(targetName in existing)) merged[targetName] = val;
         });
-        setActiveModel(prev => ({ ...prev, activity_durations: merged }));
-      }
+        return { ...prev, activity_durations: merged };
+      });
+      setModelEdited(true);
     } catch (e) {
       setTimingError(e.response?.data?.error || e.message);
     } finally {
       setIsDiscoveringTiming(false);
     }
   };
+
+  // Wraps setActiveModel so any change made through the Model Editor flags the
+  // model as user-edited (timing auto-discovery uses setActiveModel directly and
+  // therefore does NOT mark the model as custom).
+  const handleModelEdit = useCallback((updatedModel) => {
+    setActiveModel(updatedModel);
+    setModelEdited(true);
+  }, []);
+
+  // ── External OC-Declare + OCEL discovery handlers ────────────────────────
+
+  const runLifecycleDerivation = useCallback(async () => {
+    setLifecycleError(null);
+    setLifecycleResult(null);
+    try {
+      const payload = { ocdeclareFile: config.ocdeclareFile };
+      if (discoveryConfig.eventLogFile) payload.eventLogFile = discoveryConfig.eventLogFile;
+      const res = await axios.post('/api/derive-lifecycle', payload);
+      if (res.data.success) {
+        setActiveModel(prev => ({
+          ...(prev || {}),
+          activities: res.data.model.activities,
+          o2o_rules: res.data.model.o2o_rules?.length ? res.data.model.o2o_rules : ((prev || {}).o2o_rules || []),
+        }));
+        setModelEdited(true);
+        setLifecycleResult({ summary: res.data.summary, method: res.data.method });
+      } else {
+        setLifecycleError(res.data.error);
+      }
+    } catch (e) {
+      setLifecycleError(e.response?.data?.error || e.message);
+    }
+  }, [config.ocdeclareFile, discoveryConfig.eventLogFile]);
+
+  const runResourceDiscovery = useCallback(async () => {
+    setResourceError(null);
+    setResourceResult(null);
+    try {
+      const res = await axios.post('/api/discover-resources', {
+        eventLogFile: discoveryConfig.eventLogFile,
+        resourceThreshold,
+      });
+      if (res.data.success) {
+        const newTypes = res.data.resource_types;
+        const instanceCounts = {};
+        (res.data.resource_info || []).forEach(r => { instanceCounts[r.type] = r.instance_count; });
+        setActiveModel(prev => {
+          const existingPool = (prev || {}).resource_pool_sizes || {};
+          const newPool = {};
+          newTypes.forEach(t => { newPool[t] = existingPool[t] ?? (instanceCounts[t] || 1); });
+          return { ...(prev || {}), resource_types: newTypes, resource_pool_sizes: newPool };
+        });
+        setModelEdited(true);
+        setResourceResult(res.data.resource_info);
+      } else {
+        setResourceError(res.data.error || 'Discovery failed');
+      }
+    } catch (err) {
+      setResourceError(err.response?.data?.error || err.message);
+    }
+  }, [discoveryConfig.eventLogFile, resourceThreshold]);
+
+  const runO2ODiscovery = useCallback(async () => {
+    setO2oError(null);
+    setO2oResult(null);
+    try {
+      const res = await axios.post('/api/discover-o2o', { eventLogFile: discoveryConfig.eventLogFile });
+      if (res.data.success) {
+        setActiveModel(prev => ({ ...(prev || {}), o2o_rules: res.data.o2o_rules }));
+        setModelEdited(true);
+        setO2oResult({ count: res.data.count });
+      } else {
+        setO2oError(res.data.error || 'Discovery failed');
+      }
+    } catch (err) {
+      setO2oError(err.response?.data?.error || err.message);
+    }
+  }, [discoveryConfig.eventLogFile]);
+
+  const runAllDiscoveries = useCallback(async () => {
+    if (!discoveryConfig.eventLogFile) return;
+    setIsRunningDiscoveries(true);
+    try {
+      if (discoveryChecks.lifecycle) await runLifecycleDerivation();
+      if (discoveryChecks.resources) await runResourceDiscovery();
+      if (discoveryChecks.timing)    await runTimingDiscovery();
+      if (discoveryChecks.o2o)       await runO2ODiscovery();
+      if (discoveryChecks.startProb && activeProbMatrix && discoveryResults?.likely_start_activities?.length > 0) {
+        const counts = discoveryResults.activity_counts;
+        const total = Object.values(counts).reduce((s, v) => s + v, 0);
+        if (total > 0) {
+          const selected = new Set(discoveryConfig.startActivityProbSelected ?? [discoveryResults.likely_start_activities[0]]);
+          const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
+          const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
+          const newMatrix = {};
+          Object.entries(activeProbMatrix).forEach(([src, targets]) => {
+            const tgts = { ...targets };
+            selected.forEach(a => delete tgts[a]);
+            const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
+            const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
+            const scaled = {};
+            Object.entries(tgts).forEach(([t, v]) => { scaled[t] = Math.round(v * scale * 10000) / 10000; });
+            selected.forEach(a => {
+              const share = selectedCountSum > 0 ? combinedProb * (counts[a] || 0) / selectedCountSum : combinedProb / selected.size;
+              scaled[a] = Math.round(share * 10000) / 10000;
+            });
+            newMatrix[src] = scaled;
+          });
+          setActiveProbMatrix(newMatrix);
+          setStartProbApplied(true);
+          setConfig(p => ({ ...p, startActivities: [...selected] }));
+        }
+      }
+    } finally {
+      setIsRunningDiscoveries(false);
+    }
+  }, [discoveryChecks, discoveryConfig, discoveryResults, activeProbMatrix,
+      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery]);
 
   const stopSimulation = useCallback(async () => {
     if (!activeRunId) return;
@@ -1606,14 +1704,6 @@ function App() {
     if (entry.prob_matrix_override) setActiveProbMatrix(entry.prob_matrix_override);
   }, []);
 
-  // Wraps setActiveModel so any change made through the Model Editor flags the
-  // model as user-edited (timing auto-discovery uses setActiveModel directly and
-  // therefore does NOT mark the model as custom).
-  const handleModelEdit = useCallback((updatedModel) => {
-    setActiveModel(updatedModel);
-    setModelEdited(true);
-  }, []);
-
   // Load a saved parameter file (from IO/input/parameters) into the editor.
   const handleLoadParameters = useCallback(async (filename) => {
     if (!filename) return;
@@ -1626,6 +1716,7 @@ function App() {
         }
         // Loaded custom parameters → treat as user-edited so they take effect.
         setModelEdited(true);
+        setExternalTab('simulation');
       }
     } catch (err) {
       console.error('Could not load parameters:', err.response?.data?.error || err.message);
@@ -1647,6 +1738,36 @@ function App() {
     }
     return null;
   }, []);
+
+  const handleDownloadParameters = useCallback(() => {
+    if (!activeModel || Array.isArray(activeModel)) return;
+    const m = activeModel;
+    const resourceTypes = m.resource_types || [];
+    const exportObj = {
+      object_types: m.object_types || [],
+      activities:   m.activities   || [],
+      constraints:  m.constraints  || [],
+      o2o_rules:    m.o2o_rules    || [],
+      ...(m.attribute_schema && Object.keys(m.attribute_schema).length ? { attribute_schema: m.attribute_schema } : {}),
+      ...(m.activity_durations && Object.keys(m.activity_durations).length ? { activity_durations: m.activity_durations } : {}),
+      ...(m.max_consecutive && Object.keys(m.max_consecutive).length ? { max_consecutive: m.max_consecutive } : {}),
+      ...(m.max_consecutive_per_object && Object.keys(m.max_consecutive_per_object).length ? { max_consecutive_per_object: m.max_consecutive_per_object } : {}),
+      ...(resourceTypes.length ? { resource_types: resourceTypes } : {}),
+      ...(m.resource_pool_sizes && Object.keys(m.resource_pool_sizes).length ? { resource_pool_sizes: m.resource_pool_sizes } : {}),
+      ...(activeProbMatrix && Object.keys(activeProbMatrix).length ? { transition_matrix: activeProbMatrix } : {}),
+    };
+    const base = (config.ocdeclareFile || 'parameters').replace(/\.json$/i, '').replace(/^discovered_/, '');
+    const ts = new Date().toISOString().slice(0,19).replace('T','_').replace(/-/g,'').replace(/:/g,'');
+    const filename = `parameters_${base}_${ts}.json`;
+    const blob = new Blob([JSON.stringify(exportObj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    handleSaveParameters(filename, exportObj);
+  }, [activeModel, activeProbMatrix, config.ocdeclareFile, handleSaveParameters]);
 
   // ── Automated post-processing helpers ─────────────────────────────────────
 
@@ -2158,8 +2279,8 @@ function App() {
       )}
 
       <div className="workflow-container" style={!workflowMode ? {display:'none'} : {}}>
-        {/* ── STEP 1: Parameter Discovery (internal + external-ocel modes) ── */}
-        {(workflowMode === 'internal' || workflowMode === 'external-ocel') && (
+        {/* ── STEP 1: Parameter Discovery (internal mode only) ── */}
+        {workflowMode === 'internal' && (
         <div className="discovery-section">
           <div className="section-header">
             <h2>Step 1: Parameter Discovery</h2>
@@ -2169,9 +2290,15 @@ function App() {
           <div className="discovery-config">
             <div className="form-group">
               <label>Event Log File</label>
-              <select 
+              <select
                 value={discoveryConfig.eventLogFile}
-                onChange={(e) => handleDiscoveryConfigChange('eventLogFile', e.target.value)}
+                onChange={(e) => {
+                  handleDiscoveryConfigChange('eventLogFile', e.target.value);
+                  if (e.target.value && workflowMode === 'external-ocel') {
+                    // auto-trigger base discovery immediately for external-ocel
+                    setTimeout(() => runDiscovery(), 0);
+                  }
+                }}
                 disabled={isDiscovering}
               >
                 <option value="">Select event log...</option>
@@ -2402,7 +2529,6 @@ function App() {
                       <tr>
                         <th>Object Type</th>
                         <th className="octs-num">Instances</th>
-                        <th className="octs-num">Max reuse</th>
                         <th>Attributes</th>
                       </tr>
                     </thead>
@@ -2411,9 +2537,6 @@ function App() {
                         <tr key={type}>
                           <td className="octs-type">{type}</td>
                           <td className="octs-num">{info.count.toLocaleString()}</td>
-                          <td className="octs-num" title={info.mean_max_reuse != null ? `Mean max reuse per object: ${info.mean_max_reuse}` : undefined}>
-                            {info.max_reuse != null ? info.max_reuse : '—'}
-                          </td>
                           <td className="octs-attrs">
                             {info.attributes.length > 0
                               ? info.attributes.map(a => (
@@ -2444,6 +2567,1565 @@ function App() {
         </div>
 
         )}
+
+        {/* ── External OC-Declare + OCEL: Two-tab layout ── */}
+        {workflowMode === 'external-ocel' && (
+          <div className="ext-ocel-tabs">
+            <div className="ext-ocel-tab-header">
+              <button
+                className={`ext-ocel-tab-btn${externalTab === 'parameter' ? ' active' : ''}`}
+                onClick={() => setExternalTab('parameter')}
+              >
+                Parameter
+              </button>
+              <button
+                className={`ext-ocel-tab-btn${externalTab === 'simulation' ? ' active' : ''}`}
+                onClick={() => setExternalTab('simulation')}
+              >
+                Simulation
+              </button>
+            </div>
+
+            {/* ── PARAMETER TAB ── */}
+            {externalTab === 'parameter' && (
+              <div className="ext-ocel-tab-content">
+
+                {/* A: File Selection — OCEL first, then OC-Declare */}
+                <div className="discovery-section">
+                  <div className="section-header">
+                    <h2>Parameter Discovery</h2>
+                    <p>Select an OCEL log and an OC-Declare model to begin, activities, number of events and probability will be discovered</p>
+                  </div>
+                  <div className="discovery-config">
+                    <div className="form-group">
+                      <label>Event Log File (OCEL 2.0 Format)</label>
+                      <select
+                        value={discoveryConfig.eventLogFile}
+                        onChange={(e) => {
+                          handleDiscoveryConfigChange('eventLogFile', e.target.value);
+                          if (e.target.value && workflowMode === 'external-ocel') {
+                            setTimeout(() => runDiscovery(), 0);
+                          }
+                        }}
+                        disabled={isDiscovering}
+                      >
+                        <option value="">Select event log...</option>
+                        {eventLogFiles.map(file => (
+                          <option key={file} value={file}>{file}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label>OC-Declare Model</label>
+                      <select
+                        value={config.ocdeclareFile}
+                        onChange={(e) => handleConfigChange('ocdeclareFile', e.target.value)}
+                      >
+                        <option value="">Select OC-Declare file...</option>
+                        {ocdeclareFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                      </select>
+                    </div>
+                    <button
+                      className="discovery-button"
+                      onClick={runDiscovery}
+                      disabled={isDiscovering || !discoveryConfig.eventLogFile}
+                    >
+                      {isDiscovering ? 'Discovering...' : 'Run Discovery'}
+                    </button>
+                  </div>
+
+                  {discoveryError && (
+                    <div className="error-box">
+                      <h3>Discovery Error</h3>
+                      <p>{discoveryError}</p>
+                    </div>
+                  )}
+                  {isDiscovering && (
+                    <div className="loading-box">
+                      <div className="spinner"></div>
+                      <p>Running parameter discovery...</p>
+                    </div>
+                  )}
+
+                  {discoveryResults && !isDiscovering && (() => {
+                    const dr = discoveryResults;
+                    return (
+                      <div className="discovery-results" style={{marginTop:'1rem'}}>
+                        <div className="stat-grid">
+                          <div className="stat-card">
+                            <div className="stat-value">{dr.activity_count}</div>
+                            <div className="stat-label">Activities Found</div>
+                          </div>
+                          <div className="stat-card">
+                            <div className="stat-value">{dr.total_events}</div>
+                            <div className="stat-label">Events Analyzed</div>
+                          </div>
+                          <div className="stat-card">
+                            <div className="stat-value">{dr.transition_count}</div>
+                            <div className="stat-label">Transitions</div>
+                          </div>
+                        </div>
+                        {dr.object_type_stats && Object.keys(dr.object_type_stats).length > 0 && (
+                          <Collapsible title="Discovered Objects" badge={`${Object.keys(dr.object_type_stats).length} types`} defaultOpen={false} className="discovery-transition-collapsible">
+                            <table className="object-type-stats-table">
+                              <thead><tr><th>Object Type</th><th className="octs-num">Instances</th><th className="octs-num">Max reuse</th><th>Attributes</th></tr></thead>
+                              <tbody>
+                                {Object.entries(dr.object_type_stats).map(([type, info]) => (
+                                  <tr key={type}>
+                                    <td className="octs-type">{type}</td>
+                                    <td className="octs-num">{info.count.toLocaleString()}</td>
+                                    <td className="octs-num" title={info.mean_max_reuse != null ? `Mean: ${info.mean_max_reuse}` : undefined}>{info.max_reuse != null ? info.max_reuse : '—'}</td>
+                                    <td className="octs-attrs">{info.attributes.length > 0 ? info.attributes.map(a => <span key={a} className="octs-attr-badge">{a}</span>) : <span className="octs-no-attrs">—</span>}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </Collapsible>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* B: Discoveries */}
+                {discoveryResults && (() => {
+                  const DISC_ITEMS = [
+                    { key: 'lifecycle', label: 'Lifecycle' },
+                    { key: 'resources', label: 'Resources' },
+                    { key: 'timing',    label: 'Timing' },
+                    { key: 'o2o',       label: 'O2O' },
+                    { key: 'startProb', label: 'Start Probability' },
+                  ];
+                  // Ensure activeDiscoveryTab is one of the defined keys; default to first
+                  const activeKey = DISC_ITEMS.some(d => d.key === activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
+                  const resultBadge = key => {
+                    if (key === 'lifecycle' && lifecycleResult && !lifecycleResult.error) return lifecycleResult.method === 'ocel' ? '✓' : '⚠';
+                    if (key === 'resources' && resourceResult) return '✓';
+                    if (key === 'timing' && timingDiscoveryResult) return '✓';
+                    if (key === 'o2o' && o2oResult) return '✓';
+                    if (key === 'startProb' && startProbApplied) return '✓';
+                    return null;
+                  };
+                  return (
+                    <div className="discovery-section">
+                      <div className="section-header">
+                        <h2>Discoveries</h2>
+                        <p>Tick tabs to include in the run. Click a tab to configure it.</p>
+                      </div>
+
+                      {/* Tab bar — one tab per discovery */}
+                      <div className="disc-tab-bar">
+                        {DISC_ITEMS.map(({ key, label }) => {
+                          const badge = resultBadge(key);
+                          return (
+                            <button
+                              key={key}
+                              className={`disc-tab-btn${activeKey === key ? ' active' : ''}${discoveryChecks[key] ? ' checked' : ''}`}
+                              onClick={() => setActiveDiscoveryTab(key)}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={discoveryChecks[key]}
+                                onClick={e => e.stopPropagation()}
+                                onChange={e => setDiscoveryChecks(p => ({ ...p, [key]: e.target.checked }))}
+                              />
+                              {label}
+                              {badge && <span className={`disc-tab-badge ${badge === '⚠' ? 'badge-warn' : 'badge-ok'}`}>{badge}</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Active tab panel */}
+                      <div className="disc-tab-panel">
+                        {activeKey === 'lifecycle' && (
+                          <div>
+                            <p className="disc-tab-desc">Infer <code>creates</code>/<code>deactivates</code> flags for each activity binding from the OCEL log.</p>
+                            {lifecycleResult && !lifecycleResult.error && (
+                              <>
+                                <span className={`ext-disc-badge ${lifecycleResult.method === 'ocel' ? 'badge-ok' : 'badge-warn'}`}>
+                                  {lifecycleResult.method === 'ocel' ? '✓ OCEL log' : '⚠ arc heuristic'}
+                                </span>
+                                <ul style={{fontSize:'0.78rem',marginTop:'0.4rem',color:'#475569',paddingLeft:'1.25rem'}}>
+                                  {(lifecycleResult.summary||[]).slice(1).map((s,i) => <li key={i}>{s}</li>)}
+                                </ul>
+                              </>
+                            )}
+                            {lifecycleError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{lifecycleError}</p>}
+                          </div>
+                        )}
+
+                        {activeKey === 'resources' && (
+                          <div>
+                            <p className="disc-tab-desc">Classify object types as reusable resources based on average event participation.</p>
+                            <label className="resource-threshold-label">
+                              Threshold (avg events/instance):
+                              <input type="number" className="resource-threshold-input" value={resourceThreshold} min={1}
+                                onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))} />
+                            </label>
+                            {resourceResult && (
+                              <table className="resource-discover-table" style={{marginTop:'0.6rem'}}>
+                                <thead><tr><th>Type</th><th className="octs-num">Instances</th></tr></thead>
+                                <tbody>{resourceResult.map(r => <tr key={r.type}><td>{r.type}</td><td className="octs-num">{r.instance_count.toLocaleString()}</td></tr>)}</tbody>
+                              </table>
+                            )}
+                            {resourceError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{resourceError}</p>}
+                          </div>
+                        )}
+
+                        {activeKey === 'timing' && (
+                          <div>
+                            <TimingDiscoveryPanel
+                              activities={discoveryResults.activities || []}
+                              eventLogFile={discoveryConfig.eventLogFile}
+                              isDiscovering={isDiscoveringTiming}
+                              result={timingDiscoveryResult}
+                              error={timingError}
+                              onDiscover={runTimingDiscovery}
+                              timingAnchors={timingAnchors}
+                              setTimingAnchors={setTimingAnchors}
+                              hideButton={true}
+                              mode={timingMode}
+                              setMode={setTimingMode}
+                              singleActivity={timingSingleAct}
+                              setSingleActivity={setTimingSingleAct}
+                            />
+                          </div>
+                        )}
+
+                        {activeKey === 'o2o' && (
+                          <div>
+                            <p className="disc-tab-desc">Discover object-to-object cardinality rules from co-occurring objects in events.</p>
+                            {o2oResult && (
+                              <span className="ext-disc-badge badge-ok">✓ {o2oResult.count} rule{o2oResult.count !== 1 ? 's' : ''} applied to model</span>
+                            )}
+                            {o2oError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{o2oError}</p>}
+                            {activeModel && !Array.isArray(activeModel) && (activeModel.o2o_rules||[]).length > 0 && (
+                              <div style={{marginTop:'0.75rem'}}>
+                                <O2ODiagram
+                                  rules={activeModel.o2o_rules}
+                                  otNames={(activeModel.object_types||[]).map(t => typeof t === 'string' ? t : t.name)}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {activeKey === 'startProb' && (() => {
+                          const countTotal = Object.values(discoveryResults.activity_counts||{}).reduce((s,v)=>s+v,0);
+                          const candidates = [
+                            ...(discoveryResults.likely_start_activities||[]),
+                            ...Object.keys(discoveryResults.activity_counts||{})
+                              .filter(a => !(discoveryResults.likely_start_activities||[]).includes(a))
+                              .sort((a,b)=>(discoveryResults.activity_counts[b]||0)-(discoveryResults.activity_counts[a]||0)),
+                          ];
+                          const selected = new Set(discoveryConfig.startActivityProbSelected ?? (candidates[0] ? [candidates[0]] : []));
+                          const toggle = a => {
+                            const next = new Set(selected);
+                            next.has(a) ? next.delete(a) : next.add(a);
+                            setDiscoveryConfig(p => ({ ...p, startActivityProbSelected: [...next] }));
+                          };
+                          return (
+                            <div>
+                              <p className="disc-tab-desc">Apply each selected activity's log frequency as its transition probability from all sources, preserving ratios between existing targets.</p>
+                              <p style={{fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem',fontWeight:600}}>
+                                Select at least one start activity <span style={{color:'#b91c1c'}}>(required)</span>:
+                              </p>
+                              <div className="start-prob-checklist">
+                                {candidates.map((a, i) => (
+                                  <label key={a} className={`start-prob-check-item${selected.has(a) ? ' spc-checked' : ''}`}>
+                                    <input type="checkbox" checked={selected.has(a)} onChange={() => toggle(a)} />
+                                    {i === 0 && <span className="sa-top-badge">★</span>}
+                                    <span className="spc-name">{a}</span>
+                                    <span className="spc-pct">{((discoveryResults.activity_counts[a]||0)/countTotal*100).toFixed(1)}%</span>
+                                  </label>
+                                ))}
+                              </div>
+                              {selected.size === 0 && (
+                                <p style={{fontSize:'0.75rem',color:'#b91c1c',marginTop:'0.35rem'}}>⚠ Select at least one activity to enable this discovery.</p>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </div>
+
+                      <button
+                        className="discovery-button"
+                        style={{marginTop:'0.75rem'}}
+                        disabled={
+                          isRunningDiscoveries || !config.ocdeclareFile || !discoveryConfig.eventLogFile ||
+                          (discoveryChecks.startProb && (!discoveryConfig.startActivityProbSelected || discoveryConfig.startActivityProbSelected.length === 0))
+                        }
+                        onClick={runAllDiscoveries}
+                        title={discoveryChecks.startProb && (!discoveryConfig.startActivityProbSelected || discoveryConfig.startActivityProbSelected.length === 0)
+                          ? 'Select at least one start activity in the Start Activity Probability tab'
+                          : undefined}
+                      >
+                        {isRunningDiscoveries ? 'Running discoveries...' : 'Run Discoveries'}
+                      </button>
+                    </div>
+                  );
+                })()}
+
+                {/* C: Post-Processing Result (health check + suggestions) */}
+                <div className="postprocessing-result-section">
+                  <div className="section-header">
+                    <h2>Post-Processing</h2>
+                    <p>Review the constraint health before running the simulation</p>
+                  </div>
+
+                  <button
+                    className="health-check-button"
+                    onClick={runHealthCheck}
+                    disabled={isCheckingHealth || isSimulating || !config.ocdeclareFile || config.startActivities.length === 0}
+                  >
+                    {isCheckingHealth ? '⏳ Checking...' : '🩺 Run Health Check'}
+                  </button>
+
+                  {healthResult && !healthResult.error && (() => {
+                    const s = healthResult.summary || {};
+                    const hasErrors   = s.errors > 0;
+                    const hasWarnings = s.warnings > 0;
+                    const badge = `${s.errors} error${s.errors !== 1 ? 's' : ''}, ${s.warnings} warning${s.warnings !== 1 ? 's' : ''}`;
+                    const titleClass = hasErrors ? 'health-title-error' : hasWarnings ? 'health-title-warn' : 'health-title-ok';
+                    return (
+                      <Collapsible
+                        className="health-report-box"
+                        title={<span className={titleClass}>🩺 Constraint Health Report</span>}
+                        badge={badge}
+                        defaultOpen={hasErrors || hasWarnings}
+                      >
+                        {healthResult.no_input_activities?.length > 0 && (
+                          <Collapsible
+                            className="health-section health-warn"
+                            title={<span className="health-section-title">⚠ Activities with no input constraints</span>}
+                            badge={healthResult.no_input_activities.length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.no_input_activities.map((a, i) => (
+                              <div key={i} className="health-item health-no-input-item">
+                                <span className={`health-badge-${a.is_pure_start ? 'error' : 'warn'}`}>
+                                  {a.is_pure_start ? 'START' : 'NO INPUT'}
+                                </span>
+                                <strong>{a.activity}</strong>
+                                {a.input_bindings.length > 0 ? (
+                                  <ul className="health-no-input-bindings">
+                                    {a.input_bindings.map((b, j) => (
+                                      <li key={j}>
+                                        <code>{b.object_type}</code>
+                                        {b.is_resource && <span className="health-excl-hint"> (resource)</span>}
+                                        {b.created_by.length > 0 && (
+                                          <span className="health-excl-hint"> — created by: <em>{b.created_by.join(', ')}</em></span>
+                                        )}
+                                        {b.deactivated_by.length > 0 && (
+                                          <span className="health-excl-hint"> · deactivated by: <em>{b.deactivated_by.join(', ')}</em></span>
+                                        )}
+                                        {b.created_by.length === 0 && !b.is_resource && (
+                                          <span className="health-excl-hint" style={{color:'#b91c1c'}}> — no activity creates this type</span>
+                                        )}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                ) : (
+                                  <span className="health-reason"> — no input bindings (pure start activity)</span>
+                                )}
+                              </div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {healthResult.cycles?.length > 0 && (
+                          <Collapsible
+                            className="health-section health-error"
+                            title={<span className="health-section-title">🔴 Dependency cycles (deadlock)</span>}
+                            badge={healthResult.cycles.length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.cycles.map((cy, i) => (
+                              <div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {healthResult.permanently_blocked?.length > 0 && (
+                          <Collapsible
+                            className="health-section health-error"
+                            title={<span className="health-section-title">🔴 Activities never reaching the pool</span>}
+                            badge={healthResult.permanently_blocked.length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.permanently_blocked.map((b, i) => (
+                              <div key={i} className="health-item">
+                                <span className="health-badge-error">BLOCKED</span>
+                                <strong>{b.activity}</strong>
+                                {b.exclusion_reason === 'no_objects' && b.exclusion_detail?.[0] && (
+                                  <span className="health-reason health-excl-reason">
+                                    {' '}← no active <code>{b.exclusion_detail[0].binding_type}</code> objects
+                                    {(() => {
+                                      const det = b.exclusion_detail[0];
+                                      const creators    = det.created_by    || [];
+                                      const deactivators = det.deactivated_by || [];
+                                      if (!creators.length && !deactivators.length)
+                                        return <span className="health-excl-hint"> (no activity creates this type or all were deactivated)</span>;
+                                      return (
+                                        <span className="health-excl-hint">
+                                          {' '}(
+                                          {creators.length > 0 && <>created by: <em>{creators.join(', ')}</em></>}
+                                          {creators.length > 0 && deactivators.length > 0 && ' · '}
+                                          {deactivators.length > 0 && <>deactivated by: <em>{deactivators.join(', ')}</em></>}
+                                          )
+                                        </span>
+                                      );
+                                    })()}
+                                  </span>
+                                )}
+                                {b.exclusion_reason === 'guard_filtered' && b.exclusion_detail?.[0] && (
+                                  <span className="health-reason health-excl-reason">
+                                    {' '}← attribute guard filtered all <code>{b.exclusion_detail[0].binding_type}</code> objects
+                                    <span className="health-excl-hint"> (no object satisfies the guard condition)</span>
+                                  </span>
+                                )}
+                                {!b.exclusion_reason && b.top_blocker && b.top_blocker !== 'never attempted' && (
+                                  <span className="health-reason"> ← {b.top_blocker}</span>
+                                )}
+                                {!b.exclusion_reason && (!b.top_blocker || b.top_blocker === 'never attempted') && (
+                                  <span className="health-reason health-never-attempted"> — never attempted (check start activities)</span>
+                                )}
+                              </div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {healthResult.top_blocking_constraints?.filter(c => c.is_chain).length > 0 && (
+                          <Collapsible
+                            className="health-section health-warn"
+                            title={<span className="health-section-title">⚠ Chain constraints (common deadlock source)</span>}
+                            badge={healthResult.top_blocking_constraints.filter(c => c.is_chain).length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.top_blocking_constraints.filter(c => c.is_chain).map((c, i) => (
+                              <div key={i} className="health-item">
+                                <span className="health-badge-warn">{c.count}×</span>
+                                <code className="health-constraint-label">{c.label}</code>
+                                <span className="health-reason"> blocks: {c.blocks.join(', ')}</span>
+                              </div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {healthResult.weak_precedences?.length > 0 && (
+                          <Collapsible
+                            className="health-section health-warn"
+                            title={<span className="health-section-title">⚠ Weak precedences (alternative paths in log)</span>}
+                            badge={healthResult.weak_precedences.length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.weak_precedences.map((wp, i) => (
+                              <div key={i} className="health-item">
+                                <span className="health-badge-warn">{wp.co_occurrence_pct}%</span>
+                                <code className="health-constraint-label">precedence({wp.source}→{wp.target}) each {wp.scope_type}</code>
+                                <span className="health-reason"> {wp.message}</span>
+                              </div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {healthResult.top_blocking_constraints?.filter(c => !c.is_chain).length > 0 && (
+                          <Collapsible
+                            className="health-section health-info"
+                            title={<span className="health-section-title">ℹ Top non-chain blocking constraints</span>}
+                            badge={healthResult.top_blocking_constraints.filter(c => !c.is_chain).length}
+                            defaultOpen={false}
+                          >
+                            {healthResult.top_blocking_constraints.filter(c => !c.is_chain).slice(0, 8).map((c, i) => (
+                              <div key={i} className="health-item">
+                                <span className="health-badge-info">{c.count}×</span>
+                                <code className="health-constraint-label">{c.label}</code>
+                              </div>
+                            ))}
+                          </Collapsible>
+                        )}
+                        {!hasErrors && !hasWarnings && (
+                          <div className="health-ok-msg">✓ No issues detected — model looks healthy.</div>
+                        )}
+                      </Collapsible>
+                    );
+                  })()}
+
+                  {healthResult?.error && (
+                    <div className="error-box" style={{ marginTop: '0.5rem' }}>
+                      <p>Health check error: {healthResult.error}</p>
+                    </div>
+                  )}
+
+                  {/* ── Automated Post-Processing ── */}
+                  <div className="automation-section">
+                    <div className="section-header">
+                      <h2>Automated Post-Processing</h2>
+                      <p>Configure thresholds, generate suggestions from the health check, then selectively apply fixes.</p>
+                    </div>
+
+                    {/* Configuration — collapsible */}
+                    <div className="auto-config-collapsible">
+                      <button className="auto-config-toggle" onClick={() => setAutoConfigOpen(o => !o)}>
+                        <span>{autoConfigOpen ? '▼' : '▶'}</span> Configuration
+                        <span className="auto-config-toggle-hint">
+                          {[
+                            autoConfig.cycleEnabled && 'cycles',
+                            autoConfig.weakEnabled && 'weak',
+                            autoConfig.chainEnabled && 'chain',
+                            autoConfig.o2oEnabled && 'O2O',
+                            autoConfig.nmaxEnabled && 'nmax',
+                            autoConfig.createsMissingEnabled && 'creates',
+                            autoConfig.startRecEnabled && 'start',
+                            autoConfig.redundantEnabled && 'redundant',
+                            autoConfig.unconstrainedEnabled && 'unconstrained',
+                            autoConfig.noInputBindingEnabled && 'no-binding',
+                          ].filter(Boolean).join(' · ')}
+                        </span>
+                      </button>
+                      {autoConfigOpen && (
+                      <div className="auto-config-panel">
+                        <div className="auto-config-row" style={{marginBottom:'0.4rem'}}>
+                          <button className="auto-sel-btn" onClick={() => setAutoConfig(p => ({
+                            ...p, cycleEnabled:true, weakEnabled:true, chainEnabled:true, o2oEnabled:true,
+                            nmaxEnabled:true, createsMissingEnabled:true, startRecEnabled:true,
+                            redundantEnabled:true, unconstrainedEnabled:true, noInputBindingEnabled:true,
+                          }))}>Select all</button>
+                          <button className="auto-sel-btn" style={{marginLeft:'0.3rem'}} onClick={() => setAutoConfig(p => ({
+                            ...p, cycleEnabled:false, weakEnabled:false, chainEnabled:false, o2oEnabled:false,
+                            nmaxEnabled:false, createsMissingEnabled:false, startRecEnabled:false,
+                            redundantEnabled:false, unconstrainedEnabled:false, noInputBindingEnabled:false,
+                          }))}>Deselect all</button>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.cycleEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, cycleEnabled: e.target.checked }))} />
+                            {' '}Cycle removal — remove constraints with nmin ≤
+                          </label>
+                          <input type="number" min={0} max={10} className="auto-config-input"
+                            value={autoConfig.cycleNminThreshold}
+                            disabled={!autoConfig.cycleEnabled}
+                            onChange={e => setAutoConfig(p => ({ ...p, cycleNminThreshold: parseInt(e.target.value) || 0 }))}
+                          />
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.weakEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, weakEnabled: e.target.checked }))} />
+                            {' '}Weak precedences — flag if co-occurrence below
+                          </label>
+                          <input type="number" min={0} max={100} className="auto-config-input"
+                            value={autoConfig.weakThreshold}
+                            disabled={!autoConfig.weakEnabled}
+                            onChange={e => setAutoConfig(p => ({ ...p, weakThreshold: parseInt(e.target.value) || 0 }))}
+                          />
+                          <span className="auto-config-unit">%</span>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.chainEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, chainEnabled: e.target.checked }))} />
+                            {' '}Chain constraints — downgrade if rejection count ≥
+                          </label>
+                          <input type="number" min={1} max={999} className="auto-config-input"
+                            value={autoConfig.chainBlockThreshold}
+                            disabled={!autoConfig.chainEnabled}
+                            onChange={e => setAutoConfig(p => ({ ...p, chainBlockThreshold: parseInt(e.target.value) || 1 }))}
+                          />
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.o2oEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, o2oEnabled: e.target.checked }))} />
+                            {' '}O2O max_links relaxation — suggest fixes when O2O caps block activities
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.nmaxEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, nmaxEnabled: e.target.checked }))} />
+                            {' '}nmax cap — raise/remove response nmax when cap is hit
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.createsMissingEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, createsMissingEnabled: e.target.checked }))} />
+                            {' '}Missing creates — suggest creates=true when no activity creates a required type
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.startRecEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, startRecEnabled: e.target.checked }))} />
+                            {' '}Start activity recommendation — suggest when all activities are blocked at step 0
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.redundantEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, redundantEnabled: e.target.checked }))} />
+                            {' '}Redundant constraints — remove weaker constraints implied by stronger ones
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.unconstrainedEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, unconstrainedEnabled: e.target.checked }))} />
+                            {' '}Unconstrained activities — suggest predecessor constraints for activities with no input arcs
+                          </label>
+                        </div>
+                        <div className="auto-config-row">
+                          <label className="auto-config-label">
+                            <input type="checkbox" checked={autoConfig.noInputBindingEnabled}
+                              onChange={e => setAutoConfig(p => ({ ...p, noInputBindingEnabled: e.target.checked }))} />
+                            {' '}No input binding — suggest adding an object binding to activities that only create objects
+                          </label>
+                        </div>
+                      </div>
+                      )}
+                    </div>
+
+                    {/* Generate button */}
+                    <button
+                      className="auto-generate-btn"
+                      disabled={!healthResult || !!healthResult.error || !activeModel}
+                      onClick={() => {
+                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig);
+                        setAutoSuggestions(suggs);
+                        setAutoSelected(new Set(suggs.map((_, i) => i)));
+                      }}
+                    >
+                      {!healthResult || healthResult.error
+                        ? '▶ Run health check first'
+                        : `▶ Generate Suggestions`}
+                    </button>
+
+                    {/* Suggestion list */}
+                    {autoSuggestions.length > 0 && (
+                      <div className="auto-suggestions">
+                        <div className="auto-suggestions-header">
+                          <span className="auto-suggestions-count">{autoSuggestions.length} suggestion{autoSuggestions.length !== 1 ? 's' : ''}</span>
+                          <button className="auto-sel-btn" onClick={() => setAutoSelected(new Set(autoSuggestions.map((_, i) => i)))}>Select all</button>
+                          <button className="auto-sel-btn" onClick={() => setAutoSelected(new Set())}>Select none</button>
+                        </div>
+                        <ul className="auto-suggestion-list">
+                          {autoSuggestions.map((s, i) => (
+                            <li key={s.id} className={`auto-suggestion-item ${autoSelected.has(i) ? 'selected' : ''}`}>
+                              <label className="auto-suggestion-check">
+                                <input type="checkbox"
+                                  checked={autoSelected.has(i)}
+                                  onChange={e => {
+                                    const next = new Set(autoSelected);
+                                    e.target.checked ? next.add(i) : next.delete(i);
+                                    setAutoSelected(next);
+                                  }}
+                                />
+                                <span className={`auto-badge auto-badge-${s.type.toLowerCase()}`}>{s.badgeLabel}</span>
+                                <span className="auto-suggestion-label">{s.label}</span>
+                              </label>
+                              <span className="auto-suggestion-desc">{s.desc}</span>
+                              {s.type === 'ADD_CONSTRAINT' && s.actionFactory && (
+                                <div className="auto-pred-row">
+                                  <label className="auto-pred-label">Predecessor activity:</label>
+                                  <select className="auto-pred-select"
+                                    value={autoConstraintPreds[s.id] || ''}
+                                    onChange={e => setAutoConstraintPreds(p => ({ ...p, [s.id]: e.target.value }))}>
+                                    <option value="">— choose —</option>
+                                    {(activeModel?.activities || [])
+                                      .filter(a => a.name !== s.targetActivity)
+                                      .map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
+                                  </select>
+                                  <span className="auto-pred-hint">→ creates precedence + response</span>
+                                </div>
+                              )}
+                              {s.type === 'ADD_BINDING' && s.actionFactory && (
+                                <div className="auto-pred-row">
+                                  <label className="auto-pred-label">Object type to bind:</label>
+                                  <select className="auto-pred-select"
+                                    value={autoBindingTypes[s.id] || ''}
+                                    onChange={e => setAutoBindingTypes(p => ({ ...p, [s.id]: e.target.value }))}>
+                                    <option value="">— choose —</option>
+                                    {(s.candidateTypes || []).map(t => {
+                                      const creator = s.typeCreatorActivity?.[t];
+                                      return <option key={t} value={t}>{t}{creator ? ` (created by: ${creator})` : ''}</option>;
+                                    })}
+                                  </select>
+                                  <span className="auto-pred-hint">→ adds binding + precedence from creator</span>
+                                </div>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                        <button
+                          className="auto-apply-btn"
+                          disabled={autoSelected.size === 0}
+                          onClick={() => {
+                            let model = { ...activeModel };
+                            autoSuggestions.forEach((s, i) => {
+                              if (!autoSelected.has(i)) return;
+                              if (s.type === 'ADD_CONSTRAINT' && s.actionFactory) {
+                                const pred = autoConstraintPreds[s.id] || '';
+                                model = s.actionFactory(pred)(model);
+                              } else if (s.type === 'ADD_BINDING' && s.actionFactory) {
+                                const otype = autoBindingTypes[s.id] || '';
+                                model = s.actionFactory(otype)(model);
+                              } else {
+                                model = s.action(model);
+                              }
+                            });
+                            handleModelEdit(model);
+                            setAutoSuggestions([]);
+                            setAutoSelected(new Set());
+                            setAutoConstraintPreds({});
+                            setAutoBindingTypes({});
+                          }}
+                        >
+                          ✓ Apply {autoSelected.size} selected change{autoSelected.size !== 1 ? 's' : ''}
+                        </button>
+                      </div>
+                    )}
+
+                    {autoSuggestions.length === 0 && healthResult && !healthResult.error && (
+                      <p className="auto-no-suggestions">No suggestions — adjust thresholds or review the health report above.</p>
+                    )}
+                  </div>
+                </div>{/* end postprocessing-result-section (ext-ocel) */}
+
+                {/* D: Parameter Actions */}
+                <div className="ext-param-actions">
+                  <button
+                    className="model-download-btn"
+                    disabled={!activeModel || Array.isArray(activeModel)}
+                    onClick={handleDownloadParameters}
+                    title="Download current model + discovered parameters as JSON and save to parameters folder"
+                  >
+                    ⬇ Download Parameters
+                  </button>
+                  <button
+                    className="model-download-btn"
+                    style={{background:'#dbeafe',color:'#1e40af',borderColor:'#93c5fd'}}
+                    disabled={!activeModel || Array.isArray(activeModel)}
+                    onClick={() => setExternalTab('simulation')}
+                    title="Go to Simulation tab with the current parameters"
+                  >
+                    ▶ Use Parameters
+                  </button>
+                  <div className="model-params-loader">
+                    <select
+                      className="model-params-select"
+                      value=""
+                      onChange={e => { if (e.target.value) handleLoadParameters(e.target.value); }}
+                    >
+                      <option value="">⬆ Load Parameters…</option>
+                      {parameterFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+              </div>
+            )}{/* end parameter tab */}
+
+            {/* ── SIMULATION TAB ── */}
+            {externalTab === 'simulation' && (
+              <div className="ext-ocel-tab-content">
+
+                {/* Model Editor */}
+                {activeModel && !Array.isArray(activeModel) && (
+                  <ModelEditor
+                    model={activeModel}
+                    probMatrix={activeProbMatrix || {}}
+                    onModelChange={handleModelEdit}
+                    onProbMatrixChange={setActiveProbMatrix}
+                    sourceFile={config.ocdeclareFile}
+                    parameterFiles={parameterFiles}
+                    onLoadParameters={handleLoadParameters}
+                    onSaveParameters={handleSaveParameters}
+                    nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
+                    eventLogFile={discoveryConfig.eventLogFile || ''}
+                    hideParameterButtons={true}
+                  />
+                )}
+
+                {/* Inline model warnings — compact chips, visible even when editor is collapsed */}
+                {activeModel && !Array.isArray(activeModel) && (() => {
+                  const constraints = activeModel.constraints || [];
+                  const hasIncoming = new Set(constraints.map(c => c.target_activity || c.target));
+                  const warnings = [];
+                  (activeModel.activities || []).forEach(a => {
+                    const nonCreating = (a.bindings || []).filter(b => !b.creates);
+                    if (nonCreating.length === 0 && !hasIncoming.has(a.name)) {
+                      warnings.push({ label: `No input: "${a.name}"`, tab: 'activities' });
+                    }
+                  });
+                  (activeModel.activities || []).forEach(a => {
+                    if (!(a.bindings || []).length) {
+                      warnings.push({ label: `No bindings: "${a.name}"`, tab: 'activities' });
+                    }
+                  });
+                  if (!warnings.length) return null;
+                  return (
+                    <div className="sim-model-warnings">
+                      {warnings.map((w, i) => (
+                        <span
+                          key={i}
+                          className="sim-model-warn-chip"
+                          title="Click to open Model Editor"
+                          onClick={() => {
+                            // ModelEditor manages its own collapsed state internally;
+                            // scrolling to it is the best we can do from outside
+                            document.querySelector('.model-editor-header')?.click();
+                            document.querySelector('.model-editor-section')?.scrollIntoView({ behavior: 'smooth' });
+                          }}
+                        >
+                          ⚠ {w.label}
+                        </span>
+                      ))}
+                    </div>
+                  );
+                })()}
+
+                {/* Simulation config + run button + results */}
+                <div className={`simulation-section`}>
+                  <div className="section-header">
+                    <h2>Run Simulation</h2>
+                    <p>Configure and run the object-centric simulation</p>
+                  </div>
+
+                  <div className="simulation-config">
+                    {/* Start Activities — collapsed summary if already set, full picker otherwise */}
+                    <div className="form-group">
+                      <label>
+                        Start Activities
+                        <span className="start-activity-hint"> — which activities can initiate new cases</span>
+                      </label>
+                      {config.startActivities.length > 0 ? (
+                        <div className="sa-summary">
+                          {config.startActivities.map(a => (
+                            <span key={a} className="sa-summary-chip">{a}</span>
+                          ))}
+                          <button
+                            className="sa-summary-change"
+                            onClick={() => setConfig(p => ({ ...p, startActivities: [] }))}
+                            title="Clear selection to choose again"
+                          >
+                            ✕ Change
+                          </button>
+                        </div>
+                      ) : ((() => {
+                        const disabled = isSimulating;
+                        const displayCandidates = startActivityCandidates.length > 0
+                          ? startActivityCandidates
+                          : availableActivities.map(a => ({ activity: a, count: null, pct: null }));
+                        if (displayCandidates.length === 0) {
+                          return <p className="start-activity-empty">Run discovery to see candidates</p>;
+                        }
+                        const toggle = (act, on) => setConfig(prev => ({
+                          ...prev,
+                          startActivities: on
+                            ? [...prev.startActivities, act]
+                            : prev.startActivities.filter(a => a !== act)
+                        }));
+                        return (
+                          <div className={`start-activity-list ${disabled ? 'sa-disabled' : ''}`}>
+                            <div className="start-activity-controls">
+                              <button className="sa-ctrl-btn" disabled={disabled}
+                                onClick={() => setConfig(prev => ({ ...prev, startActivities: displayCandidates.map(c => c.activity) }))}>
+                                All
+                              </button>
+                              <button className="sa-ctrl-btn" disabled={disabled}
+                                onClick={() => setConfig(prev => ({ ...prev, startActivities: [] }))}>
+                                None
+                              </button>
+                              <span className="sa-selection-count">
+                                {config.startActivities.length} selected
+                              </span>
+                            </div>
+                            <div className="start-activity-items">
+                              {displayCandidates.map((c, i) => {
+                                const checked = config.startActivities.includes(c.activity);
+                                const isTop = i === 0 && c.pct !== null;
+                                return (
+                                  <label key={c.activity} className={`start-activity-item${checked ? ' sa-checked' : ''}`}>
+                                    <input type="checkbox" checked={checked} disabled={disabled}
+                                      onChange={e => toggle(c.activity, e.target.checked)} />
+                                    <span className="sa-name">{c.activity}</span>
+                                    {isTop && <span className="sa-top-badge">★ top</span>}
+                                    {c.pct !== null && <span className="sa-pct">{c.pct}%</span>}
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })()
+                      )}
+                    </div>
+
+                    <div className="form-row">
+                      <div className="form-group">
+                        <label>Max Steps</label>
+                        <input
+                          type="number"
+                          value={config.maxSteps}
+                          onChange={(e) => handleConfigChange('maxSteps', parseInt(e.target.value))}
+                          min="1"
+                          max="1000"
+                          disabled={isSimulating}
+                        />
+                      </div>
+
+                      <div className="form-group">
+                        <label>Random Seed</label>
+                        <input
+                          type="number"
+                          value={config.seed}
+                          onChange={(e) => handleConfigChange('seed', parseInt(e.target.value))}
+                          disabled={isSimulating}
+                        />
+                      </div>
+                    </div>
+
+                    <button
+                      className="simulate-button"
+                      onClick={runSimulation}
+                      disabled={isSimulating || !config.ocdeclareFile || config.startActivities.length === 0 || hasModelWarnings}
+                    >
+                      {isSimulating ? 'Simulating...' : 'Run Simulation'}
+                    </button>
+                    {hasModelWarnings && (
+                      <div className="model-warnings-notice">
+                        ⚠ Simulation blocked — {bindingWarnings.length} activit{bindingWarnings.length === 1 ? 'y has' : 'ies have'} no object bindings:{' '}
+                        <strong>{bindingWarnings.map(a => a.name).join(', ')}</strong>.
+                        Open the Model Editor → Activities tab to fix.
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Simulation Results */}
+                  {error && (
+                    <div className="error-box">
+                      <h3>Simulation Error</h3>
+                      <p>{error}</p>
+                    </div>
+                  )}
+
+                  {isSimulating && (
+                    <div className="loading-box">
+                      <div className="spinner"></div>
+                      <p>
+                        Running simulation…{' '}
+                        <span className="sim-step-counter">
+                          step {liveStepCount ?? 0} / {config.maxSteps}
+                        </span>
+                      </p>
+                      <button className="sim-stop-btn" onClick={stopSimulation}>
+                        ⏹ Stop
+                      </button>
+                    </div>
+                  )}
+
+                  {results && !isSimulating && (
+                    <div className="results-box">
+                      <h3>Simulation Complete</h3>
+
+                      {(() => {
+                        const firedTypes = results.activity_sequence
+                          ? [...new Set(results.activity_sequence)]
+                          : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
+                        const discoveredTypes = discoveryResults?.activities || [];
+                        const missingTypes = discoveredTypes.filter(a => !firedTypes.includes(a));
+                        const totalEvents = results.events_count;
+                        const coverage = discoveredTypes.length > 0
+                          ? firedTypes.filter(a => discoveredTypes.includes(a)).length
+                          : firedTypes.length;
+
+                        return (
+                          <>
+                            <div className="stat-grid">
+                              <div className="stat-card">
+                                <div className="stat-value">{results.steps_executed}</div>
+                                <div className="stat-label">Steps Executed</div>
+                              </div>
+                              <div className="stat-card">
+                                <div className="stat-value">{totalEvents}</div>
+                                <div className="stat-label">Events Fired</div>
+                              </div>
+                              <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
+                                <div className="stat-value">
+                                  {coverage}
+                                  {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
+                                </div>
+                                <div className="stat-label">Activity Types Fired</div>
+                              </div>
+                              <div className="stat-card">
+                                <div className="stat-value">{results.objects_count}</div>
+                                <div className="stat-label">Objects Created</div>
+                              </div>
+                            </div>
+                            {missingTypes.length > 0 && (
+                              <Collapsible
+                                className="sim-coverage-warning"
+                                title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
+                                badge={null}
+                                defaultOpen={false}
+                              >
+                                <ul className="sim-coverage-missing-list">
+                                  {missingTypes.map(a => {
+                                    const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
+                                    return (
+                                      <li key={a}>
+                                        <span className="sim-coverage-missing-name">{a}</span>
+                                        {reasons.length > 0 && (
+                                          <ul className="sim-coverage-missing-reasons">
+                                            {reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                          </ul>
+                                        )}
+                                      </li>
+                                    );
+                                  })}
+                                </ul>
+                              </Collapsible>
+                            )}
+                          </>
+                        );
+                      })()}
+
+                      {/* ── Activity distribution comparison: simulation vs log ── */}
+                      {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
+                        <Collapsible
+                          className="logs-box sim-compare-box"
+                          title="📊 Activity Distribution vs Log"
+                          badge={null}
+                          defaultOpen={false}
+                        >
+                          {() => {
+                            const simMetrics = results.metrics.activity_metrics;
+                            const logCounts = discoveryResults.activity_counts || {};
+                            const logRepeat = discoveryResults.activity_repeat_stats || {};
+                            const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+                            const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+                            const actSeq = results.activity_sequence
+                              ? [...new Set(results.activity_sequence)]
+                              : Object.keys(simMetrics);
+                            const idxOf = {};
+                            actSeq.forEach((n, i) => { idxOf[n] = i; });
+                            const trans = {};
+                            Object.values(results.object_traces || {}).forEach(seq => {
+                              seq.forEach((name, i) => {
+                                if (i < seq.length - 1) {
+                                  const key = `${name} → ${seq[i + 1]}`;
+                                  trans[key] = (trans[key] || 0) + 1;
+                                }
+                              });
+                            });
+                            const preds = {};
+                            actSeq.forEach(n => { preds[n] = []; });
+                            Object.keys(trans).forEach(key => {
+                              const [f, t] = key.split(' → ');
+                              if (f === t || idxOf[f] === undefined || idxOf[t] === undefined) return;
+                              if (idxOf[f] < idxOf[t]) preds[t].push(f);
+                            });
+                            const flowRank = {};
+                            actSeq.forEach(n => {
+                              flowRank[n] = preds[n].length ? Math.max(...preds[n].map(p => flowRank[p] + 1)) : 0;
+                            });
+                            const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
+                              .sort((a, b) => {
+                                const ra = a in flowRank ? flowRank[a] : 999999;
+                                const rb = b in flowRank ? flowRank[b] : 999999;
+                                return ra !== rb ? ra - rb : a.localeCompare(b);
+                              });
+                            return (
+                              <>
+                                <p className="sim-compare-hint">
+                                  Proportional share of total events (simulation vs log). Identical proportions would mean
+                                  perfect routing fidelity. Difference column shows sim − log in percentage points.
+                                </p>
+                                <table className="metrics-table sim-compare-table">
+                                  <thead>
+                                    <tr>
+                                      <th>Activity</th>
+                                      <th title="Times fired in this simulation run">Sim count</th>
+                                      <th title="Times fired in the input event log">Log count</th>
+                                      <th title="Share of all simulated events">Sim %</th>
+                                      <th title="Share of all log events">Log %</th>
+                                      <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
+                                      <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
+                                      <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {allActs.map(act => {
+                                      const simCount = simMetrics[act]?.execution_count ?? 0;
+                                      const logCount = logCounts[act] ?? 0;
+                                      const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                                      const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                                      const diff = simPct - logPct;
+                                      const logMeanObj = logRepeat[act]?.mean ?? null;
+                                      const simObjEvents = simActivityObjectCounts[act] ?? null;
+                                      const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                                      const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
+                                        : diff > 0 ? 'cmp-over' : 'cmp-under';
+                                      return (
+                                        <tr key={act}>
+                                          <td className="metrics-act-name">{act}</td>
+                                          <td>{simCount || '—'}</td>
+                                          <td>{logCount || '—'}</td>
+                                          <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                                          <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                                          <td className={`cmp-diff ${diffClass}`}>
+                                            {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
+                                          </td>
+                                          <td>{logMeanObj ?? '—'}</td>
+                                          <td>{simMeanObj ?? '—'}</td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </>
+                            );
+                          }}
+                        </Collapsible>
+                      )}
+
+                      {results.activity_sequence && results.activity_sequence.length > 0 && (
+                        <div className="flow-chart-section">
+                          <h4>Process Flow</h4>
+                          <FlowChart
+                            activitySequence={results.activity_sequence}
+                            objectTraces={results.object_traces || {}}
+                            objectTypesMap={results.object_types_map || {}}
+                            activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
+                          />
+                        </div>
+                      )}
+
+                      {results.object_types && (
+                        <Collapsible
+                          className="object-types"
+                          title="Object Type Breakdown"
+                          badge={Object.keys(results.object_types).length}
+                        >
+                          {(() => {
+                            const logStats = discoveryResults?.object_type_stats || {};
+                            const hasLogData = Object.keys(logStats).length > 0;
+                            const allTypes = new Set([
+                              ...Object.keys(results.object_types),
+                              ...Object.keys(logStats),
+                            ]);
+                            return (
+                              <table className="object-type-stats-table">
+                                <thead>
+                                  <tr>
+                                    <th>Object Type</th>
+                                    <th className="octs-num">Simulated</th>
+                                    {hasLogData && <th className="octs-num">In Log</th>}
+                                    {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {[...allTypes].sort().map(type => {
+                                    const simCount = results.object_types[type] || 0;
+                                    const logCount = logStats[type]?.count || 0;
+                                    const ratio    = logCount > 0 ? simCount / logCount : null;
+                                    const ratioClass = ratio === null ? '' :
+                                      ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
+                                    return (
+                                      <tr key={type}>
+                                        <td className="octs-type">{type}</td>
+                                        <td className="octs-num">{simCount.toLocaleString()}</td>
+                                        {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
+                                        {hasLogData && (
+                                          <td className="octs-num">
+                                            {ratio !== null
+                                              ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
+                                              : '—'}
+                                          </td>
+                                        )}
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            );
+                          })()}
+                        </Collapsible>
+                      )}
+
+                      {/* ── Object Lifecycle Audit ── */}
+                      {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
+                        <Collapsible
+                          className="logs-box"
+                          title="🔬 Object Lifecycle Audit"
+                          badge={(() => {
+                            const a = results.audit.object_lifecycle_audit;
+                            const issues = Object.values(a).filter(v => v.classification !== 'healthy').length;
+                            return issues > 0 ? `${issues} issue${issues !== 1 ? 's' : ''}` : 'healthy';
+                          })()}
+                          defaultOpen={false}
+                        >
+                          <table className="audit-table">
+                            <thead>
+                              <tr>
+                                <th>Object Type</th>
+                                <th className="audit-num">Created</th>
+                                <th className="audit-num">Active</th>
+                                <th className="audit-num">Deactivated</th>
+                                <th className="audit-num">Zero-event</th>
+                                <th className="audit-num">Events/instance</th>
+                                <th>Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(results.audit.object_lifecycle_audit).map(([otype, a]) => (
+                                <tr key={otype} className={`audit-row-${a.classification}`}>
+                                  <td className="audit-type">{otype}</td>
+                                  <td className="audit-num">{a.instance_count}</td>
+                                  <td className="audit-num">{a.active_count}</td>
+                                  <td className="audit-num">{a.deactivated_count}</td>
+                                  <td className="audit-num">{a.zero_event_count > 0 ? <span className="audit-warn">{a.zero_event_count}</span> : '0'}</td>
+                                  <td className="audit-num">{a.event_count_stats.min}–{a.event_count_stats.max} (avg {a.event_count_stats.mean})</td>
+                                  <td>
+                                    <span className={`audit-badge audit-badge-${a.classification}`}>
+                                      {a.classification.replace(/_/g, ' ')}
+                                    </span>
+                                    {a.issues.map((iss, i) => (
+                                      <div key={i} className="audit-issue">{iss}</div>
+                                    ))}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </Collapsible>
+                      )}
+
+                      {/* ── Activity Participation Audit ── */}
+                      {results.audit?.activity_participation_audit && Object.keys(results.audit.activity_participation_audit).length > 0 && (
+                        <Collapsible
+                          className="logs-box"
+                          title="🎯 Activity Participation Audit"
+                          badge={(() => {
+                            const a = results.audit.activity_participation_audit;
+                            const issues = Object.values(a).filter(v => v.classification !== 'healthy' && v.classification !== 'never_fired').length;
+                            const neverFired = Object.values(a).filter(v => v.classification === 'never_fired').length;
+                            const parts = [];
+                            if (issues > 0) parts.push(`${issues} issue${issues !== 1 ? 's' : ''}`);
+                            if (neverFired > 0) parts.push(`${neverFired} never fired`);
+                            return parts.length ? parts.join(', ') : 'healthy';
+                          })()}
+                          defaultOpen={false}
+                        >
+                          <table className="audit-table">
+                            <thead>
+                              <tr>
+                                <th>Activity</th>
+                                <th className="audit-num">Firings</th>
+                                <th className="audit-num">Unique objects</th>
+                                <th className="audit-num">Obj/firing</th>
+                                <th className="audit-num">Reuse rate</th>
+                                <th>Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(results.audit.activity_participation_audit).map(([act, a]) => (
+                                <tr key={act} className={`audit-row-${a.classification}`}>
+                                  <td className="audit-type">{act}</td>
+                                  <td className="audit-num">{a.execution_count}</td>
+                                  <td className="audit-num">{a.unique_objects ?? '—'}</td>
+                                  <td className="audit-num">
+                                    {a.objects_per_firing
+                                      ? `${a.objects_per_firing.min}–${a.objects_per_firing.max}`
+                                      : '—'}
+                                  </td>
+                                  <td className="audit-num">
+                                    {a.reuse_rate != null
+                                      ? <span className={a.reuse_rate > 0.8 ? 'audit-warn' : ''}>{(a.reuse_rate * 100).toFixed(0)}%</span>
+                                      : '—'}
+                                  </td>
+                                  <td>
+                                    <span className={`audit-badge audit-badge-${a.classification}`}>
+                                      {a.classification.replace(/_/g, ' ')}
+                                    </span>
+                                    {a.dominant_object && (
+                                      <div className="audit-issue">
+                                        Dominated by <code>{a.dominant_object.object_id}</code> ({a.dominant_object.pct}% of firings)
+                                      </div>
+                                    )}
+                                    {a.issues.map((iss, i) => (
+                                      <div key={i} className="audit-issue">{iss}</div>
+                                    ))}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </Collapsible>
+                      )}
+
+                      {results.activity_sequence && results.activity_sequence.length > 0 && (
+                        <Collapsible
+                          className="activity-sequence"
+                          title="Activity Sequence"
+                          badge={results.activity_sequence.length}
+                          defaultOpen={false}
+                        >
+                          <div className="sequence-list">
+                            {results.activity_sequence.slice(0, 200).map((activity, idx) => (
+                              <span key={idx} className="activity-badge">{activity}</span>
+                            ))}
+                            {results.activity_sequence.length > 200 && (
+                              <span className="activity-badge" style={{ borderColor: '#94a3b8', color: '#94a3b8' }}>
+                                … +{results.activity_sequence.length - 200} more
+                              </span>
+                            )}
+                          </div>
+                        </Collapsible>
+                      )}
+
+                      {results.output_file && (
+                        <div className="download-row">
+                          <button className="download-button" onClick={downloadEventLog}>
+                            Download Event Log
+                          </button>
+                          {results.metrics_file && (
+                            <button className="download-button download-button-secondary" onClick={downloadMetrics}>
+                              Download Metrics
+                            </button>
+                          )}
+                        </div>
+                      )}
+
+                      {/* ── Timing Metrics Panel ── */}
+                      {results.metrics && (
+                        <>
+                          {/* Per-Activity */}
+                          {results.metrics.activity_metrics && Object.keys(results.metrics.activity_metrics).length > 0 && (
+                            <Collapsible
+                              className="logs-box timing-metrics-box"
+                              title="⏱ Activity Timing"
+                              badge={Object.keys(results.metrics.activity_metrics).length}
+                              defaultOpen={false}
+                            >
+                              {/* ── Concurrency indicator ── */}
+                              {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
+                                <div className="concurrency-summary">
+                                  <span className="concurrency-summary-title">⚡ Concurrent activity pairs (from log)</span>
+                                  <div className="concurrency-pills">
+                                    {results.concurrency_pairs.map(({ a, b, p }) => (
+                                      <span key={`${a}|||${b}`} className="concurrency-pill" title={`${a} and ${b} fire concurrently ${Math.round(p * 100)}% of the time`}>
+                                        <span className="concurrency-pill-acts">{a} ∥ {b}</span>
+                                        <span className="concurrency-pill-p">{Math.round(p * 100)}%</span>
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              <table className="metrics-table">
+                                <thead>
+                                  <tr>
+                                    <th>Activity</th>
+                                    <th>Count</th>
+                                    <th title="Sampled clock advance at each firing">Mean service</th>
+                                    <th>Min service</th>
+                                    <th>Max service</th>
+                                    <th title="Service + wait in pool (sojourn = how long from becoming eligible to completion)">Mean sojourn</th>
+                                    <th title="Mean time the activity was in the candidate pool before being chosen">Mean wait in pool</th>
+                                    <th title="Longest time the activity was available but not chosen before finally firing">Max wait in pool</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {Object.entries(results.metrics.activity_metrics).map(([act, m]) => (
+                                    <tr key={act}>
+                                      <td className="metrics-act-name">{act}</td>
+                                      <td>{m.execution_count}</td>
+                                      <td>{fmtSeconds(m.mean_service_s)}</td>
+                                      <td>{fmtSeconds(m.min_service_s)}</td>
+                                      <td>{fmtSeconds(m.max_service_s)}</td>
+                                      <td>{fmtSeconds(m.mean_sojourn_s)}</td>
+                                      <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
+                                      <td>{fmtSeconds(m.max_wait_in_pool_s)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </Collapsible>
+                          )}
+
+                          {/* Per-Object */}
+                          {results.metrics_file && (
+                            <Collapsible
+                              className="logs-box timing-metrics-box"
+                              title="📦 Object Lifetimes"
+                              badge={objectMetricsData ? Object.keys(objectMetricsData).length : results.objects_count}
+                              defaultOpen={false}
+                            >
+                              {() => !objectMetricsData ? (
+                                <div style={{ padding: '0.75rem 0' }}>
+                                  <p style={{ fontSize: '0.82rem', color: '#64748b', marginBottom: '0.5rem' }}>
+                                    Object lifetime data is stored separately to keep the page responsive.
+                                    Click to load ({results.objects_count.toLocaleString()} objects).
+                                  </p>
+                                  <button
+                                    className="timing-discover-btn"
+                                    style={{ fontSize: '0.82rem', padding: '0.4rem 1rem' }}
+                                    disabled={isLoadingObjMetrics}
+                                    onClick={loadObjectMetrics}
+                                  >
+                                    {isLoadingObjMetrics ? 'Loading…' : '⬇ Load Object Lifetimes'}
+                                  </button>
+                                </div>
+                              ) : (
+                                objectMetricsByType.map(([otype, items]) => (
+                                  <Collapsible
+                                    key={otype}
+                                    className="metrics-type-group"
+                                    title={otype}
+                                    badge={items.length}
+                                    defaultOpen={false}
+                                  >
+                                    <table className="metrics-table">
+                                      <thead>
+                                        <tr>
+                                          <th>Object</th>
+                                          <th>Events</th>
+                                          <th>Lifetime</th>
+                                          <th>First event</th>
+                                          <th>Last event</th>
+                                          <th>Activities</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {items.map(([oid, m]) => (
+                                          <tr key={oid}>
+                                            <td className="metrics-act-name">{oid}</td>
+                                            <td>{m.event_count}</td>
+                                            <td>{fmtSeconds(m.lifetime_s)}</td>
+                                            <td className="metrics-ts">{m.first_event_time ? m.first_event_time.replace('T', ' ').slice(0, 19) : '—'}</td>
+                                            <td className="metrics-ts">{m.last_event_time  ? m.last_event_time.replace('T', ' ').slice(0, 19)  : '—'}</td>
+                                            <td className="metrics-acts">
+                                              {m.activities.length > 8
+                                                ? m.activities.slice(0, 8).join(' → ') + ` … +${m.activities.length - 8} more`
+                                                : m.activities.join(' → ')}
+                                            </td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </Collapsible>
+                                ))
+                              )}
+                            </Collapsible>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {logs.length > 0 && (
+                    <div className="logs-box">
+                      <h4>Simulation Logs</h4>
+                      <div className="logs-content">
+                        {logs.map((log, idx) => (
+                          <div key={idx} className="log-entry">{log}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {results && results.object_links && (
+                    <Collapsible
+                      className="logs-box object-tracer-box"
+                      title="🔗 Object Tracer"
+                      badge={`${results.object_links.length} links`}
+                      defaultOpen={false}
+                    >
+                      <p className="tracer-intro">
+                        For each seed object (one not created from another object), this shows the
+                        chain of objects that were linked to it during the run.
+                      </p>
+                      <ObjectTracer
+                        links={results.object_links}
+                        typesMap={results.object_types_map || {}}
+                        objectMetrics={objectMetricsData || {}}
+                        resourceTypes={results.resource_types || []}
+                      />
+                    </Collapsible>
+                  )}
+
+                  {iterationLogs.length > 0 && (
+                    <div className="logs-box">
+                      <h4
+                        className="collapsible-header"
+                        onClick={() => setIterationLogsOpen(o => !o)}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                      >
+                        {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps)
+                      </h4>
+                      {iterationLogsOpen && (
+                        <div className="logs-content iteration-trace">
+                          {(() => {
+                            const items = [];
+                            for (let i = 0; i < iterationLogs.length; i++) {
+                              const entry = iterationLogs[i];
+                              if (entry.event === 'candidates') {
+                                const next = iterationLogs[i + 1];
+                                const chosen = next?.event === 'chosen' ? next : null;
+                                const withProbs = entry.candidates_with_probs || entry.candidates.map(a => ({ activity: a, prob: null }));
+                                items.push(
+                                  <div key={i} className="iteration-step">
+                                    <span className="iter-step-label">Step {entry.step}</span>
+                                    <span className="iter-candidates">
+                                      Pool [{entry.num_candidates}]:{' '}
+                                      {withProbs.map((c, ci) => (
+                                        <span key={ci} className={chosen?.activity === c.activity ? 'iter-pool-chosen' : 'iter-pool-item'}>
+                                          {c.activity}
+                                          {c.prob !== null && <span className="iter-prob"> ({(c.prob * 100).toFixed(1)}%)</span>}
+                                          {c.objects?.length > 0 && <span className="iter-objects"> [{c.objects.join(', ')}]</span>}
+                                          {ci < withProbs.length - 1 ? ', ' : ''}
+                                        </span>
+                                      ))}
+                                    </span>
+                                    {chosen && (
+                                      <span className="iter-chosen">
+                                        → <strong>{chosen.activity}</strong>
+                                        {chosen.prob !== null && <span className="iter-prob"> ({(chosen.prob * 100).toFixed(1)}%)</span>}
+                                        {chosen.creates?.length > 0 && ` (creates: ${chosen.creates.join(', ')})`}
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              } else if (entry.event === 'stop') {
+                                items.push(
+                                  <div key={i} className="iteration-step iter-stop">
+                                    Stopped at step {entry.step}: {entry.reason}
+                                  </div>
+                                );
+                              }
+                            }
+                            return items;
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── Re-run placeholder ── */}
+                  {results && (
+                    <div style={{ marginTop: '1.5rem', display: 'flex', gap: '0.75rem' }}>
+                      <button
+                        className="discovery-button"
+                        onClick={() => { setResults(null); setLogs([]); setIterationLogs([]); }}
+                      >
+                        ↺ Run Again
+                      </button>
+                    </div>
+                  )}
+                </div>{/* end simulation-section (ext-ocel) */}
+
+              </div>
+            )}{/* end simulation tab */}
+          </div>
+        )}{/* end external-ocel tabs */}
 
         {/* ── OC-Declare Discovery (internal only) ── */}
         {workflowMode === 'internal' && (
@@ -2711,6 +4393,7 @@ function App() {
         )}
 
         {/* ── Model Selection ── */}
+        {workflowMode !== 'external-ocel' && (
         <div className="model-selection-section">
           <div className="section-header">
             <h2>Select Model to Simulate</h2>
@@ -2766,6 +4449,7 @@ function App() {
           </div>
 
         </div>
+        )}{/* end Model Selection guard */}
 
         {/* ── Session History ── */}
         {sessionHistory.length > 0 && (
@@ -2800,6 +4484,8 @@ function App() {
         )}
 
         {/* ── Post-Processing section ── */}
+        {workflowMode !== 'external-ocel' && (
+        <>
         <div className="post-processing-section">
           <div className="section-header">
             <h2>Post-Processing</h2>
@@ -2957,6 +4643,10 @@ function App() {
                   onDiscover={runTimingDiscovery}
                   timingAnchors={timingAnchors}
                   setTimingAnchors={setTimingAnchors}
+                  mode={timingMode}
+                  setMode={setTimingMode}
+                  singleActivity={timingSingleAct}
+                  setSingleActivity={setTimingSingleAct}
                 />
               )}
               {showLifecycle && (
@@ -2971,86 +4661,12 @@ function App() {
           );
         })()}
 
-        {/* ── O2O discovery — external-ocel mode only ────────────────────── */}
-        {workflowMode === 'external-ocel' && discoveryConfig.eventLogFile && activeModel && !Array.isArray(activeModel) && (
-          <O2ODiscoveryPanel
-            eventLogFile={discoveryConfig.eventLogFile}
-            activeModel={activeModel}
-            onModelChange={handleModelEdit}
-          />
+        </div>
+        </>
         )}
-        {discoveryResults?.activity_counts && discoveryResults.likely_start_activities?.length > 0 && activeProbMatrix && (
-          (() => {
-            const startCandidates = [
-              ...discoveryResults.likely_start_activities,
-              ...Object.keys(discoveryResults.activity_counts)
-                .filter(a => !discoveryResults.likely_start_activities.includes(a))
-                .sort((a, b) => (discoveryResults.activity_counts[b] || 0) - (discoveryResults.activity_counts[a] || 0)),
-            ];
-            const countTotal = Object.values(discoveryResults.activity_counts).reduce((s, v) => s + v, 0);
-            const selected = new Set(discoveryConfig.startActivityProbSelected ?? [startCandidates[0]]);
-            const toggle = (a) => {
-              const next = new Set(selected);
-              next.has(a) ? next.delete(a) : next.add(a);
-              setDiscoveryConfig(p => ({ ...p, startActivityProbSelected: [...next] }));
-            };
-            return (
-              <div className="start-prob-bar">
-                <span className="start-prob-label">Start activity probability</span>
-                <div className="start-prob-checklist">
-                  {startCandidates.map((a, i) => (
-                    <label key={a} className={`start-prob-check-item${selected.has(a) ? ' spc-checked' : ''}`}>
-                      <input type="checkbox" checked={selected.has(a)} onChange={() => toggle(a)} />
-                      {i === 0 && <span className="sa-top-badge">★</span>}
-                      <span className="spc-name">{a}</span>
-                      <span className="spc-pct">{((discoveryResults.activity_counts[a] || 0) / countTotal * 100).toFixed(1)}%</span>
-                    </label>
-                  ))}
-                </div>
-                <button
-                  className="start-prob-btn"
-                  disabled={selected.size === 0}
-                  title="Inject selected activities' log frequencies as transition target probabilities from every source, preserving relative ratios between existing targets"
-                  onClick={() => {
-                    const counts = discoveryResults.activity_counts;
-                    if (!countTotal || selected.size === 0) return;
-                    // Combined probability reserved for all selected start activities
-                    const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / countTotal;
-                    // Each selected activity's share within the combined block
-                    const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
-                    const newMatrix = {};
-                    Object.entries(activeProbMatrix).forEach(([src, targets]) => {
-                      const tgts = { ...targets };
-                      // Remove all selected activities from existing targets
-                      selected.forEach(a => delete tgts[a]);
-                      const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
-                      const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
-                      const scaled = {};
-                      Object.entries(tgts).forEach(([t, v]) => {
-                        scaled[t] = Math.round(v * scale * 10000) / 10000;
-                      });
-                      // Distribute combined block proportionally among selected activities
-                      selected.forEach(a => {
-                        const share = selectedCountSum > 0
-                          ? combinedProb * (counts[a] || 0) / selectedCountSum
-                          : combinedProb / selected.size;
-                        scaled[a] = Math.round(share * 10000) / 10000;
-                      });
-                      newMatrix[src] = scaled;
-                    });
-                    setActiveProbMatrix(newMatrix);
-                  }}
-                >
-                  Apply to probability matrix
-                </button>
-              </div>
-            );
-          })()
-        )}
-
-        </div>{/* end post-processing-section */}
 
         {/* ── Post-Processing Result section ── */}
+        {workflowMode !== 'external-ocel' && (
         <div className="postprocessing-result-section">
           <div className="section-header">
             <h2>Post-Processing Result</h2>
@@ -3078,63 +4694,17 @@ function App() {
                 badge={badge}
                 defaultOpen={hasErrors || hasWarnings}
               >
-                {healthResult.no_input_activities?.length > 0 && (
-                  <Collapsible
-                    className="health-section health-warn"
-                    title={<span className="health-section-title">⚠ Activities with no input constraints</span>}
-                    badge={healthResult.no_input_activities.length}
-                    defaultOpen={false}
-                  >
-                    {healthResult.no_input_activities.map((a, i) => (
-                      <div key={i} className="health-item health-no-input-item">
-                        <span className={`health-badge-${a.is_pure_start ? 'error' : 'warn'}`}>
-                          {a.is_pure_start ? 'START' : 'NO INPUT'}
-                        </span>
-                        <strong>{a.activity}</strong>
-                        {a.input_bindings.length > 0 ? (
-                          <ul className="health-no-input-bindings">
-                            {a.input_bindings.map((b, j) => (
-                              <li key={j}>
-                                <code>{b.object_type}</code>
-                                {b.is_resource && <span className="health-excl-hint"> (resource)</span>}
-                                {b.created_by.length > 0 && (
-                                  <span className="health-excl-hint"> — created by: <em>{b.created_by.join(', ')}</em></span>
-                                )}
-                                {b.deactivated_by.length > 0 && (
-                                  <span className="health-excl-hint"> · deactivated by: <em>{b.deactivated_by.join(', ')}</em></span>
-                                )}
-                                {b.created_by.length === 0 && !b.is_resource && (
-                                  <span className="health-excl-hint" style={{color:'#b91c1c'}}> — no activity creates this type</span>
-                                )}
-                              </li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <span className="health-reason"> — no input bindings (pure start activity)</span>
-                        )}
-                      </div>
-                    ))}
-                  </Collapsible>
-                )}
                 {healthResult.cycles?.length > 0 && (
-                  <Collapsible
-                    className="health-section health-error"
-                    title={<span className="health-section-title">🔴 Dependency cycles (deadlock)</span>}
-                    badge={healthResult.cycles.length}
-                    defaultOpen={false}
-                  >
+                  <div className="health-section health-error">
+                    <div className="health-section-title">🔴 Dependency cycles (deadlock)</div>
                     {healthResult.cycles.map((cy, i) => (
                       <div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>
                     ))}
-                  </Collapsible>
+                  </div>
                 )}
                 {healthResult.permanently_blocked?.length > 0 && (
-                  <Collapsible
-                    className="health-section health-error"
-                    title={<span className="health-section-title">🔴 Activities never reaching the pool</span>}
-                    badge={healthResult.permanently_blocked.length}
-                    defaultOpen={false}
-                  >
+                  <div className="health-section health-error">
+                    <div className="health-section-title">🔴 Activities never reaching the pool</div>
                     {healthResult.permanently_blocked.map((b, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-error">BLOCKED</span>
@@ -3174,15 +4744,11 @@ function App() {
                         )}
                       </div>
                     ))}
-                  </Collapsible>
+                  </div>
                 )}
                 {healthResult.top_blocking_constraints?.filter(c => c.is_chain).length > 0 && (
-                  <Collapsible
-                    className="health-section health-warn"
-                    title={<span className="health-section-title">⚠ Chain constraints (common deadlock source)</span>}
-                    badge={healthResult.top_blocking_constraints.filter(c => c.is_chain).length}
-                    defaultOpen={false}
-                  >
+                  <div className="health-section health-warn">
+                    <div className="health-section-title">⚠ Chain constraints (common deadlock source)</div>
                     {healthResult.top_blocking_constraints.filter(c => c.is_chain).map((c, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-warn">{c.count}×</span>
@@ -3190,15 +4756,11 @@ function App() {
                         <span className="health-reason"> blocks: {c.blocks.join(', ')}</span>
                       </div>
                     ))}
-                  </Collapsible>
+                  </div>
                 )}
                 {healthResult.weak_precedences?.length > 0 && (
-                  <Collapsible
-                    className="health-section health-warn"
-                    title={<span className="health-section-title">⚠ Weak precedences (alternative paths in log)</span>}
-                    badge={healthResult.weak_precedences.length}
-                    defaultOpen={false}
-                  >
+                  <div className="health-section health-warn">
+                    <div className="health-section-title">⚠ Weak precedences (alternative paths in log)</div>
                     {healthResult.weak_precedences.map((wp, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-warn">{wp.co_occurrence_pct}%</span>
@@ -3206,22 +4768,18 @@ function App() {
                         <span className="health-reason"> {wp.message}</span>
                       </div>
                     ))}
-                  </Collapsible>
+                  </div>
                 )}
                 {healthResult.top_blocking_constraints?.filter(c => !c.is_chain).length > 0 && (
-                  <Collapsible
-                    className="health-section health-info"
-                    title={<span className="health-section-title">ℹ Top non-chain blocking constraints</span>}
-                    badge={healthResult.top_blocking_constraints.filter(c => !c.is_chain).length}
-                    defaultOpen={false}
-                  >
+                  <div className="health-section health-info">
+                    <div className="health-section-title">ℹ Top non-chain blocking constraints</div>
                     {healthResult.top_blocking_constraints.filter(c => !c.is_chain).slice(0, 8).map((c, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-info">{c.count}×</span>
                         <code className="health-constraint-label">{c.label}</code>
                       </div>
                     ))}
-                  </Collapsible>
+                  </div>
                 )}
                 {!hasErrors && !hasWarnings && (
                   <div className="health-ok-msg">✓ No issues detected — model looks healthy.</div>
@@ -3458,9 +5016,11 @@ function App() {
               <p className="auto-no-suggestions">No suggestions — adjust thresholds or review the health report above.</p>
             )}
           </div>
-        </div>{/* end postprocessing-result-section */}
+        </div>
+        )}
 
         {/* ── Run Simulation section ── */}
+        {workflowMode !== 'external-ocel' && (
         <div className={`simulation-section ${(workflowMode !== 'external-empty' && !discoveryResults) ? 'disabled' : ''}`}>
           <div className="section-header">
             <h2>Run Simulation</h2>
@@ -3637,19 +5197,7 @@ function App() {
                         defaultOpen={false}
                       >
                         <ul className="sim-coverage-missing-list">
-                          {missingTypes.map(a => {
-                            const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
-                            return (
-                              <li key={a}>
-                                <span className="sim-coverage-missing-name">{a}</span>
-                                {reasons.length > 0 && (
-                                  <ul className="sim-coverage-missing-reasons">
-                                    {reasons.map((r, i) => <li key={i}>{r}</li>)}
-                                  </ul>
-                                )}
-                              </li>
-                            );
-                          })}
+                          {missingTypes.map(a => <li key={a}>{a}</li>)}
                         </ul>
                       </Collapsible>
                     )}
@@ -3657,6 +5205,95 @@ function App() {
                 );
               })()}
 
+
+              {/* ── Activity distribution comparison: simulation vs log ── */}
+              {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
+                <Collapsible
+                  className="logs-box sim-compare-box"
+                  title="📊 Activity Distribution vs Log"
+                  badge={null}
+                  defaultOpen={false}
+                >
+                  {() => {
+                    const simMetrics = results.metrics.activity_metrics;
+                    const logCounts = discoveryResults.activity_counts || {};
+                    const logRepeat = discoveryResults.activity_repeat_stats || {};
+                    const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+                    const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+                    const actSeq = results.metrics?.activity_sequence || [];
+                    const flowRank = {};
+                    actSeq.forEach((a, i) => { if (!(a in flowRank)) flowRank[a] = i; });
+                    const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
+                      .sort((a, b) => {
+                        const ra = a in flowRank ? flowRank[a] : 999999;
+                        const rb = b in flowRank ? flowRank[b] : 999999;
+                        return ra !== rb ? ra - rb : a.localeCompare(b);
+                      });
+                    return (
+                      <>
+                        <p className="sim-compare-hint">
+                          Proportional share of total events (simulation vs log). Identical proportions would mean
+                          perfect routing fidelity. Difference column shows sim − log in percentage points.
+                        </p>
+                        <table className="metrics-table sim-compare-table">
+                          <thead>
+                            <tr>
+                              <th>Activity</th>
+                              <th title="Times fired in this simulation run">Sim count</th>
+                              <th title="Times fired in the input event log">Log count</th>
+                              <th title="Share of all simulated events">Sim %</th>
+                              <th title="Share of all log events">Log %</th>
+                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
+                              <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
+                              <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allActs.map(act => {
+                              const simCount = simMetrics[act]?.execution_count ?? 0;
+                              const logCount = logCounts[act] ?? 0;
+                              const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                              const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                              const diff = simPct - logPct;
+                              const logMeanObj = logRepeat[act]?.mean ?? null;
+                              const simObjEvents = simActivityObjectCounts[act] ?? null;
+                              const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                              const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
+                                : diff > 0 ? 'cmp-over' : 'cmp-under';
+                              return (
+                                <tr key={act}>
+                                  <td className="metrics-act-name">{act}</td>
+                                  <td>{simCount || '—'}</td>
+                                  <td>{logCount || '—'}</td>
+                                  <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                                  <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                                  <td className={`cmp-diff ${diffClass}`}>
+                                    {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
+                                  </td>
+                                  <td>{logMeanObj ?? '—'}</td>
+                                  <td>{simMeanObj ?? '—'}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </>
+                    );
+                  }}
+                </Collapsible>
+              )}
+
+              {results.activity_sequence && results.activity_sequence.length > 0 && (
+                <div className="flow-chart-section">
+                  <h4>Process Flow</h4>
+                  <FlowChart
+                    activitySequence={results.activity_sequence}
+                    objectTraces={results.object_traces || {}}
+                    objectTypesMap={results.object_types_map || {}}
+                    activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
+                  />
+                </div>
+              )}
 
               {results.object_types && (
                 <Collapsible
@@ -3821,112 +5458,6 @@ function App() {
                 </Collapsible>
               )}
 
-              {/* ── Activity distribution comparison: simulation vs log ── */}
-              {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
-                <Collapsible
-                  className="logs-box sim-compare-box"
-                  title="📊 Activity Distribution vs Log"
-                  badge={null}
-                  defaultOpen={false}
-                >
-                  {() => {
-                    const simMetrics = results.metrics.activity_metrics;
-                    const logCounts = discoveryResults.activity_counts || {};
-                    const logRepeat = discoveryResults.activity_repeat_stats || {};
-                    const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
-                    const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-
-                    // Replicate FlowChart rank assignment so rows appear in the
-                    // same left-to-right column order as the DFG.
-                    const actSeq = results.activity_sequence
-                      ? [...new Set(results.activity_sequence)]
-                      : Object.keys(simMetrics);
-                    const idxOf = {};
-                    actSeq.forEach((n, i) => { idxOf[n] = i; });
-                    // Build transition counts from object traces (same source as FlowChart)
-                    const trans = {};
-                    Object.values(results.object_traces || {}).forEach(seq => {
-                      seq.forEach((name, i) => {
-                        if (i < seq.length - 1) {
-                          const key = `${name} → ${seq[i + 1]}`;
-                          trans[key] = (trans[key] || 0) + 1;
-                        }
-                      });
-                    });
-                    // Forward predecessors only
-                    const preds = {};
-                    actSeq.forEach(n => { preds[n] = []; });
-                    Object.keys(trans).forEach(key => {
-                      const [f, t] = key.split(' → ');
-                      if (f === t || idxOf[f] === undefined || idxOf[t] === undefined) return;
-                      if (idxOf[f] < idxOf[t]) preds[t].push(f);
-                    });
-                    // rank = longest forward path ending at node
-                    const flowRank = {};
-                    actSeq.forEach(n => {
-                      flowRank[n] = preds[n].length ? Math.max(...preds[n].map(p => flowRank[p] + 1)) : 0;
-                    });
-
-                    const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                      .sort((a, b) => {
-                        const ra = a in flowRank ? flowRank[a] : 999999;
-                        const rb = b in flowRank ? flowRank[b] : 999999;
-                        return ra !== rb ? ra - rb : a.localeCompare(b);
-                      });
-                    return (
-                      <>
-                        <p className="sim-compare-hint">
-                          Proportional share of total events (simulation vs log). Identical proportions would mean
-                          perfect routing fidelity. Difference column shows sim − log in percentage points.
-                        </p>
-                        <table className="metrics-table sim-compare-table">
-                          <thead>
-                            <tr>
-                              <th>Activity</th>
-                              <th title="Times fired in this simulation run">Sim count</th>
-                              <th title="Times fired in the input event log">Log count</th>
-                              <th title="Share of all simulated events">Sim %</th>
-                              <th title="Share of all log events">Log %</th>
-                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
-                              <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
-                              <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {allActs.map(act => {
-                              const simCount = simMetrics[act]?.execution_count ?? 0;
-                              const logCount = logCounts[act] ?? 0;
-                              const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
-                              const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
-                              const diff = simPct - logPct;
-                              const logMeanObj = logRepeat[act]?.mean ?? null;
-                              const simObjEvents = simActivityObjectCounts[act] ?? null;
-                              const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
-                              const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
-                                : diff > 0 ? 'cmp-over' : 'cmp-under';
-                              return (
-                                <tr key={act}>
-                                  <td className="metrics-act-name">{act}</td>
-                                  <td>{simCount || '—'}</td>
-                                  <td>{logCount || '—'}</td>
-                                  <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                                  <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                                  <td className={`cmp-diff ${diffClass}`}>
-                                    {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
-                                  </td>
-                                  <td>{logMeanObj ?? '—'}</td>
-                                  <td>{simMeanObj ?? '—'}</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </>
-                    );
-                  }}
-                </Collapsible>
-              )}
-
               {results.activity_sequence && results.activity_sequence.length > 0 && (
                 <Collapsible
                   className="activity-sequence"
@@ -3957,18 +5488,6 @@ function App() {
                       Download Metrics
                     </button>
                   )}
-                </div>
-              )}
-
-              {results.activity_sequence && results.activity_sequence.length > 0 && (
-                <div className="flow-chart-section">
-                  <h4>Process Flow</h4>
-                  <FlowChart
-                    activitySequence={results.activity_sequence}
-                    objectTraces={results.object_traces || {}}
-                    objectTypesMap={results.object_types_map || {}}
-                    activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
-                  />
                 </div>
               )}
 
@@ -4198,8 +5717,8 @@ function App() {
               </p>
             </div>
           )}
-        </div>{/* end simulation-section */}
-      </div>{/* end workflow-container */}
+        </div>
+        )}
 
       {/* ── Run History ── */}
       {runHistory.length > 0 && (
@@ -4295,6 +5814,7 @@ function App() {
         </div>
       )}
     </div>
+  </div>
   );
 }
 

@@ -6,7 +6,7 @@ const NODE_R   = 34;
 const O2O_PALETTE = ['#667eea','#10b981','#f59e0b','#ef4444','#8b5cf6',
                      '#ec4899','#06b6d4','#84cc16','#f97316','#14b8a6'];
 
-function O2ODiagram({ rules, otNames }) {
+export function O2ODiagram({ rules, otNames }) {
   const [hovered, setHovered] = useState(null);
   const [positions, setPositions] = useState({});  // type -> {x, y}
   const dragging = useRef(null); // { type, startX, startY, origX, origY, svgRect }
@@ -212,6 +212,7 @@ export default function ModelEditor({
   model, probMatrix, onModelChange, onProbMatrixChange,
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
   nmaxSuggestions = {}, eventLogFile = '',
+  hideParameterButtons = false,
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
@@ -502,6 +503,7 @@ export default function ModelEditor({
           </h3>
           <div className="model-editor-actions">
             {/* Load saved parameters from IO/input/parameters */}
+            {!hideParameterButtons && (
             <div className="model-params-loader">
               <select
                 className="model-params-select"
@@ -523,6 +525,8 @@ export default function ModelEditor({
                 ⬆ Load
               </button>
             </div>
+            )}
+            {!hideParameterButtons && (
             <button
               className="model-download-btn"
               onClick={downloadModel}
@@ -530,6 +534,7 @@ export default function ModelEditor({
             >
               ⬇ Download JSON
             </button>
+            )}
           </div>
         </div>
         {!collapsed && (

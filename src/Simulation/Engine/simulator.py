@@ -345,7 +345,16 @@ class Simulator:
                 # weight = row[activity] (or epsilon if absent). Dividing by the total of
                 # ALL row weights (plus epsilon per start activity) preserves the relative
                 # ratios between existing targets while giving start activities their fair share.
-                if self.transition_matrix and activity.name in start_activity_names and state.executed_events:
+                #
+                # Safety bypass: if in_progress is empty AND the candidate list is still empty
+                # at this point, skip the gate for start activities — otherwise the simulation
+                # could deadlock permanently if all start activities roll unlucky simultaneously.
+                is_potential_deadlock = (
+                    activity.name in start_activity_names
+                    and not state.in_progress
+                    and not candidates
+                )
+                if self.transition_matrix and activity.name in start_activity_names and state.executed_events and not is_potential_deadlock:
                     last_act = state.executed_events[-1].activity_name
                     row = self.transition_matrix.get(last_act, {})
                     epsilon = 1e-6
@@ -417,6 +426,8 @@ class Simulator:
                     cap_obj = max_consec_obj[activity.name]
                     blocked = False
                     for pid in candidate.participating_object_ids:
+                        if state._type_of_object.get(pid) in resource_types:
+                            continue  # resources are freely reusable — exempt from per-object streak cap
                         streak_obj = state._object_streak.get((activity.name, pid), 0)
                         if streak_obj >= cap_obj:
                             blocked = True

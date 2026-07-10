@@ -26,7 +26,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules, discover_resource_types
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -624,6 +624,7 @@ def run_simulation():
         event_log_file = data.get('eventLogFile')
         run_id         = data.get('runId')          # optional: enables live status/stop
         max_steps = int(data.get('maxSteps', 50))
+        print(f"[simulate] maxSteps received: {max_steps}", flush=True)
         seed = int(data.get('seed', 42))
         # Accept either startActivities (list, new) or startActivity (string, legacy)
         start_activities = data.get('startActivities')
@@ -760,15 +761,12 @@ def run_simulation():
         from collections import deque
         _LOG_CAP = 500  # only keep last 500 steps in the response to avoid huge payloads
         iteration_logs = deque(maxlen=_LOG_CAP)
-        _steps_to_skip = max(0, max_steps - _LOG_CAP)  # skip trace building for early steps
-        _trace_step_counter = [0]
+        # No upfront skipping — the deque's maxlen naturally keeps only the last 500
+        # entries, so early steps are evicted as the simulation progresses. This also
+        # ensures the trace is populated when the simulation stops before max_steps.
 
         def trace_func(event: str, payload: dict):
             if event == "iteration":
-                _trace_step_counter[0] += 1
-                # Skip building the expensive dict for early steps we'll discard anyway
-                if _trace_step_counter[0] <= _steps_to_skip:
-                    return
                 step = payload.get("step_count", "?")
                 candidates = payload.get("candidate_activity_names", [])
                 # Build per-candidate detail: prob + participating object IDs
@@ -793,8 +791,6 @@ def run_simulation():
                     "num_candidates": payload.get("num_candidates", 0),
                 })
             elif event == "chosen":
-                if _trace_step_counter[0] <= _steps_to_skip:
-                    return
                 activity = payload.get("activity_name", "?")
                 objects = payload.get("participating_object_ids", [])
                 creates = payload.get("object_types_to_create", [])
@@ -1428,6 +1424,52 @@ def discover_o2o():
             'success': True,
             'o2o_rules': rules,
             'count': len(rules),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/discover-resources', methods=['POST'])
+def discover_resources():
+    """Discover resource object types from an OCEL event log.
+
+    Body JSON:
+      eventLogFile      – filename in EVENTLOG_DIR (required)
+      resourceThreshold – avg events/instance to qualify as resource (default 50)
+    """
+    try:
+        data = request.json or {}
+        event_log_file = data.get('eventLogFile')
+        resource_threshold = float(data.get('resourceThreshold', 50.0))
+
+        if not event_log_file:
+            return jsonify({'error': 'Missing eventLogFile parameter'}), 400
+
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
+
+        event_log = load_ocel2(str(log_path))
+        resource_type_names = discover_resource_types(event_log, resource_threshold)
+
+        # Count individual object instances per resource type
+        objects_raw = event_log.get('objects', {})
+        objs_list = list(objects_raw.values()) if isinstance(objects_raw, dict) else (objects_raw or [])
+        from collections import Counter
+        type_counts = Counter(
+            o.get('type') or o.get('ocel:type', '')
+            for o in objs_list
+        )
+        resource_info = [
+            {'type': rt, 'instance_count': type_counts.get(rt, 0)}
+            for rt in resource_type_names
+        ]
+
+        return jsonify({
+            'success': True,
+            'resource_types': resource_type_names,
+            'resource_info': resource_info,
         })
     except Exception as e:
         import traceback
