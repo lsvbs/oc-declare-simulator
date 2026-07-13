@@ -190,15 +190,35 @@ function HelpTip({ text }) {
   );
 }
 
-const CONSTRAINT_TYPES = ['precedence', 'not_precedence', 'response', 'not_coexistence', 'chain_precedence', 'chain_response'];
+const CONSTRAINT_TYPES = [
+  'precedence', 'not_precedence', 'response', 'not_coexistence',
+  'chain_precedence', 'chain_response',
+  'responded_existence',
+  'absence', 'exactly', 'init',
+  'exclusive_choice',
+  'succession', 'chain_succession', 'not_succession', 'not_chain_succession',
+  'alternate_response', 'alternate_precedence', 'alternate_succession',
+];
 
 const CONSTRAINT_HELP = {
-  precedence:       'B is blocked until A has fired on the same scope object. nmin ≥ 1 (default) enforces this; nmax caps how many A-occurrences may precede B.',
-  not_precedence:   'Once A fires on a scope object, B is permanently blocked for that object. B can still fire freely before A occurs.',
-  response:         'If A fires on an object, B must eventually follow. Use n≤ to cap how many times B may fire per scope object (counted across all B-firings, not per A).',
-  not_coexistence:  'Mutual exclusion per scope object: once A fires, B is blocked; once B fires, A is blocked. At most one of the two activities can ever fire per object.',
-  chain_precedence: 'B must be immediately preceded by A on the scope object — no other event for that object may occur in between. Creating a fresh scope object for B also violates this.',
-  chain_response:   'Once A fires, every other activity is blocked for the scope object until B fires next. The constraint is "armed" by A and disarmed only by B.',
+  precedence:           'B is blocked until A has fired on the same scope object. nmin ≥ 1 (default) enforces this; nmax caps how many A-occurrences may precede B.',
+  not_precedence:       'Once A fires on a scope object, B is permanently blocked for that object. B can still fire freely before A occurs.',
+  response:             'If A fires on an object, B must eventually follow. Use n≤ to cap how many times B may fire per scope object.',
+  not_coexistence:      'Mutual exclusion per scope object: once A fires, B is blocked; once B fires, A is blocked. At most one of the two activities can ever fire per object.',
+  chain_precedence:     'B must be immediately preceded by A on the scope object — no other event for that object may occur in between.',
+  chain_response:       'Once A fires, every other activity is blocked for the scope object until B fires next.',
+  responded_existence:  'If A occurs, B must also occur (before or after). Post-hoc obligation only — not enforced eagerly during simulation.',
+  absence:              'A must never occur (set n≤ = 0) or at most n≤ times. Set source = target = the activity to restrict.',
+  exactly:              'A must occur exactly n≥ times. Block further firings after n≥. Set source = target = the activity.',
+  init:                 'A must be the first activity to fire. All other activities are blocked until A has fired at least once.',
+  exclusive_choice:     'Exactly one of A or B may occur. Once one fires, the other is permanently blocked.',
+  succession:           'A must precede B (Precedence) AND after every A, B must eventually follow (Response). Composed constraint.',
+  chain_succession:     'A and B must occur consecutively (Chain Precedence ∧ Chain Response).',
+  not_succession:       'After A fires, B must never follow.',
+  not_chain_succession: 'B must not occur immediately after A.',
+  alternate_response:   'Between each A and its matching B response, no other A may occur. Source cannot re-fire while "armed".',
+  alternate_precedence: 'Each B must be preceded by A, with no other B in between. B is blocked when it would exceed the count of A firings.',
+  alternate_succession: 'Alternating A then B with no repetitions (Alternate Response ∧ Alternate Precedence).',
 };
 const SCOPE_KINDS      = ['each', 'global', 'any', 'all'];
 
@@ -806,7 +826,7 @@ export default function ModelEditor({
                 return (
                   <div key={idx} className="constraint-row">
                     <span className={`constraint-type-badge ${c.constraint_type}`}>
-                      {c.constraint_type}
+                      {c.constraint_type.replace(/_/g, ' ')}
                     </span>
                     <span className="constraint-src">{c.source_activity}</span>
                     <span className="constraint-arrow">→</span>
@@ -835,10 +855,10 @@ export default function ModelEditor({
                 onChange={e => setNewCon(p => ({
                   ...p,
                   constraint_type: e.target.value,
-                  nmin: e.target.value === 'precedence' ? 1 : 0,
-                  nmax: null,
+                  nmin: e.target.value === 'precedence' ? 1 : e.target.value === 'exactly' ? 1 : 0,
+                  nmax: e.target.value === 'absence' ? 0 : null,
                 }))}>
-                {CONSTRAINT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                {CONSTRAINT_TYPES.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
               </select>
               {CONSTRAINT_HELP[newCon.constraint_type] && (
                 <HelpTip text={CONSTRAINT_HELP[newCon.constraint_type]} />
@@ -865,13 +885,17 @@ export default function ModelEditor({
                   {otNames.map(t => <option key={t} value={t}>{t}</option>)}
                 </select>
               )}
-              {(newCon.constraint_type === 'precedence' || newCon.constraint_type === 'response') && (
+              {(['precedence', 'response', 'absence', 'exactly'].includes(newCon.constraint_type)) && (
                 <span className="card-inputs" title={
                   newCon.constraint_type === 'response'
                     ? 'n≤ caps how many times the target may fire per scope object (blank = no upper bound).'
+                    : newCon.constraint_type === 'absence'
+                    ? 'n≤ = 0 means never. Increase to allow at most n≤ occurrences.'
+                    : newCon.constraint_type === 'exactly'
+                    ? 'n≥ = exact required count. Activity is blocked after this many firings.'
                     : 'Cardinality bounds: nmin ≥ 1 enforces "source before target"; nmax optionally caps how many sources may precede the target (blank = no upper bound).'
                 }>
-                  {newCon.constraint_type === 'precedence' && (
+                  {(newCon.constraint_type === 'precedence' || newCon.constraint_type === 'exactly') && (
                     <>
                       <label className="card-label">n≥</label>
                       <input

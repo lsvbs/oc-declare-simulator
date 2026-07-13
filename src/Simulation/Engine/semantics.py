@@ -231,6 +231,160 @@ def check_chain_response(constraint: Any, candidate: Any, state: SimulationState
     return True
 
 
+def check_responded_existence(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Post-hoc obligation — cannot block eagerly. Always returns True."""
+    return True
+
+
+def check_absence(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Activity must never occur (nmax=0) or at most nmax times."""
+    target = constraint.target_activity or constraint.source_activity
+    if candidate.activity_name != target:
+        return True
+    nmax = getattr(constraint, "nmax", 0)
+    if nmax is None:
+        nmax = 0
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return len(state._events_by_activity.get(target, [])) < nmax if nmax > 0 else not _activity_fired_globally(state, target)
+        for oid in scope_ids:
+            cnt = _count_activity_for_object(state, target, oid)
+            if nmax == 0 and cnt > 0:
+                return False
+            if nmax > 0 and cnt >= nmax:
+                return False
+        return True
+    cnt = len(state._events_by_activity.get(target, []))
+    return cnt < nmax if nmax > 0 else cnt == 0
+
+
+def check_exactly(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Activity must occur exactly nmin times. Block after nmin firings."""
+    target = constraint.target_activity or constraint.source_activity
+    if candidate.activity_name != target:
+        return True
+    nmin = getattr(constraint, "nmin", 1) or 1
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return len(state._events_by_activity.get(target, [])) < nmin
+        for oid in scope_ids:
+            if _count_activity_for_object(state, target, oid) >= nmin:
+                return False
+        return True
+    return len(state._events_by_activity.get(target, [])) < nmin
+
+
+def check_init(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Activity must be the first event. Block all others until it fires."""
+    target = constraint.target_activity or constraint.source_activity
+    if candidate.activity_name == target:
+        return True
+    return _activity_fired_globally(state, target)
+
+
+def check_exclusive_choice(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Exactly one of source or target may occur. Once one fires, block the other."""
+    source = constraint.source_activity
+    target = constraint.target_activity
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return True
+        for oid in scope_ids:
+            if candidate.activity_name == source and _activity_fired_for_object(state, target, oid):
+                return False
+            if candidate.activity_name == target and _activity_fired_for_object(state, source, oid):
+                return False
+        return True
+    if candidate.activity_name == source:
+        return not _activity_fired_globally(state, target)
+    if candidate.activity_name == target:
+        return not _activity_fired_globally(state, source)
+    return True
+
+
+def check_not_succession(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """After source fires, target must never follow."""
+    source = constraint.source_activity
+    target = constraint.target_activity
+    if candidate.activity_name != target:
+        return True
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return not _activity_fired_globally(state, source)
+        for oid in scope_ids:
+            if _activity_fired_for_object(state, source, oid):
+                return False
+        return True
+    return not _activity_fired_globally(state, source)
+
+
+def check_not_chain_succession(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Target must not occur immediately after source."""
+    source = constraint.source_activity
+    target = constraint.target_activity
+    if candidate.activity_name != target:
+        return True
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            if not state.executed_events:
+                return True
+            return state.executed_events[-1].activity_name != source
+        for oid in scope_ids:
+            if _last_activity_for_scope_object(state, oid) == source:
+                return False
+        return True
+    if not state.executed_events:
+        return True
+    return state.executed_events[-1].activity_name != source
+
+
+def check_alternate_response(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Block source from firing again while it is armed (fired but target hasn't responded)."""
+    source = constraint.source_activity
+    target = constraint.target_activity
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return True
+        for oid in scope_ids:
+            src_count = _count_activity_for_object(state, source, oid)
+            tgt_count = _count_activity_for_object(state, target, oid)
+            if candidate.activity_name == source and src_count > tgt_count:
+                return False
+        return True
+    src_count = len(state._events_by_activity.get(source, []))
+    tgt_count = len(state._events_by_activity.get(target, []))
+    if candidate.activity_name == source and src_count > tgt_count:
+        return False
+    return True
+
+
+def check_alternate_precedence(constraint: Any, candidate: Any, state: SimulationState) -> bool:
+    """Each target firing must be matched by a preceding source; block target when balanced."""
+    source = constraint.source_activity
+    target = constraint.target_activity
+    if candidate.activity_name != target:
+        return True
+    if constraint.scope.kind == "each":
+        scope_ids = _get_scope_object_ids_from_candidate(candidate, state, constraint.scope.object_type)
+        if not scope_ids:
+            return True
+        for oid in scope_ids:
+            src_count = _count_activity_for_object(state, source, oid)
+            tgt_count = _count_activity_for_object(state, target, oid)
+            if tgt_count >= src_count:
+                return False
+        return True
+    src_count = len(state._events_by_activity.get(source, []))
+    tgt_count = len(state._events_by_activity.get(target, []))
+    return tgt_count < src_count
+
+
 def check_constraint(constraint: Any, candidate: Any, state: SimulationState) -> bool:
     kind = getattr(constraint, "constraint_type", None)
     if kind == "not_coexistence":
@@ -242,11 +396,43 @@ def check_constraint(constraint: Any, candidate: Any, state: SimulationState) ->
     if kind == "not_precedence":
         return check_not_precedence(constraint, candidate, state)
     if kind == "responded_existence":
-        return True
+        return check_responded_existence(constraint, candidate, state)
     if kind == "chain_response":
         return check_chain_response(constraint, candidate, state)
     if kind == "chain_precedence":
         return check_chain_precedence(constraint, candidate, state)
+    # New constraint types
+    if kind == "absence":
+        return check_absence(constraint, candidate, state)
+    if kind == "exactly":
+        return check_exactly(constraint, candidate, state)
+    if kind == "init":
+        return check_init(constraint, candidate, state)
+    if kind == "exclusive_choice":
+        return check_exclusive_choice(constraint, candidate, state)
+    if kind == "not_succession":
+        return check_not_succession(constraint, candidate, state)
+    if kind == "not_chain_succession":
+        return check_not_chain_succession(constraint, candidate, state)
+    if kind == "alternate_response":
+        return check_alternate_response(constraint, candidate, state)
+    if kind == "alternate_precedence":
+        return check_alternate_precedence(constraint, candidate, state)
+    # Composite constraints decomposed into existing checks
+    if kind == "succession":
+        # Succession = Precedence ∧ Response (nmax enforcement)
+        return (check_precedence(constraint, candidate, state) and
+                check_response(constraint, candidate, state))
+    if kind == "chain_succession":
+        # Chain Succession = Chain Precedence ∧ Chain Response
+        return (check_chain_precedence(constraint, candidate, state) and
+                check_chain_response(constraint, candidate, state))
+    if kind == "alternate_succession":
+        # Alternate Succession = Alternate Response ∧ Alternate Precedence
+        return (check_alternate_response(constraint, candidate, state) and
+                check_alternate_precedence(constraint, candidate, state))
+    # participation and choice are post-hoc (end-of-trace) — not enforced eagerly
+    # coexistence is also post-hoc
     return True
 
 

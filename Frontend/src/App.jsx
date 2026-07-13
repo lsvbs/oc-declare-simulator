@@ -1035,6 +1035,9 @@ function App() {
   const [liveStepCount, setLiveStepCount] = useState(null); // step counter during run
   const [activeRunId,   setActiveRunId]   = useState(null); // run_id for status/stop polling
   const pollIntervalRef = useRef(null);
+  const ocelFileRef    = useRef(null);
+  const ocdeclFileRef  = useRef(null);
+  const paramsFileRef  = useRef(null);
   const [results, setResults] = useState(null);
   const [healthResult, setHealthResult] = useState(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
@@ -1137,6 +1140,7 @@ function App() {
   });
   const [activeDiscoveryTab, setActiveDiscoveryTab] = useState('lifecycle');
   const [isRunningDiscoveries, setIsRunningDiscoveries] = useState(false);
+  const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
   const [lifecycleError, setLifecycleError] = useState(null);
@@ -1192,9 +1196,7 @@ function App() {
         if (ocdeclareFiles.length > 0) {
           setConfig(prev => ({ ...prev, ocdeclareFile: ocdeclareFiles[0] }));
         }
-        if (eventLogFiles.length > 0) {
-          setDiscoveryConfig(prev => ({ ...prev, eventLogFile: eventLogFiles[0] }));
-        }
+        // Event log file is intentionally left blank on load — user must select explicitly
       }
     } catch (err) {
       setDiscoveryError('Failed to load available files. Make sure the backend server is running.');
@@ -1534,46 +1536,6 @@ function App() {
     }
   }, [discoveryConfig.eventLogFile]);
 
-  const runAllDiscoveries = useCallback(async () => {
-    if (!discoveryConfig.eventLogFile) return;
-    setIsRunningDiscoveries(true);
-    try {
-      if (discoveryChecks.lifecycle) await runLifecycleDerivation();
-      if (discoveryChecks.resources) await runResourceDiscovery();
-      if (discoveryChecks.timing)    await runTimingDiscovery();
-      if (discoveryChecks.o2o)       await runO2ODiscovery();
-      if (discoveryChecks.startProb && activeProbMatrix && discoveryResults?.likely_start_activities?.length > 0) {
-        const counts = discoveryResults.activity_counts;
-        const total = Object.values(counts).reduce((s, v) => s + v, 0);
-        if (total > 0) {
-          const selected = new Set(discoveryConfig.startActivityProbSelected ?? [discoveryResults.likely_start_activities[0]]);
-          const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
-          const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
-          const newMatrix = {};
-          Object.entries(activeProbMatrix).forEach(([src, targets]) => {
-            const tgts = { ...targets };
-            selected.forEach(a => delete tgts[a]);
-            const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
-            const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
-            const scaled = {};
-            Object.entries(tgts).forEach(([t, v]) => { scaled[t] = Math.round(v * scale * 10000) / 10000; });
-            selected.forEach(a => {
-              const share = selectedCountSum > 0 ? combinedProb * (counts[a] || 0) / selectedCountSum : combinedProb / selected.size;
-              scaled[a] = Math.round(share * 10000) / 10000;
-            });
-            newMatrix[src] = scaled;
-          });
-          setActiveProbMatrix(newMatrix);
-          setStartProbApplied(true);
-          setConfig(p => ({ ...p, startActivities: [...selected] }));
-        }
-      }
-    } finally {
-      setIsRunningDiscoveries(false);
-    }
-  }, [discoveryChecks, discoveryConfig, discoveryResults, activeProbMatrix,
-      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery]);
-
   const stopSimulation = useCallback(async () => {
     if (!activeRunId) return;
     try { await axios.post(`/api/simulate/stop/${activeRunId}`); } catch {}
@@ -1667,6 +1629,60 @@ function App() {
     }
   };
 
+  const runAllDiscoveries = useCallback(async () => {
+    if (!discoveryConfig.eventLogFile) return;
+    setIsRunningDiscoveries(true);
+
+    const startProbFn = async () => {
+      if (!activeProbMatrix || !discoveryResults?.likely_start_activities?.length) return;
+      const counts = discoveryResults.activity_counts;
+      const total = Object.values(counts).reduce((s, v) => s + v, 0);
+      if (!total) return;
+      const selected = new Set(discoveryConfig.startActivityProbSelected ?? [discoveryResults.likely_start_activities[0]]);
+      const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
+      const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
+      const newMatrix = {};
+      Object.entries(activeProbMatrix).forEach(([src, targets]) => {
+        const tgts = { ...targets };
+        selected.forEach(a => delete tgts[a]);
+        const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
+        const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
+        const scaled = {};
+        Object.entries(tgts).forEach(([t, v]) => { scaled[t] = Math.round(v * scale * 10000) / 10000; });
+        selected.forEach(a => {
+          const share = selectedCountSum > 0 ? combinedProb * (counts[a] || 0) / selectedCountSum : combinedProb / selected.size;
+          scaled[a] = Math.round(share * 10000) / 10000;
+        });
+        newMatrix[src] = scaled;
+      });
+      setActiveProbMatrix(newMatrix);
+      setStartProbApplied(true);
+      setConfig(p => ({ ...p, startActivities: [...selected] }));
+    };
+
+    const allSteps = [
+      { key: 'lifecycle', label: 'Object Constraints',           fn: runLifecycleDerivation },
+      { key: 'resources', label: 'Resource Objects',             fn: runResourceDiscovery },
+      { key: 'timing',    label: 'Timing',                       fn: runTimingDiscovery },
+      { key: 'o2o',       label: 'O2O Relationships',            fn: runO2ODiscovery },
+      { key: 'startProb', label: 'Start Activity + Probability', fn: startProbFn },
+    ];
+    const steps = allSteps.filter(s => discoveryChecks[s.key]);
+    const total = steps.length;
+
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        setDiscoveryProgress({ current: i + 1, total, currentName: steps[i].label });
+        await steps[i].fn();
+      }
+      await runHealthCheck();
+    } finally {
+      setIsRunningDiscoveries(false);
+      setDiscoveryProgress({ current: 0, total: 0, currentName: '' });
+    }
+  }, [discoveryChecks, discoveryConfig, discoveryResults, activeProbMatrix,
+      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery, runHealthCheck]);
+
   const restoreFromHistory = useCallback((entry) => {
     if (entry.model)      setActiveModel(entry.model);
     if (entry.probMatrix) setActiveProbMatrix(entry.probMatrix);
@@ -1739,6 +1755,34 @@ function App() {
     return null;
   }, []);
 
+  const handleFileUpload = useCallback(async (file, type) => {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('type', type);
+    try {
+      const res = await axios.post('/api/upload-file', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      if (res.data.success) {
+        await loadAvailableFiles({ preserveSelections: true });
+        const filename = res.data.filename;
+        if (type === 'eventlog') {
+          handleDiscoveryConfigChange('eventLogFile', filename);
+          if (workflowMode === 'external-ocel') setTimeout(() => runDiscovery(), 0);
+        } else if (type === 'ocdeclare') {
+          handleConfigChange('ocdeclareFile', filename);
+        } else if (type === 'parameters') {
+          handleLoadParameters(filename);
+        }
+      } else {
+        alert(`Upload failed: ${res.data.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      alert(`Upload failed: ${err.response?.data?.error || err.message}`);
+    }
+  }, [loadAvailableFiles, handleDiscoveryConfigChange, handleConfigChange, handleLoadParameters, workflowMode, runDiscovery]);
+
   const handleDownloadParameters = useCallback(() => {
     if (!activeModel || Array.isArray(activeModel)) return;
     const m = activeModel;
@@ -1800,10 +1844,11 @@ function App() {
 
   // Generate the full suggestion list from health report + config.
   // Returns [{id, type, badgeLabel, label, desc, action}]
-  const generateSuggestions = (hr, model, cfg) => {
+  const generateSuggestions = (hr, model, cfg, startActivities = []) => {
     if (!hr || !model) return [];
     const suggestions = [];
     let id = 0;
+    const startActSet = new Set(startActivities);
 
     // ── Rule 1: Cycle removal ──────────────────────────────────────────────
     const cycleConstraints = [];
@@ -2148,6 +2193,7 @@ function App() {
       });
 
       (model.activities || []).forEach(a => {
+        if (startActSet.has(a.name)) return; // start activities don't need input bindings
         const nonCreatingBindings = (a.bindings || []).filter(b => !b.creates);
         if (nonCreatingBindings.length > 0) return; // already has input bindings
         // Skip pure-creator activities (only creates bindings) if they also have constraints targeting them
@@ -2308,7 +2354,7 @@ function App() {
               </select>
             </div>
 
-            <button 
+            <button
               className="discovery-button"
               onClick={runDiscovery}
               disabled={isDiscovering || !discoveryConfig.eventLogFile}
@@ -2599,39 +2645,47 @@ function App() {
                   <div className="discovery-config">
                     <div className="form-group">
                       <label>Event Log File (OCEL 2.0 Format)</label>
-                      <select
-                        value={discoveryConfig.eventLogFile}
-                        onChange={(e) => {
-                          handleDiscoveryConfigChange('eventLogFile', e.target.value);
-                          if (e.target.value && workflowMode === 'external-ocel') {
-                            setTimeout(() => runDiscovery(), 0);
-                          }
-                        }}
-                        disabled={isDiscovering}
-                      >
-                        <option value="">Select event log...</option>
-                        {eventLogFiles.map(file => (
-                          <option key={file} value={file}>{file}</option>
-                        ))}
-                      </select>
+                      <div className="file-select-row">
+                        <select
+                          value={discoveryConfig.eventLogFile}
+                          onChange={(e) => {
+                            handleDiscoveryConfigChange('eventLogFile', e.target.value);
+                            if (e.target.value && workflowMode === 'external-ocel') {
+                              setTimeout(() => runDiscovery(), 0);
+                            }
+                          }}
+                          disabled={isDiscovering}
+                        >
+                          <option value="">Select event log...</option>
+                          {eventLogFiles.map(file => (
+                            <option key={file} value={file}>{file}</option>
+                          ))}
+                        </select>
+                        <button className="browse-btn" onClick={() => ocelFileRef.current?.click()} title="Browse and upload a file">📁</button>
+                        <input ref={ocelFileRef} type="file" accept=".json,.xml" style={{display:'none'}}
+                          onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
+                      </div>
                     </div>
                     <div className="form-group">
                       <label>OC-Declare Model</label>
-                      <select
-                        value={config.ocdeclareFile}
-                        onChange={(e) => handleConfigChange('ocdeclareFile', e.target.value)}
-                      >
-                        <option value="">Select OC-Declare file...</option>
-                        {ocdeclareFiles.map(f => <option key={f} value={f}>{f}</option>)}
-                      </select>
+                      <div className="file-select-row">
+                        <select
+                          value={config.ocdeclareFile}
+                          onChange={(e) => {
+                            handleConfigChange('ocdeclareFile', e.target.value);
+                            if (e.target.value && discoveryConfig.eventLogFile && workflowMode === 'external-ocel') {
+                              setTimeout(() => runDiscovery(), 0);
+                            }
+                          }}
+                        >
+                          <option value="">Select OC-Declare file...</option>
+                          {ocdeclareFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                        </select>
+                        <button className="browse-btn" onClick={() => ocdeclFileRef.current?.click()} title="Browse and upload a file">📁</button>
+                        <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
+                          onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
+                      </div>
                     </div>
-                    <button
-                      className="discovery-button"
-                      onClick={runDiscovery}
-                      disabled={isDiscovering || !discoveryConfig.eventLogFile}
-                    >
-                      {isDiscovering ? 'Discovering...' : 'Run Discovery'}
-                    </button>
                   </div>
 
                   {discoveryError && (
@@ -2690,11 +2744,11 @@ function App() {
                 {/* B: Discoveries */}
                 {discoveryResults && (() => {
                   const DISC_ITEMS = [
-                    { key: 'lifecycle', label: 'Lifecycle' },
-                    { key: 'resources', label: 'Resources' },
+                    { key: 'lifecycle', label: 'Object Constraints' },
+                    { key: 'resources', label: 'Resource Objects' },
                     { key: 'timing',    label: 'Timing' },
                     { key: 'o2o',       label: 'O2O' },
-                    { key: 'startProb', label: 'Start Probability' },
+                    { key: 'startProb', label: 'Start Activity + Probability' },
                   ];
                   // Ensure activeDiscoveryTab is one of the defined keys; default to first
                   const activeKey = DISC_ITEMS.some(d => d.key === activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
@@ -2863,6 +2917,17 @@ function App() {
                       >
                         {isRunningDiscoveries ? 'Running discoveries...' : 'Run Discoveries'}
                       </button>
+                      {isRunningDiscoveries && discoveryProgress.total > 0 && (
+                        <div className="disc-progress">
+                          <div className="spinner spinner-sm"></div>
+                          <span className="disc-progress-label">
+                            {discoveryProgress.currentName}… ({discoveryProgress.current}/{discoveryProgress.total})
+                          </span>
+                          <div className="disc-progress-bar">
+                            <div className="disc-progress-fill" style={{width:`${(discoveryProgress.current/discoveryProgress.total)*100}%`}} />
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
@@ -2871,16 +2936,14 @@ function App() {
                 <div className="postprocessing-result-section">
                   <div className="section-header">
                     <h2>Post-Processing</h2>
-                    <p>Review the constraint health before running the simulation</p>
+                    <p>Health check runs automatically after discoveries complete</p>
                   </div>
 
-                  <button
-                    className="health-check-button"
-                    onClick={runHealthCheck}
-                    disabled={isCheckingHealth || isSimulating || !config.ocdeclareFile || config.startActivities.length === 0}
-                  >
-                    {isCheckingHealth ? '⏳ Checking...' : '🩺 Run Health Check'}
-                  </button>
+                  {isCheckingHealth && (
+                    <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                      <div className="spinner spinner-sm"></div> Running health check…
+                    </div>
+                  )}
 
                   {healthResult && !healthResult.error && (() => {
                     const s = healthResult.summary || {};
@@ -3188,7 +3251,7 @@ function App() {
                       className="auto-generate-btn"
                       disabled={!healthResult || !!healthResult.error || !activeModel}
                       onClick={() => {
-                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig);
+                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities);
                         setAutoSuggestions(suggs);
                         setAutoSelected(new Set(suggs.map((_, i) => i)));
                       }}
@@ -3309,14 +3372,19 @@ function App() {
                     ▶ Use Parameters
                   </button>
                   <div className="model-params-loader">
-                    <select
-                      className="model-params-select"
-                      value=""
-                      onChange={e => { if (e.target.value) handleLoadParameters(e.target.value); }}
-                    >
-                      <option value="">⬆ Load Parameters…</option>
-                      {parameterFiles.map(f => <option key={f} value={f}>{f}</option>)}
-                    </select>
+                    <div className="file-select-row">
+                      <select
+                        className="model-params-select"
+                        value=""
+                        onChange={e => { if (e.target.value) handleLoadParameters(e.target.value); }}
+                      >
+                        <option value="">⬆ Load Parameters…</option>
+                        {parameterFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                      </select>
+                      <button className="browse-btn" onClick={() => paramsFileRef.current?.click()} title="Browse and upload a parameter file">📁</button>
+                      <input ref={paramsFileRef} type="file" accept=".json" style={{display:'none'}}
+                        onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'parameters'); e.target.value=''; }} />
+                    </div>
                   </div>
                 </div>
 
@@ -4673,13 +4741,11 @@ function App() {
             <p>Review the constraint health before running the simulation</p>
           </div>
 
-          <button
-            className="health-check-button"
-            onClick={runHealthCheck}
-            disabled={isCheckingHealth || isSimulating || !config.ocdeclareFile || config.startActivities.length === 0}
-          >
-            {isCheckingHealth ? '⏳ Checking...' : '🩺 Run Health Check'}
-          </button>
+          {isCheckingHealth && (
+            <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginBottom:'0.5rem'}}>
+              <div className="spinner spinner-sm"></div> Running health check…
+            </div>
+          )}
 
           {healthResult && !healthResult.error && (() => {
             const s = healthResult.summary || {};

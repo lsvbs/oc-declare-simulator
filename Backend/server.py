@@ -1476,6 +1476,48 @@ def discover_resources():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/upload-file', methods=['POST'])
+def upload_file():
+    """Upload a file into the appropriate input directory.
+
+    Accepts multipart/form-data with fields:
+      file  – the file to upload
+      type  – 'ocdeclare' | 'eventlog' | 'parameters'
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+        file_type = request.form.get('type', '')
+
+        if not file.filename:
+            return jsonify({'error': 'Empty filename'}), 400
+
+        dir_map = {
+            'ocdeclare':  OCDECLARE_DIR,
+            'eventlog':   EVENTLOG_DIR,
+            'parameters': PARAMETERS_DIR,
+        }
+        target_dir = dir_map.get(file_type)
+        if target_dir is None:
+            return jsonify({'error': f'Unknown file type: {file_type}'}), 400
+
+        # Sanitise filename — keep only the basename
+        filename = os.path.basename(file.filename)
+        if not filename:
+            return jsonify({'error': 'Invalid filename'}), 400
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        save_path = target_dir / filename
+        file.save(str(save_path))
+
+        return jsonify({'success': True, 'filename': filename})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
