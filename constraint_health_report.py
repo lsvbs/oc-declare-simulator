@@ -11,7 +11,7 @@ Standalone usage:
 
 Library usage:
     from constraint_health_report import run_health_check
-    result = run_health_check(model_dict, start_activities, event_log=ocel_dict, steps=20)
+    result = run_health_check(model_dict, start_activities, event_log=ocel_dict, steps=500)
 """
 
 import sys
@@ -184,7 +184,7 @@ def _weak_precedence_check(constraints: list, event_log: dict, threshold: float 
     return results
 
 
-def _run_simulation_checks(static_model, start_activities: list, steps: int = 20):
+def _run_simulation_checks(static_model, start_activities: list, steps: int = 500):
     """Run N steps with instrumented constraint checking. Returns rejection log, step pools,
     and exclusion_log recording why activities were skipped before constraint checking."""
     import src.Simulation.Engine.semantics as _sem
@@ -307,7 +307,7 @@ def run_health_check(
     model_dict: dict,
     start_activities: list,
     event_log=None,
-    steps: int = 20,
+    steps: int = 500,
     weak_threshold: float = 0.25,
 ) -> dict:
     """Run all four health checks and return a structured result dict.
@@ -661,7 +661,7 @@ if __name__ == "__main__":
 
     try:
         cfg = SimulationConfig(
-            max_steps=20,
+            max_steps=500,
             seed=42,
             start_policy=StartPolicy(start_activity_names=start_activities),
         )

@@ -1140,6 +1140,7 @@ function App() {
   });
   const [activeDiscoveryTab, setActiveDiscoveryTab] = useState('lifecycle');
   const [isRunningDiscoveries, setIsRunningDiscoveries] = useState(false);
+  const [healthCheckSteps, setHealthCheckSteps] = useState(500);
   const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
@@ -1204,7 +1205,7 @@ function App() {
     }
   };
 
-  const runDiscovery = async () => {
+  const runDiscovery = async (overrideEventLogFile) => {
     setIsDiscovering(true);
     setDiscoveryError(null);
     setDiscoveryResults(null);
@@ -1213,18 +1214,23 @@ function App() {
     setError(null);
 
     try {
-      const response = await axios.post('/api/discover', discoveryConfig);
+      const payload = overrideEventLogFile
+        ? { ...discoveryConfig, eventLogFile: overrideEventLogFile }
+        : discoveryConfig;
+      const response = await axios.post('/api/discover', payload);
       
       if (response.data.success) {
         setDiscoveryResults(response.data.results);
         setDiscoveryLogs(response.data.logs || []);
         setAvailableActivities(response.data.results.activities || []);
         
-        // Prefer the chronologically first activity from the log as start activity
+        // Only auto-set start activity if none are currently selected
         const firstActivity = response.data.results.first_activity
           || response.data.results.activities?.[0];
         if (firstActivity) {
-          setConfig(prev => ({ ...prev, startActivities: [firstActivity] }));
+          setConfig(prev => prev.startActivities.length > 0
+            ? prev
+            : { ...prev, startActivities: [firstActivity] });
         }
         // Build unranked candidates from all activities (no pct info at this stage)
         setStartActivityCandidates(
@@ -1339,7 +1345,9 @@ function App() {
         const topStart = ranked[0]?.activity || modelActivities[0];
         if (modelActivities.length > 0) {
           setAvailableActivities(modelActivities);
-          setConfig(prev => ({ ...prev, startActivities: topStart ? [topStart] : [] }));
+          setConfig(prev => prev.startActivities.length > 0
+            ? prev
+            : { ...prev, startActivities: topStart ? [topStart] : [] });
         }
 
         // Reload available files (preserve current selections to avoid overwrite)
@@ -1368,7 +1376,9 @@ function App() {
             if (startActivityCandidates.length === 0) {
               const firstActivity = discResponse.data.results.first_activity || discActivities[0];
               if (firstActivity) {
-                setConfig(prev => ({ ...prev, startActivities: [firstActivity] }));
+                setConfig(prev => prev.startActivities.length > 0
+                  ? prev
+                  : { ...prev, startActivities: [firstActivity] });
               }
             }
             // Sync the Step 1 event log selector to match
@@ -1619,6 +1629,7 @@ function App() {
         ...config,
         eventLogFile: discoveryConfig.eventLogFile,
         ...(activeModel ? { modelOverride: activeModel } : {}),
+        steps: healthCheckSteps,
       };
       const res = await axios.post('/api/constraint-health', payload);
       setHealthResult(res.data);
@@ -1629,43 +1640,49 @@ function App() {
     }
   };
 
+  // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)
+  const applyStartProbability = useCallback(async () => {
+    if (!activeProbMatrix || !discoveryResults?.likely_start_activities?.length) return;
+    const counts = discoveryResults.activity_counts;
+    const total = Object.values(counts).reduce((s, v) => s + v, 0);
+    if (!total) return;
+    const selected = new Set(
+      discoveryConfig.startActivityProbSelected?.length
+        ? discoveryConfig.startActivityProbSelected
+        : [discoveryResults.likely_start_activities[0]]
+    );
+    if (!selected.size) return;
+    const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
+    const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
+    const newMatrix = {};
+    Object.entries(activeProbMatrix).forEach(([src, targets]) => {
+      const tgts = { ...targets };
+      selected.forEach(a => delete tgts[a]);
+      const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
+      const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
+      const scaled = {};
+      Object.entries(tgts).forEach(([t, v]) => { scaled[t] = Math.round(v * scale * 10000) / 10000; });
+      selected.forEach(a => {
+        const share = selectedCountSum > 0 ? combinedProb * (counts[a] || 0) / selectedCountSum : combinedProb / selected.size;
+        scaled[a] = Math.round(share * 10000) / 10000;
+      });
+      newMatrix[src] = scaled;
+    });
+    setActiveProbMatrix(newMatrix);
+    setStartProbApplied(true);
+    setConfig(p => ({ ...p, startActivities: [...selected] }));
+  }, [discoveryConfig.startActivityProbSelected, discoveryResults, activeProbMatrix]);
+
   const runAllDiscoveries = useCallback(async () => {
     if (!discoveryConfig.eventLogFile) return;
     setIsRunningDiscoveries(true);
-
-    const startProbFn = async () => {
-      if (!activeProbMatrix || !discoveryResults?.likely_start_activities?.length) return;
-      const counts = discoveryResults.activity_counts;
-      const total = Object.values(counts).reduce((s, v) => s + v, 0);
-      if (!total) return;
-      const selected = new Set(discoveryConfig.startActivityProbSelected ?? [discoveryResults.likely_start_activities[0]]);
-      const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
-      const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
-      const newMatrix = {};
-      Object.entries(activeProbMatrix).forEach(([src, targets]) => {
-        const tgts = { ...targets };
-        selected.forEach(a => delete tgts[a]);
-        const existingSum = Object.values(tgts).reduce((s, v) => s + v, 0);
-        const scale = existingSum > 0 ? (1 - combinedProb) / existingSum : 0;
-        const scaled = {};
-        Object.entries(tgts).forEach(([t, v]) => { scaled[t] = Math.round(v * scale * 10000) / 10000; });
-        selected.forEach(a => {
-          const share = selectedCountSum > 0 ? combinedProb * (counts[a] || 0) / selectedCountSum : combinedProb / selected.size;
-          scaled[a] = Math.round(share * 10000) / 10000;
-        });
-        newMatrix[src] = scaled;
-      });
-      setActiveProbMatrix(newMatrix);
-      setStartProbApplied(true);
-      setConfig(p => ({ ...p, startActivities: [...selected] }));
-    };
 
     const allSteps = [
       { key: 'lifecycle', label: 'Object Constraints',           fn: runLifecycleDerivation },
       { key: 'resources', label: 'Resource Objects',             fn: runResourceDiscovery },
       { key: 'timing',    label: 'Timing',                       fn: runTimingDiscovery },
       { key: 'o2o',       label: 'O2O Relationships',            fn: runO2ODiscovery },
-      { key: 'startProb', label: 'Start Activity + Probability', fn: startProbFn },
+      { key: 'startProb', label: 'Start Activity + Probability', fn: applyStartProbability },
     ];
     const steps = allSteps.filter(s => discoveryChecks[s.key]);
     const total = steps.length;
@@ -1680,8 +1697,9 @@ function App() {
       setIsRunningDiscoveries(false);
       setDiscoveryProgress({ current: 0, total: 0, currentName: '' });
     }
-  }, [discoveryChecks, discoveryConfig, discoveryResults, activeProbMatrix,
-      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery, runHealthCheck]);
+  }, [discoveryChecks, discoveryConfig.eventLogFile,
+      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery,
+      applyStartProbability, runHealthCheck]);
 
   const restoreFromHistory = useCallback((entry) => {
     if (entry.model)      setActiveModel(entry.model);
@@ -1726,11 +1744,24 @@ function App() {
     try {
       const res = await axios.get(`/api/parameters/${encodeURIComponent(filename)}`);
       if (res.data.success && res.data.model && !Array.isArray(res.data.model)) {
-        setActiveModel(res.data.model);
+        const m = res.data.model;
+        setActiveModel(m);
         if (res.data.probMatrix && Object.keys(res.data.probMatrix).length > 0) {
           setActiveProbMatrix(res.data.probMatrix);
         }
-        // Loaded custom parameters → treat as user-edited so they take effect.
+        // Restore simulation config fields saved in the parameter file
+        if (m.start_activities?.length) {
+          setConfig(prev => ({ ...prev, startActivities: m.start_activities }));
+        }
+        if (m.seed != null) {
+          setConfig(prev => ({ ...prev, seed: m.seed }));
+        }
+        if (m.max_steps != null) {
+          setConfig(prev => ({ ...prev, maxSteps: m.max_steps }));
+        }
+        if (m.start_activity_prob_selected?.length) {
+          setDiscoveryConfig(prev => ({ ...prev, startActivityProbSelected: m.start_activity_prob_selected }));
+        }
         setModelEdited(true);
         setExternalTab('simulation');
       }
@@ -1769,7 +1800,7 @@ function App() {
         const filename = res.data.filename;
         if (type === 'eventlog') {
           handleDiscoveryConfigChange('eventLogFile', filename);
-          if (workflowMode === 'external-ocel') setTimeout(() => runDiscovery(), 0);
+          if (workflowMode === 'external-ocel') setTimeout(() => runDiscovery(filename), 0);
         } else if (type === 'ocdeclare') {
           handleConfigChange('ocdeclareFile', filename);
         } else if (type === 'parameters') {
@@ -1799,6 +1830,12 @@ function App() {
       ...(resourceTypes.length ? { resource_types: resourceTypes } : {}),
       ...(m.resource_pool_sizes && Object.keys(m.resource_pool_sizes).length ? { resource_pool_sizes: m.resource_pool_sizes } : {}),
       ...(activeProbMatrix && Object.keys(activeProbMatrix).length ? { transition_matrix: activeProbMatrix } : {}),
+      // Simulation config
+      ...(config.startActivities?.length ? { start_activities: config.startActivities } : {}),
+      ...(config.seed != null ? { seed: config.seed } : {}),
+      ...(config.maxSteps != null ? { max_steps: config.maxSteps } : {}),
+      // Start activity probability selection
+      ...(discoveryConfig.startActivityProbSelected?.length ? { start_activity_prob_selected: discoveryConfig.startActivityProbSelected } : {}),
     };
     const base = (config.ocdeclareFile || 'parameters').replace(/\.json$/i, '').replace(/^discovered_/, '');
     const ts = new Date().toISOString().slice(0,19).replace('T','_').replace(/-/g,'').replace(/:/g,'');
@@ -1811,7 +1848,7 @@ function App() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
     handleSaveParameters(filename, exportObj);
-  }, [activeModel, activeProbMatrix, config.ocdeclareFile, handleSaveParameters]);
+  }, [activeModel, activeProbMatrix, config, discoveryConfig.startActivityProbSelected, handleSaveParameters]);
 
   // ── Automated post-processing helpers ─────────────────────────────────────
 
@@ -2342,7 +2379,7 @@ function App() {
                   handleDiscoveryConfigChange('eventLogFile', e.target.value);
                   if (e.target.value && workflowMode === 'external-ocel') {
                     // auto-trigger base discovery immediately for external-ocel
-                    setTimeout(() => runDiscovery(), 0);
+                    setTimeout(() => runDiscovery(e.target.value), 0);
                   }
                 }}
                 disabled={isDiscovering}
@@ -2651,7 +2688,7 @@ function App() {
                           onChange={(e) => {
                             handleDiscoveryConfigChange('eventLogFile', e.target.value);
                             if (e.target.value && workflowMode === 'external-ocel') {
-                              setTimeout(() => runDiscovery(), 0);
+                              setTimeout(() => runDiscovery(e.target.value), 0);
                             }
                           }}
                           disabled={isDiscovering}
@@ -2674,7 +2711,7 @@ function App() {
                           onChange={(e) => {
                             handleConfigChange('ocdeclareFile', e.target.value);
                             if (e.target.value && discoveryConfig.eventLogFile && workflowMode === 'external-ocel') {
-                              setTimeout(() => runDiscovery(), 0);
+                              setTimeout(() => runDiscovery(discoveryConfig.eventLogFile), 0);
                             }
                           }}
                         >
@@ -2901,6 +2938,20 @@ function App() {
                             </div>
                           );
                         })()}
+                      </div>
+
+                      <div className="disc-steps-row">
+                        <label className="disc-steps-label">
+                          Health check steps:
+                          <input
+                            type="number"
+                            className="disc-steps-input"
+                            min={10}
+                            max={10000}
+                            value={healthCheckSteps}
+                            onChange={e => setHealthCheckSteps(Math.max(10, parseInt(e.target.value) || 500))}
+                          />
+                        </label>
                       </div>
 
                       <button
@@ -3479,11 +3530,16 @@ function App() {
                         </div>
                       ) : ((() => {
                         const disabled = isSimulating;
+                        const modelActivities = !Array.isArray(activeModel)
+                          ? (activeModel?.activities || []).map(a => ({ activity: a.name, count: null, pct: null }))
+                          : [];
                         const displayCandidates = startActivityCandidates.length > 0
                           ? startActivityCandidates
-                          : availableActivities.map(a => ({ activity: a, count: null, pct: null }));
+                          : availableActivities.length > 0
+                          ? availableActivities.map(a => ({ activity: a, count: null, pct: null }))
+                          : modelActivities;
                         if (displayCandidates.length === 0) {
-                          return <p className="start-activity-empty">Run discovery to see candidates</p>;
+                          return <p className="start-activity-empty">Load a model or run discovery to see candidates</p>;
                         }
                         const toggle = (act, on) => setConfig(prev => ({
                           ...prev,
@@ -3554,7 +3610,7 @@ function App() {
                     <button
                       className="simulate-button"
                       onClick={runSimulation}
-                      disabled={isSimulating || !config.ocdeclareFile || config.startActivities.length === 0 || hasModelWarnings}
+                      disabled={isSimulating || (!config.ocdeclareFile && !activeModel) || config.startActivities.length === 0 || (hasModelWarnings && !modelEdited)}
                     >
                       {isSimulating ? 'Simulating...' : 'Run Simulation'}
                     </button>
@@ -3819,6 +3875,15 @@ function App() {
                         </Collapsible>
                       )}
 
+                      {/* ── Evaluation ── */}
+                      {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
+                        <Collapsible
+                          className="logs-box"
+                          title="📋 Evaluation"
+                          badge={null}
+                          defaultOpen={false}
+                        >
+
                       {/* ── Object Lifecycle Audit ── */}
                       {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
                         <Collapsible
@@ -3930,6 +3995,9 @@ function App() {
                         </Collapsible>
                       )}
 
+                        </Collapsible>
+                      )}{/* end Evaluation */}
+
                       {results.activity_sequence && results.activity_sequence.length > 0 && (
                         <Collapsible
                           className="activity-sequence"
@@ -3974,6 +4042,44 @@ function App() {
                               badge={Object.keys(results.metrics.activity_metrics).length}
                               defaultOpen={false}
                             >
+                              {/* ── Time span comparison: input OCEL vs output sim ── */}
+                              {(() => {
+                                const allTs = Object.values(results.metrics.activity_metrics)
+                                  .flatMap(m => m.timestamps || [])
+                                  .filter(Boolean).sort();
+                                const simSpanS = allTs.length >= 2
+                                  ? (new Date(allTs[allTs.length-1]) - new Date(allTs[0])) / 1000
+                                  : null;
+                                const ocelSpanS = discoveryResults?.ocel_time_span_s ?? null;
+                                const fmtDur = s => {
+                                  if (s == null) return '—';
+                                  if (s < 3600) return `${Math.round(s / 60)} min`;
+                                  if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
+                                  return `${(s / 86400).toFixed(1)} days`;
+                                };
+                                if (simSpanS == null && ocelSpanS == null) return null;
+                                const ratio = (simSpanS != null && ocelSpanS != null && ocelSpanS > 0)
+                                  ? (simSpanS / ocelSpanS) : null;
+                                return (
+                                  <div className="timing-span-comparison">
+                                    <span className="timing-span-label">Time span</span>
+                                    <span className="timing-span-item">
+                                      <span className="timing-span-tag">Input OCEL</span>
+                                      <strong>{fmtDur(ocelSpanS)}</strong>
+                                    </span>
+                                    <span className="timing-span-sep">→</span>
+                                    <span className="timing-span-item">
+                                      <span className="timing-span-tag">Simulation</span>
+                                      <strong>{fmtDur(simSpanS)}</strong>
+                                    </span>
+                                    {ratio != null && (
+                                      <span className={`timing-span-ratio ${ratio > 1.5 || ratio < 0.5 ? 'timing-span-ratio-warn' : 'timing-span-ratio-ok'}`}>
+                                        {ratio.toFixed(2)}× input
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })()}
                               {/* ── Concurrency indicator ── */}
                               {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
                                 <div className="concurrency-summary">
@@ -5413,6 +5519,10 @@ function App() {
                 </Collapsible>
               )}
 
+              {/* ── Evaluation ── */}
+              {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
+                <Collapsible className="logs-box" title="📋 Evaluation" badge={null} defaultOpen={false}>
+
               {/* ── Object Lifecycle Audit ── */}
               {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
                 <Collapsible
@@ -5524,6 +5634,9 @@ function App() {
                 </Collapsible>
               )}
 
+                </Collapsible>
+              )}{/* end Evaluation */}
+
               {results.activity_sequence && results.activity_sequence.length > 0 && (
                 <Collapsible
                   className="activity-sequence"
@@ -5568,6 +5681,42 @@ function App() {
                       badge={Object.keys(results.metrics.activity_metrics).length}
                       defaultOpen={false}
                     >
+                      {/* ── Time span comparison ── */}
+                      {(() => {
+                        const allTs = Object.values(results.metrics.activity_metrics)
+                          .flatMap(m => m.timestamps || []).filter(Boolean).sort();
+                        const simSpanS = allTs.length >= 2
+                          ? (new Date(allTs[allTs.length-1]) - new Date(allTs[0])) / 1000 : null;
+                        const ocelSpanS = discoveryResults?.ocel_time_span_s ?? null;
+                        const fmtDur = s => {
+                          if (s == null) return '—';
+                          if (s < 3600) return `${Math.round(s/60)} min`;
+                          if (s < 86400) return `${(s/3600).toFixed(1)} h`;
+                          return `${(s/86400).toFixed(1)} days`;
+                        };
+                        if (simSpanS == null && ocelSpanS == null) return null;
+                        const ratio = (simSpanS != null && ocelSpanS != null && ocelSpanS > 0)
+                          ? (simSpanS / ocelSpanS) : null;
+                        return (
+                          <div className="timing-span-comparison">
+                            <span className="timing-span-label">Time span</span>
+                            <span className="timing-span-item">
+                              <span className="timing-span-tag">Input OCEL</span>
+                              <strong>{fmtDur(ocelSpanS)}</strong>
+                            </span>
+                            <span className="timing-span-sep">→</span>
+                            <span className="timing-span-item">
+                              <span className="timing-span-tag">Simulation</span>
+                              <strong>{fmtDur(simSpanS)}</strong>
+                            </span>
+                            {ratio != null && (
+                              <span className={`timing-span-ratio ${ratio > 1.5 || ratio < 0.5 ? 'timing-span-ratio-warn' : 'timing-span-ratio-ok'}`}>
+                                {ratio.toFixed(2)}× input
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })()}
                       {/* ── Concurrency indicator ── */}
                       {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
                         <div className="concurrency-summary">

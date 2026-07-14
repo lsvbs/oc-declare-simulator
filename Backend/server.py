@@ -55,6 +55,39 @@ import threading
 _active_runs: dict = {}
 
 
+def _compute_ocel_time_span(ocel_source) -> float | None:
+    """Return the total time span of an OCEL log in seconds (last − first timestamp)."""
+    if not ocel_source or not isinstance(ocel_source, dict):
+        return None
+    events_raw = ocel_source.get('events', {})
+    events_list = list(events_raw.values()) if isinstance(events_raw, dict) else (events_raw or [])
+    timestamps = []
+    for e in events_list:
+        ts = e.get('time') or e.get('timestamp') or e.get('ocel:timestamp')
+        if ts:
+            timestamps.append(str(ts))
+    if len(timestamps) < 2:
+        return None
+    timestamps.sort()
+    try:
+        from datetime import datetime
+        def _parse(s):
+            for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S+00:00',
+                        '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+                try:
+                    return datetime.strptime(s[:19], fmt[:len(s[:19])])
+                except Exception:
+                    pass
+            return None
+        t0 = _parse(timestamps[0])
+        t1 = _parse(timestamps[-1])
+        if t0 and t1:
+            return round((t1 - t0).total_seconds(), 1)
+    except Exception:
+        pass
+    return None
+
+
 def _load_history() -> list:
     """Load run history from disk, or return empty list."""
     try:
@@ -387,6 +420,7 @@ def run_discovery():
                     src: {tgt: round(float(cnt), 4) for tgt, cnt in tgts.items()}
                     for src, tgts in prob_matrix.items()
                 },
+                'ocel_time_span_s': _compute_ocel_time_span(ocel_source),
             },
             'logs': [
                 f"Loaded event log: {event_log_file}",
@@ -634,19 +668,21 @@ def run_simulation():
         model_override = data.get('modelOverride')            # full edited model dict (optional)
         prob_matrix_override = data.get('probMatrixOverride') # normalised prob matrix (optional)
 
-        if not event_log_file or not start_activities:
-            return jsonify({'error': 'Missing required configuration'}), 400
+        if not start_activities:
+            return jsonify({'error': 'Missing required configuration: startActivities'}), 400
         if not ocdeclare_file and not model_override:
             return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
-        
-        # Check if discovery has been run for this event log
-        if event_log_file not in discovery_cache:
-            return jsonify({'error': 'Discovery not run for this event log. Please run discovery first.'}), 400
-        
-        # Get cached discovery results
-        cached = discovery_cache[event_log_file]
-        prob_matrix = cached['prob_matrix']
-        time_distributions = cached['time_distributions']
+
+        # Get cached discovery results if available; fall back to empty defaults
+        # so the simulation can run with just a model override + prob matrix override.
+        cached = {}
+        if event_log_file and event_log_file in discovery_cache:
+            cached = discovery_cache[event_log_file]
+            prob_matrix = cached['prob_matrix']
+            time_distributions = cached['time_distributions']
+        else:
+            prob_matrix = {}
+            time_distributions = {}
 
         # Apply overrides supplied by the model editor
         if prob_matrix_override:
@@ -1155,7 +1191,7 @@ def constraint_health():
             model_dict=model_dict,
             start_activities=start_activities,
             event_log=event_log,
-            steps=20,
+            steps=int(data.get('steps', 500)),
         )
 
         # ── Annotate exclusion_detail with lifecycle info ─────────────────────
