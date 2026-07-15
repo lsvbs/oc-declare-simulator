@@ -244,6 +244,8 @@ export default function ModelEditor({
   const [conFilter,      setConFilter]      = useState('');
   const [newCon,         setNewCon]         = useState(EMPTY_CONSTRAINT);
   const [newO2O,         setNewO2O]         = useState(EMPTY_O2O);
+  const [editingConIdx,  setEditingConIdx]  = useState(null);
+  const [showConSummary, setShowConSummary] = useState(new Set()); // activity names with popup visible
   // Per-activity "add binding" selected type: { [actName]: objectType }
   const [newBindingTypes, setNewBindingTypes] = useState({});
 
@@ -315,6 +317,11 @@ export default function ModelEditor({
   // ── Constraint helpers ────────────────────────────────────────────────────
   const deleteConstraint = (idx) =>
     onModelChange({ ...model, constraints: constraints.filter((_, i) => i !== idx) });
+
+  const updateConstraint = (idx, patch) => {
+    const updated = constraints.map((c, i) => i === idx ? { ...c, ...patch } : c);
+    onModelChange({ ...model, constraints: updated });
+  };
 
   const addConstraint = () => {
     if (!newCon.source_activity || !newCon.target_activity) return;
@@ -519,11 +526,10 @@ export default function ModelEditor({
             title={collapsed ? 'Expand the Model Editor' : 'Collapse the Model Editor'}
           >
             <span className="model-editor-caret">{collapsed ? '▶' : '▼'}</span>
-            ✏️ Model Editor
+            Model Editor
           </h3>
           <div className="model-editor-actions">
             {/* Load saved parameters from IO/input/parameters */}
-            {!hideParameterButtons && (
             <div className="model-params-loader">
               <select
                 className="model-params-select"
@@ -545,8 +551,6 @@ export default function ModelEditor({
                 ⬆ Load
               </button>
             </div>
-            )}
-            {!hideParameterButtons && (
             <button
               className="model-download-btn"
               onClick={downloadModel}
@@ -554,7 +558,6 @@ export default function ModelEditor({
             >
               ⬇ Download JSON
             </button>
-            )}
           </div>
         </div>
         {!collapsed && (
@@ -579,6 +582,38 @@ export default function ModelEditor({
         {/* ━━ ACTIVITIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
         {activeTab === 'activities' && (
           <div className="activities-list">
+            {/* ── Toolbar: global constraint toggle + parameter buttons ── */}
+            <div className="activities-toolbar">
+              <label className="act-con-summary-toggle" title="Show/hide constraint summary for each activity">
+                <input
+                  type="checkbox"
+                  checked={showConSummary.size === activities.length && activities.length > 0}
+                  ref={el => { if (el) el.indeterminate = showConSummary.size > 0 && showConSummary.size < activities.length; }}
+                  onChange={e => {
+                    if (e.target.checked) setShowConSummary(new Set(activities.map(a => a.name)));
+                    else setShowConSummary(new Set());
+                  }}
+                />
+                Show constraints
+              </label>
+              <div className="activities-toolbar-right">
+                {!hideParameterButtons && (
+                  <div className="model-params-loader">
+                    <select className="model-params-select" value=""
+                      onChange={e => { if (e.target.value) onLoadParameters?.(e.target.value); }}>
+                      <option value="">Load Parameters…</option>
+                      {parameterFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                    </select>
+                  </div>
+                )}
+                {!hideParameterButtons && (
+                  <button className="model-download-btn" onClick={downloadModel}
+                    title="Download current parameters as JSON">
+                    Download Parameters
+                  </button>
+                )}
+              </div>
+            </div>
             {activities.length === 0 && <p className="empty-notice">No activities defined.</p>}
             {activities.map((act, ai) => (
               <div key={act.name} className={`activity-row ${expandedActs.has(act.name) ? 'open' : ''}`}>
@@ -799,6 +834,127 @@ export default function ModelEditor({
                     </div>
                   </div>
                 )}
+                {/* ── Constraint summary popup ── */}
+                {showConSummary.has(act.name) && (() => {
+                  const actName = act.name;
+                  const cons = constraints || [];
+                  const scopePart = c => c.scope?.object_type ? ` per ${c.scope.object_type}` : '';
+                  const times = n => n == null ? '' : n === 1 ? 'once' : `${n} times`;
+                  const nminPart = c => (c.nmin ?? 0) > 1 ? ` at least ${times(c.nmin)}` : '';
+                  const nmaxPart = c => (c.nmax ?? null) !== null ? `, at most ${times(c.nmax)}` : '';
+
+                  // All constraints where this activity is source or target
+                  const involved = cons.filter(c =>
+                    c.source_activity === actName || c.target_activity === actName
+                  );
+
+                  // Natural language per constraint type
+                  const describe = (c) => {
+                    const src = c.source_activity, tgt = c.target_activity;
+                    const sp = scopePart(c);
+                    const isSrc = src === actName;
+                    const other = isSrc ? tgt : src;
+                    const nmin = c.nmin ?? 1;
+                    const nmax = c.nmax ?? null;
+                    const timesMin = nmin === 1 ? 'once' : `${nmin} times`;
+                    const timesMax = nmax != null ? (nmax === 1 ? 'once' : `${nmax} times`) : null;
+
+                    switch (c.constraint_type) {
+                      case 'precedence':
+                        if (isSrc) {
+                          // This activity must precede other
+                          let t = `"${actName}" must happen at least ${timesMin}${sp} before "${other}" can happen`;
+                          if (timesMax) t += `, and at most ${timesMax}${sp}`;
+                          return t;
+                        } else {
+                          // Other must precede this
+                          let t = `"${other}" must happen at least ${timesMin}${sp} before "${actName}" can happen`;
+                          if (timesMax) t += `, and at most ${timesMax}${sp}`;
+                          return t;
+                        }
+                      case 'chain_precedence':
+                        if (isSrc) return `"${actName}" must occur immediately before every "${other}" firing${sp}`;
+                        else return `"${other}" must occur immediately before every "${actName}" firing${sp}`;
+                      case 'response':
+                        if (isSrc) {
+                          let t = `After "${actName}" fires, "${other}" must eventually follow${sp}`;
+                          if (timesMax) t += ` (at most ${timesMax}${sp})`;
+                          return t;
+                        } else {
+                          let t = `After "${other}" fires, "${actName}" must eventually follow${sp}`;
+                          if (timesMax) t += ` (at most ${timesMax}${sp})`;
+                          return t;
+                        }
+                      case 'chain_response':
+                        if (isSrc) return `"${other}" must occur immediately after every "${actName}" firing${sp}`;
+                        else return `"${actName}" must occur immediately after every "${other}" firing${sp}`;
+                      case 'not_coexistence':
+                        return `"${actName}" and "${other}" cannot both occur${sp} — once one fires the other is blocked`;
+                      case 'not_precedence':
+                        if (isSrc) return `Once "${actName}" fires${sp}, "${other}" is permanently blocked for that object`;
+                        else return `Once "${other}" fires${sp}, "${actName}" is permanently blocked for that object`;
+                      case 'not_succession':
+                        if (isSrc) return `After "${actName}" fires, "${other}" must never follow${sp}`;
+                        else return `After "${other}" fires, "${actName}" must never follow${sp}`;
+                      case 'not_chain_succession':
+                        if (isSrc) return `"${other}" must not occur immediately after "${actName}"${sp}`;
+                        else return `"${actName}" must not occur immediately after "${other}"${sp}`;
+                      case 'responded_existence':
+                        if (isSrc) return `If "${actName}" occurs, "${other}" must also occur${sp} (before or after)`;
+                        else return `If "${other}" occurs, "${actName}" must also occur${sp} (before or after)`;
+                      case 'succession':
+                        if (isSrc) {
+                          let t = `"${actName}" must happen at least ${timesMin}${sp} before "${other}", and after "${actName}" fires "${other}" must eventually follow`;
+                          if (timesMax) t += ` (source capped at ${timesMax}${sp})`;
+                          return t;
+                        } else {
+                          let t = `"${other}" must happen at least ${timesMin}${sp} before "${actName}", and after "${other}" fires "${actName}" must eventually follow`;
+                          if (timesMax) t += ` (source capped at ${timesMax}${sp})`;
+                          return t;
+                        }
+                      case 'chain_succession':
+                        if (isSrc) return `"${actName}" and "${other}" must always occur consecutively${sp}`;
+                        else return `"${other}" and "${actName}" must always occur consecutively${sp}`;
+                      case 'alternate_response':
+                        if (isSrc) return `Between each "${actName}" and its matching "${other}", no other "${actName}" may occur${sp}`;
+                        else return `Between each "${other}" and its matching "${actName}", no other "${other}" may occur${sp}`;
+                      case 'alternate_precedence':
+                        if (isSrc) return `Each "${other}" must be preceded by "${actName}" with no other "${other}" in between${sp}`;
+                        else return `Each "${actName}" must be preceded by "${other}" with no other "${actName}" in between${sp}`;
+                      case 'alternate_succession':
+                        if (isSrc) return `"${actName}" and "${other}" must alternate without repetitions${sp}`;
+                        else return `"${other}" and "${actName}" must alternate without repetitions${sp}`;
+                      case 'exclusive_choice':
+                        return `Exactly one of "${actName}" or "${other}" may occur${sp} — once one fires the other is blocked`;
+                      case 'absence':
+                        return `"${actName}" must never occur${nmax != null ? ` more than ${timesMax}` : ''}${sp}`;
+                      case 'exactly':
+                        return `"${actName}" must occur exactly ${timesMin}${sp}`;
+                      case 'init':
+                        return `"${actName}" must be the first activity to fire`;
+                      default:
+                        return `${c.constraint_type.replace(/_/g,' ')}: "${src}" → "${tgt}"${sp}`;
+                    }
+                  };
+
+                  return (
+                    <div className="act-con-summary">
+                      {involved.length === 0 && (
+                        <p className="act-con-summary-empty">No constraints involve this activity.</p>
+                      )}
+                      <ul>
+                        {involved.map((c, i) => (
+                          <li key={i}>
+                            <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.68rem',marginRight:'0.4rem'}}>
+                              {c.constraint_type.replace(/_/g,' ')}
+                            </span>
+                            {describe(c)}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })()}
               </div>
             ))}
           </div>
@@ -823,28 +979,57 @@ export default function ModelEditor({
               )}
               {filteredConstraints.map((c, idx) => {
                 const realIdx = constraints.indexOf(c);
+                const isEditing = editingConIdx === realIdx;
                 return (
-                  <div key={idx} className="constraint-row">
+                  <div key={idx} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}>
                     <span className={`constraint-type-badge ${c.constraint_type}`}>
                       {c.constraint_type.replace(/_/g, ' ')}
                     </span>
                     <span className="constraint-src">{c.source_activity}</span>
                     <span className="constraint-arrow">→</span>
                     <span className="constraint-tgt">{c.target_activity}</span>
-                    <span className="constraint-scope">
-                      [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
-                    </span>
-                    {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
-                      ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
-                      <span className="constraint-card" title={
-                        c.constraint_type === 'response'
-                          ? 'Cardinality bound: n≤ caps how many times the target may fire per scope object.'
-                          : 'Enforced cardinality: source must precede target (n≥1).'
-                      }>
-                        {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
-                      </span>
+                    {!isEditing ? (
+                      <>
+                        <span className="constraint-scope">
+                          [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
+                        </span>
+                        {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
+                          ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
+                          <span className="constraint-card">
+                            {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
+                          </span>
+                        )}
+                        <button className="row-edit-btn" onClick={() => setEditingConIdx(realIdx)} title="Edit constraint">✏</button>
+                      </>
+                    ) : (
+                      <div className="constraint-edit-inline">
+                        <label className="constraint-edit-label">scope type:
+                          <select
+                            className="constraint-edit-select"
+                            value={c.scope?.object_type || ''}
+                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, object_type: e.target.value } })}
+                          >
+                            <option value="">—</option>
+                            {otNames.map(t => <option key={t} value={t}>{t}</option>)}
+                          </select>
+                        </label>
+                        <label className="constraint-edit-label">n≥:
+                          <input type="number" min={0} className="constraint-edit-num"
+                            value={c.nmin ?? 0}
+                            onChange={e => updateConstraint(realIdx, { nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) })}
+                          />
+                        </label>
+                        <label className="constraint-edit-label">n≤:
+                          <input type="number" min={0} className="constraint-edit-num"
+                            placeholder="∞"
+                            value={c.nmax ?? ''}
+                            onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
+                          />
+                        </label>
+                        <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
+                      </div>
                     )}
-                    <button className="row-delete-btn" onClick={() => deleteConstraint(realIdx)} title="Remove">✕</button>
+                    <button className="row-delete-btn" onClick={() => { deleteConstraint(realIdx); setEditingConIdx(null); }} title="Remove">✕</button>
                   </div>
                 );
               })}

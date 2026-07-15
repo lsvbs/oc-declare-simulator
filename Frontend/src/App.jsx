@@ -1043,6 +1043,8 @@ function App() {
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
   const [iterationLogs, setIterationLogs] = useState([]);
   const [iterationLogsOpen, setIterationLogsOpen] = useState(false);
+  const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
+  const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
   const iterationStepCount = useMemo(
     () => iterationLogs.filter(e => e.event === 'candidates').length,
     [iterationLogs]
@@ -1111,6 +1113,21 @@ function App() {
     }
   }, [results]);
 
+  const loadFullIterationLog = useCallback(async () => {
+    const runId = results?.output_file;
+    if (!runId) return;
+    setIsLoadingFullIterationLog(true);
+    try {
+      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+      setIterationLogs(r.data.iteration_logs || []);
+      setFullIterationLogLoaded(true);
+    } catch {
+      // keep existing capped logs on failure
+    } finally {
+      setIsLoadingFullIterationLog(false);
+    }
+  }, [results]);
+
   // ── Model warnings (activities with no bindings) ──────────────────────────
   const bindingWarnings = activeModel
     ? (activeModel.activities || []).filter(a => !(a.bindings?.length))
@@ -1120,7 +1137,8 @@ function App() {
   // ── Step 2.5: Timing discovery state ─────────────────────────────────────
   const [timingAnchors,       setTimingAnchors]       = useState({});
   const [timingMode,          setTimingMode]          = useState('single');
-  const [timingSingleAct,     setTimingSingleAct]     = useState(''); // actName → {mean_seconds,std_seconds,min_seconds,max_seconds}
+  const [timingSingleAct,     setTimingSingleAct]     = useState('');
+  const [serviceTimeMode,     setServiceTimeMode]     = useState('minimum'); // 'minimum' | 'p25' | 'p50'
   const [isDiscoveringTiming, setIsDiscoveringTiming] = useState(false);
   const [timingDiscoveryResult, setTimingDiscoveryResult] = useState(null);
   const [timingDiscoveryFile,   setTimingDiscoveryFile]   = useState(null);
@@ -1430,6 +1448,7 @@ function App() {
       const resp = await axios.post('/api/discover-timing', {
         eventLogFile: discoveryConfig.eventLogFile,
         anchorActivities: anchors,
+        serviceTimeMode,
       });
       const metrics = resp.data.metrics || {};
       setTimingDiscoveryResult(metrics);
@@ -1561,6 +1580,7 @@ function App() {
     setLogs([]);
     setIterationLogs([]);
     setIterationLogsOpen(false);
+    setFullIterationLogLoaded(false);
 
     // Start polling the live step counter every second
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -1640,15 +1660,24 @@ function App() {
     }
   };
 
+  // Ref always holds the latest startActivityProbSelected so applyStartProbability
+  // never reads a stale closure value.
+  const startActivityProbSelectedRef = React.useRef(discoveryConfig.startActivityProbSelected);
+  React.useEffect(() => {
+    startActivityProbSelectedRef.current = discoveryConfig.startActivityProbSelected;
+  }, [discoveryConfig.startActivityProbSelected]);
+
   // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)
   const applyStartProbability = useCallback(async () => {
     if (!activeProbMatrix || !discoveryResults?.likely_start_activities?.length) return;
     const counts = discoveryResults.activity_counts;
     const total = Object.values(counts).reduce((s, v) => s + v, 0);
     if (!total) return;
+    // Always read the latest selection from the ref, not the closure
+    const latestSelected = startActivityProbSelectedRef.current;
     const selected = new Set(
-      discoveryConfig.startActivityProbSelected?.length
-        ? discoveryConfig.startActivityProbSelected
+      latestSelected?.length
+        ? latestSelected
         : [discoveryResults.likely_start_activities[0]]
     );
     if (!selected.size) return;
@@ -1671,7 +1700,7 @@ function App() {
     setActiveProbMatrix(newMatrix);
     setStartProbApplied(true);
     setConfig(p => ({ ...p, startActivities: [...selected] }));
-  }, [discoveryConfig.startActivityProbSelected, discoveryResults, activeProbMatrix]);
+  }, [discoveryResults, activeProbMatrix]);
 
   const runAllDiscoveries = useCallback(async () => {
     if (!discoveryConfig.eventLogFile) return;
@@ -2866,21 +2895,37 @@ function App() {
 
                         {activeKey === 'timing' && (
                           <div>
-                            <TimingDiscoveryPanel
-                              activities={discoveryResults.activities || []}
-                              eventLogFile={discoveryConfig.eventLogFile}
-                              isDiscovering={isDiscoveringTiming}
-                              result={timingDiscoveryResult}
-                              error={timingError}
-                              onDiscover={runTimingDiscovery}
-                              timingAnchors={timingAnchors}
-                              setTimingAnchors={setTimingAnchors}
-                              hideButton={true}
-                              mode={timingMode}
-                              setMode={setTimingMode}
-                              singleActivity={timingSingleAct}
-                              setSingleActivity={setTimingSingleAct}
-                            />
+                            <p className="disc-tab-desc">
+                              Derive service time for each activity from its sojourn time distribution in the OCEL log.
+                              No manual input required — choose how the estimate is computed:
+                            </p>
+                            <div className="timing-mode-options">
+                              {[
+                                { value: 'minimum', label: 'Minimum', desc: 'Use the lowest observed sojourn time — tightest lower bound on service time' },
+                                { value: 'p25',     label: 'P25 (25th percentile)', desc: 'Use the 25th percentile sojourn — filters out outliers while staying conservative' },
+                                { value: 'p50',     label: 'P50 (median)',           desc: 'Use the median sojourn — balanced estimate, includes typical waiting time' },
+                              ].map(opt => (
+                                <label key={opt.value} className={`timing-mode-option${serviceTimeMode === opt.value ? ' active' : ''}`}>
+                                  <input
+                                    type="radio"
+                                    name="serviceTimeMode"
+                                    value={opt.value}
+                                    checked={serviceTimeMode === opt.value}
+                                    onChange={() => setServiceTimeMode(opt.value)}
+                                  />
+                                  <div>
+                                    <span className="timing-mode-option-label">{opt.label}</span>
+                                    <span className="timing-mode-option-desc">{opt.desc}</span>
+                                  </div>
+                                </label>
+                              ))}
+                            </div>
+                            {timingDiscoveryResult && (
+                              <p style={{fontSize:'0.78rem',color:'#15803d',marginTop:'0.5rem'}}>
+                                ✓ {Object.keys(timingDiscoveryResult).length} activities discovered
+                              </p>
+                            )}
+                            {timingError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{timingError}</p>}
                           </div>
                         )}
 
@@ -3662,54 +3707,70 @@ function App() {
                           : firedTypes.length;
 
                         return (
-                          <>
-                            <div className="stat-grid">
-                              <div className="stat-card">
-                                <div className="stat-value">{results.steps_executed}</div>
-                                <div className="stat-label">Steps Executed</div>
-                              </div>
-                              <div className="stat-card">
-                                <div className="stat-value">{totalEvents}</div>
-                                <div className="stat-label">Events Fired</div>
-                              </div>
-                              <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
-                                <div className="stat-value">
-                                  {coverage}
-                                  {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
-                                </div>
-                                <div className="stat-label">Activity Types Fired</div>
-                              </div>
-                              <div className="stat-card">
-                                <div className="stat-value">{results.objects_count}</div>
-                                <div className="stat-label">Objects Created</div>
-                              </div>
+                          <div className="stat-grid">
+                            <div className="stat-card">
+                              <div className="stat-value">{results.steps_executed}</div>
+                              <div className="stat-label">Steps Executed</div>
                             </div>
-                            {missingTypes.length > 0 && (
-                              <Collapsible
-                                className="sim-coverage-warning"
-                                title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
-                                badge={null}
-                                defaultOpen={false}
-                              >
-                                <ul className="sim-coverage-missing-list">
-                                  {missingTypes.map(a => {
-                                    const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
-                                    return (
-                                      <li key={a}>
-                                        <span className="sim-coverage-missing-name">{a}</span>
-                                        {reasons.length > 0 && (
-                                          <ul className="sim-coverage-missing-reasons">
-                                            {reasons.map((r, i) => <li key={i}>{r}</li>)}
-                                          </ul>
-                                        )}
-                                      </li>
-                                    );
-                                  })}
-                                </ul>
-                              </Collapsible>
-                            )}
-                          </>
+                            <div className="stat-card">
+                              <div className="stat-value">{totalEvents}</div>
+                              <div className="stat-label">Events Fired</div>
+                            </div>
+                            <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
+                              <div className="stat-value">
+                                {coverage}
+                                {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
+                              </div>
+                              <div className="stat-label">Activity Types Fired</div>
+                            </div>
+                            <div className="stat-card">
+                              <div className="stat-value">{results.objects_count}</div>
+                              <div className="stat-label">Objects Created</div>
+                            </div>
+                          </div>
                         );
+                      })()}
+
+                      {/* ── Evaluation ── */}
+                      {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
+                        <Collapsible
+                          className="logs-box"
+                          title="📋 Evaluation"
+                          badge={null}
+                          defaultOpen={false}
+                        >
+
+                      {/* ── sim-coverage-warning ── */}
+                      {(() => {
+                        const _firedTypes = results.activity_sequence
+                          ? [...new Set(results.activity_sequence)]
+                          : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
+                        const _discoveredTypes = discoveryResults?.activities || [];
+                        const missingTypes = _discoveredTypes.filter(a => !_firedTypes.includes(a));
+                        return missingTypes.length > 0 ? (
+                          <Collapsible
+                            className="sim-coverage-warning"
+                            title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
+                            badge={null}
+                            defaultOpen={false}
+                          >
+                            <ul className="sim-coverage-missing-list">
+                              {missingTypes.map(a => {
+                                const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
+                                return (
+                                  <li key={a}>
+                                    <span className="sim-coverage-missing-name">{a}</span>
+                                    {reasons.length > 0 && (
+                                      <ul className="sim-coverage-missing-reasons">
+                                        {reasons.map((r, i) => <li key={i}>{r}</li>)}
+                                      </ul>
+                                    )}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </Collapsible>
+                        ) : null;
                       })()}
 
                       {/* ── Activity distribution comparison: simulation vs log ── */}
@@ -3810,79 +3871,6 @@ function App() {
                           }}
                         </Collapsible>
                       )}
-
-                      {results.activity_sequence && results.activity_sequence.length > 0 && (
-                        <div className="flow-chart-section">
-                          <h4>Process Flow</h4>
-                          <FlowChart
-                            activitySequence={results.activity_sequence}
-                            objectTraces={results.object_traces || {}}
-                            objectTypesMap={results.object_types_map || {}}
-                            activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
-                          />
-                        </div>
-                      )}
-
-                      {results.object_types && (
-                        <Collapsible
-                          className="object-types"
-                          title="Object Type Breakdown"
-                          badge={Object.keys(results.object_types).length}
-                        >
-                          {(() => {
-                            const logStats = discoveryResults?.object_type_stats || {};
-                            const hasLogData = Object.keys(logStats).length > 0;
-                            const allTypes = new Set([
-                              ...Object.keys(results.object_types),
-                              ...Object.keys(logStats),
-                            ]);
-                            return (
-                              <table className="object-type-stats-table">
-                                <thead>
-                                  <tr>
-                                    <th>Object Type</th>
-                                    <th className="octs-num">Simulated</th>
-                                    {hasLogData && <th className="octs-num">In Log</th>}
-                                    {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {[...allTypes].sort().map(type => {
-                                    const simCount = results.object_types[type] || 0;
-                                    const logCount = logStats[type]?.count || 0;
-                                    const ratio    = logCount > 0 ? simCount / logCount : null;
-                                    const ratioClass = ratio === null ? '' :
-                                      ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
-                                    return (
-                                      <tr key={type}>
-                                        <td className="octs-type">{type}</td>
-                                        <td className="octs-num">{simCount.toLocaleString()}</td>
-                                        {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
-                                        {hasLogData && (
-                                          <td className="octs-num">
-                                            {ratio !== null
-                                              ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
-                                              : '—'}
-                                          </td>
-                                        )}
-                                      </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                            );
-                          })()}
-                        </Collapsible>
-                      )}
-
-                      {/* ── Evaluation ── */}
-                      {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
-                        <Collapsible
-                          className="logs-box"
-                          title="📋 Evaluation"
-                          badge={null}
-                          defaultOpen={false}
-                        >
 
                       {/* ── Object Lifecycle Audit ── */}
                       {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
@@ -3999,6 +3987,70 @@ function App() {
                       )}{/* end Evaluation */}
 
                       {results.activity_sequence && results.activity_sequence.length > 0 && (
+                        <div className="flow-chart-section">
+                          <h4>Process Flow</h4>
+                          <FlowChart
+                            activitySequence={results.activity_sequence}
+                            objectTraces={results.object_traces || {}}
+                            objectTypesMap={results.object_types_map || {}}
+                            activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
+                          />
+                        </div>
+                      )}
+
+                      {results.object_types && (
+                        <Collapsible
+                          className="object-types"
+                          title="Object Type Breakdown"
+                          badge={Object.keys(results.object_types).length}
+                        >
+                          {(() => {
+                            const logStats = discoveryResults?.object_type_stats || {};
+                            const hasLogData = Object.keys(logStats).length > 0;
+                            const allTypes = new Set([
+                              ...Object.keys(results.object_types),
+                              ...Object.keys(logStats),
+                            ]);
+                            return (
+                              <table className="object-type-stats-table">
+                                <thead>
+                                  <tr>
+                                    <th>Object Type</th>
+                                    <th className="octs-num">Simulated</th>
+                                    {hasLogData && <th className="octs-num">In Log</th>}
+                                    {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {[...allTypes].sort().map(type => {
+                                    const simCount = results.object_types[type] || 0;
+                                    const logCount = logStats[type]?.count || 0;
+                                    const ratio    = logCount > 0 ? simCount / logCount : null;
+                                    const ratioClass = ratio === null ? '' :
+                                      ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
+                                    return (
+                                      <tr key={type}>
+                                        <td className="octs-type">{type}</td>
+                                        <td className="octs-num">{simCount.toLocaleString()}</td>
+                                        {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
+                                        {hasLogData && (
+                                          <td className="octs-num">
+                                            {ratio !== null
+                                              ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
+                                              : '—'}
+                                          </td>
+                                        )}
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            );
+                          })()}
+                        </Collapsible>
+                      )}
+
+                      {results.activity_sequence && results.activity_sequence.length > 0 && (
                         <Collapsible
                           className="activity-sequence"
                           title="Activity Sequence"
@@ -4099,12 +4151,14 @@ function App() {
                                   <tr>
                                     <th>Activity</th>
                                     <th>Count</th>
-                                    <th title="Sampled clock advance at each firing">Mean service</th>
+                                    <th title="Sampled service duration at each firing">Mean service</th>
                                     <th>Min service</th>
                                     <th>Max service</th>
-                                    <th title="Service + wait in pool (sojourn = how long from becoming eligible to completion)">Mean sojourn</th>
-                                    <th title="Mean time the activity was in the candidate pool before being chosen">Mean wait in pool</th>
-                                    <th title="Longest time the activity was available but not chosen before finally firing">Max wait in pool</th>
+                                    <th title="Pre-start process waiting time sampled from discovered distribution (DES only)">Mean process wait</th>
+                                    <th title="Longest pre-start process wait">Max process wait</th>
+                                    <th title="Service + process wait (total elapsed per firing)">Mean sojourn</th>
+                                    <th title="Resource-contention wait (time in queue for a busy resource, DES only)">Mean resource wait</th>
+                                    <th title="Mean time the activity was in the candidate pool before being chosen (non-DES only)">Mean wait in pool</th>
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -4115,9 +4169,11 @@ function App() {
                                       <td>{fmtSeconds(m.mean_service_s)}</td>
                                       <td>{fmtSeconds(m.min_service_s)}</td>
                                       <td>{fmtSeconds(m.max_service_s)}</td>
+                                      <td>{fmtSeconds(m.mean_process_wait_s)}</td>
+                                      <td>{fmtSeconds(m.max_process_wait_s)}</td>
                                       <td>{fmtSeconds(m.mean_sojourn_s)}</td>
+                                      <td>{fmtSeconds(m.mean_resource_wait_s)}</td>
                                       <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
-                                      <td>{fmtSeconds(m.max_wait_in_pool_s)}</td>
                                     </tr>
                                   ))}
                                 </tbody>
@@ -4233,8 +4289,42 @@ function App() {
                         onClick={() => setIterationLogsOpen(o => !o)}
                         style={{ cursor: 'pointer', userSelect: 'none' }}
                       >
-                        {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps)
+                        {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps
+                        {fullIterationLogLoaded ? ', full' : ', last 500'})
                       </h4>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.3rem'}}>
+                        {!fullIterationLogLoaded && results?.iteration_log_file && (
+                          <button
+                            className="download-button download-button-secondary"
+                            disabled={isLoadingFullIterationLog}
+                            onClick={loadFullIterationLog}
+                          >
+                            {isLoadingFullIterationLog ? 'Loading…' : '⬇ Load Full Trace'}
+                          </button>
+                        )}
+                        {fullIterationLogLoaded && (
+                          <span style={{fontSize:'0.75rem',color:'#15803d'}}>✓ Full trace loaded ({iterationStepCount} steps)</span>
+                        )}
+                        {results?.iteration_log_file && (
+                          <button
+                            className="download-button download-button-secondary"
+                            onClick={async () => {
+                              const runId = results.output_file;
+                              const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+                              const blob = new Blob([JSON.stringify(r.data.iteration_logs, null, 2)], {type:'application/json'});
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `iteration_${runId}`;
+                              document.body.appendChild(a); a.click();
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }}
+                          >
+                            ⬇ Download Trace
+                          </button>
+                        )}
+                      </div>
                       {iterationLogsOpen && (
                         <div className="logs-content iteration-trace">
                           {(() => {
@@ -5339,44 +5429,55 @@ function App() {
                   : firedTypes.length;
 
                 return (
-                  <>
-                    <div className="stat-grid">
-                      <div className="stat-card">
-                        <div className="stat-value">{results.steps_executed}</div>
-                        <div className="stat-label">Steps Executed</div>
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-value">{totalEvents}</div>
-                        <div className="stat-label">Events Fired</div>
-                      </div>
-                      <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
-                        <div className="stat-value">
-                          {coverage}
-                          {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
-                        </div>
-                        <div className="stat-label">Activity Types Fired</div>
-                      </div>
-                      <div className="stat-card">
-                        <div className="stat-value">{results.objects_count}</div>
-                        <div className="stat-label">Objects Created</div>
-                      </div>
+                  <div className="stat-grid">
+                    <div className="stat-card">
+                      <div className="stat-value">{results.steps_executed}</div>
+                      <div className="stat-label">Steps Executed</div>
                     </div>
-                    {missingTypes.length > 0 && (
-                      <Collapsible
-                        className="sim-coverage-warning"
-                        title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
-                        badge={null}
-                        defaultOpen={false}
-                      >
-                        <ul className="sim-coverage-missing-list">
-                          {missingTypes.map(a => <li key={a}>{a}</li>)}
-                        </ul>
-                      </Collapsible>
-                    )}
-                  </>
+                    <div className="stat-card">
+                      <div className="stat-value">{totalEvents}</div>
+                      <div className="stat-label">Events Fired</div>
+                    </div>
+                    <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
+                      <div className="stat-value">
+                        {coverage}
+                        {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
+                      </div>
+                      <div className="stat-label">Activity Types Fired</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="stat-value">{results.objects_count}</div>
+                      <div className="stat-label">Objects Created</div>
+                    </div>
+                  </div>
                 );
               })()}
 
+
+              {/* ── Evaluation ── */}
+              {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
+                <Collapsible className="logs-box" title="📋 Evaluation" badge={null} defaultOpen={false}>
+
+              {/* ── sim-coverage-warning ── */}
+              {(() => {
+                const _firedTypes = results.activity_sequence
+                  ? [...new Set(results.activity_sequence)]
+                  : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
+                const _discoveredTypes = discoveryResults?.activities || [];
+                const missingTypes = _discoveredTypes.filter(a => !_firedTypes.includes(a));
+                return missingTypes.length > 0 ? (
+                  <Collapsible
+                    className="sim-coverage-warning"
+                    title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
+                    badge={null}
+                    defaultOpen={false}
+                  >
+                    <ul className="sim-coverage-missing-list">
+                      {missingTypes.map(a => <li key={a}>{a}</li>)}
+                    </ul>
+                  </Collapsible>
+                ) : null;
+              })()}
 
               {/* ── Activity distribution comparison: simulation vs log ── */}
               {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
@@ -5454,74 +5555,6 @@ function App() {
                   }}
                 </Collapsible>
               )}
-
-              {results.activity_sequence && results.activity_sequence.length > 0 && (
-                <div className="flow-chart-section">
-                  <h4>Process Flow</h4>
-                  <FlowChart
-                    activitySequence={results.activity_sequence}
-                    objectTraces={results.object_traces || {}}
-                    objectTypesMap={results.object_types_map || {}}
-                    activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
-                  />
-                </div>
-              )}
-
-              {results.object_types && (
-                <Collapsible
-                  className="object-types"
-                  title="Object Type Breakdown"
-                  badge={Object.keys(results.object_types).length}
-                >
-                  {(() => {
-                    const logStats = discoveryResults?.object_type_stats || {};
-                    const hasLogData = Object.keys(logStats).length > 0;
-                    const allTypes = new Set([
-                      ...Object.keys(results.object_types),
-                      ...Object.keys(logStats),
-                    ]);
-                    return (
-                      <table className="object-type-stats-table">
-                        <thead>
-                          <tr>
-                            <th>Object Type</th>
-                            <th className="octs-num">Simulated</th>
-                            {hasLogData && <th className="octs-num">In Log</th>}
-                            {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {[...allTypes].sort().map(type => {
-                            const simCount = results.object_types[type] || 0;
-                            const logCount = logStats[type]?.count || 0;
-                            const ratio    = logCount > 0 ? simCount / logCount : null;
-                            const ratioClass = ratio === null ? '' :
-                              ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
-                            return (
-                              <tr key={type}>
-                                <td className="octs-type">{type}</td>
-                                <td className="octs-num">{simCount.toLocaleString()}</td>
-                                {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
-                                {hasLogData && (
-                                  <td className="octs-num">
-                                    {ratio !== null
-                                      ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
-                                      : '—'}
-                                  </td>
-                                )}
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    );
-                  })()}
-                </Collapsible>
-              )}
-
-              {/* ── Evaluation ── */}
-              {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
-                <Collapsible className="logs-box" title="📋 Evaluation" badge={null} defaultOpen={false}>
 
               {/* ── Object Lifecycle Audit ── */}
               {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
@@ -5638,6 +5671,70 @@ function App() {
               )}{/* end Evaluation */}
 
               {results.activity_sequence && results.activity_sequence.length > 0 && (
+                <div className="flow-chart-section">
+                  <h4>Process Flow</h4>
+                  <FlowChart
+                    activitySequence={results.activity_sequence}
+                    objectTraces={results.object_traces || {}}
+                    objectTypesMap={results.object_types_map || {}}
+                    activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
+                  />
+                </div>
+              )}
+
+              {results.object_types && (
+                <Collapsible
+                  className="object-types"
+                  title="Object Type Breakdown"
+                  badge={Object.keys(results.object_types).length}
+                >
+                  {(() => {
+                    const logStats = discoveryResults?.object_type_stats || {};
+                    const hasLogData = Object.keys(logStats).length > 0;
+                    const allTypes = new Set([
+                      ...Object.keys(results.object_types),
+                      ...Object.keys(logStats),
+                    ]);
+                    return (
+                      <table className="object-type-stats-table">
+                        <thead>
+                          <tr>
+                            <th>Object Type</th>
+                            <th className="octs-num">Simulated</th>
+                            {hasLogData && <th className="octs-num">In Log</th>}
+                            {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...allTypes].sort().map(type => {
+                            const simCount = results.object_types[type] || 0;
+                            const logCount = logStats[type]?.count || 0;
+                            const ratio    = logCount > 0 ? simCount / logCount : null;
+                            const ratioClass = ratio === null ? '' :
+                              ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
+                            return (
+                              <tr key={type}>
+                                <td className="octs-type">{type}</td>
+                                <td className="octs-num">{simCount.toLocaleString()}</td>
+                                {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
+                                {hasLogData && (
+                                  <td className="octs-num">
+                                    {ratio !== null
+                                      ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
+                                      : '—'}
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    );
+                  })()}
+                </Collapsible>
+              )}
+
+              {results.activity_sequence && results.activity_sequence.length > 0 && (
                 <Collapsible
                   className="activity-sequence"
                   title="Activity Sequence"
@@ -5736,12 +5833,14 @@ function App() {
                           <tr>
                             <th>Activity</th>
                             <th>Count</th>
-                            <th title="Sampled clock advance at each firing">Mean service</th>
+                            <th title="Sampled service duration at each firing">Mean service</th>
                             <th>Min service</th>
                             <th>Max service</th>
-                            <th title="Service + wait in pool (sojourn = how long from becoming eligible to completion)">Mean sojourn</th>
-                            <th title="Mean time the activity was in the candidate pool before being chosen">Mean wait in pool</th>
-                            <th title="Longest time the activity was available but not chosen before finally firing">Max wait in pool</th>
+                            <th title="Pre-start process waiting time (DES only)">Mean process wait</th>
+                            <th title="Longest pre-start process wait">Max process wait</th>
+                            <th title="Service + process wait total">Mean sojourn</th>
+                            <th title="Resource-contention wait (DES only)">Mean resource wait</th>
+                            <th title="Mean wait in candidate pool (non-DES only)">Mean wait in pool</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -5752,9 +5851,11 @@ function App() {
                               <td>{fmtSeconds(m.mean_service_s)}</td>
                               <td>{fmtSeconds(m.min_service_s)}</td>
                               <td>{fmtSeconds(m.max_service_s)}</td>
+                              <td>{fmtSeconds(m.mean_process_wait_s)}</td>
+                              <td>{fmtSeconds(m.max_process_wait_s)}</td>
                               <td>{fmtSeconds(m.mean_sojourn_s)}</td>
+                              <td>{fmtSeconds(m.mean_resource_wait_s)}</td>
                               <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
-                              <td>{fmtSeconds(m.max_wait_in_pool_s)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -5870,8 +5971,42 @@ function App() {
                 onClick={() => setIterationLogsOpen(o => !o)}
                 style={{ cursor: 'pointer', userSelect: 'none' }}
               >
-                {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps)
+                {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps
+                {fullIterationLogLoaded ? ', full' : ', last 500'})
               </h4>
+              <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.3rem'}}>
+                {!fullIterationLogLoaded && results?.iteration_log_file && (
+                  <button
+                    className="download-button download-button-secondary"
+                    disabled={isLoadingFullIterationLog}
+                    onClick={loadFullIterationLog}
+                  >
+                    {isLoadingFullIterationLog ? 'Loading…' : '⬇ Load Full Trace'}
+                  </button>
+                )}
+                {fullIterationLogLoaded && (
+                  <span style={{fontSize:'0.75rem',color:'#15803d'}}>✓ Full trace loaded ({iterationStepCount} steps)</span>
+                )}
+                {results?.iteration_log_file && (
+                  <button
+                    className="download-button download-button-secondary"
+                    onClick={async () => {
+                      const runId = results.output_file;
+                      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+                      const blob = new Blob([JSON.stringify(r.data.iteration_logs, null, 2)], {type:'application/json'});
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `iteration_${runId}`;
+                      document.body.appendChild(a); a.click();
+                      document.body.removeChild(a);
+                      URL.revokeObjectURL(url);
+                    }}
+                  >
+                    ⬇ Download Trace
+                  </button>
+                )}
+              </div>
               {iterationLogsOpen && (
                 <div className="logs-content iteration-trace">
                   {(() => {

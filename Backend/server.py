@@ -796,7 +796,8 @@ def run_simulation():
         # Run simulation
         from collections import deque
         _LOG_CAP = 500  # only keep last 500 steps in the response to avoid huge payloads
-        iteration_logs = deque(maxlen=_LOG_CAP)
+        iteration_logs = deque(maxlen=_LOG_CAP)  # capped — sent inline with response
+        full_iteration_logs = []                 # unbounded — saved to disk, loaded on demand
         # No upfront skipping — the deque's maxlen naturally keeps only the last 500
         # entries, so early steps are evicted as the simulation progresses. This also
         # ensures the trace is populated when the simulation stops before max_steps.
@@ -826,6 +827,13 @@ def run_simulation():
                     "candidates_with_probs": candidates_with_probs,
                     "num_candidates": payload.get("num_candidates", 0),
                 })
+                full_iteration_logs.append({
+                    "step": step,
+                    "event": "candidates",
+                    "candidates": candidates,
+                    "candidates_with_probs": candidates_with_probs,
+                    "num_candidates": payload.get("num_candidates", 0),
+                })
             elif event == "chosen":
                 activity = payload.get("activity_name", "?")
                 objects = payload.get("participating_object_ids", [])
@@ -838,8 +846,21 @@ def run_simulation():
                     "objects": objects,
                     "creates": creates,
                 })
+                full_iteration_logs.append({
+                    "step": None,
+                    "event": "chosen",
+                    "activity": activity,
+                    "prob": _last_prob_map.get(activity, None),
+                    "objects": objects,
+                    "creates": creates,
+                })
             elif event == "stop":
                 iteration_logs.append({
+                    "step": payload.get("step_count", "?"),
+                    "event": "stop",
+                    "reason": payload.get("reason", "unknown"),
+                })
+                full_iteration_logs.append({
                     "step": payload.get("step_count", "?"),
                     "event": "stop",
                     "reason": payload.get("reason", "unknown"),
@@ -917,6 +938,15 @@ def run_simulation():
         metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
         metrics_filename = os.path.basename(metrics_file)
 
+        # Save full iteration log to disk for on-demand loading
+        iteration_log_filename = output_filename.replace('log_', 'iteration_')
+        iteration_log_path = METRICS_DIR / iteration_log_filename
+        try:
+            with open(iteration_log_path, 'w', encoding='utf-8') as f:
+                json.dump(full_iteration_logs, f)
+        except Exception:
+            iteration_log_filename = None
+
         # Compute object lifecycle and activity participation audits
         from src.Simulation.IO.output.metrics import compute_audit
         audit = compute_audit(final_state, static_model=static_model, prob_matrix=prob_matrix)
@@ -936,6 +966,7 @@ def run_simulation():
             'objects_count':  len(final_state.objects),
             'output_file':    output_filename,
             'metrics_file':   metrics_filename,
+            'iteration_log_file': iteration_log_filename,
             # store config snapshot so re-run can replay it
             'model_override': model_override,
             'prob_matrix_override': prob_matrix_override,
@@ -974,6 +1005,7 @@ def run_simulation():
                 'object_links': object_links,
                 'output_file': output_filename,
                 'metrics_file': metrics_filename,
+                'iteration_log_file': iteration_log_filename,
                 # metrics intentionally omitted from inline response — can be very large
                 # (hundreds of MB for big runs). Use GET /api/run-history/{id}/metrics
                 # or the Download Metrics button to access the full data.
@@ -1058,6 +1090,25 @@ def get_run_metrics(run_id):
     if section == 'object':
         return jsonify({'object_metrics': data.get('object_metrics', {})})
     return jsonify({'activity_metrics': data.get('activity_metrics', {})})
+
+
+
+@app.route('/api/run-history/<run_id>/iteration-log', methods=['GET'])
+def get_iteration_log(run_id):
+    """Return the full iteration log for a specific run."""
+    history = _load_history()
+    entry = next((e for e in history if e['id'] == run_id), None)
+    if not entry:
+        return jsonify({'error': 'Run not found'}), 404
+    ilf = entry.get('iteration_log_file')
+    if not ilf:
+        return jsonify({'error': 'No iteration log file for this run'}), 404
+    path = METRICS_DIR / ilf
+    if not path.exists():
+        return jsonify({'error': 'Iteration log file missing from disk'}), 404
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return jsonify({'iteration_logs': data, 'count': len(data)})
 
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])
@@ -1247,7 +1298,7 @@ def discover_timing():
         data = request.json or {}
         event_log_file = data.get('eventLogFile')
         anchor_activities = data.get('anchorActivities', [])
-
+        service_time_mode = data.get('serviceTimeMode', 'minimum')
         if not event_log_file:
             return jsonify({'error': 'Missing eventLogFile parameter'}), 400
 
@@ -1259,7 +1310,7 @@ def discover_timing():
         # traces). compute_ocpa_metrics needs the normalised dict with per-event
         # timestamps, activities and object maps.
         event_log = load_ocel2(str(log_path))
-        metrics = compute_ocpa_metrics(event_log, anchor_activities)
+        metrics = compute_ocpa_metrics(event_log, anchor_activities, service_time_mode=service_time_mode)
 
         # Discover concurrency probabilities using the timing distributions as
         # the window reference (max of each pair's mean_seconds).

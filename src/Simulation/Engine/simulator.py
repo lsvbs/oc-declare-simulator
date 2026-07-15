@@ -888,6 +888,17 @@ class Simulator:
 
         started_at = state.current_time
         complete_at = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
+
+        # Sample and apply process waiting time (pre-start delay from discovered distribution)
+        dur = getattr(self.time_policy, 'durations', {}).get(candidate.activity_name)
+        if dur is not None:
+            from src.Simulation.Engine.timepolicy import _sample_waiting
+            wait_s = _sample_waiting(dur, self.rng)
+            if wait_s > 0:
+                from datetime import timedelta as _td
+                complete_at = complete_at + _td(seconds=wait_s)
+                state.process_wait_s.setdefault(candidate.activity_name, []).append(wait_s)
+
         state.last_generated_timestamp = complete_at
 
         self._des_lock_resources(held_resource_ids, candidate.activity_name, complete_at, state)

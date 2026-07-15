@@ -127,6 +127,8 @@ class SimulationState:
     # activity_name -> list of service durations in seconds (one per firing):
     # the clock advance sampled by the time policy when the activity fired.
     activity_service_s: dict[str, list[float]] = field(default_factory=dict)
+    # activity_name -> list of pre-start process waiting durations (DES only)
+    process_wait_s: dict[str, list[float]] = field(default_factory=dict)
 
     # ── DES (Discrete Event Simulation) fields ────────────────────────────────
     # Current simulation clock — advances to the next completion timestamp in DES mode

@@ -94,6 +94,42 @@ def _sample_duration(dur: Any, rng: Any = None) -> float:
 	return _clamp(s)
 
 
+def _sample_waiting(dur: Any, rng: Any = None) -> float:
+	"""Sample a pre-start process waiting time in seconds from ActivityDuration.
+
+	Uses ``waiting_mean`` and ``waiting_std`` (set by timing discovery).
+	Returns 0.0 when no waiting distribution is available.
+	"""
+	import random as _random
+
+	mean = getattr(dur, "waiting_mean", None)
+	std  = getattr(dur, "waiting_std",  None)
+
+	if mean is None or mean <= 0:
+		return 0.0
+
+	std_f = float(std) if std is not None else 0.0
+
+	if std_f < 1e-9:
+		return float(mean)
+
+	if rng is None:
+		rng = _random.Random()
+
+	numpy_api = hasattr(rng, "lognormal")
+	var = std_f ** 2
+	if var <= 0 or mean <= 0:
+		return float(mean)
+	sigma_log = math.sqrt(math.log(1.0 + var / (mean ** 2)))
+	mu_log    = math.log(mean) - 0.5 * sigma_log ** 2
+	s = (
+		float(rng.lognormal(mean=mu_log, sigma=sigma_log))
+		if numpy_api
+		else float(rng.lognormvariate(mu_log, sigma_log))
+	)
+	return max(0.0, s)
+
+
 @dataclass
 class DistributionTimePolicy:
     """Time policy that samples realistic durations from per-activity distributions.

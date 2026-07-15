@@ -1408,6 +1408,7 @@ def discover_ocdeclare_model(
 def compute_ocpa_metrics(
     ocel_log: Dict[str, Any],
     anchor_activities: List[Dict[str, Any]] = None,
+    service_time_mode: str = 'minimum',
 ) -> Dict[str, Dict[str, Any]]:
     """Compute OCPA time metrics per activity from an OCEL 2.0 log.
 
@@ -1506,22 +1507,34 @@ def compute_ocpa_metrics(
         if not obj_ids:
             continue
 
-        # Find most recent preceding event for each object (the event
-        # just before the current one in that object's timeline).
+        # For service time estimation: find the NEXT event on each object
+        # after the current one. Service time = time until the object is
+        # used again (how long activity A held the object).
+        next_ts_by_obj: Dict[str, Optional[datetime]] = {}
+        # Also keep preceding for OCPA sync/flow/pooling metrics
         preceding_ts_by_obj: Dict[str, Optional[datetime]] = {}
         obj_type_map: Dict[str, str] = {}
         for obj_id in obj_ids:
             otype = (objects.get(obj_id) or {}).get("type", "unknown")
             obj_type_map[obj_id] = otype
             tl = obj_timeline.get(obj_id, [])
-            # Find the position of the current event and take the one before
             prev_ts = None
+            next_ts = None
             for i, (ts_i, eid_i) in enumerate(tl):
                 if eid_i == eid:
                     if i > 0:
                         prev_ts = tl[i - 1][0]
+                    if i < len(tl) - 1:
+                        next_ts = tl[i + 1][0]
                     break
             preceding_ts_by_obj[obj_id] = prev_ts
+            next_ts_by_obj[obj_id] = next_ts
+
+        # Collect service time samples: time from this event to next event on same object
+        valid_next = [t for t in next_ts_by_obj.values() if t is not None]
+        for next_ts in valid_next:
+            svc_s = max(0.0, (next_ts - ts_complete).total_seconds())
+            buckets[activity]["service_direct_s"].append(svc_s)
 
         valid_preceding = [t for t in preceding_ts_by_obj.values() if t is not None]
         if not valid_preceding:
@@ -1584,7 +1597,11 @@ def compute_ocpa_metrics(
         pool = _stats(b["pooling_s"])
         lag  = _stats(b["lagging_s"])
 
-        # Service time: use anchor params if available
+        # Service time: use anchor params if available, otherwise use
+        # direct measurement (time from this event to next event on same object).
+        # Fall back to sojourn-based estimate if no next-event data exists.
+        raw_direct = b["service_direct_s"]
+        raw_source = raw_direct if raw_direct else b["sojourn_s"]
         if act in anchor_map:
             anc = anchor_map[act]
             svc_mean = float(anc.get("mean_seconds", soj["mean"]))
@@ -1592,15 +1609,43 @@ def compute_ocpa_metrics(
             svc_min  = float(anc.get("min_seconds",  0.0))
             svc_max  = anc.get("max_seconds")
             svc_max  = float(svc_max) if svc_max is not None else None
+        elif raw_source:
+            sorted_svc = sorted(raw_source)
+            n = len(sorted_svc)
+
+            # Option 2: fit lognormal to the sub-range around the chosen percentile.
+            # Each mode defines a [lo_pct, hi_pct] window; mean and std are computed
+            # only from observations within that window so they are mutually consistent.
+            if service_time_mode == 'p25':
+                lo_idx = 0
+                hi_idx = max(0, int(math.ceil(0.50 * n)) - 1)  # [min, P50]
+            elif service_time_mode == 'p50':
+                lo_idx = max(0, int(math.ceil(0.25 * n)) - 1)  # [P25, P75]
+                hi_idx = max(0, int(math.ceil(0.75 * n)) - 1)
+            else:  # 'minimum' — [min, P25], deterministic if only one value
+                lo_idx = 0
+                hi_idx = max(0, int(math.ceil(0.25 * n)) - 1)
+
+            sub = sorted_svc[lo_idx : hi_idx + 1]
+            if not sub:
+                sub = sorted_svc  # fallback: use all if window is empty
+
+            sub_stats = _stats(sub)
+            svc_mean = sub_stats["mean"]
+            svc_std  = sub_stats["std"]    # std of the sub-range — coherent with mean
+            svc_min  = sub_stats["min"]
+            svc_max  = sub_stats["max"]
         else:
-            # Estimate: service ≈ sojourn (no waiting info without an anchor)
             svc_mean = soj["mean"]
             svc_std  = soj["std"]
             svc_min  = soj["min"]
             svc_max  = soj["max"] if soj["count"] > 0 else None
 
-        # Waiting time requires anchor (sojourn − service, floor 0)
-        if act in anchor_map and soj["count"] > 0:
+        # Waiting time = full sojourn mean − service mean (floor 0).
+        # Sojourn here is the OCPA sojourn (backward-looking: prev→this event),
+        # which represents the total elapsed time including real-world waiting.
+        # Subtracting the service estimate gives the process waiting component.
+        if soj["count"] > 0 and svc_mean is not None and svc_mean >= 0:
             wait_mean = max(0.0, soj["mean"] - svc_mean)
             wait_std  = soj["std"]
         else:

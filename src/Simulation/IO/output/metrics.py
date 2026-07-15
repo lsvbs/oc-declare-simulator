@@ -54,15 +54,19 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
 
     activity_metrics: dict[str, Any] = {}
     for act_name, events in sorted(act_events.items()):
-        svc_s      = state.activity_service_s.get(act_name, [])
-        wait_s     = state.candidate_wait_s.get(act_name, [])
-        res_wait_s = getattr(state, 'resource_wait_s', {}).get(act_name, [])
+        svc_s       = state.activity_service_s.get(act_name, [])
+        wait_s      = state.candidate_wait_s.get(act_name, [])
+        res_wait_s  = getattr(state, 'resource_wait_s', {}).get(act_name, [])
+        proc_wait_s = getattr(state, 'process_wait_s', {}).get(act_name, [])
 
-        # Sojourn = service + wait, paired by index.  We zip the two lists so
-        # only firings where both values exist contribute (first firing typically
-        # has no pre-fire base so service list may be one shorter than wait list).
-        n_paired = min(len(svc_s), len(wait_s))
-        sojourn_s = [svc_s[i] + wait_s[i] for i in range(n_paired)]
+        # Sojourn = service + process_wait (pre-start) when both are available.
+        # Falls back to service + pool-wait for non-DES mode.
+        if proc_wait_s:
+            n_paired  = min(len(svc_s), len(proc_wait_s))
+            sojourn_s = [svc_s[i] + proc_wait_s[i] for i in range(n_paired)]
+        else:
+            n_paired  = min(len(svc_s), len(wait_s))
+            sojourn_s = [svc_s[i] + wait_s[i] for i in range(n_paired)]
 
         activity_metrics[act_name] = {
             "execution_count":   len(events),
@@ -72,11 +76,15 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
             "mean_service_s":    round(statistics.mean(svc_s), 3)  if svc_s    else None,
             "min_service_s":     round(min(svc_s), 3)              if svc_s    else None,
             "max_service_s":     round(max(svc_s), 3)              if svc_s    else None,
-            # Pool-wait time (eligible but not yet chosen)
+            # Process waiting time (pre-start delay sampled from discovered distribution, DES only)
+            "process_wait_s":         proc_wait_s,
+            "mean_process_wait_s":    round(statistics.mean(proc_wait_s), 3) if proc_wait_s else None,
+            "max_process_wait_s":     round(max(proc_wait_s), 3)             if proc_wait_s else None,
+            # Pool-wait time (eligible but not yet chosen — non-DES only)
             "wait_in_pool_s":    wait_s,
             "mean_wait_in_pool_s": round(statistics.mean(wait_s), 3) if wait_s else None,
             "max_wait_in_pool_s":  round(max(wait_s), 3)             if wait_s else None,
-            # Sojourn = service + wait (paired)
+            # Sojourn = service + wait
             "sojourn_s":         sojourn_s,
             "mean_sojourn_s":    round(statistics.mean(sojourn_s), 3) if sojourn_s else None,
             "max_sojourn_s":     round(max(sojourn_s), 3)             if sojourn_s else None,

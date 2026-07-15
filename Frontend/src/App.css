@@ -2642,8 +2642,31 @@
 .nmax-suggest-btn:hover { background: #dcfce7; }
 
 /* ── Concurrency summary ───────────────────────────────────────────────────── */
-.timing-span-comparison {
+.timing-mode-options {
   display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+}
+.timing-mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 6px;
+  background: white;
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: border-color 0.15s, background 0.15s;
+}
+.timing-mode-option:hover { border-color: #93c5fd; background: #f0f9ff; }
+.timing-mode-option.active { border-color: #3b82f6; background: #eff6ff; }
+.timing-mode-option input[type="radio"] { margin-top: 0.1rem; flex-shrink: 0; }
+.timing-mode-option-label { font-weight: 600; color: #1e293b; display: block; }
+.timing-mode-option-desc  { font-size: 0.73rem; color: #64748b; display: block; }
+
+.timing-span-comparison {
   align-items: center;
   gap: 0.6rem;
   flex-wrap: wrap;
