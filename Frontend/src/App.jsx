@@ -867,7 +867,7 @@ function TimingDiscoveryPanel({
 // ── WorkflowTopBar ───────────────────────────────────────────────────────────
 function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
   ocdeclareDiscoveryResults, activeModel, modelEdited,
-  timingDiscoveryResult, results, workflowMode }) {
+  timingDiscoveryResult, results, workflowMode, onChangeMode }) {
 
   const steps = [
     { key: 'ocel',    label: 'OCEL',        done: !!discoveryConfig.eventLogFile },
@@ -889,7 +889,17 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
   return (
     <div className="workflow-topbar">
       <div className="topbar-files">
-        {modeLabel && <span className="topbar-mode-badge">{modeLabel}</span>}
+        {modeLabel && (
+          <span className="topbar-mode-section">
+            <span className="topbar-mode-label">Mode:</span>
+            <span className="topbar-mode-badge">{modeLabel}</span>
+            {onChangeMode && (
+              <button className="mode-switch-btn topbar-mode-change-btn" onClick={onChangeMode} title="Switch workflow mode">
+                ↩ Change
+              </button>
+            )}
+          </span>
+        )}
         <span className={`topbar-file-pill ${ocelFile ? 'loaded' : ''}`}>
           📄 {ocelFile || 'No OCEL loaded'}
         </span>
@@ -1152,7 +1162,7 @@ function App() {
   });
 
   // ── External OC-Declare + OCEL tab state ──────────────────────────────────
-  const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'simulation'
+  const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'simulation' | 'evaluation'
   const [discoveryChecks, setDiscoveryChecks] = useState({
     lifecycle: true, timing: true, resources: true, o2o: true, startProb: true,
   });
@@ -2346,12 +2356,37 @@ function App() {
         timingDiscoveryResult={timingDiscoveryResult}
         results={results}
         workflowMode={workflowMode}
+        onChangeMode={workflowMode ? () => setWorkflowMode(null) : null}
       />
 
       <header className="header">
         <h1>Declarative OC Simulator</h1>
         <p>Object-centric declarative process simulation</p>
       </header>
+
+      {/* ── Main tab bar — attached directly below header when a mode is chosen ── */}
+      {workflowMode === 'external-ocel' && (
+        <div className="main-tab-bar">
+          <button
+            className={`main-tab-btn${externalTab === 'parameter' ? ' active' : ''}`}
+            onClick={() => setExternalTab('parameter')}
+          >
+            Parameters
+          </button>
+          <button
+            className={`main-tab-btn${externalTab === 'simulation' ? ' active' : ''}`}
+            onClick={() => setExternalTab('simulation')}
+          >
+            Simulation
+          </button>
+          <button
+            className={`main-tab-btn${externalTab === 'evaluation' ? ' active' : ''}`}
+            onClick={() => setExternalTab('evaluation')}
+          >
+            Evaluation
+          </button>
+        </div>
+      )}
 
       {/* ── Mode selector ── */}
       {!workflowMode && (
@@ -2376,17 +2411,6 @@ function App() {
           </div>
           {/* Small link to switch later */}
           <p className="mode-selector-hint">You can change mode at any time using the button below.</p>
-        </div>
-      )}
-
-      {workflowMode && (
-        <div className="mode-switch-bar">
-          <span className="mode-current-label">
-            Mode: <strong>{workflowMode === 'internal' ? 'Internal Discovery' : workflowMode === 'external-ocel' ? 'External OC-Declare + OCEL' : 'Manual / No Files'}</strong>
-          </span>
-          <button className="mode-switch-btn" onClick={() => setWorkflowMode(null)}>
-            ↩ Change mode
-          </button>
         </div>
       )}
 
@@ -2680,37 +2704,22 @@ function App() {
 
         )}
 
-        {/* ── External OC-Declare + OCEL: Two-tab layout ── */}
-        {workflowMode === 'external-ocel' && (
+      {workflowMode === 'external-ocel' && (
           <div className="ext-ocel-tabs">
-            <div className="ext-ocel-tab-header">
-              <button
-                className={`ext-ocel-tab-btn${externalTab === 'parameter' ? ' active' : ''}`}
-                onClick={() => setExternalTab('parameter')}
-              >
-                Parameter
-              </button>
-              <button
-                className={`ext-ocel-tab-btn${externalTab === 'simulation' ? ' active' : ''}`}
-                onClick={() => setExternalTab('simulation')}
-              >
-                Simulation
-              </button>
-            </div>
 
             {/* ── PARAMETER TAB ── */}
             {externalTab === 'parameter' && (
               <div className="ext-ocel-tab-content">
 
-                {/* A: File Selection — OCEL first, then OC-Declare */}
+                {/* A: File Selection — OCEL + OC-Declare side by side */}
                 <div className="discovery-section">
                   <div className="section-header">
                     <h2>Parameter Discovery</h2>
-                    <p>Select an OCEL log and an OC-Declare model to begin, activities, number of events and probability will be discovered</p>
+                    <p>Select an OCEL log and an OC-Declare model to begin</p>
                   </div>
-                  <div className="discovery-config">
-                    <div className="form-group">
-                      <label>Event Log File (OCEL 2.0 Format)</label>
+                  <div className="file-selection-row">
+                    <div className="form-group" style={{flex:1}}>
+                      <label>Event Log File (OCEL 2.0)</label>
                       <div className="file-select-row">
                         <select
                           value={discoveryConfig.eventLogFile}
@@ -2732,7 +2741,7 @@ function App() {
                           onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
                       </div>
                     </div>
-                    <div className="form-group">
+                    <div className="form-group" style={{flex:1}}>
                       <label>OC-Declare Model</label>
                       <div className="file-select-row">
                         <select
@@ -2767,11 +2776,17 @@ function App() {
                     </div>
                   )}
 
+                  {/* First Log Insights — collapsible, directly below file selectors */}
                   {discoveryResults && !isDiscovering && (() => {
                     const dr = discoveryResults;
                     return (
-                      <div className="discovery-results" style={{marginTop:'1rem'}}>
-                        <div className="stat-grid">
+                      <Collapsible
+                        className="first-log-insights"
+                        title="First Log Insights"
+                        badge={`${dr.activity_count} activities · ${dr.total_events} events`}
+                        defaultOpen={true}
+                      >
+                        <div className="stat-grid" style={{marginBottom:'0.75rem'}}>
                           <div className="stat-card">
                             <div className="stat-value">{dr.activity_count}</div>
                             <div className="stat-label">Activities Found</div>
@@ -2784,28 +2799,35 @@ function App() {
                             <div className="stat-value">{dr.transition_count}</div>
                             <div className="stat-label">Transitions</div>
                           </div>
+                          {dr.object_type_stats && (
+                            <div className="stat-card">
+                              <div className="stat-value">{Object.keys(dr.object_type_stats).length}</div>
+                              <div className="stat-label">Discovered Objects</div>
+                            </div>
+                          )}
                         </div>
                         {dr.object_type_stats && Object.keys(dr.object_type_stats).length > 0 && (
-                          <Collapsible title="Discovered Objects" badge={`${Object.keys(dr.object_type_stats).length} types`} defaultOpen={false} className="discovery-transition-collapsible">
-                            <table className="object-type-stats-table">
-                              <thead><tr><th>Object Type</th><th className="octs-num">Instances</th><th className="octs-num">Max reuse</th><th>Attributes</th></tr></thead>
-                              <tbody>
-                                {Object.entries(dr.object_type_stats).map(([type, info]) => (
-                                  <tr key={type}>
-                                    <td className="octs-type">{type}</td>
-                                    <td className="octs-num">{info.count.toLocaleString()}</td>
-                                    <td className="octs-num" title={info.mean_max_reuse != null ? `Mean: ${info.mean_max_reuse}` : undefined}>{info.max_reuse != null ? info.max_reuse : '—'}</td>
-                                    <td className="octs-attrs">{info.attributes.length > 0 ? info.attributes.map(a => <span key={a} className="octs-attr-badge">{a}</span>) : <span className="octs-no-attrs">—</span>}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </Collapsible>
+                          <table className="object-type-stats-table">
+                            <thead><tr><th>Object Type</th><th className="octs-num">Instances</th><th className="octs-num">Max reuse</th><th>Attributes</th></tr></thead>
+                            <tbody>
+                              {Object.entries(dr.object_type_stats).map(([type, info]) => (
+                                <tr key={type}>
+                                  <td className="octs-type">{type}</td>
+                                  <td className="octs-num">{info.count.toLocaleString()}</td>
+                                  <td className="octs-num" title={info.mean_max_reuse != null ? `Mean: ${info.mean_max_reuse}` : undefined}>{info.max_reuse != null ? info.max_reuse : '—'}</td>
+                                  <td className="octs-attrs">{info.attributes.length > 0 ? info.attributes.map(a => <span key={a} className="octs-attr-badge">{a}</span>) : <span className="octs-no-attrs">—</span>}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
                         )}
-                      </div>
+                      </Collapsible>
                     );
                   })()}
                 </div>
+
+                {/* Space between file selection and discoveries */}
+                <div style={{height:'1.5rem'}} />
 
                 {/* B: Discoveries */}
                 {discoveryResults && (() => {
@@ -3029,11 +3051,16 @@ function App() {
                 })()}
 
                 {/* C: Post-Processing Result (health check + suggestions) */}
-                <div className="postprocessing-result-section">
-                  <div className="section-header">
-                    <h2>Post-Processing</h2>
-                    <p>Health check runs automatically after discoveries complete</p>
-                  </div>
+                <Collapsible
+                  className="postprocessing-result-section"
+                  title="Post-Processing"
+                  badge={healthResult && !healthResult.error ? (() => {
+                    const s = healthResult.summary || {};
+                    return s.errors > 0 ? `${s.errors} errors` : s.warnings > 0 ? `${s.warnings} warnings` : 'healthy';
+                  })() : null}
+                  defaultOpen={true}
+                >
+                  <p style={{fontSize:'0.82rem',color:'#64748b',margin:'0 0 0.75rem'}}>Health check runs automatically after discoveries complete</p>
 
                   {isCheckingHealth && (
                     <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginBottom:'0.5rem'}}>
@@ -3446,42 +3473,33 @@ function App() {
                       <p className="auto-no-suggestions">No suggestions — adjust thresholds or review the health report above.</p>
                     )}
                   </div>
-                </div>{/* end postprocessing-result-section (ext-ocel) */}
+                </Collapsible>{/* end Post-Processing collapsible */}
 
-                {/* D: Parameter Actions */}
-                <div className="ext-param-actions">
-                  <button
-                    className="model-download-btn"
-                    disabled={!activeModel || Array.isArray(activeModel)}
-                    onClick={handleDownloadParameters}
-                    title="Download current model + discovered parameters as JSON and save to parameters folder"
-                  >
-                    ⬇ Download Parameters
-                  </button>
-                  <button
-                    className="model-download-btn"
-                    style={{background:'#dbeafe',color:'#1e40af',borderColor:'#93c5fd'}}
-                    disabled={!activeModel || Array.isArray(activeModel)}
-                    onClick={() => setExternalTab('simulation')}
-                    title="Go to Simulation tab with the current parameters"
-                  >
-                    ▶ Use Parameters
-                  </button>
-                  <div className="model-params-loader">
-                    <div className="file-select-row">
-                      <select
-                        className="model-params-select"
-                        value=""
-                        onChange={e => { if (e.target.value) handleLoadParameters(e.target.value); }}
-                      >
-                        <option value="">⬆ Load Parameters…</option>
-                        {parameterFiles.map(f => <option key={f} value={f}>{f}</option>)}
-                      </select>
-                      <button className="browse-btn" onClick={() => paramsFileRef.current?.click()} title="Browse and upload a parameter file">📁</button>
-                      <input ref={paramsFileRef} type="file" accept=".json" style={{display:'none'}}
-                        onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'parameters'); e.target.value=''; }} />
+                {/* D: Model Editor — mirrored with simulation tab */}
+                <div style={{marginTop:'1.5rem'}}>
+                  <ModelEditor
+                    model={activeModel && !Array.isArray(activeModel) ? activeModel : null}
+                    probMatrix={activeProbMatrix || {}}
+                    onModelChange={handleModelEdit}
+                    onProbMatrixChange={setActiveProbMatrix}
+                    sourceFile={config.ocdeclareFile}
+                    parameterFiles={parameterFiles}
+                    onLoadParameters={handleLoadParameters}
+                    onSaveParameters={handleSaveParameters}
+                    nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
+                    eventLogFile={discoveryConfig.eventLogFile || ''}
+                    hideParameterButtons={true}
+                    startActivities={config.startActivities}
+                    onUseParameters={() => setExternalTab('simulation')}
+                  />
+                  {(!activeModel || Array.isArray(activeModel)) && (
+                    <div className="model-editor-empty-hint">
+                      Run discoveries or load a parameter file to populate the Model Editor.
                     </div>
-                  </div>
+                  )}
+                  {/* Hidden file input for browsing parameter files from ModelEditor */}
+                  <input ref={paramsFileRef} type="file" accept=".json" style={{display:'none'}}
+                    onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'parameters'); e.target.value=''; }} />
                 </div>
 
               </div>
@@ -3512,10 +3530,11 @@ function App() {
                 {activeModel && !Array.isArray(activeModel) && (() => {
                   const constraints = activeModel.constraints || [];
                   const hasIncoming = new Set(constraints.map(c => c.target_activity || c.target));
+                  const startActs = new Set(config.startActivities || []);
                   const warnings = [];
                   (activeModel.activities || []).forEach(a => {
                     const nonCreating = (a.bindings || []).filter(b => !b.creates);
-                    if (nonCreating.length === 0 && !hasIncoming.has(a.name)) {
+                    if (nonCreating.length === 0 && !hasIncoming.has(a.name) && !startActs.has(a.name)) {
                       warnings.push({ label: `No input: "${a.name}"`, tab: 'activities' });
                     }
                   });
@@ -3879,7 +3898,11 @@ function App() {
                           title="🔬 Object Lifecycle Audit"
                           badge={(() => {
                             const a = results.audit.object_lifecycle_audit;
-                            const issues = Object.values(a).filter(v => v.classification !== 'healthy').length;
+                            const resourceTypeSet = new Set(results.resource_types || []);
+                            const issues = Object.entries(a).filter(([otype, v]) => {
+                              if (resourceTypeSet.has(otype) && v.classification === 'accumulating') return false;
+                              return v.classification !== 'healthy';
+                            }).length;
                             return issues > 0 ? `${issues} issue${issues !== 1 ? 's' : ''}` : 'healthy';
                           })()}
                           defaultOpen={false}
@@ -3897,24 +3920,45 @@ function App() {
                               </tr>
                             </thead>
                             <tbody>
-                              {Object.entries(results.audit.object_lifecycle_audit).map(([otype, a]) => (
-                                <tr key={otype} className={`audit-row-${a.classification}`}>
-                                  <td className="audit-type">{otype}</td>
+                              {Object.entries(results.audit.object_lifecycle_audit).map(([otype, a]) => {
+                                const isResource = (results.resource_types || []).includes(otype);
+                                const effectiveClass = isResource && a.classification === 'accumulating' ? 'healthy' : a.classification;
+                                const reuseCount = isResource
+                                  ? Math.round(a.event_count_stats.mean)
+                                  : null;
+                                return (
+                                <tr key={otype} className={`audit-row-${effectiveClass}`}>
+                                  <td className="audit-type">
+                                    {otype}
+                                    {isResource && <span className="binding-resource-badge" style={{marginLeft:'0.3rem',fontSize:'0.68rem'}}>R</span>}
+                                  </td>
                                   <td className="audit-num">{a.instance_count}</td>
                                   <td className="audit-num">{a.active_count}</td>
                                   <td className="audit-num">{a.deactivated_count}</td>
                                   <td className="audit-num">{a.zero_event_count > 0 ? <span className="audit-warn">{a.zero_event_count}</span> : '0'}</td>
                                   <td className="audit-num">{a.event_count_stats.min}–{a.event_count_stats.max} (avg {a.event_count_stats.mean})</td>
                                   <td>
-                                    <span className={`audit-badge audit-badge-${a.classification}`}>
-                                      {a.classification.replace(/_/g, ' ')}
-                                    </span>
-                                    {a.issues.map((iss, i) => (
-                                      <div key={i} className="audit-issue">{iss}</div>
-                                    ))}
+                                    {isResource && a.classification === 'accumulating' ? (
+                                      <>
+                                        <span className="audit-badge audit-badge-healthy">resource</span>
+                                        <div className="audit-issue" style={{color:'#475569'}}>
+                                          Reused avg {reuseCount}× per instance (resource pool — always active by design)
+                                        </div>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <span className={`audit-badge audit-badge-${effectiveClass}`}>
+                                          {effectiveClass.replace(/_/g, ' ')}
+                                        </span>
+                                        {a.issues.map((iss, i) => (
+                                          <div key={i} className="audit-issue">{iss}</div>
+                                        ))}
+                                      </>
+                                    )}
                                   </td>
                                 </tr>
-                              ))}
+                                );
+                              })}
                             </tbody>
                           </table>
                         </Collapsible>
@@ -4388,6 +4432,18 @@ function App() {
 
               </div>
             )}{/* end simulation tab */}
+
+            {/* ── EVALUATION TAB ── */}
+            {externalTab === 'evaluation' && (
+              <div className="ext-ocel-tab-content">
+                <div className="discovery-section">
+                  <div className="section-header">
+                    <h2>Evaluation</h2>
+                    <p>Run a simulation first to see evaluation results here.</p>
+                  </div>
+                </div>
+              </div>
+            )}{/* end evaluation tab */}
           </div>
         )}{/* end external-ocel tabs */}
 

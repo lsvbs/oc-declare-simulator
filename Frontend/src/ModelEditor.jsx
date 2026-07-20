@@ -233,6 +233,8 @@ export default function ModelEditor({
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
   nmaxSuggestions = {}, eventLogFile = '',
   hideParameterButtons = false,
+  startActivities = [],
+  onUseParameters = null,
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
@@ -421,6 +423,7 @@ export default function ModelEditor({
     { id: 'resources',    label: 'Resources',    count: resourceTypes.length || null },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
+    { id: 'flow',         label: 'Object Flow',  count: null },
   ];
 
   const filteredConstraints = constraints.filter(c =>
@@ -528,6 +531,15 @@ export default function ModelEditor({
             <span className="model-editor-caret">{collapsed ? '▶' : '▼'}</span>
             Model Editor
           </h3>
+          {onUseParameters && (
+            <button
+              className="model-use-params-btn"
+              onClick={onUseParameters}
+              title="Go to Simulation tab"
+            >
+              ▶ Use Parameters
+            </button>
+          )}
           <div className="model-editor-actions">
             {/* Load saved parameters from IO/input/parameters */}
             <div className="model-params-loader">
@@ -616,7 +628,7 @@ export default function ModelEditor({
             </div>
             {activities.length === 0 && <p className="empty-notice">No activities defined.</p>}
             {activities.map((act, ai) => (
-              <div key={act.name} className={`activity-row ${expandedActs.has(act.name) ? 'open' : ''}`}>
+              <div key={act.name} id={`activity-row-${act.name}`} className={`activity-row ${expandedActs.has(act.name) ? 'open' : ''}`}>
                 <div className="activity-header" onClick={() => toggleAct(act.name)}>
                   <span className={`activity-expand ${expandedActs.has(act.name) ? 'open' : ''}`}>▶</span>
                   <span className="activity-name">{act.name}</span>
@@ -943,14 +955,57 @@ export default function ModelEditor({
                         <p className="act-con-summary-empty">No constraints involve this activity.</p>
                       )}
                       <ul>
-                        {involved.map((c, i) => (
-                          <li key={i}>
-                            <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.68rem',marginRight:'0.4rem'}}>
-                              {c.constraint_type.replace(/_/g,' ')}
-                            </span>
-                            {describe(c)}
-                          </li>
-                        ))}
+                        {involved.map((c, i) => {
+                          const text = describe(c);
+                          // Highlight the focal activity in bold and make other activity names clickable
+                          const renderText = (t) => {
+                            const parts = [];
+                            let remaining = t;
+                            const allActNames = activities.map(a => a.name);
+                            // Replace quoted activity names with styled spans
+                            const re = /"([^"]+)"/g;
+                            let lastIndex = 0;
+                            let m;
+                            while ((m = re.exec(t)) !== null) {
+                              if (m.index > lastIndex) parts.push(t.slice(lastIndex, m.index));
+                              const name = m[1];
+                              const isFocal = name === actName;
+                              const isAct = allActNames.includes(name);
+                              if (isFocal) {
+                                parts.push(<strong key={m.index} className="act-hint-focal">"{name}"</strong>);
+                              } else if (isAct) {
+                                parts.push(
+                                  <button
+                                    key={m.index}
+                                    className="act-hint-link"
+                                    onClick={e => {
+                                      e.stopPropagation();
+                                      setExpandedActs(prev => { const n = new Set(prev); n.add(name); return n; });
+                                      setTimeout(() => {
+                                        document.getElementById(`activity-row-${name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                      }, 50);
+                                    }}
+                                  >
+                                    "{name}"
+                                  </button>
+                                );
+                              } else {
+                                parts.push(`"${name}"`);
+                              }
+                              lastIndex = m.index + m[0].length;
+                            }
+                            if (lastIndex < t.length) parts.push(t.slice(lastIndex));
+                            return parts;
+                          };
+                          return (
+                            <li key={i}>
+                              <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.68rem',marginRight:'0.4rem'}}>
+                                {c.constraint_type.replace(/_/g,' ')}
+                              </span>
+                              {renderText(text)}
+                            </li>
+                          );
+                        })}
                       </ul>
                     </div>
                   );
@@ -1463,6 +1518,123 @@ export default function ModelEditor({
                         <span className="timing-ocpa-chip timing-sample-count">n={td.sample_count}</span>
                       )}
                     </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ━━ OBJECT FLOW ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+        {activeTab === 'flow' && (
+          <div className="object-flow-tab">
+            <p className="prob-hint">
+              Per object type: the activities it participates in, where it is created and deactivated,
+              and which transitions are possible (based on constraints and the probability matrix).
+              Back-edges indicate the object can return to an earlier activity.
+            </p>
+            {otNames.length === 0 && <p className="empty-notice">No object types defined.</p>}
+            {otNames.map(otype => {
+              // Activities that have a binding for this type
+              const involvedActs = activities.filter(a =>
+                (a.bindings || []).some(b => b.object_type === otype)
+              );
+              if (involvedActs.length === 0) return null;
+
+              const creatingActs    = involvedActs.filter(a => (a.bindings || []).some(b => b.object_type === otype && b.creates));
+              const deactivatingActs = involvedActs.filter(a => (a.bindings || []).some(b => b.object_type === otype && (b.deactivates || b.consumes)));
+
+              // Build a set of activity names in order they appear in the model
+              const actOrder = activities.map(a => a.name);
+              const sortedInvolved = involvedActs
+                .slice()
+                .sort((a, b) => actOrder.indexOf(a.name) - actOrder.indexOf(b.name));
+
+              // Derive edges: from probMatrix, only between activities involved with this type
+              const involvedNames = new Set(sortedInvolved.map(a => a.name));
+              const edges = [];
+              sortedInvolved.forEach(a => {
+                const row = probMatrix[a.name] || {};
+                Object.entries(row).forEach(([tgt, prob]) => {
+                  if (involvedNames.has(tgt) && prob > 0.001) {
+                    edges.push({ from: a.name, to: tgt, prob });
+                  }
+                });
+              });
+
+              // Detect back-edges: if target appears earlier in model order than source
+              const nameIndex = {};
+              sortedInvolved.forEach((a, i) => { nameIndex[a.name] = i; });
+              const backEdges = new Set(
+                edges
+                  .filter(e => (nameIndex[e.to] ?? 999) < (nameIndex[e.from] ?? 999))
+                  .map(e => `${e.from}→${e.to}`)
+              );
+
+              return (
+                <div key={otype} className="object-flow-type">
+                  <div className="object-flow-type-header">
+                    <span className="object-flow-type-name">{otype}</span>
+                    {resourceTypes.includes(otype) && (
+                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Resource</span>
+                    )}
+                    <span className="object-flow-act-count">{sortedInvolved.length} activities</span>
+                  </div>
+
+                  <div className="object-flow-track">
+                    {sortedInvolved.map((act, i) => {
+                      const isCreating    = creatingActs.some(a => a.name === act.name);
+                      const isDeactivating = deactivatingActs.some(a => a.name === act.name);
+                      const outgoing = edges.filter(e => e.from === act.name);
+                      const isLast = i === sortedInvolved.length - 1;
+
+                      return (
+                        <div key={act.name} className="object-flow-node-wrap">
+                          <div className={`object-flow-node${isCreating ? ' flow-creates' : ''}${isDeactivating ? ' flow-deactivates' : ''}`}>
+                            {isCreating && <span className="flow-node-badge flow-badge-create" title="Creates this object type">+</span>}
+                            {isDeactivating && <span className="flow-node-badge flow-badge-deact" title="Deactivates this object type">✕</span>}
+                            <button
+                              className="flow-node-name"
+                              onClick={() => {
+                                setActiveTab('activities');
+                                setExpandedActs(prev => { const n = new Set(prev); n.add(act.name); return n; });
+                                setTimeout(() => {
+                                  document.getElementById(`activity-row-${act.name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                }, 50);
+                              }}
+                              title="Jump to this activity in the Activities tab"
+                            >
+                              {act.name}
+                            </button>
+                          </div>
+
+                          {/* Outgoing transitions */}
+                          {outgoing.length > 0 && (
+                            <div className="object-flow-edges">
+                              {outgoing.map(e => {
+                                const isBack = backEdges.has(`${e.from}→${e.to}`);
+                                return (
+                                  <span
+                                    key={e.to}
+                                    className={`object-flow-edge${isBack ? ' flow-edge-back' : ''}`}
+                                    title={`${e.from} → ${e.to}: ${(e.prob * 100).toFixed(1)}%${isBack ? ' (back-edge)' : ''}`}
+                                  >
+                                    {isBack ? '↩ ' : '→ '}{e.to}
+                                    <span className="flow-edge-prob">{(e.prob * 100).toFixed(0)}%</span>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {backEdges.size > 0 && (
+                    <p className="object-flow-back-note">
+                      ↩ Back-edges detected — this object type can revisit earlier activities.
+                    </p>
                   )}
                 </div>
               );
