@@ -3037,6 +3037,9 @@
   color: #64748b;
   margin: 0;
 }
+.evaluation-tab .section-header {
+  background: white;
+}
 
 /* ── Main tab bar (Parameters | Simulation | Evaluation) ─────────────────── */
 .main-tab-bar {
@@ -3256,3 +3259,240 @@
   font-style: italic;
 }
 
+
+/* ── Run Evaluation button ───────────────────────────────────────────────── */
+.run-evaluation-btn {
+  display: inline-block;
+  margin-left: 0.75rem;
+  padding: 0.5rem 1.1rem;
+  background: #f0fdf4;
+  color: #166534;
+  border: 1.5px solid #86efac;
+  border-radius: 7px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.run-evaluation-btn:hover { background: #dcfce7; }
+
+/* ── Evaluation tab ──────────────────────────────────────────────────────── */
+.evaluation-tab {
+  padding: 0.25rem 0;
+}
+.eval-section {
+  background: white;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  margin-bottom: 1.25rem;
+}
+.eval-subsection {
+  margin-top: 1rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+
+/* Time span comparison row */
+.eval-timespan-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+  padding: 0.85rem 1rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+.eval-timespan-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.eval-timespan-label {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.eval-timespan-val {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #1e293b;
+}
+.eval-timespan-arrow {
+  font-size: 1.25rem;
+  color: #94a3b8;
+}
+.eval-ratio-ok   { font-size: 0.82rem; font-weight: 700; color: #166534; background: #dcfce7; padding: 0.2rem 0.6rem; border-radius: 20px; }
+.eval-ratio-warn { font-size: 0.82rem; font-weight: 700; color: #92400e; background: #fef3c7; padding: 0.2rem 0.6rem; border-radius: 20px; }
+
+/* Bar chart */
+.eval-chart-wrap {
+  width: 100%;
+}
+.eval-chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+.eval-chart-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #475569;
+}
+.eval-chart-mode-btns {
+  display: flex;
+  gap: 0.25rem;
+}
+.eval-mode-btn {
+  padding: 0.15rem 0.55rem;
+  font-size: 0.72rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  background: white;
+  color: #64748b;
+  cursor: pointer;
+}
+.eval-mode-btn.active {
+  background: #6366f1;
+  color: white;
+  border-color: #6366f1;
+}
+.eval-charts-row {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.eval-chart-side {
+  flex: 1;
+  min-width: 280px;
+  overflow-x: auto;
+}
+.eval-chart-side-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #64748b;
+  text-align: center;
+  margin-bottom: 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* O2O comparison */
+.eval-o2o-row {
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.eval-o2o-side {
+  flex: 1;
+  min-width: 260px;
+}
+.eval-o2o-side-label {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #64748b;
+  text-align: center;
+  margin-bottom: 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+/* ── Conformance section ─────────────────────────────────────────────────── */
+.conf-metric-row {
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid #f1f5f9;
+}
+.conf-metric-row:last-child { border-bottom: none; margin-bottom: 0; }
+
+.conf-metric-main {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.3rem;
+}
+.conf-metric-label {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: #1e293b;
+  flex: 1;
+}
+.conf-metric-value {
+  font-size: 1.4rem;
+  font-weight: 700;
+  min-width: 70px;
+  text-align: right;
+}
+.conf-good { color: #166534; }
+.conf-mid  { color: #92400e; }
+.conf-bad  { color: #991b1b; }
+
+.conf-metric-explanation {
+  font-size: 0.76rem;
+  color: #64748b;
+  line-height: 1.5;
+  margin: 0;
+}
+.conf-detail-collapsible {
+  margin-top: 0.75rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+}
+.conf-detail-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+.conf-detail-table th { text-align: left; padding: 0.3rem 0.4rem; color: #64748b; border-bottom: 1px solid #e2e8f0; }
+.conf-detail-table td { padding: 0.25rem 0.4rem; border-bottom: 1px solid #f8fafc; }
+
+/* ── Per-object-type expand button ──────────────────────────────────────── */
+.conf-expand-type-btn {
+  background: none;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #475569;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.conf-expand-type-btn:hover { background: #f8fafc; }
+.conf-expand-warn {
+  font-size: 0.72rem;
+  color: #b45309;
+  font-weight: 400;
+  margin-left: 0.5rem;
+}
+
+/* ── Run history legacy collapsible ─────────────────────────────────────── */
+.rh-legacy-collapsible {
+  margin-top: 0.75rem;
+  border-top: 1px solid #e2e8f0;
+  padding-top: 0.5rem;
+}
+
+/* ── Run history conformance columns ────────────────────────────────────── */
+.run-history-table th.rh-conf-col {
+  background: #1e3a5f;
+  color: #bfdbfe;
+  font-size: 0.72rem;
+}
+.run-history-table td.rh-conf-col {
+  background: #1e3a5f;
+}

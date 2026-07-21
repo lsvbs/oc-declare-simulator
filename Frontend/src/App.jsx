@@ -990,6 +990,808 @@ function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onMod
   );
 }
 
+
+// ── EvaluationTab ─────────────────────────────────────────────────────────────
+function ActivityBarChart({ logDurations, simDurations, metric, title, orderedActivities }) {
+  const [mode, setMode] = React.useState('mean');
+  const activities = orderedActivities?.length
+    ? orderedActivities.filter(a => logDurations?.[a] || simDurations?.[a])
+    : [...new Set([...Object.keys(logDurations || {}), ...Object.keys(simDurations || {})])].sort();
+
+  if (activities.length === 0) return (
+    <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic',padding:'0.5rem 0'}}>No data available for this metric.</p>
+  );
+
+  // Both sides use the same discovered format from compute_ocpa_metrics
+  const keyMap = {
+    service: { mean: 'service_mean', min: 'service_min', max: 'service_max' },
+    waiting: { mean: 'waiting_mean', min: null,          max: null },
+  };
+  const k = keyMap[metric]?.[mode];
+
+  const logVals = activities.map(a => {
+    const v = k ? logDurations?.[a]?.[k] : null;
+    return (v != null && v > 0) ? v : null;
+  });
+  const simVals = activities.map(a => {
+    const v = k ? simDurations?.[a]?.[k] : null;
+    return (v != null && v > 0) ? v : null;
+  });
+
+  const allVals = [...simVals, ...logVals].filter(v => v != null);
+  if (allVals.length === 0) return (
+    <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic',padding:'0.5rem 0'}}>No data for this metric/mode combination.</p>
+  );
+  const maxVal = Math.max(...allVals);
+
+  const timeUnit = maxVal > 86400 ? 'days' : maxVal > 3600 ? 'h' : maxVal > 60 ? 'min' : 's';
+  const divider = timeUnit === 'days' ? 86400 : timeUnit === 'h' ? 3600 : timeUnit === 'min' ? 60 : 1;
+  const fmtV = v => v == null ? '' : (v / divider).toFixed(timeUnit === 'days' || timeUnit === 'h' ? 1 : 0);
+  const fmtLabel = v => v == null ? '—' : `${fmtV(v)} ${timeUnit}`;
+
+  const BAR_H = 160, Y_LABEL_W = 52, NAME_H = 90;
+  const barW = Math.max(28, Math.min(52, Math.floor(520 / Math.max(activities.length, 1))));
+  const gap = Math.max(8, Math.floor(barW * 0.25));
+  const chartW = activities.length * (barW + gap) + Y_LABEL_W + 10;
+  const ticks = [maxVal, maxVal / 2, 0];
+
+  const renderChart = (vals, color) => (
+    <svg width={chartW} height={BAR_H + NAME_H} style={{overflow:'visible', display:'block'}}>
+      <line x1={Y_LABEL_W} y1={0} x2={Y_LABEL_W} y2={BAR_H} stroke="#e2e8f0" strokeWidth={1}/>
+      {ticks.map((tv, ti) => {
+        const ty = ti === 0 ? 2 : ti === 1 ? BAR_H / 2 : BAR_H;
+        return (
+          <g key={ti}>
+            <line x1={Y_LABEL_W - 4} y1={ty} x2={Y_LABEL_W} y2={ty} stroke="#cbd5e1" strokeWidth={1}/>
+            <text x={Y_LABEL_W - 6} y={ty + 4} textAnchor="end" fontSize="9" fill="#64748b">
+              {tv > 0 ? `${fmtV(tv)} ${timeUnit}` : '0'}
+            </text>
+            {ti < 2 && <line x1={Y_LABEL_W} y1={ty} x2={chartW} y2={ty} stroke="#f1f5f9" strokeWidth={1}/>}
+          </g>
+        );
+      })}
+      {activities.map((act, i) => {
+        const v = vals[i];
+        const h = v != null && maxVal > 0 ? Math.max(2, (v / maxVal) * BAR_H) : 0;
+        const x = Y_LABEL_W + i * (barW + gap) + gap / 2;
+        const y = BAR_H - h;
+        const lx = x + barW / 2, ly = BAR_H + 8;
+        return (
+          <g key={act}>
+            <rect x={x} y={y} width={barW} height={h} fill={color} fillOpacity={0.8} rx={3}>
+              <title>{act}: {fmtLabel(v)}</title>
+            </rect>
+            {v != null && h > 16 && (
+              <text x={x + barW/2} y={y+11} textAnchor="middle" fontSize="8" fill="white" fontWeight="600">{fmtV(v)}</text>
+            )}
+            <text x={lx} y={ly} textAnchor="end" fontSize="9" fill="#475569"
+              transform={`rotate(-45,${lx},${ly})`}>{act}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+
+  return (
+    <div className="eval-chart-wrap">
+      <div className="eval-chart-header">
+        <span className="eval-chart-title">{title}</span>
+        <div className="eval-chart-mode-btns">
+          {['mean', 'min', 'max'].map(m => (
+            <button key={m} className={`eval-mode-btn${mode === m ? ' active' : ''}`} onClick={() => setMode(m)}>{m}</button>
+          ))}
+        </div>
+      </div>
+      <div className="eval-charts-row">
+        <div className="eval-chart-side">
+          <div className="eval-chart-side-label">Input Log</div>
+          {renderChart(logVals, '#6366f1')}
+        </div>
+        <div className="eval-chart-side">
+          <div className="eval-chart-side-label">Simulation Output</div>
+          {renderChart(simVals, '#10b981')}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function PerObjectTypeBreakdown({ fitnessPerObject, objectTypesMap }) {
+  const [expandedType, setExpandedType] = React.useState(null);
+
+  // Group objects by type
+  const byType = React.useMemo(() => {
+    const groups = {};
+    Object.entries(fitnessPerObject).forEach(([oid, d]) => {
+      const otype = objectTypesMap[oid] || 'Unknown';
+      if (!groups[otype]) groups[otype] = [];
+      groups[otype].push({ oid, ...d });
+    });
+    return groups;
+  }, [fitnessPerObject, objectTypesMap]);
+
+  const typeSummary = Object.entries(byType).map(([otype, objs]) => {
+    const totalEvents   = objs.reduce((s, o) => s + o.total, 0);
+    const totalEnabled  = objs.reduce((s, o) => s + o.enabled, 0);
+    const rate = totalEvents > 0 ? totalEnabled / totalEvents : 1;
+    const worstObj = objs.slice().sort((a, b) => (a.enabled/a.total) - (b.enabled/b.total))[0];
+    return { otype, objs, totalEvents, totalEnabled, rate, count: objs.length, worstObj };
+  }).sort((a, b) => a.rate - b.rate);
+
+  const pct = v => `${(v * 100).toFixed(1)}%`;
+  const rateClass = r => r >= 0.8 ? 'conf-good' : r >= 0.5 ? 'conf-mid' : 'conf-bad';
+
+  return (
+    <div>
+      {/* Type-level summary table */}
+      <table className="conf-detail-table" style={{marginBottom:'0.75rem'}}>
+        <thead>
+          <tr>
+            <th>Object Type</th>
+            <th className="audit-num">Objects</th>
+            <th className="audit-num">Total events</th>
+            <th className="audit-num">Enabled</th>
+            <th className="audit-num">Fitness</th>
+            <th className="audit-num">Worst object</th>
+          </tr>
+        </thead>
+        <tbody>
+          {typeSummary.map(({ otype, objs, totalEvents, totalEnabled, rate, count, worstObj }) => (
+            <tr key={otype} className={rate < 0.5 ? 'audit-row-accumulating' : ''}>
+              <td style={{fontWeight:600}}>{otype}</td>
+              <td className="audit-num">{count}</td>
+              <td className="audit-num">{totalEvents}</td>
+              <td className="audit-num">{totalEnabled}</td>
+              <td className="audit-num"><span className={rateClass(rate)}>{pct(rate)}</span></td>
+              <td className="audit-num" style={{fontSize:'0.72rem',color:'#64748b'}}>
+                {worstObj && worstObj.total > 0
+                  ? `${worstObj.oid} (${pct(worstObj.enabled/worstObj.total)})`
+                  : '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {/* Per-type expandable object list */}
+      {typeSummary.map(({ otype, objs }) => (
+        <div key={otype} style={{marginBottom:'0.4rem'}}>
+          <button
+            className="conf-expand-type-btn"
+            onClick={() => setExpandedType(expandedType === otype ? null : otype)}
+          >
+            {expandedType === otype ? '▼' : '▶'} {otype} — {objs.length} object{objs.length !== 1 ? 's' : ''}
+            {objs.length > 200 && (
+              <span className="conf-expand-warn"> ⚠ {objs.length} objects — may be slow to render</span>
+            )}
+          </button>
+          {expandedType === otype && (
+            <table className="conf-detail-table" style={{marginTop:'0.25rem'}}>
+              <thead>
+                <tr>
+                  <th>Object ID</th>
+                  <th className="audit-num">Events</th>
+                  <th className="audit-num">Enabled</th>
+                  <th className="audit-num">Fitness</th>
+                </tr>
+              </thead>
+              <tbody>
+                {objs
+                  .slice()
+                  .sort((a, b) => (a.enabled/a.total) - (b.enabled/b.total))
+                  .map(o => {
+                    const r = o.total > 0 ? o.enabled / o.total : 1;
+                    return (
+                      <tr key={o.oid} className={r < 0.5 ? 'audit-row-accumulating' : ''}>
+                        <td style={{fontFamily:'monospace',fontSize:'0.75rem'}}>{o.oid}</td>
+                        <td className="audit-num">{o.total}</td>
+                        <td className="audit-num">{o.enabled}</td>
+                        <td className="audit-num">
+                          <span className={rateClass(r)}>{pct(r)}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── ConformanceSection ────────────────────────────────────────────────────────
+function computeConformance(objectTraces, constraints, activities) {
+  // Build lookup: activity name → binding object types
+  const actBindings = {};
+  (activities || []).forEach(a => { actBindings[a.name] = (a.bindings || []).map(b => b.object_type); });
+
+  // For each object trace, simulate which activities were enabled at each step.
+  // We track: for each constraint, whether it was satisfied by the end of the trace.
+  // State per object trace: counts of how often each activity fired so far.
+
+  // ── Declarative Token-Replay Fitness ──────────────────────────────────────
+  // Per object: for each event in its trace, check if that activity was enabled
+  // (all precedence constraints already satisfied at that point).
+  // fitness = enabled_events / total_events across all objects.
+
+  let fitnessEnabled = 0, fitnessTotal = 0;
+  const fitnessPerObject = {}; // oid → { enabled, total }
+
+  // ── Declarative Constraint Fitness ────────────────────────────────────────
+  // Per constraint × object: satisfied at end of trace?
+  // ratio = satisfied / evaluated
+
+  let constraintSatisfied = 0, constraintTotal = 0;
+  const constraintDetail = {}; // constraint label → { satisfied, total }
+
+  // ── Declarative Precision ─────────────────────────────────────────────────
+  // Per transition (position i → i+1 in trace): was the observed next activity
+  // in the allowed set (not blocked by any constraint)?
+  // precision = allowed_transitions / total_transitions
+
+  let precisionAllowed = 0, precisionTotal = 0;
+  const precisionDetail = {}; // constraint label → { blocked_observed, total_transitions }
+  // For each transition, also track which constraints were blocking candidates
+
+  const allActNames = (activities || []).map(a => a.name);
+
+  Object.entries(objectTraces || {}).forEach(([oid, trace]) => {
+    if (!trace || trace.length === 0) return;
+
+    // Track how many times each activity fired on this object so far
+    const fired = {}; // activity → count
+    const lastFired = {}; // activity → last index it fired
+
+    fitnessPerObject[oid] = { enabled: 0, total: trace.length };
+
+    trace.forEach((act, step) => {
+      fitnessTotal++;
+
+      // Check if this activity was enabled at this step
+      // An activity is enabled if all its precedence constraints are satisfied
+      const relevantPrecs = constraints.filter(c =>
+        c.constraint_type === 'precedence' && c.target_activity === act
+      );
+      const enabled = relevantPrecs.every(c => {
+        const srcCount = fired[c.source_activity] || 0;
+        const nmin = c.nmin ?? 1;
+        const nmax = c.nmax ?? null;
+        if (nmin > 0 && srcCount === 0) return false;
+        if (nmax !== null && srcCount > nmax) return false;
+        return true;
+      });
+
+      if (enabled) {
+        fitnessEnabled++;
+        fitnessPerObject[oid].enabled++;
+      }
+
+      // Fire the activity — update state
+      fired[act] = (fired[act] || 0) + 1;
+      lastFired[act] = step;
+
+      // ── Precision: after firing act, what was allowed next? ──────────────
+      if (step < trace.length - 1) {
+        const nextAct = trace[step + 1];
+        const tempFired = { ...fired };
+
+        // For each activity, track which constraints block it
+        const blockedBy = {}; // candidate → [constraint label]
+        allActNames.forEach(candidate => {
+          const blocks = [];
+          constraints.filter(c =>
+            c.constraint_type === 'precedence' && c.target_activity === candidate
+          ).forEach(c => {
+            const srcCount = tempFired[c.source_activity] || 0;
+            const nmin = c.nmin ?? 1;
+            const nmax = c.nmax ?? null;
+            const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+            if (nmin > 0 && srcCount === 0) blocks.push(label);
+            else if (nmax !== null && srcCount > nmax) blocks.push(label);
+          });
+          constraints.filter(c =>
+            (c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession') &&
+            (c.source_activity === candidate || c.target_activity === candidate)
+          ).forEach(c => {
+            const other = c.source_activity === candidate ? c.target_activity : c.source_activity;
+            const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+            if (c.constraint_type === 'not_succession' && c.source_activity !== candidate) {
+              if (tempFired[c.source_activity] > 0) blocks.push(label);
+            }
+            if (c.constraint_type === 'not_coexistence') {
+              if (tempFired[other] > 0) blocks.push(label);
+            }
+          });
+          if (blocks.length > 0) blockedBy[candidate] = blocks;
+        });
+
+        const allowed = new Set(allActNames.filter(c => !blockedBy[c]));
+
+        // Track per-constraint precision: how many times did this constraint
+        // block the OBSERVED next activity (i.e. caused imprecision)?
+        // We count total transitions for each constraint as a denominator
+        // (how many times was it active / relevant at this step)
+        const activeConstraintLabels = new Set();
+        Object.values(blockedBy).forEach(labels => labels.forEach(l => activeConstraintLabels.add(l)));
+        activeConstraintLabels.forEach(label => {
+          if (!precisionDetail[label]) precisionDetail[label] = { blocked_observed: 0, total: 0 };
+          precisionDetail[label].total++;
+          // If the next observed activity was blocked by this constraint → imprecise for it
+          if (blockedBy[nextAct]?.includes(label)) precisionDetail[label].blocked_observed++;
+        });
+        // Also record constraints that blocked the observed next activity
+        // but weren't counted above (because they only blocked nextAct specifically)
+        if (blockedBy[nextAct]) {
+          blockedBy[nextAct].forEach(label => {
+            if (!precisionDetail[label]) precisionDetail[label] = { blocked_observed: 0, total: 0 };
+            if (!activeConstraintLabels.has(label)) {
+              precisionDetail[label].total++;
+              precisionDetail[label].blocked_observed++;
+            }
+          });
+        }
+
+        precisionTotal++;
+        if (allowed.has(nextAct)) precisionAllowed++;
+      }
+    });
+
+    // ── Constraint fitness: check each constraint at end of trace ─────────
+    constraints.forEach(c => {
+      const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+      const srcCount = fired[c.source_activity] || 0;
+      const tgtCount = fired[c.target_activity] || 0;
+      const nmin = c.nmin ?? 1;
+
+      let evaluated = false;
+      let satisfied = false;
+
+      if (c.constraint_type === 'response') {
+        // If source fired, target must eventually follow
+        if (srcCount > 0) {
+          evaluated = true;
+          satisfied = tgtCount >= srcCount;
+        }
+      } else if (c.constraint_type === 'precedence') {
+        // If target fired, source must have preceded it
+        if (tgtCount > 0) {
+          evaluated = true;
+          satisfied = srcCount >= nmin;
+        }
+      } else if (c.constraint_type === 'not_coexistence') {
+        // Both must not appear
+        evaluated = true;
+        satisfied = !(srcCount > 0 && tgtCount > 0);
+      } else if (c.constraint_type === 'not_succession') {
+        // After source, target must never follow
+        if (srcCount > 0) {
+          evaluated = true;
+          // Check if target fired after source's last position
+          const srcLast = lastFired[c.source_activity] ?? -1;
+          const tgtLast = lastFired[c.target_activity] ?? -1;
+          satisfied = tgtLast <= srcLast;
+        }
+      }
+
+      if (evaluated) {
+        constraintTotal++;
+        if (satisfied) constraintSatisfied++;
+        if (!constraintDetail[label]) constraintDetail[label] = { satisfied: 0, total: 0, type: c.constraint_type };
+        constraintDetail[label].total++;
+        if (satisfied) constraintDetail[label].satisfied++;
+      }
+    });
+  });
+
+  return {
+    fitness: fitnessTotal > 0 ? fitnessEnabled / fitnessTotal : null,
+    fitnessEnabled, fitnessTotal,
+    fitnessPerObject,
+    constraintFitness: constraintTotal > 0 ? constraintSatisfied / constraintTotal : null,
+    constraintSatisfied, constraintTotal, constraintDetail,
+    precision: precisionTotal > 0 ? precisionAllowed / precisionTotal : null,
+    precisionAllowed, precisionTotal, precisionDetail,
+  };
+}
+
+function ConformanceSection({ results, activeModel, onConformanceSaved }) {
+  const constraints  = activeModel?.constraints || [];
+  const activities   = activeModel?.activities  || [];
+  const objectTraces = results?.object_traces   || {};
+  const runId        = results?.output_file     || null;
+
+  const conf = React.useMemo(
+    () => computeConformance(objectTraces, constraints, activities),
+    [objectTraces, constraints, activities]
+  );
+
+  // Persist scores back to run history once computed
+  const persistedRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!runId || conf.fitness == null || persistedRef.current === runId) return;
+    persistedRef.current = runId;
+    axios.patch(`/api/run-history/${encodeURIComponent(runId)}/conformance`, {
+      fitness:            conf.fitness,
+      constraint_fitness: conf.constraintFitness,
+      precision:          conf.precision,
+    }).then(() => { onConformanceSaved?.(); }).catch(() => {});
+  }, [runId, conf.fitness, conf.constraintFitness, conf.precision]);
+
+  const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const MetricRow = ({ label, value, explanation }) => (
+    <div className="conf-metric-row">
+      <div className="conf-metric-main">
+        <span className="conf-metric-label">{label}</span>
+        <span className={`conf-metric-value ${value != null ? (value >= 0.8 ? 'conf-good' : value >= 0.5 ? 'conf-mid' : 'conf-bad') : ''}`}>
+          {pct(value)}
+        </span>
+      </div>
+      <p className="conf-metric-explanation">{explanation}</p>
+    </div>
+  );
+
+  return (
+    <Collapsible className="eval-section" title="Conformance" defaultOpen={false}>
+      {Object.keys(objectTraces).length === 0 ? (
+        <p className="empty-notice">No object traces recorded — run simulation with a larger step count.</p>
+      ) : (
+        <>
+          {/* ── Fitness ── */}
+          <Collapsible className="eval-subsection" title="Fitness" defaultOpen={true}>
+            <MetricRow
+              label="Object-Replay Fitness"
+              value={conf.fitness}
+              explanation={`For each object, each event in its trace is checked: was that activity enabled at that point (all precedence constraints already met)? Fitness = enabled events ÷ total events. ${conf.fitnessEnabled} of ${conf.fitnessTotal} events were enabled across ${Object.keys(objectTraces).length} objects.`}
+            />
+
+            {/* Per-object breakdown */}
+            {Object.keys(conf.fitnessPerObject).length > 0 && (
+              <Collapsible className="conf-detail-collapsible" title="Per-object breakdown" defaultOpen={false}>
+                {/* Per-object-type summary */}
+                <PerObjectTypeBreakdown
+                  fitnessPerObject={conf.fitnessPerObject}
+                  objectTypesMap={results?.object_types_map || {}}
+                />
+              </Collapsible>
+            )}
+
+            <MetricRow
+              label="Declarative Constraint Fitness"
+              value={conf.constraintFitness}
+              explanation={`For each (constraint, object) pair where the constraint is relevant: is the constraint satisfied at the end of the object's trace? Counts response constraints (did the target follow the source?), precedence (did the source precede the target?), and not_coexistence/not_succession violations. ${conf.constraintSatisfied} of ${conf.constraintTotal} constraint-trace pairs satisfied.`}
+            />
+
+            {/* Per-constraint fitness breakdown */}
+            {Object.keys(conf.constraintDetail).length > 0 && (
+              <Collapsible className="conf-detail-collapsible" title="Per-constraint breakdown" defaultOpen={false}>
+                <table className="conf-detail-table">
+                  <thead>
+                    <tr>
+                      <th>Constraint</th>
+                      <th className="audit-num">Evaluated</th>
+                      <th className="audit-num">Satisfied</th>
+                      <th className="audit-num">Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(conf.constraintDetail)
+                      .sort((a, b) => (a[1].satisfied / a[1].total) - (b[1].satisfied / b[1].total))
+                      .map(([label, d]) => (
+                        <tr key={label} className={d.satisfied / d.total < 0.5 ? 'audit-row-accumulating' : ''}>
+                          <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{label}</td>
+                          <td className="audit-num">{d.total}</td>
+                          <td className="audit-num">{d.satisfied}</td>
+                          <td className="audit-num">
+                            <span className={d.satisfied/d.total >= 0.8 ? 'conf-good' : d.satisfied/d.total >= 0.5 ? 'conf-mid' : 'conf-bad'}>
+                              {(d.satisfied / d.total * 100).toFixed(0)}%
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </Collapsible>
+            )}
+          </Collapsible>
+
+          {/* ── Precision ── */}
+          <Collapsible className="eval-subsection" title="Precision" defaultOpen={true}>
+            <MetricRow
+              label="Declarative Precision"
+              value={conf.precision}
+              explanation={`At each step in every object trace, the set of activities not blocked by any constraint at that point is computed (the "allowed" set). Precision = transitions where the observed next activity was in the allowed set ÷ total observed transitions. ${conf.precisionAllowed} of ${conf.precisionTotal} transitions were allowed. High precision means the model tightly constrains the process — few alternatives were open at each step.`}
+            />
+
+            {/* Per-constraint precision breakdown */}
+            {Object.keys(conf.precisionDetail).length > 0 && (
+              <Collapsible className="conf-detail-collapsible" title="Per-constraint breakdown" defaultOpen={false}>
+                <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                  For each constraint: how many times was it actively blocking at least one candidate (Total), and how many of those times did it block the activity that actually fired next (Blocked observed). A high blocked-observed rate means this constraint frequently prevented the simulation from taking a step it was about to take.
+                </p>
+                <table className="conf-detail-table">
+                  <thead>
+                    <tr>
+                      <th>Constraint</th>
+                      <th className="audit-num">Active at step</th>
+                      <th className="audit-num">Blocked observed</th>
+                      <th className="audit-num">Block rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(conf.precisionDetail)
+                      .sort((a, b) => (b[1].blocked_observed / Math.max(b[1].total, 1)) - (a[1].blocked_observed / Math.max(a[1].total, 1)))
+                      .map(([label, d]) => {
+                        const rate = d.total > 0 ? d.blocked_observed / d.total : 0;
+                        return (
+                          <tr key={label} className={rate > 0.5 ? 'audit-row-accumulating' : ''}>
+                            <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{label}</td>
+                            <td className="audit-num">{d.total}</td>
+                            <td className="audit-num">{d.blocked_observed}</td>
+                            <td className="audit-num">
+                              <span className={rate <= 0.1 ? 'conf-good' : rate <= 0.4 ? 'conf-mid' : 'conf-bad'}>
+                                {(rate * 100).toFixed(0)}%
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              </Collapsible>
+            )}
+
+            <MetricRow
+              label="Object-Centric Precision"
+              value={null}
+              explanation="Coming soon — will measure how specifically the model constrains object interactions (e.g. whether it over-permits concurrent object combinations that never appeared in the log)."
+            />
+          </Collapsible>
+        </>
+      )}
+    </Collapsible>
+  );
+}
+
+function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved }) {
+  const simMetrics = results?.metrics?.activity_metrics || {};
+  const logDurations = activeModel?.activity_durations || {};
+  const o2oRules = activeModel?.o2o_rules || [];
+  const otNames = (activeModel?.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+
+  // ── Timing discovery on output log ───────────────────────────────────────
+  const [simDiscovered, setSimDiscovered] = React.useState(null);   // discovered metrics for output log
+  const [simDiscovering, setSimDiscovering] = React.useState(false);
+  const [simDiscoverError, setSimDiscoverError] = React.useState(null);
+  const discoveredForFile = React.useRef(null); // track which output_file we already ran for
+
+  React.useEffect(() => {
+    const outputFile = results?.output_file;
+    if (!outputFile || discoveredForFile.current === outputFile) return;
+    discoveredForFile.current = outputFile;
+    setSimDiscovered(null);
+    setSimDiscoverError(null);
+    setSimDiscovering(true);
+    axios.post('/api/discover-timing-output', { outputFile, serviceTimeMode })
+      .then(r => { setSimDiscovered(r.data.metrics || {}); })
+      .catch(e => { setSimDiscoverError(e.response?.data?.error || e.message); })
+      .finally(() => setSimDiscovering(false));
+  }, [results?.output_file, serviceTimeMode]);
+
+  // Compute flow-rank activity order (same as simulation tab evaluation table)
+  const orderedActivities = React.useMemo(() => {
+    const actSeq = results?.activity_sequence
+      ? [...new Set(results.activity_sequence)]
+      : Object.keys(simMetrics);
+    const idxOf = {};
+    actSeq.forEach((n, i) => { idxOf[n] = i; });
+    const trans = {};
+    Object.values(results?.object_traces || {}).forEach(seq => {
+      seq.forEach((name, i) => {
+        if (i < seq.length - 1) {
+          const key = `${name}||${seq[i+1]}`;
+          trans[key] = (trans[key] || 0) + 1;
+        }
+      });
+    });
+    const preds = {};
+    actSeq.forEach(n => { preds[n] = []; });
+    Object.keys(trans).forEach(key => {
+      const [f, t] = key.split('||');
+      if (f === t || idxOf[f] === undefined || idxOf[t] === undefined) return;
+      if (idxOf[f] < idxOf[t]) preds[t]?.push(f);
+    });
+    const flowRank = {};
+    actSeq.forEach(n => {
+      flowRank[n] = preds[n]?.length ? Math.max(...preds[n].map(p => (flowRank[p] ?? 0) + 1)) : 0;
+    });
+    return [...new Set([...Object.keys(simMetrics), ...Object.keys(logDurations)])]
+      .sort((a, b) => {
+        const ra = a in flowRank ? flowRank[a] : 999999;
+        const rb = b in flowRank ? flowRank[b] : 999999;
+        return ra !== rb ? ra - rb : a.localeCompare(b);
+      });
+  }, [results, simMetrics, logDurations]);
+
+  // Time spans
+  const allTs = Object.values(simMetrics).flatMap(m => m.timestamps || []).filter(Boolean).sort();
+  const simSpanS = allTs.length >= 2 ? (new Date(allTs[allTs.length-1]) - new Date(allTs[0])) / 1000 : null;
+  const ocelSpanS = discoveryResults?.ocel_time_span_s ?? null;
+  const fmtDur = s => {
+    if (s == null) return '—';
+    if (s < 3600) return `${Math.round(s / 60)} min`;
+    if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
+    return `${(s / 86400).toFixed(1)} days`;
+  };
+  const ratio = simSpanS != null && ocelSpanS != null && ocelSpanS > 0 ? simSpanS / ocelSpanS : null;
+
+  // O2O from sim output
+  const simO2ORules = React.useMemo(() => {
+    const links = results?.object_links;
+    if (!links || !Array.isArray(links) || links.length === 0) return [];
+    const typesMap = results?.object_types_map || {};
+    const linkCounts = {};
+    links.forEach(item => {
+      const [a, b] = Array.isArray(item) ? item : [item?.source, item?.target];
+      if (!a || !b) return;
+      const ta = typesMap[a], tb = typesMap[b];
+      if (!ta || !tb) return;
+      const key = [ta, tb].sort().join('|||');
+      if (!linkCounts[key]) linkCounts[key] = { source_type: ta, target_type: tb, perSource: {} };
+      linkCounts[key].perSource[a] = (linkCounts[key].perSource[a] || 0) + 1;
+    });
+    return Object.values(linkCounts).map(r => {
+      const counts = Object.values(r.perSource);
+      return { source_type: r.source_type, target_type: r.target_type,
+        min_links: counts.length > 0 ? Math.min(...counts) : 1,
+        max_links: counts.length > 0 ? Math.max(...counts) : 1, bidirectional: true };
+    });
+  }, [results?.object_links, results?.object_types_map]);
+
+  const simOtNames = results?.object_types ? Object.keys(results.object_types) : otNames;
+
+  // Activity distribution data (same as simulation tab)
+  const logCounts = discoveryResults?.activity_counts || {};
+  const logRepeat = discoveryResults?.activity_repeat_stats || {};
+  const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+  const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+
+  const modeLabel = { minimum: 'Minimum sojourn', p25: 'P25 sojourn', p50: 'P50 (median) sojourn' };
+
+  return (
+    <div className="evaluation-tab">
+      <div className="section-header" style={{marginBottom:'1rem', background:'white'}}>
+        <h2>Evaluation</h2>
+        <p>Comparison of input event log vs simulation output</p>
+      </div>
+
+      {/* ── Simulation Result ── */}
+      {Object.keys(simMetrics).length > 0 && (
+        <Collapsible className="eval-section" title="Simulation Result" defaultOpen={true}>
+          <p className="sim-compare-hint">
+            Proportional share of total events (simulation vs log). Difference column shows sim − log in percentage points.
+          </p>
+          <table className="metrics-table sim-compare-table">
+            <thead>
+              <tr>
+                <th>Activity</th>
+                <th title="Times fired in simulation">Sim count</th>
+                <th title="Times fired in input log">Log count</th>
+                <th title="Share of simulated events">Sim %</th>
+                <th title="Share of log events">Log %</th>
+                <th title="Sim % − Log %">Diff</th>
+                <th title="Mean firings per object in log">Log /obj</th>
+                <th title="Mean firings per object in simulation">Sim /obj</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orderedActivities.map(act => {
+                const simCount = simMetrics[act]?.execution_count ?? 0;
+                const logCount = logCounts[act] ?? 0;
+                const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                const diff = simPct - logPct;
+                const logMeanObj = logRepeat[act]?.mean ?? null;
+                const simObjEvts = simActivityObjectCounts?.[act] ?? null;
+                const simMeanObj = simObjEvts > 0 ? (simCount / simObjEvts).toFixed(2) : null;
+                const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
+                return (
+                  <tr key={act}>
+                    <td className="metrics-act-name">{act}</td>
+                    <td>{simCount || '—'}</td>
+                    <td>{logCount || '—'}</td>
+                    <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                    <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                    <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
+                    <td>{logMeanObj ?? '—'}</td>
+                    <td>{simMeanObj ?? '—'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Collapsible>
+      )}
+
+      {/* ── Time Comparison ── */}
+      <Collapsible className="eval-section" title="Time Comparison" defaultOpen={true}>
+        {/* Time span */}
+        <div className="eval-timespan-row">
+          <div className="eval-timespan-card">
+            <span className="eval-timespan-label">Input OCEL time span</span>
+            <span className="eval-timespan-val">{fmtDur(ocelSpanS)}</span>
+          </div>
+          <div className="eval-timespan-arrow">→</div>
+          <div className="eval-timespan-card">
+            <span className="eval-timespan-label">Simulation time span</span>
+            <span className="eval-timespan-val">{fmtDur(simSpanS)}</span>
+          </div>
+          {ratio != null && (
+            <div className={`eval-timespan-ratio ${ratio > 1.5 || ratio < 0.5 ? 'eval-ratio-warn' : 'eval-ratio-ok'}`}>
+              {ratio.toFixed(2)}× input
+            </div>
+          )}
+        </div>
+
+        {/* Service time chart */}
+        <Collapsible className="eval-subsection" title="Service Time per Activity" defaultOpen={true}>
+          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+            Both sides use the <strong>{modeLabel[serviceTimeMode] || serviceTimeMode}</strong> discovery method.
+            Left: input OCEL log (from Parameter tab discovery). Right: simulated output log (discovered now).
+            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+            {simDiscoverError && <span style={{marginLeft:'0.5rem',color:'#b91c1c'}}>⚠ {simDiscoverError}</span>}
+          </p>
+          <ActivityBarChart
+            logDurations={logDurations}
+            simDurations={simDiscovered || {}}
+            metric="service"
+            title="Service Time"
+            orderedActivities={orderedActivities}
+          />
+        </Collapsible>
+
+        {/* Waiting time chart */}
+        <Collapsible className="eval-subsection" title="Waiting Time per Activity" defaultOpen={false}>
+          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+            Waiting time = sojourn − service, using the same discovery method as service time.
+            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+          </p>
+          <ActivityBarChart
+            logDurations={logDurations}
+            simDurations={simDiscovered || {}}
+            metric="waiting"
+            title="Waiting Time"
+            orderedActivities={orderedActivities}
+          />
+        </Collapsible>
+      </Collapsible>
+
+      {/* ── O2O Comparison ── */}
+      <Collapsible className="eval-section" title="O2O Rules Comparison" defaultOpen={false}>
+        <div className="eval-o2o-row">
+          <div className="eval-o2o-side">
+            <div className="eval-o2o-side-label">Input Model</div>
+            {o2oRules.length > 0
+              ? <O2ODiagram rules={o2oRules} otNames={otNames} />
+              : <p className="empty-notice">No O2O rules in model.</p>}
+          </div>
+          <div className="eval-o2o-side">
+            <div className="eval-o2o-side-label">Simulation Output</div>
+            {simO2ORules.length > 0
+              ? <O2ODiagram rules={simO2ORules} otNames={simOtNames} />
+              : <p className="empty-notice">No object links recorded in simulation.</p>}
+          </div>
+        </div>
+      </Collapsible>
+
+      {/* ── Conformance ── */}
+      <ConformanceSection results={results} activeModel={activeModel} onConformanceSaved={onConformanceSaved} />
+    </div>
+  );
+}
+
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -3678,6 +4480,14 @@ function App() {
                     >
                       {isSimulating ? 'Simulating...' : 'Run Simulation'}
                     </button>
+                    {results && !isSimulating && (
+                      <button
+                        className="run-evaluation-btn"
+                        onClick={() => setExternalTab('evaluation')}
+                      >
+                        ▶ Run Evaluation
+                      </button>
+                    )}
                     {hasModelWarnings && (
                       <div className="model-warnings-notice">
                         ⚠ Simulation blocked — {bindingWarnings.length} activit{bindingWarnings.length === 1 ? 'y has' : 'ies have'} no object bindings:{' '}
@@ -4138,44 +4948,6 @@ function App() {
                               badge={Object.keys(results.metrics.activity_metrics).length}
                               defaultOpen={false}
                             >
-                              {/* ── Time span comparison: input OCEL vs output sim ── */}
-                              {(() => {
-                                const allTs = Object.values(results.metrics.activity_metrics)
-                                  .flatMap(m => m.timestamps || [])
-                                  .filter(Boolean).sort();
-                                const simSpanS = allTs.length >= 2
-                                  ? (new Date(allTs[allTs.length-1]) - new Date(allTs[0])) / 1000
-                                  : null;
-                                const ocelSpanS = discoveryResults?.ocel_time_span_s ?? null;
-                                const fmtDur = s => {
-                                  if (s == null) return '—';
-                                  if (s < 3600) return `${Math.round(s / 60)} min`;
-                                  if (s < 86400) return `${(s / 3600).toFixed(1)} h`;
-                                  return `${(s / 86400).toFixed(1)} days`;
-                                };
-                                if (simSpanS == null && ocelSpanS == null) return null;
-                                const ratio = (simSpanS != null && ocelSpanS != null && ocelSpanS > 0)
-                                  ? (simSpanS / ocelSpanS) : null;
-                                return (
-                                  <div className="timing-span-comparison">
-                                    <span className="timing-span-label">Time span</span>
-                                    <span className="timing-span-item">
-                                      <span className="timing-span-tag">Input OCEL</span>
-                                      <strong>{fmtDur(ocelSpanS)}</strong>
-                                    </span>
-                                    <span className="timing-span-sep">→</span>
-                                    <span className="timing-span-item">
-                                      <span className="timing-span-tag">Simulation</span>
-                                      <strong>{fmtDur(simSpanS)}</strong>
-                                    </span>
-                                    {ratio != null && (
-                                      <span className={`timing-span-ratio ${ratio > 1.5 || ratio < 0.5 ? 'timing-span-ratio-warn' : 'timing-span-ratio-ok'}`}>
-                                        {ratio.toFixed(2)}× input
-                                      </span>
-                                    )}
-                                  </div>
-                                );
-                              })()}
                               {/* ── Concurrency indicator ── */}
                               {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
                                 <div className="concurrency-summary">
@@ -4436,12 +5208,23 @@ function App() {
             {/* ── EVALUATION TAB ── */}
             {externalTab === 'evaluation' && (
               <div className="ext-ocel-tab-content">
-                <div className="discovery-section">
-                  <div className="section-header">
-                    <h2>Evaluation</h2>
-                    <p>Run a simulation first to see evaluation results here.</p>
+                {!results ? (
+                  <div className="discovery-section">
+                    <div className="section-header">
+                      <h2>Evaluation</h2>
+                      <p>Run a simulation first to see evaluation results here.</p>
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  <EvaluationTab
+                    results={results}
+                    discoveryResults={discoveryResults}
+                    activeModel={activeModel}
+                    serviceTimeMode={serviceTimeMode}
+                    simActivityObjectCounts={simActivityObjectCounts}
+                    onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {})}
+                  />
+                )}
               </div>
             )}{/* end evaluation tab */}
           </div>
@@ -6137,85 +6920,133 @@ function App() {
           >
             <p className="run-history-hint">
               All simulation runs from this project, persisted across sessions.
+              Conformance scores appear after visiting the Evaluation tab for that run.
               Click a row to expand timing metrics; use ↩ Restore to reload its settings.
             </p>
-            <table className="run-history-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Event log</th>
-                  <th>Model</th>
-                  <th>Steps</th>
-                  <th>Events</th>
-                  <th>Objects</th>
-                  <th>Seed</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {runHistory.map(run => (
-                  <React.Fragment key={run.id}>
-                    <tr
-                      className={`run-history-row${expandedRunId === run.id ? ' expanded' : ''}`}
-                      onClick={() => loadRunMetrics(run.id)}
-                      title="Click to view timing metrics"
-                    >
-                      <td className="rh-ts">{new Date(run.timestamp).toLocaleString()}</td>
-                      <td className="rh-file">{run.event_log_file}</td>
-                      <td className="rh-file">{run.ocdeclare_file}</td>
-                      <td>{run.steps_executed}</td>
-                      <td>{run.events_count}</td>
-                      <td>{run.objects_count}</td>
-                      <td>{run.seed}</td>
-                      <td className="rh-actions" onClick={e => e.stopPropagation()}>
-                        <button className="rh-btn" onClick={() => reRunFromHistory(run)} title="Restore these settings into the editor">↩ Restore</button>
-                        {run.output_file && (
-                          <button className="rh-btn" onClick={() => window.open(`/api/download/${run.output_file}`, '_blank')} title="Download event log">⬇ Log</button>
-                        )}
-                        {run.metrics_file && (
-                          <button className="rh-btn" onClick={() => window.open(`/api/download-metrics/${run.metrics_file}`, '_blank')} title="Download metrics">⬇ Metrics</button>
-                        )}
-                      </td>
+            {(() => {
+              const withConf    = runHistory.filter(r => r.conformance?.fitness != null);
+              const withoutConf = runHistory.filter(r => r.conformance?.fitness == null);
+              const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+              const confClass = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
+
+              const RunTable = ({ runs, showConf }) => (
+                <table className="run-history-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Event log</th>
+                      <th>Model</th>
+                      <th>Steps</th>
+                      <th>Events</th>
+                      <th>Objects</th>
+                      <th>Seed</th>
+                      {showConf && <th className="audit-num rh-conf-col" title="Object-Replay Fitness">Fitness</th>}
+                      {showConf && <th className="audit-num rh-conf-col" title="Declarative Constraint Fitness">Con. Fitness</th>}
+                      {showConf && <th className="audit-num rh-conf-col" title="Declarative Precision">Precision</th>}
+                      <th></th>
                     </tr>
-                    {expandedRunId === run.id && runMetrics[run.id] && (
-                      <tr className="run-history-metrics-row">
-                        <td colSpan={8}>
-                          <div className="rh-metrics-expand">
-                            <strong>Activity timing</strong>
-                            <table className="metrics-table rh-metrics-table">
-                              <thead>
-                                <tr>
-                                  <th>Activity</th>
-                                  <th>Count</th>
-                                  <th>Mean service</th>
-                                  <th>Min service</th>
-                                  <th>Max service</th>
-                                  <th>Mean sojourn</th>
-                                  <th>Mean wait in pool</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {Object.entries(runMetrics[run.id].activity_metrics || {}).map(([act, m]) => (
-                                  <tr key={act}>
-                                    <td className="metrics-act-name">{act}</td>
-                                    <td>{m.execution_count}</td>
-                                    <td>{fmtSeconds(m.mean_service_s)}</td>
-                                    <td>{fmtSeconds(m.min_service_s)}</td>
-                                    <td>{fmtSeconds(m.max_service_s)}</td>
-                                    <td>{fmtSeconds(m.mean_sojourn_s)}</td>
-                                    <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
-                ))}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody>
+                    {runs.map(run => (
+                      <React.Fragment key={run.id}>
+                        <tr
+                          className={`run-history-row${expandedRunId === run.id ? ' expanded' : ''}`}
+                          onClick={() => loadRunMetrics(run.id)}
+                          title="Click to view timing metrics"
+                        >
+                          <td className="rh-ts">{new Date(run.timestamp).toLocaleString()}</td>
+                          <td className="rh-file">{run.event_log_file}</td>
+                          <td className="rh-file">{run.ocdeclare_file}</td>
+                          <td>{run.steps_executed}</td>
+                          <td>{run.events_count}</td>
+                          <td>{run.objects_count}</td>
+                          <td>{run.seed}</td>
+                          {showConf && (
+                            <td className="audit-num rh-conf-col">
+                              <span className={confClass(run.conformance?.fitness)}>{pct(run.conformance?.fitness)}</span>
+                            </td>
+                          )}
+                          {showConf && (
+                            <td className="audit-num rh-conf-col">
+                              <span className={confClass(run.conformance?.constraint_fitness)}>{pct(run.conformance?.constraint_fitness)}</span>
+                            </td>
+                          )}
+                          {showConf && (
+                            <td className="audit-num rh-conf-col">
+                              <span className={confClass(run.conformance?.precision)}>{pct(run.conformance?.precision)}</span>
+                            </td>
+                          )}
+                          <td className="rh-actions" onClick={e => e.stopPropagation()}>
+                            <button className="rh-btn" onClick={() => reRunFromHistory(run)} title="Restore these settings into the editor">↩ Restore</button>
+                            {run.output_file && (
+                              <button className="rh-btn" onClick={() => window.open(`/api/download/${run.output_file}`, '_blank')} title="Download event log">⬇ Log</button>
+                            )}
+                            {run.metrics_file && (
+                              <button className="rh-btn" onClick={() => window.open(`/api/download-metrics/${run.metrics_file}`, '_blank')} title="Download metrics">⬇ Metrics</button>
+                            )}
+                          </td>
+                        </tr>
+                        {expandedRunId === run.id && runMetrics[run.id] && (
+                          <tr className="run-history-metrics-row">
+                            <td colSpan={showConf ? 11 : 8}>
+                              <div className="rh-metrics-expand">
+                                <strong>Activity timing</strong>
+                                <table className="metrics-table rh-metrics-table">
+                                  <thead>
+                                    <tr>
+                                      <th>Activity</th>
+                                      <th>Count</th>
+                                      <th>Mean service</th>
+                                      <th>Min service</th>
+                                      <th>Max service</th>
+                                      <th>Mean sojourn</th>
+                                      <th>Mean wait in pool</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {Object.entries(runMetrics[run.id].activity_metrics || {}).map(([act, m]) => (
+                                      <tr key={act}>
+                                        <td className="metrics-act-name">{act}</td>
+                                        <td>{m.execution_count}</td>
+                                        <td>{fmtSeconds(m.mean_service_s)}</td>
+                                        <td>{fmtSeconds(m.min_service_s)}</td>
+                                        <td>{fmtSeconds(m.max_service_s)}</td>
+                                        <td>{fmtSeconds(m.mean_sojourn_s)}</td>
+                                        <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              );
+
+              return (
+                <>
+                  {withConf.length > 0 && <RunTable runs={withConf} showConf={true} />}
+                  {withConf.length === 0 && withoutConf.length > 0 && (
+                    <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic',marginBottom:'0.5rem'}}>
+                      No conformance scores yet — open a run in the Evaluation tab to compute them.
+                    </p>
+                  )}
+                  {withoutConf.length > 0 && (
+                    <Collapsible
+                      className="rh-legacy-collapsible"
+                      title={`Runs without conformance scores (${withoutConf.length})`}
+                      defaultOpen={withConf.length === 0}
+                    >
+                      <RunTable runs={withoutConf} showConf={false} />
+                    </Collapsible>
+                  )}
+                </>
+              );
+            })()}
           </Collapsible>
         </div>
       )}

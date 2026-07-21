@@ -1069,6 +1069,26 @@ def get_run_history():
     return jsonify({'runs': list(reversed(history))})
 
 
+@app.route('/api/run-history/<run_id>/conformance', methods=['PATCH'])
+def patch_run_conformance(run_id):
+    """Persist conformance scores (fitness, precision) into the run history entry."""
+    try:
+        data = request.json or {}
+        history = _load_history()
+        for entry in history:
+            if entry['id'] == run_id:
+                entry['conformance'] = {
+                    'fitness':             data.get('fitness'),
+                    'constraint_fitness':  data.get('constraint_fitness'),
+                    'precision':           data.get('precision'),
+                }
+                _save_history(history)
+                return jsonify({'success': True})
+        return jsonify({'error': 'Run not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/run-history/<run_id>/metrics', methods=['GET'])
 def get_run_metrics(run_id):
     """Load the metrics JSON for a specific run."""
@@ -1327,6 +1347,42 @@ def discover_timing():
             'activity_count': len(metrics),
             'empty': len(metrics) == 0,
             'concurrency_probs': {k: v for k, v in concurrency.items() if '|||' in k and k.split('|||')[0] <= k.split('|||')[1]},
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/discover-timing-output', methods=['POST'])
+def discover_timing_output():
+    """Run timing discovery on a simulation output OCEL log.
+
+    Identical to /api/discover-timing but reads from OUTPUT_DIR instead of
+    EVENTLOG_DIR so the same discovery algorithm can be applied to simulated logs.
+
+    Body JSON:
+      outputFile        – filename in OUTPUT_DIR (e.g. 'log_20260721_123456.json')
+      serviceTimeMode   – 'minimum' | 'p25' | 'p50'  (default: 'minimum')
+    """
+    try:
+        data = request.json or {}
+        output_file = data.get('outputFile')
+        service_time_mode = data.get('serviceTimeMode', 'minimum')
+        if not output_file:
+            return jsonify({'error': 'Missing outputFile parameter'}), 400
+
+        log_path = OUTPUT_DIR / output_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log file not found: {output_file}'}), 404
+
+        event_log = load_ocel2(str(log_path))
+        metrics = compute_ocpa_metrics(event_log, [], service_time_mode=service_time_mode)
+
+        return jsonify({
+            'success': True,
+            'metrics': metrics,
+            'activity_count': len(metrics),
         })
 
     except Exception as e:
