@@ -949,64 +949,99 @@ export default function ModelEditor({
                     }
                   };
 
+                  // Direction relative to focal actName:
+                  // "before" = actName is target (other → actName)
+                  // "after"  = actName is source (actName → other)
+                  // "mutual" = symmetric
+                  const classifyDirection = (c) => {
+                    const mutual = ['not_coexistence', 'exclusive_choice', 'responded_existence',
+                                    'chain_succession', 'alternate_succession', 'succession'].includes(c.constraint_type);
+                    if (mutual) return 'mutual';
+                    if (c.target_activity === actName) return 'before';
+                    if (c.source_activity === actName) return 'after';
+                    return 'mutual';
+                  };
+
+                  const renderActivityLink = (name) => {
+                    const allActNames = activities.map(a => a.name);
+                    if (allActNames.includes(name)) {
+                      return (
+                        <button className="act-hint-link" onClick={e => {
+                          e.stopPropagation();
+                          setExpandedActs(prev => { const n = new Set(prev); n.add(name); return n; });
+                          setTimeout(() => {
+                            document.getElementById(`activity-row-${name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                          }, 50);
+                        }}>{name}</button>
+                      );
+                    }
+                    return <span>{name}</span>;
+                  };
+
+                  // Cardinality label: shows nmin/nmax and scope object type with count
+                  const cardLabel = (c) => {
+                    const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
+                    const scope = c.scope?.object_type;
+                    if (!scope) return '';
+                    const count = nmax != null
+                      ? `${nmin}–${nmax}`
+                      : nmin > 1 ? `${nmin}+` : '1';
+                    const plural = (nmax != null && nmax > 1) || nmin > 1 ? 'objects' : 'object';
+                    return `per ${count} ${scope} ${plural}`;
+                  };
+
+                  const ConstraintBadge = ({ c }) => (
+                    <div className="con-hint-badge-wrap">
+                      <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.6rem'}}>
+                        {c.constraint_type.replace(/_/g,' ')}
+                      </span>
+                      {cardLabel(c) && <span className="con-hint-card">{cardLabel(c)}</span>}
+                    </div>
+                  );
+
                   return (
                     <div className="act-con-summary">
                       {involved.length === 0 && (
                         <p className="act-con-summary-empty">No constraints involve this activity.</p>
                       )}
-                      <ul>
-                        {involved.map((c, i) => {
-                          const text = describe(c);
-                          // Highlight the focal activity in bold and make other activity names clickable
-                          const renderText = (t) => {
-                            const parts = [];
-                            let remaining = t;
-                            const allActNames = activities.map(a => a.name);
-                            // Replace quoted activity names with styled spans
-                            const re = /"([^"]+)"/g;
-                            let lastIndex = 0;
-                            let m;
-                            while ((m = re.exec(t)) !== null) {
-                              if (m.index > lastIndex) parts.push(t.slice(lastIndex, m.index));
-                              const name = m[1];
-                              const isFocal = name === actName;
-                              const isAct = allActNames.includes(name);
-                              if (isFocal) {
-                                parts.push(<strong key={m.index} className="act-hint-focal">"{name}"</strong>);
-                              } else if (isAct) {
-                                parts.push(
-                                  <button
-                                    key={m.index}
-                                    className="act-hint-link"
-                                    onClick={e => {
-                                      e.stopPropagation();
-                                      setExpandedActs(prev => { const n = new Set(prev); n.add(name); return n; });
-                                      setTimeout(() => {
-                                        document.getElementById(`activity-row-${name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                      }, 50);
-                                    }}
-                                  >
-                                    "{name}"
-                                  </button>
-                                );
-                              } else {
-                                parts.push(`"${name}"`);
-                              }
-                              lastIndex = m.index + m[0].length;
-                            }
-                            if (lastIndex < t.length) parts.push(t.slice(lastIndex));
-                            return parts;
-                          };
-                          return (
-                            <li key={i}>
-                              <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.68rem',marginRight:'0.4rem'}}>
-                                {c.constraint_type.replace(/_/g,' ')}
-                              </span>
-                              {renderText(text)}
-                            </li>
-                          );
-                        })}
-                      </ul>
+                      {involved.length > 0 && (
+                        <table className="con-hint-table">
+                          <thead>
+                            <tr>
+                              <th className="con-hint-left">Before</th>
+                              <th className="con-hint-focal-col"><strong className="act-hint-focal">{actName}</strong></th>
+                              <th className="con-hint-right">After</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {involved.map((c, i) => {
+                              const dir = classifyDirection(c);
+                              const other = c.source_activity === actName ? c.target_activity : c.source_activity;
+                              return (
+                                <tr key={i}>
+                                  <td className="con-hint-left">
+                                    {(dir === 'before' || dir === 'mutual') && (
+                                      <div className="con-hint-side-wrap con-hint-side-left">
+                                        {renderActivityLink(other)}
+                                        <ConstraintBadge c={c} />
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="con-hint-focal-col" />
+                                  <td className="con-hint-right">
+                                    {(dir === 'after' || dir === 'mutual') && (
+                                      <div className="con-hint-side-wrap con-hint-side-right">
+                                        <ConstraintBadge c={c} />
+                                        {renderActivityLink(other)}
+                                      </div>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      )}
                     </div>
                   );
                 })()}

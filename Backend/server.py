@@ -1145,6 +1145,37 @@ def get_run_events(run_id):
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/eventlog-events', methods=['GET'])
+def get_eventlog_events():
+    """Return a lightweight event list from an input OCEL log for conformance checking."""
+    try:
+        filename = request.args.get('file')
+        if not filename:
+            return jsonify({'error': 'Missing file parameter'}), 400
+        log_path = EVENTLOG_DIR / filename
+        if not log_path.exists():
+            return jsonify({'error': f'Event log not found: {filename}'}), 404
+        with open(log_path, 'r', encoding='utf-8') as f:
+            ocel = json.load(f)
+        objects_raw = ocel.get('objects', [])
+        if isinstance(objects_raw, dict):
+            objects_raw = list(objects_raw.values())
+        obj_type_map = {obj.get('id', ''): obj.get('type', '') for obj in objects_raw}
+        events_raw = ocel.get('events', [])
+        if isinstance(events_raw, dict):
+            events_raw = list(events_raw.values())
+        result = []
+        for ev in events_raw:
+            rels = ev.get('relationships', []) or []
+            oids = [r['objectId'] for r in rels if r.get('objectId')]
+            result.append({'id': ev.get('id', ''), 'activity': ev.get('type', ''),
+                           'timestamp': ev.get('time', ''), 'object_ids': oids})
+        result.sort(key=lambda e: e['timestamp'])
+        return jsonify({'events': result, 'count': len(result), 'object_types_map': obj_type_map})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
 
 def get_iteration_log(run_id):
     """Return the full iteration log for a specific run."""

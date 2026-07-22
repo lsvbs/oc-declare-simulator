@@ -340,6 +340,7 @@
 }
 .auto-badge-cycle    { background: #fee2e2; color: #991b1b; }
 .auto-badge-blocked  { background: #fef3c7; color: #92400e; }
+.auto-badge-zero_conf { background: #fce7f3; color: #9d174d; }
 .auto-badge-weak     { background: #dbeafe; color: #1e40af; }
 .auto-badge-chain    { background: #fce7f3; color: #9d174d; }
 .auto-badge-o2o      { background: #d1fae5; color: #065f46; }
@@ -3495,4 +3496,21 @@
 }
 .run-history-table td.rh-conf-col {
   background: #1e3a5f;
+}
+
+/* ── OC-Declare model check progress bar ────────────────────────────────── */
+.ocd-progress-bar {
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.ocd-progress-fill {
+  height: 100%;
+  background: #6366f1;
+  border-radius: 3px;
+  transition: width 0.1s ease;
+}
+.disc-option-disabled {
+  opacity: 0.5;
 }

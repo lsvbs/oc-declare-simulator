@@ -1209,3 +1209,96 @@
   outline: none;
   border-color: #6366f1;
 }
+
+/* ── Constraint hint table ───────────────────────────────────────────────── */
+.con-hint-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  margin-top: 0.25rem;
+  table-layout: fixed;
+}
+.con-hint-table thead th {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.25rem 0.4rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+.con-hint-table tbody tr {
+  border-bottom: 1px solid #f1f5f9;
+}
+.con-hint-table tbody tr:last-child { border-bottom: none; }
+
+/* Before (left) — right-aligned */
+.con-hint-left {
+  text-align: right;
+  padding: 0.3rem 0.2rem;
+  color: #1e293b;
+  width: 44%;
+  vertical-align: middle;
+}
+/* Arrow columns — narrow, centred */
+.con-hint-arrow-col {
+  text-align: center;
+  width: 6%;
+  padding: 0.2rem 0.05rem;
+  vertical-align: middle;
+}
+/* Focal activity — centre, highlighted */
+.con-hint-focal-col {
+  text-align: center;
+  width: 12%;
+  padding: 0.3rem 0.2rem;
+  vertical-align: middle;
+}
+/* After (right) — left-aligned */
+.con-hint-right {
+  text-align: left;
+  padding: 0.3rem 0.2rem;
+  color: #1e293b;
+  width: 44%;
+  vertical-align: middle;
+}
+
+.con-hint-badge-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+}
+.con-hint-arrow-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+}
+.con-hint-arrow-sym {
+  font-size: 0.85rem;
+  color: #94a3b8;
+  line-height: 1;
+}
+.con-hint-card {
+  display: block;
+  font-size: 0.62rem;
+  color: #6366f1;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+}
+.con-hint-focal-col strong {
+  color: #6366f1;
+  font-weight: 700;
+  font-size: 0.78rem;
+}
+
+.con-hint-side-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.con-hint-side-left  { justify-content: flex-end; }
+.con-hint-side-right { justify-content: flex-start; }

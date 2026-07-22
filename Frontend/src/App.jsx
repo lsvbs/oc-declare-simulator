@@ -2010,6 +2010,227 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
   );
 }
 
+// ── LogModelConformance ───────────────────────────────────────────────────────
+function LogModelConformance({ eventLogFile, activeModel, onResults }) {
+  const [events,    setEvents]    = React.useState(null);
+  const [typesMap,  setTypesMap]  = React.useState({});
+  const [loading,   setLoading]   = React.useState(false);
+  const [error,     setError]     = React.useState(null);
+  const [checked,   setChecked]   = React.useState(false);
+  const [progress,  setProgress]  = React.useState({ done: 0, total: 0 }); // constraint progress
+  const [conf,      setConf]      = React.useState(null);
+  const loadedFor = React.useRef(null);
+  const computing = React.useRef(false);
+
+  const constraints = activeModel?.constraints || [];
+  const hasModel = activeModel && !Array.isArray(activeModel) && constraints.length > 0;
+
+  const run = async () => {
+    if (!eventLogFile || !hasModel) return;
+    setChecked(true);
+    setConf(null);
+    setProgress({ done: 0, total: 0 });
+    computing.current = true;
+
+    let evts = events;
+    let tmap = typesMap;
+    if (loadedFor.current !== eventLogFile || !evts) {
+      setLoading(true);
+      setError(null);
+      try {
+        const r = await axios.get(`/api/eventlog-events?file=${encodeURIComponent(eventLogFile)}`);
+        evts = r.data.events || [];
+        tmap = r.data.object_types_map || {};
+        setEvents(evts);
+        setTypesMap(tmap);
+        loadedFor.current = eventLogFile;
+      } catch(e) {
+        setError(e.response?.data?.error || e.message);
+        setLoading(false);
+        computing.current = false;
+        return;
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    // Run constraint-by-constraint with progress updates using setTimeout
+    // to yield to the browser between each constraint
+    const n = evts.length;
+    const total = constraints.length;
+    setProgress({ done: 0, total });
+
+    // Build the satisfies function inline (same logic as computeOCDeclareConformance)
+    const eventObjs = evts.map(e => new Set(e.object_ids || []));
+    const temporalFilter = (srcIdx, ctype) => {
+      const srcTs = evts[srcIdx].timestamp;
+      if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
+      if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
+      const result = [];
+      for (let j = 0; j < n; j++) {
+        if (j === srcIdx) continue;
+        const ts = evts[j].timestamp;
+        if (['response','chain_response','succession','alternate_response'].includes(ctype)) {
+          if (ts >= srcTs) result.push(j);
+        } else if (['precedence','chain_precedence','alternate_precedence'].includes(ctype)) {
+          if (ts <= srcTs) result.push(j);
+        } else {
+          result.push(j);
+        }
+      }
+      return result;
+    };
+    const satisfies = (i, c) => {
+      if (evts[i].activity !== c.source_activity) return true;
+      const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
+      const tgt = c.target_activity;
+      const scope = c.scope || { kind: 'global' };
+      const temporal = temporalFilter(i, c.constraint_type);
+      const tgtCandidates = temporal.filter(j => evts[j].activity === tgt);
+      if (scope.kind === 'global') {
+        const cnt = tgtCandidates.length;
+        if (['not_coexistence','not_succession'].includes(c.constraint_type)) return cnt === 0;
+        return cnt >= nmin && (nmax == null || cnt <= nmax);
+      }
+      const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
+      if (scopeObjs.length === 0) return true;
+      for (const oid of scopeObjs) {
+        const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
+        const cnt = matching.length;
+        if (['not_coexistence','not_succession'].includes(c.constraint_type)) {
+          if (cnt > 0) return false;
+        } else {
+          if (cnt < nmin) return false;
+          if (nmax != null && cnt > nmax) return false;
+        }
+      }
+      return true;
+    };
+
+    // Evaluate constraints one by one, yielding between each
+    const results = [];
+    let globalSatisfied = new Array(n).fill(true);
+
+    const evalNext = (idx) => {
+      if (!computing.current || idx >= total) {
+        // Done — compute global
+        const globalCount = globalSatisfied.filter(Boolean).length;
+        const result = {
+          constraintResults: results,
+          globalConformance: n > 0 ? globalCount / n : null,
+          globalSatisfied: globalCount,
+          totalEvents: n,
+        };
+        setConf(result);
+        setProgress({ done: total, total });
+        onResults?.(result);
+        computing.current = false;
+        return;
+      }
+      const c = constraints[idx];
+      const srcIndices = evts.reduce((acc, e, i) => { if (e.activity === c.source_activity) acc.push(i); return acc; }, []);
+      let satisfied = 0;
+      for (const i of srcIndices) {
+        if (satisfies(i, c)) satisfied++;
+        else globalSatisfied[i] = false;
+      }
+      const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+      if (srcIndices.length > 0) {
+        results.push({ label, confidence: satisfied / srcIndices.length, satisfied, total: srcIndices.length });
+      }
+      setProgress({ done: idx + 1, total });
+      setTimeout(() => evalNext(idx + 1), 0);
+    };
+
+    evalNext(0);
+  };
+
+  React.useEffect(() => () => { computing.current = false; }, []);
+
+  const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const cls = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
+  const progressPct = progress.total > 0 ? Math.round(progress.done / progress.total * 100) : 0;
+  const isComputing = checked && progress.done < progress.total && progress.total > 0;
+
+  return (
+    <Collapsible className="log-model-conf-collapsible" title="OC-Declare Model Check" defaultOpen={false}>
+      <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
+        Checks whether every event in the input OCEL satisfies the constraints of the loaded OC-Declare model
+        (Definition 9 confidence). A low confidence on a constraint means the log regularly violates it.
+      </p>
+      {!hasModel && (
+        <p style={{fontSize:'0.78rem',color:'#b45309'}}>⚠ No OC-Declare model loaded or no constraints defined.</p>
+      )}
+      {hasModel && !checked && (
+        <button className="discovery-button" style={{fontSize:'0.82rem',padding:'0.4rem 1rem'}} onClick={run}>
+          Check model against log
+        </button>
+      )}
+      {loading && (
+        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#6366f1'}}>
+          <div className="spinner spinner-sm"></div> Loading events…
+        </div>
+      )}
+      {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
+
+      {/* Progress bar while computing */}
+      {isComputing && (
+        <div style={{marginBottom:'0.75rem'}}>
+          <div style={{display:'flex',justifyContent:'space-between',fontSize:'0.75rem',color:'#64748b',marginBottom:'0.25rem'}}>
+            <span>Checking constraints…</span>
+            <span>{progress.done} / {progress.total} ({progressPct}%)</span>
+          </div>
+          <div className="ocd-progress-bar">
+            <div className="ocd-progress-fill" style={{width:`${progressPct}%`}} />
+          </div>
+        </div>
+      )}
+
+      {conf && !isComputing && (
+        <>
+          <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'0.75rem',flexWrap:'wrap'}}>
+            <div>
+              <span style={{fontSize:'0.72rem',color:'#94a3b8',fontWeight:600,textTransform:'uppercase'}}>Global conformance</span>
+              <div style={{fontSize:'1.4rem',fontWeight:700}} className={cls(conf.globalConformance)}>
+                {pct(conf.globalConformance)}
+              </div>
+              <span style={{fontSize:'0.72rem',color:'#64748b'}}>
+                {conf.globalSatisfied} of {conf.totalEvents} events satisfy all constraints
+              </span>
+            </div>
+            <button className="discovery-button" style={{fontSize:'0.75rem',padding:'0.3rem 0.7rem',marginLeft:'auto'}}
+              onClick={() => { setChecked(false); setConf(null); setProgress({done:0,total:0}); setEvents(null); loadedFor.current = null; computing.current = false; onResults?.(null); }}>
+              ↺ Re-check
+            </button>
+          </div>
+          {conf.constraintResults.length > 0 && (
+            <table className="conf-detail-table">
+              <thead>
+                <tr>
+                  <th>Constraint</th>
+                  <th className="audit-num">Source events</th>
+                  <th className="audit-num">Satisfied</th>
+                  <th className="audit-num">Confidence</th>
+                </tr>
+              </thead>
+              <tbody>
+                {conf.constraintResults.slice().sort((a, b) => a.confidence - b.confidence).map(r => (
+                  <tr key={r.label} className={r.confidence < 0.5 ? 'audit-row-accumulating' : ''}>
+                    <td style={{fontFamily:'monospace',fontSize:'0.75rem'}}>{r.label}</td>
+                    <td className="audit-num">{r.total}</td>
+                    <td className="audit-num">{r.satisfied}</td>
+                    <td className="audit-num"><span className={cls(r.confidence)}>{pct(r.confidence)}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </Collapsible>
+  );
+}
+
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -2191,6 +2412,10 @@ function App() {
   const [healthCheckSteps, setHealthCheckSteps] = useState(500);
   const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
+  // OC-Declare model check results (from First Log Insights panel)
+  const [logConfResults, setLogConfResults] = useState(null); // null = not run yet
+  // Whether to drop 0%-confidence constraints before Run Discoveries
+  const [dropZeroConfConstraints, setDropZeroConfConstraints] = useState(false);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
   const [lifecycleError, setLifecycleError] = useState(null);
   const [resourceResult, setResourceResult] = useState(null);     // [{type, instance_count}]
@@ -2750,6 +2975,25 @@ function App() {
     if (!discoveryConfig.eventLogFile) return;
     setIsRunningDiscoveries(true);
 
+    // If checkbox is on and model check was run, drop 0%-confidence constraints first
+    if (dropZeroConfConstraints && logConfResults?.constraintResults) {
+      const zeroLabels = new Set(
+        logConfResults.constraintResults
+          .filter(r => r.confidence === 0)
+          .map(r => r.label)
+      );
+      if (zeroLabels.size > 0) {
+        setActiveModel(prev => {
+          if (!prev || Array.isArray(prev)) return prev;
+          const filtered = (prev.constraints || []).filter(c => {
+            const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+            return !zeroLabels.has(label);
+          });
+          return { ...prev, constraints: filtered };
+        });
+      }
+    }
+
     const allSteps = [
       { key: 'lifecycle', label: 'Object Constraints',           fn: runLifecycleDerivation },
       { key: 'resources', label: 'Resource Objects',             fn: runResourceDiscovery },
@@ -2770,7 +3014,7 @@ function App() {
       setIsRunningDiscoveries(false);
       setDiscoveryProgress({ current: 0, total: 0, currentName: '' });
     }
-  }, [discoveryChecks, discoveryConfig.eventLogFile,
+  }, [discoveryChecks, discoveryConfig.eventLogFile, dropZeroConfConstraints, logConfResults,
       runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery,
       applyStartProbability, runHealthCheck]);
 
@@ -2954,11 +3198,29 @@ function App() {
 
   // Generate the full suggestion list from health report + config.
   // Returns [{id, type, badgeLabel, label, desc, action}]
-  const generateSuggestions = (hr, model, cfg, startActivities = []) => {
+  const generateSuggestions = (hr, model, cfg, startActivities = [], confResults = null, dropZeroConf = false) => {
     if (!hr || !model) return [];
     const suggestions = [];
     let id = 0;
     const startActSet = new Set(startActivities);
+
+    // ── Rule 0: Remove 0%-confidence constraints from model check ─────────
+    if (dropZeroConf && confResults?.constraintResults) {
+      const zeroConf = confResults.constraintResults.filter(r => r.confidence === 0);
+      zeroConf.forEach(r => {
+        const c = (model.constraints || []).find(con =>
+          `${con.constraint_type}(${con.source_activity}→${con.target_activity})` === r.label
+        );
+        if (!c) return;
+        suggestions.push({
+          id: id++, type: 'ZERO_CONF',
+          badgeLabel: '0% conf',
+          label: `Remove ${r.label}`,
+          desc: `0% confidence in OC-Declare model check — this constraint was never satisfied by any source event in the input log.`,
+          action: m => ({ ...m, constraints: (m.constraints || []).filter(x => x !== c) }),
+        });
+      });
+    }
 
     // ── Rule 1: Cycle removal ──────────────────────────────────────────────
     const cycleConstraints = [];
@@ -3855,6 +4117,13 @@ function App() {
                             </tbody>
                           </table>
                         )}
+
+                        {/* Model conformance check against input log */}
+                        <LogModelConformance
+                          eventLogFile={discoveryConfig.eventLogFile}
+                          activeModel={activeModel}
+                          onResults={setLogConfResults}
+                        />
                       </Collapsible>
                     );
                   })()}
@@ -4313,6 +4582,31 @@ function App() {
                             redundantEnabled:false, unconstrainedEnabled:false, noInputBindingEnabled:false,
                           }))}>Deselect all</button>
                         </div>
+                        {/* Zero-confidence constraint removal — first option */}
+                        <div className="auto-config-row" style={{paddingBottom:'0.4rem',borderBottom:'1px solid #f1f5f9',marginBottom:'0.3rem'}}>
+                          <label
+                            className={`auto-config-label${!logConfResults ? ' disc-option-disabled' : ''}`}
+                            style={{cursor: logConfResults ? 'pointer' : 'not-allowed'}}
+                            title={!logConfResults ? 'Run the OC-Declare Model Check in First Log Insights first' : ''}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={dropZeroConfConstraints}
+                              disabled={!logConfResults}
+                              onChange={e => setDropZeroConfConstraints(e.target.checked)}
+                            />
+                            {' '}Remove 0%-confidence constraints (model check)
+                          </label>
+                          {!logConfResults
+                            ? <span style={{fontSize:'0.68rem',color:'#94a3b8',fontStyle:'italic'}}>run OC-Declare Model Check first</span>
+                            : (() => {
+                                const z = (logConfResults.constraintResults || []).filter(r => r.confidence === 0).length;
+                                return z > 0
+                                  ? <span style={{fontSize:'0.68rem',color:'#b91c1c',fontWeight:600}}>{z} at 0%</span>
+                                  : <span style={{fontSize:'0.68rem',color:'#166534'}}>none at 0%</span>;
+                              })()
+                          }
+                        </div>
                         <div className="auto-config-row">
                           <label className="auto-config-label">
                             <input type="checkbox" checked={autoConfig.cycleEnabled}
@@ -4408,7 +4702,7 @@ function App() {
                       className="auto-generate-btn"
                       disabled={!healthResult || !!healthResult.error || !activeModel}
                       onClick={() => {
-                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities);
+                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints);
                         setAutoSuggestions(suggs);
                         setAutoSelected(new Set(suggs.map((_, i) => i)));
                       }}
@@ -6250,7 +6544,7 @@ function App() {
               className="auto-generate-btn"
               disabled={!healthResult || !!healthResult.error || !activeModel}
               onClick={() => {
-                const suggs = generateSuggestions(healthResult, activeModel, autoConfig);
+                const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints);
                 setAutoSuggestions(suggs);
                 setAutoSelected(new Set(suggs.map((_, i) => i))); // select all by default
               }}

@@ -165,7 +165,13 @@ class SimulationState:
         return obj
 
     def deactivate_object(self, object_id: str) -> None:
-        """Mark an object inactive and update the active-by-type index."""
+        """Mark an object inactive and update the active-by-type index.
+
+        When a non-resource object is deactivated, any resource-type neighbors
+        whose only remaining active links are to now-inactive objects have those
+        links removed from the runtime index (_links_by_object).  The persistent
+        link log (self.links) is untouched so the OCEL output is unchanged.
+        """
         obj = self.objects.get(object_id)
         if obj is None:
             return
@@ -173,6 +179,40 @@ class SimulationState:
         active_set = self._active_by_type.get(obj.object_type)
         if active_set:
             active_set.discard(object_id)
+
+        # Free resource neighbors whose case-object links are all now inactive.
+        resource_types: set = getattr(self, '_resource_types', set()) or set()
+        if obj.object_type in resource_types:
+            # The deactivated object is itself a resource — nothing extra to do.
+            return
+
+        # For each resource neighbor of the deactivated object, remove the
+        # deactivated object from that resource's runtime link set.
+        # Then, if the resource has NO remaining active (non-resource) neighbors,
+        # clear its entire link set so O2O caps reset for the next case.
+        for neighbor_id in list(self._links_by_object.get(object_id, set())):
+            neighbor = self.objects.get(neighbor_id)
+            if neighbor is None or neighbor.object_type not in resource_types:
+                continue
+            # Remove this deactivated object from the resource's neighbors
+            res_links = self._links_by_object.get(neighbor_id)
+            if res_links:
+                res_links.discard(object_id)
+            # Also remove the resource from the deactivated object's neighbors
+            own_links = self._links_by_object.get(object_id)
+            if own_links:
+                own_links.discard(neighbor_id)
+            # If the resource now has no active non-resource neighbors, wipe its
+            # link set entirely so it is fully free for the next case chain.
+            if res_links is not None:
+                remaining_active = any(
+                    self.objects.get(nid) is not None
+                    and self.objects[nid].active
+                    and self.objects[nid].object_type not in resource_types
+                    for nid in res_links
+                )
+                if not remaining_active:
+                    res_links.clear()
 
     def add_link(self, source_object_id: str, target_object_id: str) -> None:
         self.links.append(

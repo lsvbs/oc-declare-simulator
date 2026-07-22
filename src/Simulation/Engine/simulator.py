@@ -177,11 +177,12 @@ class Simulator:
             # Tracing should never break the simulation.
             return
     def run(self, state: Optional[SimulationState] = None) -> SimulationState:
-        # Auto-select DES mode when resource types are configured and timing durations exist.
-        # This gives contention-aware simulation without any change to calling code.
+        # Auto-select DES mode whenever resource types are configured.
+        # DES is required for correct resource contention (locking/waiting queue).
+        # Without timing distributions the engine falls back to DefaultTimePolicy
+        # (fixed clock delta), which is still valid for resource-aware simulation.
         resource_types = getattr(self.static_model, 'resource_types', []) or []
-        has_durations = bool(getattr(self.static_model, 'activity_durations', {}))
-        if resource_types and has_durations:
+        if resource_types:
             return self.run_des(state)
 
         if state is None:

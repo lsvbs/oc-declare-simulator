@@ -462,6 +462,8 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
     if not static_model.o2o_rules:
         return True
 
+    resource_types: set = getattr(state, '_resource_types', set()) or set()
+
     created_counts: dict[str, int] = {}
     for t in getattr(candidate, "object_types_to_create", []) or []:
         created_counts[t] = created_counts.get(t, 0) + 1
@@ -477,6 +479,10 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
 
     for rule in static_model.o2o_rules:
         if rule.max_links is None:
+            continue
+        # Skip rules where either side is a resource type — resources are
+        # shared across cases and must not accumulate permanent link caps.
+        if rule.source_type in resource_types or rule.target_type in resource_types:
             continue
         for oid in participating_ids:
             otype = participant_types.get(oid)
