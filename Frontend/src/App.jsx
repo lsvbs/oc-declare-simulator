@@ -1097,6 +1097,122 @@ function ActivityBarChart({ logDurations, simDurations, metric, title, orderedAc
 }
 
 
+// ── OC-Declare conformance per Definition 8 & 9 ─────────────────────────────
+function computeOCDeclareConformance(events, objectTypesMap, constraints) {
+  // events: [{id, activity, timestamp, object_ids}]
+  // objectTypesMap: {oid → type}
+  // constraints: model constraints array
+
+  if (!events || events.length === 0 || !constraints || constraints.length === 0) return null;
+
+  const n = events.length;
+
+  // Build per-event object-type map
+  // eventObjs[i] = Set of object IDs for event i
+  const eventObjs = events.map(e => new Set(e.object_ids || []));
+
+  // For each event, which constraints it must satisfy (source activity matches)
+  // and does it satisfy them?
+
+  // Temporal filter helper — given source event index i and constraint type,
+  // return which event indices are in the correct temporal position
+  const temporalFilter = (srcIdx, ctype) => {
+    const srcTs = events[srcIdx].timestamp;
+    const result = [];
+    for (let j = 0; j < n; j++) {
+      if (j === srcIdx) continue;
+      const ts = events[j].timestamp;
+      if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' || ctype === 'alternate_response') {
+        if (ts >= srcTs) result.push(j);
+      } else if (ctype === 'precedence' || ctype === 'chain_precedence' || ctype === 'alternate_precedence') {
+        if (ts <= srcTs) result.push(j);
+      } else if (ctype === 'not_succession' || ctype === 'not_coexistence' || ctype === 'responded_existence') {
+        result.push(j); // no temporal restriction
+      } else {
+        result.push(j);
+      }
+    }
+    // Chain constraints: only immediately adjacent
+    if (ctype === 'chain_response') {
+      // Only the very next event after srcIdx
+      return srcIdx + 1 < n ? [srcIdx + 1] : [];
+    }
+    if (ctype === 'chain_precedence') {
+      // Only the event immediately before srcIdx
+      return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
+    }
+    return result;
+  };
+
+  // Per-event satisfaction: event i satisfies constraint c?
+  // Only events of c.source_activity are evaluated; others trivially satisfy.
+  const satisfies = (i, c) => {
+    if (events[i].activity !== c.source_activity) return true; // trivial
+
+    const nmin = c.nmin ?? 1;
+    const nmax = c.nmax ?? null;
+    const tgt  = c.target_activity;
+    const scope = c.scope || { kind: 'global' };
+
+    // Candidate events: of target activity, in correct temporal window
+    const temporal = temporalFilter(i, c.constraint_type);
+    const tgtCandidates = temporal.filter(j => events[j].activity === tgt);
+
+    if (scope.kind === 'global') {
+      const cnt = tgtCandidates.length;
+      if (c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession') {
+        return cnt === 0;
+      }
+      return cnt >= nmin && (nmax == null || cnt <= nmax);
+    }
+
+    // scope.kind === 'each' — must hold for every object of scope.object_type in event i
+    const scopeObjs = [...eventObjs[i]].filter(oid => objectTypesMap[oid] === scope.object_type);
+
+    if (scopeObjs.length === 0) {
+      // No scope objects in this event — constraint is vacuously satisfied
+      return true;
+    }
+
+    for (const oid of scopeObjs) {
+      // Filter tgtCandidates to those involving this specific object
+      const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
+      const cnt = matching.length;
+      if (c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession') {
+        if (cnt > 0) return false;
+      } else {
+        if (cnt < nmin) return false;
+        if (nmax != null && cnt > nmax) return false;
+      }
+    }
+    return true;
+  };
+
+  // Per-constraint confidence (Def 9)
+  const constraintResults = constraints.map(c => {
+    const sourceEvents = events.filter((e, i) => e.activity === c.source_activity);
+    if (sourceEvents.length === 0) return null; // not applicable
+    const srcIndices = events.reduce((acc, e, i) => { if (e.activity === c.source_activity) acc.push(i); return acc; }, []);
+    let satisfied = 0;
+    for (const i of srcIndices) {
+      if (satisfies(i, c)) satisfied++;
+    }
+    const confidence = satisfied / srcIndices.length;
+    const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+    return { label, confidence, satisfied, total: srcIndices.length, constraint: c };
+  }).filter(Boolean);
+
+  // Global conformance: fraction of ALL events that satisfy ALL constraints
+  let globalSatisfied = 0;
+  for (let i = 0; i < n; i++) {
+    const allSat = constraints.every(c => satisfies(i, c));
+    if (allSat) globalSatisfied++;
+  }
+  const globalConformance = n > 0 ? globalSatisfied / n : null;
+
+  return { constraintResults, globalConformance, globalSatisfied, totalEvents: n };
+}
+
 function PerObjectTypeBreakdown({ fitnessPerObject, objectTypesMap }) {
   const [expandedType, setExpandedType] = React.useState(null);
 
@@ -1402,6 +1518,38 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
   const activities   = activeModel?.activities  || [];
   const objectTraces = results?.object_traces   || {};
   const runId        = results?.output_file     || null;
+  const typesMap     = results?.object_types_map || {};
+
+  // OC-Declare conformance — load full event list from output OCEL
+  const [ocdEvents,      setOcdEvents]      = React.useState(null);
+  const [ocdLoading,     setOcdLoading]     = React.useState(false);
+  const [ocdError,       setOcdError]       = React.useState(null);
+  const ocdLoadedFor = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!runId || ocdLoadedFor.current === runId) return;
+    ocdLoadedFor.current = runId;
+    setOcdLoading(true);
+    setOcdError(null);
+    axios.get(`/api/run-history/${encodeURIComponent(runId)}/events`)
+      .then(r => setOcdEvents(r.data.events || []))
+      .catch(e => setOcdError(e.response?.data?.error || e.message))
+      .finally(() => setOcdLoading(false));
+  }, [runId]);
+
+  // OC-Declare conformance uses a full object type map built from ALL objects
+  const fullTypesMap = React.useMemo(() => {
+    const m = { ...typesMap };
+    (results?.object_types ? Object.entries(results.object_types) : []).forEach(([otype, count]) => {
+      // already have per-object map; just keep typesMap
+    });
+    return m;
+  }, [typesMap, results]);
+
+  const ocdConf = React.useMemo(() => {
+    if (!ocdEvents || ocdEvents.length === 0) return null;
+    return computeOCDeclareConformance(ocdEvents, fullTypesMap, constraints);
+  }, [ocdEvents, fullTypesMap, constraints]);
 
   const conf = React.useMemo(
     () => computeConformance(objectTraces, constraints, activities),
@@ -1439,6 +1587,76 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
         <p className="empty-notice">No object traces recorded — run simulation with a larger step count.</p>
       ) : (
         <>
+          {/* ── OC-Declare Conformance (Def 8 & 9) — per event ── */}
+          <Collapsible className="eval-subsection" title="OC-Declare Conformance (per event)" defaultOpen={true}>
+            <p className="conf-metric-explanation" style={{marginBottom:'0.75rem'}}>
+              <strong>Definition 8 — Per-event satisfaction:</strong> An event of source activity <em>s</em> satisfies
+              constraint <em>D</em> if, for every combination of EACH-scoped objects in the event, filtering the log
+              to target-activity events in the correct temporal position that share those objects yields a count
+              within [n_min, n_max]. Events of any other activity trivially satisfy D.
+              <br/><br/>
+              <strong>Definition 9 — Confidence:</strong> Per constraint = satisfied source events ÷ total source events.
+              Global = events satisfying all constraints simultaneously ÷ total events.
+            </p>
+
+            {ocdLoading && (
+              <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#6366f1'}}>
+                <div className="spinner spinner-sm"></div> Loading event log for conformance check…
+              </div>
+            )}
+            {ocdError && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {ocdError}</p>}
+
+            {ocdConf && (
+              <>
+                {/* Global score */}
+                <MetricRow
+                  label="Global OC-Declare Conformance"
+                  value={ocdConf.globalConformance}
+                  explanation={`${ocdConf.globalSatisfied} of ${ocdConf.totalEvents} events satisfy every constraint in the model simultaneously. Formula: events satisfying all constraints ÷ total events.`}
+                />
+
+                {/* Per-constraint confidence */}
+                {ocdConf.constraintResults.length > 0 && (
+                  <Collapsible className="conf-detail-collapsible" title="Per-constraint confidence" defaultOpen={false}>
+                    <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                      For each constraint: confidence = source-activity events that satisfy it ÷ total source-activity events (Definition 9).
+                    </p>
+                    <table className="conf-detail-table">
+                      <thead>
+                        <tr>
+                          <th>Constraint</th>
+                          <th className="audit-num">Source events</th>
+                          <th className="audit-num">Satisfied</th>
+                          <th className="audit-num">Confidence</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {ocdConf.constraintResults
+                          .slice()
+                          .sort((a, b) => a.confidence - b.confidence)
+                          .map(r => {
+                            const cls = r.confidence >= 0.8 ? 'conf-good' : r.confidence >= 0.5 ? 'conf-mid' : 'conf-bad';
+                            return (
+                              <tr key={r.label} className={r.confidence < 0.5 ? 'audit-row-accumulating' : ''}>
+                                <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{r.label}</td>
+                                <td className="audit-num">{r.total}</td>
+                                <td className="audit-num">{r.satisfied}</td>
+                                <td className="audit-num"><span className={cls}>{(r.confidence * 100).toFixed(1)}%</span></td>
+                              </tr>
+                            );
+                          })}
+                      </tbody>
+                    </table>
+                  </Collapsible>
+                )}
+              </>
+            )}
+
+            {!ocdLoading && !ocdConf && !ocdError && (
+              <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>Loading event data…</p>
+            )}
+          </Collapsible>
+
           {/* ── Fitness ── */}
           <Collapsible className="eval-subsection" title="Fitness" defaultOpen={true}>
             <MetricRow
@@ -2477,6 +2695,20 @@ function App() {
   const startActivityProbSelectedRef = React.useRef(discoveryConfig.startActivityProbSelected);
   React.useEffect(() => {
     startActivityProbSelectedRef.current = discoveryConfig.startActivityProbSelected;
+  }, [discoveryConfig.startActivityProbSelected]);
+
+  // Keep config.startActivities in sync with the discovery tab selection at all times.
+  // This ensures the simulation always uses whichever activities the user picked in
+  // the "Start Activity + Probability" panel, regardless of whether Run Discoveries was clicked.
+  React.useEffect(() => {
+    const selected = discoveryConfig.startActivityProbSelected;
+    if (!selected?.length) return;
+    setConfig(prev => {
+      // Only update if the selection actually differs to avoid unnecessary re-renders
+      const same = prev.startActivities.length === selected.length &&
+        selected.every(a => prev.startActivities.includes(a));
+      return same ? prev : { ...prev, startActivities: [...selected] };
+    });
   }, [discoveryConfig.startActivityProbSelected]);
 
   // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)

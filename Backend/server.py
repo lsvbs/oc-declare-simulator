@@ -1113,7 +1113,39 @@ def get_run_metrics(run_id):
 
 
 
-@app.route('/api/run-history/<run_id>/iteration-log', methods=['GET'])
+@app.route('/api/run-history/<run_id>/events', methods=['GET'])
+def get_run_events(run_id):
+    """Return a lightweight event list from the output OCEL for conformance checking.
+
+    Returns [{id, activity, object_ids, timestamp}] sorted by timestamp.
+    """
+    try:
+        log_path = OUTPUT_DIR / run_id
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {run_id}'}), 404
+        with open(log_path, 'r', encoding='utf-8') as f:
+            ocel = json.load(f)
+        events_raw = ocel.get('events', [])
+        if isinstance(events_raw, dict):
+            events_raw = list(events_raw.values())
+        result = []
+        for ev in events_raw:
+            rels = ev.get('relationships', []) or []
+            oids = [r['objectId'] for r in rels if r.get('objectId')]
+            result.append({
+                'id':         ev.get('id', ''),
+                'activity':   ev.get('type', ''),
+                'timestamp':  ev.get('time', ''),
+                'object_ids': oids,
+            })
+        result.sort(key=lambda e: e['timestamp'])
+        return jsonify({'events': result, 'count': len(result)})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+
 def get_iteration_log(run_id):
     """Return the full iteration log for a specific run."""
     history = _load_history()
