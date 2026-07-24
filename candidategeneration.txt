@@ -1,0 +1,214 @@
+Candidate Generation and Selection — Technical Reference
+=========================================================
+
+This document describes how the simulation builds its candidate pool each step and
+how it selects one candidate to fire. It covers both DES and step-based modes, the
+response obligation injection mechanism, and the optimisations applied.
+
+
+1. OVERVIEW
+-----------
+Each simulation step goes through three phases:
+  1. Build candidate pool  — which activities with which objects could fire right now?
+  2. Filter and inject     — apply constraints, O2O rules, obligation injection
+  3. Select one candidate  — probability matrix picks the winner
+
+
+2. CANDIDATE POOL CONSTRUCTION (DES mode: _generate_candidates_des)
+--------------------------------------------------------------------
+The pool is built once per step. DES mode expands per-object because multiple
+case objects can be in flight simultaneously.
+
+Step 1 — For each activity in the model:
+  a) Find the "primary binding": the first non-creating, non-resource input binding.
+     This is the binding that identifies which case object drives this activity.
+
+  b) If no primary binding (activity only creates objects or uses resources):
+     - Generate a single global candidate.
+     - For start activities: gate by transition matrix probability so they don't
+       fire unconditionally every step (unless it's the only option left).
+
+  c) If a primary binding exists:
+     - Collect up to 32 active objects of the primary type.
+     - Exclude objects already in-progress for this activity (prevents duplicate
+       concurrent starts on the same object, which would bypass per-object checks).
+     - For each object, temporarily restrict _active_by_type[primary_type] to {oid},
+       then call build_candidate_for_activity. This forces the candidate builder to
+       use exactly that object as the anchor, while still picking linked objects for
+       other bindings from the real pool.
+     - Apply max_consecutive and max_consecutive_per_object caps.
+     - Add to pool if semantically allowed (constraints + O2O pass).
+
+Step 2 — Response obligation injection (Option 4, optimised with B+F):
+  See section 4 below.
+
+Step 3 — Deduplication via seen_keys set.
+  Key = (activity_name, sorted(participating_object_ids), sorted(object_types_to_create))
+
+
+3. build_candidate_for_activity (candidategeneration.py)
+---------------------------------------------------------
+For each binding in the activity definition:
+
+  creates=False (input binding):
+    - Find active objects of that type (find_active_objects_of_type).
+    - Apply attribute guard filter if present.
+    - Apply link preference: prefer objects already linked to current participants
+      (_find_objects_preferring_linked). This keeps related case objects together.
+    - Select min(len(available), target_count, max_count) objects.
+    - Require at least 1 — if none found, return None (activity is ineligible).
+    - Add to participating_object_ids.
+
+  creates=True AND type is a resource:
+    - Treat as pool selection: pick from active, non-busy resource objects.
+    - Never create a new resource object.
+    - Add to participating_object_ids.
+
+  creates=True AND type is NOT a resource:
+    - Always create exactly 1 new object (add to object_types_to_create).
+    - If max_count is set: reuse up to (max_count - 1) existing linked objects.
+    - If max_count is None: no reuse — the created object is the sole participant.
+
+find_active_objects_of_type:
+  - Returns objects from state._active_by_type[object_type].
+  - For resource types: also checks busy_until > current_time and skips busy ones.
+  - Respects limit parameter (default 0 = no limit).
+
+
+4. RESPONSE OBLIGATION INJECTION
+---------------------------------
+After the normal pool is built, every pending response obligation is checked
+and its target activity is injected into the pool if not already present.
+
+Obligations are stored in state._obligations_count as:
+  { (target_activity, scope_object_id): count }
+
+Created by: _create_response_obligations — called after every event fires.
+  When source activity A fires with scope object o:
+    _obligations_count[(B, o)] += 1
+
+Cleared by: _fulfill_response_obligations — called after every event fires.
+  When target activity B fires with scope object o:
+    del _obligations_count[(B, o)]
+
+Also cleared by: state.deactivate_object
+  When scope object o is deactivated, all (*, o) obligations are removed immediately
+  since a deactivated object can never fire activities.
+
+Injection loop (per step, after normal pool is built):
+
+  For each (target_act, scope_oid) in _obligations_count:
+
+    OPTIMISATION B — O(1) pool membership check:
+      Build pool_index = set of (activity_name, object_id) from existing candidates.
+      Check if (target_act, scope_oid) is already in pool_index.
+      If yes: skip (no redundant build+check needed).
+      Cost: O(pool_size) once to build index, then O(1) per obligation.
+      Before this: O(pool_size) linear scan per obligation = O(pool × obligations).
+      After this:  O(pool_size) once + O(obligations) for all checks.
+
+    OPTIMISATION F — Cheap precedence pre-filter:
+      Before calling build_candidate_for_activity (expensive), check whether
+      any precedence constraint on target_act is unsatisfied for scope_oid.
+      Uses only cached index lookups:
+        state._events_by_act_obj[(source_activity, scope_oid)] — O(1)
+      If any precedence is unsatisfied: skip (obligation is blocked, no point building).
+      Cost: O(precedence_constraints_on_target) per obligation — typically 1-3 checks.
+      Eliminates the majority of wasted builds since most obligations at any step are
+      blocked by precedence (the source hasn't fired enough times yet).
+
+  If neither optimisation skips the obligation:
+    - Temporarily restrict _active_by_type[scope_type] to {scope_oid}.
+    - Call build_candidate_for_activity.
+    - Call is_candidate_semantically_allowed (full constraint + O2O check).
+    - If passes: add to pool with deduplication.
+
+  Effect: obligated activities are always in the candidate pool from the moment the
+  obligation is created until it fires, subject to precedence and O2O constraints.
+  The probability matrix still determines when within that window they fire.
+
+
+5. SEMANTIC CHECK (is_candidate_semantically_allowed)
+------------------------------------------------------
+Called for every candidate before it enters the pool. Two checks:
+
+  check_all_constraints(static_model, candidate, state):
+    For each constraint relevant to candidate.activity_name (from per-activity index):
+      - check_precedence: target blocked if source count < nmin or > nmax on scope obj
+      - check_response: only enforces nmax (blocks target if already fired >= nmax times)
+      - check_not_coexistence: blocks if the other activity already fired on scope obj
+      - check_chain_precedence: requires last event on scope obj to be source
+      - check_chain_response: blocks non-target if source was last on scope obj (armed)
+      - check_alternate_response: blocks source if it fired but target hasn't responded
+      - check_alternate_precedence: blocks target if count(target) >= count(source)
+      - check_not_succession: blocks target if source ever fired on scope obj
+      - check_not_chain_succession: blocks target if source was last on scope obj
+      - check_absence: blocks if already fired >= nmax times
+      - check_exactly: blocks after nmin firings
+      - check_init: blocks all others until init activity fires
+      - check_exclusive_choice: blocks if the other fired on scope obj
+      - Composites (succession, chain_succession, alternate_succession): decomposed into above
+
+  check_o2o_rules(static_model, candidate, state):
+    For each O2O rule (not involving resource types — resources are exempt):
+      Count existing links + new links this firing would create.
+      If total > max_links: return False (candidate rejected).
+
+
+6. CANDIDATE SELECTION (selection.py: select_candidate)
+--------------------------------------------------------
+Called with the final pool after all filtering.
+
+Step 1 — Declarative filter (default: pass-through, filtering already done in generation).
+
+Step 2 — O2O filter (default: pass-through, already done in generation).
+
+Step 3 — Obligations filter (currently DISABLED for response constraints).
+  Response obligations should not force immediate selection — that would make them
+  behave like chain_response. They are already handled by pool injection (section 4).
+  Only chain_response semantically requires the target to fire immediately.
+
+Step 4 — Reorder: move already-seen activities to the back.
+  Activities that have never fired yet are sorted to the front, giving new activities
+  a slight priority boost to improve process coverage early in the run.
+
+Step 5 — Selection:
+  If transition_matrix provided (normal DES/external-ocel mode):
+    Get transition_probs = transition_matrix[last_activity]
+    Assign weight = prob + epsilon to each candidate.
+    Use rng.choices(pool, weights=weights, k=1) for weighted random selection.
+    Epsilon smoothing (1e-6) prevents zero-probability traps when an activity
+    is not in the transition matrix for the last activity.
+
+  If no transition_matrix:
+    Return pool[0] (deterministic, first candidate).
+
+
+7. PERFORMANCE CHARACTERISTICS
+-------------------------------
+Per step (DES mode with N activities, O objects, C constraints, K obligations):
+
+  Normal pool construction:  O(N × min(O, 32) × C)  — dominant for large models
+  Obligation B check:        O(pool_size) once + O(K)
+  Obligation F pre-filter:   O(K × prec_per_target)   — typically O(K × 2)
+  Obligation build+check:    O(K_unblocked × C)        — only for obligations that
+                                                          pass both B and F filters
+
+  In practice: F eliminates ~80-90% of obligations at any step (most are blocked
+  by precedence). B eliminates most of the remaining ones that happen to match
+  the normal pool. Only a handful require the expensive build+check path.
+
+
+8. CHANGES FROM PREVIOUS VERSION
+---------------------------------
+Before B+F optimisations:
+  - already_in_pool: O(pool_size) linear scan PER obligation
+    → O(pool_size × K) total = severe bottleneck with thousands of obligations
+  - No precedence pre-filter: every obligation called build_candidate_for_activity
+    even when clearly blocked by precedence
+    → O(K) expensive builds per step regardless of whether the obligation could fire
+
+After B+F optimisations:
+  - Pool index built once: O(pool_size), then O(1) per obligation membership check
+  - Precedence pre-filter: O(prec_per_target) per obligation before any expensive call
+  - Estimated speedup: 5-20× for models with many response constraints and active objects

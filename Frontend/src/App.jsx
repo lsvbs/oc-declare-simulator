@@ -869,6 +869,19 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
   ocdeclareDiscoveryResults, activeModel, modelEdited,
   timingDiscoveryResult, results, workflowMode, onChangeMode }) {
 
+  const barRef = React.useRef(null);
+  React.useEffect(() => {
+    const el = barRef.current;
+    if (!el) return;
+    const update = () => {
+      document.documentElement.style.setProperty('--topbar-h', el.offsetHeight + 'px');
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   const steps = [
     { key: 'ocel',    label: 'OCEL',        done: !!discoveryConfig.eventLogFile },
     { key: 'prob',    label: 'Probability',  done: !!discoveryResults },
@@ -887,7 +900,7 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
                      : null;
 
   return (
-    <div className="workflow-topbar">
+    <div className="workflow-topbar" ref={barRef}>
       <div className="topbar-files">
         {modeLabel && (
           <span className="topbar-mode-section">
@@ -1773,6 +1786,369 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
   );
 }
 
+// ── ActivityGanttChart (Canvas-based for performance) ────────────────────────
+function ActivityGanttChart({ results, orderedActivities, simMetrics }) {
+  const [loaded,  setLoaded]  = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [events,  setEvents]  = React.useState(null);
+  const [tooltip, setTooltip] = React.useState(null);
+  const [selBar,  setSelBar]  = React.useState(null); // {x1,x2,y1,y2,event,act}
+  const [error,   setError]   = React.useState(null);
+  const canvasRef = React.useRef(null);
+  const hitmap    = React.useRef([]);
+  const drawData  = React.useRef(null); // cached layout for redraw
+  const loadedFor = React.useRef(null);
+
+  const fmtTs  = ts => ts ? ts.replace('T',' ').slice(0,19) : '—';
+  const fmtDur = s => {
+    if (s == null) return '—';
+    if (s >= 86400) return `${(s/86400).toFixed(1)} d`;
+    if (s >= 3600)  return `${(s/3600).toFixed(1)} h`;
+    if (s >= 60)    return `${Math.round(s/60)} min`;
+    return `${Math.round(s)} s`;
+  };
+
+  const load = async () => {
+    const runId = results?.output_file;
+    if (!runId || loadedFor.current === runId) { setLoaded(true); return; }
+    setLoading(true); setError(null);
+    try {
+      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/events`);
+      setEvents(r.data.events || []);
+      loadedFor.current = runId;
+      setLoaded(true);
+    } catch(e) { setError(e.response?.data?.error || e.message); }
+    finally { setLoading(false); }
+  };
+
+  const draw = React.useCallback((sel) => {
+    const canvas = canvasRef.current;
+    const dd = drawData.current;
+    if (!canvas || !dd) return;
+    const { acts, hitItems, tMin, tMax, span, LABEL_W, CHART_W, ROW_H, TICK_H, numTicks } = dd;
+
+    canvas.width  = LABEL_W + CHART_W + 20;
+    canvas.height = TICK_H + acts.length * ROW_H + TICK_H;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const tsToX = ts => LABEL_W + ((ts - tMin) / span) * CHART_W;
+
+    // Determine overlapping activities with selected bar
+    const overlaps = new Set();
+    if (sel) {
+      hitItems.forEach(h => {
+        if (h.act !== sel.act && h.startMs < sel.endMs && h.endMs > sel.startMs) {
+          overlaps.add(h.act);
+        }
+      });
+    }
+
+    // Row backgrounds
+    acts.forEach((act, ai) => {
+      const y = TICK_H + ai * ROW_H;
+      const isOverlap = overlaps.has(act);
+      const isSel = sel && sel.act === act;
+      ctx.fillStyle = isSel ? '#eef2ff' : isOverlap ? '#fef9c3' : (ai % 2 === 0 ? '#f8fafc' : '#ffffff');
+      ctx.fillRect(LABEL_W, y, CHART_W, ROW_H);
+    });
+
+    // Tick grid + labels
+    ctx.strokeStyle = '#e2e8f0'; ctx.lineWidth = 1;
+    ctx.fillStyle = '#94a3b8'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center';
+    for (let i = 0; i < numTicks; i++) {
+      const f = i / (numTicks - 1);
+      const x = LABEL_W + f * CHART_W;
+      const ms = tMin + f * span;
+      const d = new Date(ms);
+      const label = span < 3600000 ? d.toISOString().slice(11,19)
+                  : span < 86400000 ? d.toISOString().slice(11,16)
+                  : d.toISOString().slice(0,10);
+      ctx.beginPath(); ctx.moveTo(x, TICK_H); ctx.lineTo(x, TICK_H + acts.length * ROW_H); ctx.stroke();
+      ctx.fillText(label, x, TICK_H - 4);
+      ctx.fillText(label, x, TICK_H + acts.length * ROW_H + 12);
+    }
+
+    // Bars and labels
+    acts.forEach((act, ai) => {
+      const y = TICK_H + ai * ROW_H;
+      const PAD = 3;
+      const isOverlap = overlaps.has(act);
+      const isSel = sel && sel.act === act;
+      const baseColor = `hsl(${(ai * 37) % 360},60%,55%)`;
+
+      // Activity label
+      ctx.textAlign = 'right';
+      ctx.font = (isOverlap ? 'bold ' : '') + '10px sans-serif';
+      ctx.fillStyle = isOverlap ? '#1e293b' : '#475569';
+      const label = act.length > 24 ? act.slice(0,23)+'…' : act;
+      ctx.fillText(label, LABEL_W - 4, y + ROW_H / 2 + 4);
+
+      // Draw bars for this activity
+      hitItems.filter(h => h.act === act).forEach(h => {
+        const bx1Raw = tsToX(h.startMs);
+        const bx2    = tsToX(h.endMs);
+        const bx1    = Math.max(LABEL_W, bx1Raw); // clamp to chart area
+        const bW     = Math.max(1.5, bx2 - bx1);
+        const bY     = y + PAD, bH = ROW_H - PAD * 2;
+
+        // Highlight selected bar
+        if (sel && h === sel) {
+          ctx.fillStyle = '#f59e0b';
+          ctx.fillRect(bx1 - 1, bY - 1, bW + 2, bH + 2);
+        }
+        ctx.fillStyle = isOverlap ? '#ef4444' : (isSel ? '#6366f1' : baseColor);
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(bx1, bY, bW, bH);
+        ctx.globalAlpha = 1.0;
+      });
+    });
+
+    // Bottom axis line
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(LABEL_W, TICK_H + acts.length * ROW_H);
+    ctx.lineTo(LABEL_W + CHART_W, TICK_H + acts.length * ROW_H);
+    ctx.stroke();
+
+    // Selected bar vertical dotted lines (start and end)
+    if (sel) {
+      ctx.save();
+      ctx.strokeStyle = '#6366f1'; ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      [tsToX(sel.startMs), tsToX(sel.endMs)].forEach(lx => {
+        ctx.beginPath();
+        ctx.moveTo(lx, TICK_H); ctx.lineTo(lx, TICK_H + acts.length * ROW_H);
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+  }, []);
+
+  // Build layout data and draw when events change
+  React.useEffect(() => {
+    if (!events || !canvasRef.current) return;
+
+    const actEvents = {};
+    events.forEach(e => { (actEvents[e.activity] = actEvents[e.activity] || []).push(e); });
+    const acts = orderedActivities.filter(a => actEvents[a]);
+    if (acts.length === 0) return;
+
+    const allTs = events.map(e => new Date(e.timestamp).getTime()).filter(t => !isNaN(t));
+    const tMin = Math.min(...allTs), tMax = Math.max(...allTs);
+    const span = tMax - tMin || 1;
+
+    const ROW_H = 22, LABEL_W = 180, TICK_H = 20;
+    const CHART_W = Math.max(1400, events.length * 4);
+    const numTicks = Math.min(20, Math.max(5, Math.floor(CHART_W / 200)));
+
+    // Build hit items with start/end times.
+    // Clamp startMs to tMin so bars never extend left of the chart boundary.
+    // This prevents activities with long mean_service_s (e.g. Depart ~3 days)
+    // from appearing to start before the simulation began.
+    const hitItems = [];
+    acts.forEach(act => {
+      const meanSvc = simMetrics?.[act]?.mean_service_s ?? 60;
+      const evts = actEvents[act] || [];
+      evts.forEach(e => {
+        const endMs   = new Date(e.timestamp).getTime();
+        const startMs = Math.max(tMin, endMs - meanSvc * 1000);
+        hitItems.push({ act, event: e, startMs, endMs });
+      });
+    });
+
+    drawData.current = { acts, hitItems, tMin, tMax, span, LABEL_W, CHART_W, ROW_H, TICK_H, numTicks };
+    hitmap.current = hitItems;
+    draw(null);
+  }, [events, orderedActivities, simMetrics, draw]);
+
+  // Redraw when selection changes
+  React.useEffect(() => { draw(selBar); }, [selBar, draw]);
+
+  const handleClick = React.useCallback(e => {
+    const canvas = canvasRef.current;
+    const dd = drawData.current;
+    if (!canvas || !dd) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const cx = (e.clientX - rect.left) * scaleX;
+    const cy = (e.clientY - rect.top)  * scaleY;
+
+    const { tMin, span, LABEL_W, CHART_W, TICK_H, ROW_H, acts } = dd;
+    const tsToX = ts => LABEL_W + ((ts - tMin) / span) * CHART_W;
+
+    // Find which activity row was clicked
+    const rowIdx = Math.floor((cy - TICK_H) / ROW_H);
+    if (rowIdx < 0 || rowIdx >= acts.length) { setSelBar(null); setTooltip(null); return; }
+
+    // Find closest bar in that row
+    let best = null, bestDist = 12;
+    hitmap.current.filter(h => h.act === acts[rowIdx]).forEach(h => {
+      const mid = (tsToX(h.startMs) + tsToX(h.endMs)) / 2;
+      const d = Math.abs(cx - mid);
+      if (d < bestDist) { bestDist = d; best = h; }
+    });
+
+    if (best) {
+      setSelBar(best);
+      setTooltip({
+        x: (tsToX(best.startMs) + tsToX(best.endMs)) / 2 / scaleX,
+        y: (TICK_H + rowIdx * ROW_H) / scaleY,
+        activity:  best.act,
+        start:     new Date(best.startMs).toISOString().replace('T',' ').slice(0,19),
+        end:       new Date(best.endMs).toISOString().replace('T',' ').slice(0,19),
+        duration:  fmtDur((best.endMs - best.startMs) / 1000),
+        objects:   (best.event.object_ids || []).join(', ') || '—',
+      });
+    } else {
+      setSelBar(null); setTooltip(null);
+    }
+  }, [fmtDur]);
+
+  return (
+    <Collapsible className="eval-section" title="Activity Timeline (Gantt)" defaultOpen={false}>
+      {!loaded && !loading && (
+        <div>
+          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+            Each firing is shown as a bar sized by mean service time. Click a bar to see start/end
+            and highlight overlapping activities in red. Canvas-rendered for performance.
+          </p>
+          <button className="discovery-button" style={{fontSize:'0.82rem',padding:'0.4rem 1rem'}} onClick={load}>
+            Load Timeline
+          </button>
+        </div>
+      )}
+      {loading && <div style={{display:'flex',gap:'0.5rem',alignItems:'center',fontSize:'0.82rem',color:'#6366f1'}}><div className="spinner spinner-sm"></div>Loading events…</div>}
+      {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
+      {loaded && events && (
+        <div style={{overflowX:'scroll',overflowY:'visible',position:'relative',border:'1px solid #e2e8f0',borderRadius:'6px'}}>
+          <canvas ref={canvasRef} style={{display:'block',cursor:'crosshair',maxWidth:'none'}} onClick={handleClick} />
+          {tooltip && (
+            <div style={{
+              position:'absolute', left: tooltip.x + 12, top: tooltip.y - 10,
+              background:'#1e293b', color:'white', borderRadius:'6px',
+              padding:'0.5rem 0.75rem', fontSize:'0.75rem', maxWidth:'300px',
+              pointerEvents:'none', zIndex:10, lineHeight:1.7,
+              boxShadow:'0 4px 12px rgba(0,0,0,0.3)',
+            }}>
+              <strong>{tooltip.activity}</strong><br/>
+              Start: {tooltip.start}<br/>
+              End:&nbsp;&nbsp; {tooltip.end}<br/>
+              Duration: {tooltip.duration}<br/>
+              Objects: {tooltip.objects}
+            </div>
+          )}
+        </div>
+      )}
+    </Collapsible>
+  );
+}
+
+
+// ── SimVsDiscoveredComparison ─────────────────────────────────────────────────
+// Compares simulation output metrics (mean_service_s, mean_wait_in_pool_s, etc.)
+// directly against the input log's discovered timing values.
+function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities }) {
+  const [metric, setMetric] = React.useState('service');
+
+  const fmtS = v => {
+    if (v == null || v === 0) return '—';
+    if (v >= 86400) return `${(v/86400).toFixed(1)} d`;
+    if (v >= 3600)  return `${(v/3600).toFixed(1)} h`;
+    if (v >= 60)    return `${Math.round(v/60)} min`;
+    return `${Math.round(v)} s`;
+  };
+  const pctDiff = (a, b) => (a == null || b == null || a === 0) ? null : (b - a) / a * 100;
+  const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+  const pctCls  = v => { if (v == null) return ''; const n = Math.abs(v); return n < 10 ? 'cmp-ok' : v > 0 ? 'cmp-over' : 'cmp-under'; };
+
+  // sim keys from activity_metrics
+  // In DES mode, resource_wait_s is the meaningful waiting metric.
+  // candidate_wait_s (wait_in_pool) is only populated in step-based mode.
+  const simKeys = {
+    service:       { mean: 'mean_service_s',        min: 'min_service_s',       max: 'max_service_s' },
+    resource_wait: { mean: 'mean_resource_wait_s',  min: null,                  max: 'max_resource_wait_s' },
+    pool_wait:     { mean: 'mean_wait_in_pool_s',   min: null,                  max: 'max_wait_in_pool_s' },
+  };
+  // log keys from activity_durations (discovered)
+  const logKeys = {
+    service:       { mean: 'service_mean', min: 'service_min', max: 'service_max' },
+    resource_wait: { mean: 'waiting_mean', min: null,          max: null },
+    pool_wait:     { mean: 'waiting_mean', min: null,          max: null },
+  };
+
+  const sk = simKeys[metric];
+  const lk = logKeys[metric];
+  const acts = orderedActivities.filter(a => simMetrics[a] || logDurations[a]);
+  if (acts.length === 0) return null;
+
+  return (
+    <Collapsible className="eval-subsection" title="Sim Metrics vs Log Discovery" defaultOpen={false}>
+      <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+        Compares the simulation run's measured metrics (from activity_metrics) directly against the
+        input log's discovered timing values. Left = input log discovered, Right = sim output metrics.
+      </p>
+      <div style={{display:'flex',gap:'0.5rem',alignItems:'center',marginBottom:'0.75rem'}}>
+        <span style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Metric:</span>
+        {[
+          {v:'service',      l:'Service time'},
+          {v:'resource_wait',l:'Resource wait (DES)'},
+          {v:'pool_wait',    l:'Pool wait (step-based)'},
+        ].map(o => (
+          <button key={o.v}
+            className={`eval-mode-btn${metric === o.v ? ' active' : ''}`}
+            style={{padding:'0.25rem 0.7rem'}}
+            onClick={() => setMetric(o.v)}
+          >{o.l}</button>
+        ))}
+      </div>
+      <table className="metrics-table" style={{fontSize:'0.78rem'}}>
+        <thead>
+          <tr>
+            <th>Activity</th>
+            <th className="audit-num">Log mean</th>
+            <th className="audit-num">Sim mean</th>
+            <th className="audit-num">Δ mean</th>
+            {sk.min && lk.min && <th className="audit-num">Log min</th>}
+            {sk.min && lk.min && <th className="audit-num">Sim min</th>}
+            {sk.min && lk.min && <th className="audit-num">Δ min</th>}
+            <th className="audit-num">Log max</th>
+            <th className="audit-num">Sim max</th>
+            <th className="audit-num">Δ max</th>
+          </tr>
+        </thead>
+        <tbody>
+          {acts.map(act => {
+            const log = logDurations[act] || {};
+            const sim = simMetrics[act]  || {};
+            const lMean = log[lk.mean], sMean = sim[sk.mean];
+            const lMin  = lk.min ? log[lk.min] : null, sMin = sk.min ? sim[sk.min] : null;
+            const lMax  = lk.max ? log[lk.max] : null, sMax = sk.max ? sim[sk.max] : null;
+            const dMean = pctDiff(lMean, sMean);
+            const dMin  = pctDiff(lMin, sMin);
+            const dMax  = pctDiff(lMax, sMax);
+            return (
+              <tr key={act}>
+                <td className="metrics-act-name">{act}</td>
+                <td className="audit-num">{fmtS(lMean)}</td>
+                <td className="audit-num">{fmtS(sMean)}</td>
+                <td className={`audit-num cmp-diff ${pctCls(dMean)}`}>{fmtPct(dMean)}</td>
+                {sk.min && lk.min && <td className="audit-num">{fmtS(lMin)}</td>}
+                {sk.min && lk.min && <td className="audit-num">{fmtS(sMin)}</td>}
+                {sk.min && lk.min && <td className={`audit-num cmp-diff ${pctCls(dMin)}`}>{fmtPct(dMin)}</td>}
+                <td className="audit-num">{fmtS(lMax)}</td>
+                <td className="audit-num">{fmtS(sMax)}</td>
+                <td className={`audit-num cmp-diff ${pctCls(dMax)}`}>{fmtPct(dMax)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </Collapsible>
+  );
+}
+
 function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
   const logDurations = activeModel?.activity_durations || {};
@@ -1984,7 +2360,137 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
             orderedActivities={orderedActivities}
           />
         </Collapsible>
+
+        {/* Timing Discovery Comparison table */}
+        <Collapsible className="eval-subsection" title="Timing Discovery Comparison" defaultOpen={true}>
+          {(() => {
+            const fmtS = v => {
+              if (v == null || v === 0) return '—';
+              if (v >= 86400) return `${(v/86400).toFixed(1)} d`;
+              if (v >= 3600)  return `${(v/3600).toFixed(1)} h`;
+              if (v >= 60)    return `${Math.round(v/60)} min`;
+              return `${Math.round(v)} s`;
+            };
+            const pctDiff = (a, b) => (a == null || b == null || a === 0) ? null : (b - a) / a * 100;
+            const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+            const pctCls = v => { if (v == null) return ''; const n = Math.abs(v); return n < 5 ? 'cmp-ok' : v > 0 ? 'cmp-over' : 'cmp-under'; };
+
+            const fields = [
+              { key: 'service_mean', label: 'Service mean' },
+              { key: 'service_min',  label: 'Service min' },
+              { key: 'service_max',  label: 'Service max' },
+              { key: 'waiting_mean', label: 'Waiting mean' },
+              { key: 'sojourn_mean', label: 'Sojourn mean' },
+            ];
+            const acts = orderedActivities.filter(a => logDurations[a] || simDiscovered?.[a]);
+            if (acts.length === 0) return <p className="empty-notice">No timing data available yet.{simDiscovering && ' Discovering…'}</p>;
+
+            // Overall relative deviation: mean of |Δ%| across all (act, field) pairs
+            let deviations = [];
+            acts.forEach(act => {
+              const log = logDurations[act] || {};
+              const sim = simDiscovered?.[act] || {};
+              fields.forEach(f => {
+                const d = pctDiff(log[f.key], sim[f.key]);
+                if (d != null) deviations.push(d);
+              });
+            });
+            const overallMeanDev = deviations.length > 0
+              ? deviations.reduce((s, v) => s + v, 0) / deviations.length : null;
+            const overallAbsDev = deviations.length > 0
+              ? deviations.reduce((s, v) => s + Math.abs(v), 0) / deviations.length : null;
+
+            return (
+              <div>
+                <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                  Input OCEL log vs simulated output log, both using <strong>{({minimum:'Minimum sojourn',p25:'P25 sojourn',p50:'P50 (median) sojourn'})[serviceTimeMode] || serviceTimeMode}</strong>.
+                  {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+                </p>
+
+                {/* Overall deviation summary */}
+                <div className="timing-compare-overall">
+                  <span className="timing-compare-overall-label">Overall mean relative deviation</span>
+                  <span className={`timing-compare-overall-val ${pctCls(overallMeanDev)}`}>{fmtPct(overallMeanDev)}</span>
+                  <span className="timing-compare-overall-label" style={{marginLeft:'1.5rem'}}>Mean absolute deviation</span>
+                  <span className="timing-compare-overall-val" style={{color:'#475569'}}>{overallAbsDev != null ? overallAbsDev.toFixed(1) + '%' : '—'}</span>
+                </div>
+
+                {/* Per-activity foldable rows */}
+                <div className="timing-compare-act-list">
+                  {acts.map(act => {
+                    const log = logDurations[act] || {};
+                    const sim = simDiscovered?.[act] || {};
+                    const summaryPcts = fields.map(f => pctDiff(log[f.key], sim[f.key])).filter(v => v != null);
+                    const avgPct = summaryPcts.length > 0 ? summaryPcts.reduce((s,v)=>s+v,0)/summaryPcts.length : null;
+                    return (
+                      <details key={act} className="timing-compare-act-details">
+                        <summary className="timing-compare-act-summary">
+                          <span className="timing-compare-act-name">{act}</span>
+                          <span className="timing-compare-act-chips">
+                            {fields.map(f => {
+                              const d = pctDiff(log[f.key], sim[f.key]);
+                              return d != null ? (
+                                <span key={f.key} className={`timing-compare-chip ${pctCls(d)}`} title={f.label}>
+                                  {f.label.replace('Service ','svc ').replace('Waiting ','wait ').replace('Sojourn ','sojourn ')}:&nbsp;{fmtPct(d)}
+                                </span>
+                              ) : null;
+                            })}
+                          </span>
+                          <span className={`timing-compare-act-avg ${pctCls(avgPct)}`}>{fmtPct(avgPct)}</span>
+                        </summary>
+                        {/* Expanded detail table */}
+                        <table className="timing-compare-detail-table">
+                          <thead>
+                            <tr>
+                              <th>Metric</th>
+                              <th className="audit-num">Input Log</th>
+                              <th className="audit-num">Sim Output</th>
+                              <th className="audit-num">Δ absolute</th>
+                              <th className="audit-num">Δ %</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {fields.map(f => {
+                              const lv = log[f.key], sv = sim[f.key];
+                              const da = (lv != null && sv != null) ? sv - lv : null;
+                              const dp = pctDiff(lv, sv);
+                              return (
+                                <tr key={f.key}>
+                                  <td style={{color:'#64748b',fontSize:'0.72rem'}}>{f.label}</td>
+                                  <td className="audit-num">{fmtS(lv)}</td>
+                                  <td className="audit-num">{fmtS(sv)}</td>
+                                  <td className={`audit-num cmp-diff ${pctCls(da != null ? (da > 0 ? 1 : da < 0 ? -1 : 0) : null)}`}>
+                                    {da != null ? (da >= 0 ? '+' : '') + fmtS(da) : '—'}
+                                  </td>
+                                  <td className={`audit-num cmp-diff ${pctCls(dp)}`}>{fmtPct(dp)}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </details>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })()}
+        </Collapsible>
+
+        {/* Sim Metrics vs Log Discovery */}
+        <SimVsDiscoveredComparison
+          simMetrics={simMetrics}
+          logDurations={logDurations}
+          orderedActivities={orderedActivities}
+        />
       </Collapsible>
+
+      {/* ── Activity Gantt Chart ── */}
+      <ActivityGanttChart
+        results={results}
+        orderedActivities={orderedActivities}
+        simMetrics={simMetrics}
+      />
 
       {/* ── O2O Comparison ── */}
       <Collapsible className="eval-section" title="O2O Rules Comparison" defaultOpen={false}>
@@ -2010,8 +2516,188 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
   );
 }
 
+// ── PerObjectBoundsChecker ────────────────────────────────────────────────────
+// Checks nmin/nmax per scope object across the whole log.
+// For each constraint with a scope, for each object of that scope type:
+//   - collects all source events involving that object
+//   - collects all target events in the correct temporal window involving that object
+//   - checks count is in [nmin, nmax]
+// Reports per-constraint: how many scope objects violated the bounds.
+function PerObjectBoundsChecker({ events, typesMap, constraints, onBoundsResults }) {
+  const results = React.useMemo(() => {
+    if (!events || events.length === 0 || !constraints || constraints.length === 0) return [];
+    const eventObjs = events.map(e => new Set(e.object_ids || []));
+
+    const objEvents = {};
+    events.forEach((e, i) => {
+      (e.object_ids || []).forEach(oid => {
+        (objEvents[oid] = objEvents[oid] || []).push(i);
+      });
+    });
+
+    const objsByType = {};
+    Object.entries(typesMap).forEach(([oid, t]) => {
+      (objsByType[t] = objsByType[t] || []).push(oid);
+    });
+
+    return constraints
+      .filter(c => c.scope?.kind === 'each' && c.scope?.object_type)
+      .map(c => {
+        const { source_activity: src, target_activity: tgt, constraint_type: ctype,
+                scope, nmin = 1, nmax } = c;
+        const label = `${ctype}(${src}→${tgt})`;
+        const scopeObjs = objsByType[scope.object_type] || [];
+        const isBefore = ['precedence','chain_precedence','alternate_precedence'].includes(ctype);
+        const isNot = ['not_coexistence','not_succession'].includes(ctype);
+
+        let violated = 0, checked = 0, underMin = 0, overMax = 0, tgtCount = 0;
+        let maxObserved = 0; // max target count seen across all scope objects
+        const violators = [];
+
+        scopeObjs.forEach(oid => {
+          const objEvtIdxs = objEvents[oid] || [];
+          if (objEvtIdxs.length === 0) return;
+
+          if (isNot) {
+            const hasSrc = objEvtIdxs.some(i => events[i].activity === src);
+            const hasTgt = objEvtIdxs.some(i => events[i].activity === tgt);
+            if (hasSrc && hasTgt) {
+              checked++;
+              violated++;
+              overMax++;
+              if (violators.length < 5) violators.push({ oid, srcCount: 1, tgtCount: 1 });
+            }
+            return;
+          }
+
+          if (isBefore) {
+            const tgtEvts = objEvtIdxs.filter(i => events[i].activity === tgt);
+            if (tgtEvts.length === 0) return;
+            checked++;
+            let anyViolation = false;
+            tgtEvts.forEach(ti => {
+              const tgtTs = events[ti].timestamp;
+              const srcBefore = objEvtIdxs.filter(i =>
+                events[i].activity === src && events[i].timestamp <= tgtTs
+              ).length;
+              if (srcBefore > maxObserved) maxObserved = srcBefore;
+              if (srcBefore < nmin) { anyViolation = true; underMin++; }
+              if (nmax != null && srcBefore > nmax) { anyViolation = true; overMax++; }
+              tgtCount = srcBefore;
+            });
+            // Also track max target count per object (for response-style nmax suggestion)
+            const tgtOnObj = tgtEvts.length;
+            if (tgtOnObj > maxObserved) maxObserved = tgtOnObj;
+            if (anyViolation) {
+              violated++;
+              if (violators.length < 5) violators.push({ oid, srcCount: objEvtIdxs.filter(i => events[i].activity === src).length, tgtCount });
+            }
+          } else {
+            const srcEvtIdxs = objEvtIdxs.filter(i => events[i].activity === src);
+            if (srcEvtIdxs.length === 0) return;
+            checked++;
+            let anyViolation = false;
+            srcEvtIdxs.forEach(si => {
+              const srcTs = events[si].timestamp;
+              const cnt = objEvtIdxs.filter(i =>
+                events[i].activity === tgt && events[i].timestamp >= srcTs
+              ).length;
+              if (cnt > maxObserved) maxObserved = cnt;
+              if (cnt < nmin) { anyViolation = true; underMin++; }
+              if (nmax != null && cnt > nmax) { anyViolation = true; overMax++; }
+              tgtCount = cnt;
+            });
+            if (anyViolation) {
+              violated++;
+              if (violators.length < 5) violators.push({ oid, srcCount: srcEvtIdxs.length, tgtCount });
+            }
+          }
+        });
+
+        if (checked === 0) return null;
+        return { label, checked, violated, underMin, overMax, nmin, nmax, maxObserved, violators,
+                 constraint: c, hasNmax: nmax != null };
+      })
+      .filter(Boolean);
+  }, [events, typesMap, constraints]);
+
+  React.useEffect(() => { onBoundsResults?.(results); }, [results]);
+
+  if (results.length === 0) return <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No scoped constraints to evaluate.</p>;
+
+  const anyViolations = results.some(r => r.violated > 0);
+  const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+
+  return (
+    <Collapsible
+      className="conf-detail-collapsible"
+      title="Per-Object Bounds Check (nmin/nmax)"
+      defaultOpen={false}
+    >
+      <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+        For each scoped constraint: checks every scope object in the log to see if the count
+        of target events falls within [nmin, nmax]. Constraints with nmax=∞ only check the lower bound.
+        The <strong>Max observed</strong> column shows the highest count seen — useful for setting nmax.
+      </p>
+      {!anyViolations && (
+        <p style={{fontSize:'0.8rem',color:'#166534',fontWeight:600}}>✓ All scope objects satisfy [nmin, nmax] bounds.</p>
+      )}
+      <table className="conf-detail-table">
+        <thead>
+          <tr>
+            <th>Constraint</th>
+            <th className="audit-num">Bounds</th>
+            <th className="audit-num">Max observed</th>
+            <th className="audit-num">Objects checked</th>
+            <th className="audit-num">Violated</th>
+            <th className="audit-num">Under-min</th>
+            <th className="audit-num">Over-max</th>
+            <th className="audit-num">Compliance</th>
+          </tr>
+        </thead>
+        <tbody>
+          {results.sort((a, b) => b.violated - a.violated).map(r => {
+            const compliance = r.checked > 0 ? (r.checked - r.violated) / r.checked : 1;
+            const cls = compliance >= 0.9 ? 'conf-good' : compliance >= 0.5 ? 'conf-mid' : 'conf-bad';
+            const suggestNmax = !r.hasNmax && r.maxObserved > 0;
+            return (
+              <React.Fragment key={r.label}>
+                <tr className={r.violated > 0 ? 'audit-row-accumulating' : ''}>
+                  <td style={{fontFamily:'monospace',fontSize:'0.72rem'}}>{r.label}</td>
+                  <td className="audit-num" style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:600}}>[{r.nmin}, {r.nmax ?? '∞'}]</td>
+                  <td className="audit-num">
+                    <span style={{fontWeight:700,color: suggestNmax ? '#6366f1' : '#1e293b'}}
+                          title={suggestNmax ? 'No nmax set — consider setting nmax to this value' : ''}>
+                      {r.maxObserved}
+                      {suggestNmax && <span style={{fontSize:'0.65rem',color:'#6366f1',marginLeft:'0.2rem'}}>→ set nmax?</span>}
+                    </span>
+                  </td>
+                  <td className="audit-num">{r.checked}</td>
+                  <td className="audit-num">{r.violated > 0 ? <span style={{color:'#b91c1c',fontWeight:700}}>{r.violated}</span> : '0'}</td>
+                  <td className="audit-num">{r.underMin > 0 ? <span style={{color:'#b91c1c'}}>{r.underMin}</span> : '0'}</td>
+                  <td className="audit-num">{r.overMax > 0 ? <span style={{color:'#b45309'}}>{r.overMax}</span> : '0'}</td>
+                  <td className="audit-num"><span className={cls}>{pct(compliance)}</span></td>
+                </tr>
+                {r.violated > 0 && r.violators.length > 0 && (
+                  <tr>
+                    <td colSpan={8} style={{fontSize:'0.68rem',color:'#64748b',paddingLeft:'1rem',paddingBottom:'0.3rem'}}>
+                      Example violations: {r.violators.map(v =>
+                        `${v.oid} (src×${v.srcCount}, tgt×${v.tgtCount})`
+                      ).join(' · ')}{r.violated > r.violators.length ? ` … +${r.violated - r.violators.length} more` : ''}
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </Collapsible>
+  );
+}
+
 // ── LogModelConformance ───────────────────────────────────────────────────────
-function LogModelConformance({ eventLogFile, activeModel, onResults }) {
+function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsResults }) {
   const [events,    setEvents]    = React.useState(null);
   const [typesMap,  setTypesMap]  = React.useState({});
   const [loading,   setLoading]   = React.useState(false);
@@ -2225,6 +2911,16 @@ function LogModelConformance({ eventLogFile, activeModel, onResults }) {
               </tbody>
             </table>
           )}
+
+          {/* Per-object bounds checker */}
+          {conf && events && (
+            <PerObjectBoundsChecker
+              events={events}
+              typesMap={typesMap}
+              constraints={constraints}
+              onBoundsResults={onBoundsResults}
+            />
+          )}
         </>
       )}
     </Collapsible>
@@ -2283,8 +2979,12 @@ function App() {
     startActivities: [],
   });
   const [isSimulating, setIsSimulating] = useState(false);
-  const [liveStepCount, setLiveStepCount] = useState(null); // step counter during run
-  const [activeRunId,   setActiveRunId]   = useState(null); // run_id for status/stop polling
+  const [liveStepCount, setLiveStepCount] = useState(null);
+  const [activeRunId,   setActiveRunId]   = useState(null);
+  const [simElapsed,    setSimElapsed]    = useState(null); // seconds elapsed during last run
+  const [lastRunDuration, setLastRunDuration] = useState(null); // seconds for completed run
+  const simStartRef = useRef(null);
+  const simTimerRef = useRef(null);
   const pollIntervalRef = useRef(null);
   const ocelFileRef    = useRef(null);
   const ocdeclFileRef  = useRef(null);
@@ -2414,8 +3114,11 @@ function App() {
   const [startProbApplied, setStartProbApplied] = useState(false);
   // OC-Declare model check results (from First Log Insights panel)
   const [logConfResults, setLogConfResults] = useState(null); // null = not run yet
+  const [logBoundsResults, setLogBoundsResults] = useState(null); // per-object bounds check results
   // Whether to drop 0%-confidence constraints before Run Discoveries
   const [dropZeroConfConstraints, setDropZeroConfConstraints] = useState(false);
+  // Whether to set nmax to max observed for unbounded constraints
+  const [setNmaxFromBounds, setSetNmaxFromBounds] = useState(false);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
   const [lifecycleError, setLifecycleError] = useState(null);
   const [resourceResult, setResourceResult] = useState(null);     // [{type, instance_count}]
@@ -2830,6 +3533,14 @@ function App() {
     setIsSimulating(true);
     setLiveStepCount(0);
     setActiveRunId(runId);
+    // Start elapsed timer
+    simStartRef.current = Date.now();
+    setSimElapsed(0);
+    setLastRunDuration(null);
+    if (simTimerRef.current) clearInterval(simTimerRef.current);
+    simTimerRef.current = setInterval(() => {
+      setSimElapsed(Math.floor((Date.now() - simStartRef.current) / 1000));
+    }, 1000);
     setError(null);
     setResults(null);
     setLogs([]);
@@ -2891,6 +3602,12 @@ function App() {
     } finally {
       clearInterval(pollIntervalRef.current);
       pollIntervalRef.current = null;
+      // Stop elapsed timer and record final duration
+      clearInterval(simTimerRef.current);
+      simTimerRef.current = null;
+      const duration = Math.floor((Date.now() - (simStartRef.current || Date.now())) / 1000);
+      setLastRunDuration(duration);
+      setSimElapsed(null);
       setIsSimulating(false);
       setActiveRunId(null);
     }
@@ -2942,14 +3659,10 @@ function App() {
     const counts = discoveryResults.activity_counts;
     const total = Object.values(counts).reduce((s, v) => s + v, 0);
     if (!total) return;
-    // Always read the latest selection from the ref, not the closure
     const latestSelected = startActivityProbSelectedRef.current;
-    const selected = new Set(
-      latestSelected?.length
-        ? latestSelected
-        : [discoveryResults.likely_start_activities[0]]
-    );
-    if (!selected.size) return;
+    // Nothing selected → skip (user must explicitly choose start activities)
+    if (!latestSelected?.length) return;
+    const selected = new Set(latestSelected);
     const combinedProb = [...selected].reduce((s, a) => s + (counts[a] || 0), 0) / total;
     const selectedCountSum = [...selected].reduce((s, a) => s + (counts[a] || 0), 0);
     const newMatrix = {};
@@ -3198,7 +3911,7 @@ function App() {
 
   // Generate the full suggestion list from health report + config.
   // Returns [{id, type, badgeLabel, label, desc, action}]
-  const generateSuggestions = (hr, model, cfg, startActivities = [], confResults = null, dropZeroConf = false) => {
+  const generateSuggestions = (hr, model, cfg, startActivities = [], confResults = null, dropZeroConf = false, boundsResults = null, setNmaxFromLog = false) => {
     if (!hr || !model) return [];
     const suggestions = [];
     let id = 0;
@@ -3220,6 +3933,30 @@ function App() {
           action: m => ({ ...m, constraints: (m.constraints || []).filter(x => x !== c) }),
         });
       });
+    }
+
+    // ── Rule 0b: Set nmax to max observed for unbounded constraints ───────────
+    if (setNmaxFromLog && boundsResults?.length) {
+      boundsResults
+        .filter(r => !r.hasNmax && r.maxObserved > 0)
+        .forEach(r => {
+          const c = (model.constraints || []).find(con =>
+            `${con.constraint_type}(${con.source_activity}→${con.target_activity})` === r.label
+          );
+          if (!c) return;
+          suggestions.push({
+            id: id++, type: 'SET_NMAX',
+            badgeLabel: `nmax=${r.maxObserved}`,
+            label: `Set nmax=${r.maxObserved} on ${r.label}`,
+            desc: `No upper bound currently set. Max observed in input log: ${r.maxObserved} firings per scope object. Setting nmax to this value caps the constraint at what was actually seen.`,
+            action: m => ({
+              ...m,
+              constraints: (m.constraints || []).map(con =>
+                con === c ? { ...con, nmax: r.maxObserved } : con
+              ),
+            }),
+          });
+        });
     }
 
     // ── Rule 1: Cycle removal ──────────────────────────────────────────────
@@ -4123,6 +4860,7 @@ function App() {
                           eventLogFile={discoveryConfig.eventLogFile}
                           activeModel={activeModel}
                           onResults={setLogConfResults}
+                          onBoundsResults={setLogBoundsResults}
                         />
                       </Collapsible>
                     );
@@ -4280,7 +5018,7 @@ function App() {
                               .filter(a => !(discoveryResults.likely_start_activities||[]).includes(a))
                               .sort((a,b)=>(discoveryResults.activity_counts[b]||0)-(discoveryResults.activity_counts[a]||0)),
                           ];
-                          const selected = new Set(discoveryConfig.startActivityProbSelected ?? (candidates[0] ? [candidates[0]] : []));
+                          const selected = new Set(discoveryConfig.startActivityProbSelected ?? []);
                           const toggle = a => {
                             const next = new Set(selected);
                             next.has(a) ? next.delete(a) : next.add(a);
@@ -4607,6 +5345,31 @@ function App() {
                               })()
                           }
                         </div>
+                        {/* Set nmax from bounds check */}
+                        <div className="auto-config-row" style={{paddingBottom:'0.4rem',borderBottom:'1px solid #f1f5f9',marginBottom:'0.3rem'}}>
+                          <label
+                            className={`auto-config-label${!logBoundsResults ? ' disc-option-disabled' : ''}`}
+                            style={{cursor: logBoundsResults ? 'pointer' : 'not-allowed'}}
+                            title={!logBoundsResults ? 'Run the OC-Declare Model Check in First Log Insights first' : ''}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={setNmaxFromBounds}
+                              disabled={!logBoundsResults}
+                              onChange={e => setSetNmaxFromBounds(e.target.checked)}
+                            />
+                            {' '}Set nmax to max observed for unbounded constraints (bounds check)
+                          </label>
+                          {!logBoundsResults
+                            ? <span style={{fontSize:'0.68rem',color:'#94a3b8',fontStyle:'italic'}}>run OC-Declare Model Check first</span>
+                            : (() => {
+                                const n = (logBoundsResults || []).filter(r => !r.hasNmax && r.maxObserved > 0).length;
+                                return n > 0
+                                  ? <span style={{fontSize:'0.68rem',color:'#6366f1',fontWeight:600}}>{n} unbounded with data</span>
+                                  : <span style={{fontSize:'0.68rem',color:'#166534'}}>none applicable</span>;
+                              })()
+                          }
+                        </div>
                         <div className="auto-config-row">
                           <label className="auto-config-label">
                             <input type="checkbox" checked={autoConfig.cycleEnabled}
@@ -4702,7 +5465,7 @@ function App() {
                       className="auto-generate-btn"
                       disabled={!healthResult || !!healthResult.error || !activeModel}
                       onClick={() => {
-                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints);
+                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints, logBoundsResults, setNmaxFromBounds);
                         setAutoSuggestions(suggs);
                         setAutoSelected(new Set(suggs.map((_, i) => i)));
                       }}
@@ -5014,6 +5777,11 @@ function App() {
                         ▶ Run Evaluation
                       </button>
                     )}
+                    {results && !isSimulating && lastRunDuration != null && (
+                      <span className="sim-duration-badge">
+                        ⏱ {Math.floor(lastRunDuration/60).toString().padStart(2,'0')}:{(lastRunDuration%60).toString().padStart(2,'0')}
+                      </span>
+                    )}
                     {hasModelWarnings && (
                       <div className="model-warnings-notice">
                         ⚠ Simulation blocked — {bindingWarnings.length} activit{bindingWarnings.length === 1 ? 'y has' : 'ies have'} no object bindings:{' '}
@@ -5039,6 +5807,14 @@ function App() {
                         <span className="sim-step-counter">
                           step {liveStepCount ?? 0} / {config.maxSteps}
                         </span>
+                      </p>
+                      <p className="sim-elapsed-timer">
+                        {(() => {
+                          const s = simElapsed ?? 0;
+                          const m = Math.floor(s / 60).toString().padStart(2,'0');
+                          const sec = (s % 60).toString().padStart(2,'0');
+                          return `⏱ ${m}:${sec}`;
+                        })()}
                       </p>
                       <button className="sim-stop-btn" onClick={stopSimulation}>
                         ⏹ Stop
@@ -6544,7 +7320,7 @@ function App() {
               className="auto-generate-btn"
               disabled={!healthResult || !!healthResult.error || !activeModel}
               onClick={() => {
-                const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints);
+                const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints, logBoundsResults, setNmaxFromBounds);
                 setAutoSuggestions(suggs);
                 setAutoSelected(new Set(suggs.map((_, i) => i))); // select all by default
               }}

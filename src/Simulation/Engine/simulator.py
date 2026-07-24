@@ -442,6 +442,108 @@ class Simulator:
                     seen_keys.add(key)
                     candidates.append(candidate)
 
+        # ── Option 4: Response obligation injection (B + F optimised) ────────
+        # B: Build a set of (activity, object) pairs already in the pool so
+        #    in-pool checks are O(1) instead of O(pool_size) per obligation.
+        # F: Cheap pre-filter before calling build_candidate_for_activity —
+        #    skip obligations whose target activity is blocked by precedence
+        #    on the scope object without doing a full semantic check.
+        if state._obligations_count and not is_simulation_start:
+            act_by_name = {a.name: a for a in self.static_model.activities}
+
+            # B: index of (activity_name, scope_oid) already covered by normal pool
+            pool_index: set[tuple] = set()
+            for c in candidates:
+                for oid in c.participating_object_ids:
+                    pool_index.add((c.activity_name, oid))
+                if not c.participating_object_ids:
+                    pool_index.add((c.activity_name, None))
+
+            # Pre-index precedence constraints by target activity for F
+            prec_by_target: dict[str, list] = {}
+            for con in self.static_model.constraints:
+                if con.constraint_type == 'precedence':
+                    prec_by_target.setdefault(con.target_activity, []).append(con)
+
+            seen_obligation_keys: set = set()
+            for (target_act, scope_oid), count in list(state._obligations_count.items()):
+                if count <= 0:
+                    continue
+                dedup_key = (target_act, scope_oid)
+                if dedup_key in seen_obligation_keys:
+                    continue
+                seen_obligation_keys.add(dedup_key)
+
+                # B: O(1) pool membership check
+                if scope_oid is not None:
+                    if (target_act, scope_oid) in pool_index:
+                        continue
+                else:
+                    if (target_act, None) in pool_index:
+                        continue
+
+                # Scope object must exist and be active
+                if scope_oid is not None:
+                    scope_obj = state.objects.get(scope_oid)
+                    if scope_obj is None or not scope_obj.active:
+                        continue
+
+                # F: cheap precedence pre-filter — skip if any precedence
+                # constraint on the target is unsatisfied for this scope object.
+                # Uses only the cached event count index (O(1) per constraint).
+                blocked = False
+                for con in prec_by_target.get(target_act, []):
+                    if scope_oid is None:
+                        # global scope — check global fire count
+                        if not state._events_by_activity.get(con.source_activity):
+                            blocked = True
+                            break
+                    elif con.scope.kind == 'each' and con.scope.object_type:
+                        # check source count on this specific object
+                        if scope_obj is not None and scope_obj.object_type == con.scope.object_type:
+                            src_count = len(state._events_by_act_obj.get(
+                                (con.source_activity, scope_oid), []))
+                            nmin = con.nmin if con.nmin is not None else 1
+                            nmax = con.nmax
+                            if nmin > 0 and src_count == 0:
+                                blocked = True
+                                break
+                            if nmax is not None and src_count > nmax:
+                                blocked = True
+                                break
+                if blocked:
+                    continue
+
+                activity = act_by_name.get(target_act)
+                if activity is None:
+                    continue
+
+                if scope_oid is not None:
+                    primary_type = scope_obj.object_type
+                    original_active = state._active_by_type.get(primary_type, set())
+                    state._active_by_type[primary_type] = {scope_oid}
+                    try:
+                        candidate = build_candidate_for_activity(
+                            activity, state, resource_types=resource_types
+                        )
+                    finally:
+                        state._active_by_type[primary_type] = original_active
+                else:
+                    candidate = build_candidate_for_activity(
+                        activity, state, resource_types=resource_types
+                    )
+
+                if candidate is None:
+                    continue
+                if not is_candidate_semantically_allowed(self.static_model, candidate, state):
+                    continue
+
+                key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
+                       tuple(sorted(candidate.object_types_to_create)))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    candidates.append(candidate)
+
         return candidates
 
     def _generate_candidates(self, state: SimulationState) -> list[Candidate]:
@@ -888,9 +990,26 @@ class Simulator:
         )
 
         started_at = state.current_time
+        # In DES mode the base for sampling must be current_time (when the activity
+        # actually starts), not last_generated_timestamp.
+        saved_ts = state.last_generated_timestamp
+        state.last_generated_timestamp = state.current_time
         complete_at = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
+        # Restore: don't let this activity's complete_at become the base for the
+        # next concurrently started activity. In DES mode all activities in the same
+        # step start from current_time, not from each other's completion times.
+        state.last_generated_timestamp = saved_ts
 
-        # Sample and apply process waiting time (pre-start delay from discovered distribution)
+        # Record pure service time (sampled work duration only, before waiting is added)
+        if started_at is not None and complete_at is not None:
+            svc = (complete_at - started_at).total_seconds()
+            if svc >= 0:
+                state.activity_service_s.setdefault(candidate.activity_name, []).append(svc)
+
+        # Add process waiting time to advance the clock to realistic calendar scale.
+        # This reproduces inter-event gaps (lead times, batching, admin delays) that
+        # are not explicitly modelled. It only advances complete_at — the service
+        # metric above is already recorded and correct.
         dur = getattr(self.time_policy, 'durations', {}).get(candidate.activity_name)
         if dur is not None:
             from src.Simulation.Engine.timepolicy import _sample_waiting
@@ -900,7 +1019,9 @@ class Simulator:
                 complete_at = complete_at + _td(seconds=wait_s)
                 state.process_wait_s.setdefault(candidate.activity_name, []).append(wait_s)
 
-        state.last_generated_timestamp = complete_at
+        # Do NOT update last_generated_timestamp here in DES mode —
+        # concurrent activities all start from current_time, not from
+        # each other's completion times.
 
         self._des_lock_resources(held_resource_ids, candidate.activity_name, complete_at, state)
 
@@ -914,11 +1035,6 @@ class Simulator:
             created_object_ids=created_object_ids,
         )
         heapq.heappush(state.in_progress, in_prog)
-
-        if started_at is not None and complete_at is not None:
-            svc = (complete_at - started_at).total_seconds()
-            if svc >= 0:
-                state.activity_service_s.setdefault(candidate.activity_name, []).append(svc)
 
         self._trace("des_started", {
             "activity_name": candidate.activity_name,
