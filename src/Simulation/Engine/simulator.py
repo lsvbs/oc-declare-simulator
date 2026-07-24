@@ -168,6 +168,28 @@ class Simulator:
         # activities that don't appear in the last row of the transition matrix.
         self.start_counts = start_counts or {}
 
+        # ── Hot-path caches (computed once, reused every step) ────────────────
+        # #2: resource types as a set — avoids rebuilding set(...) in every generator call
+        self._resource_types_set: set = set(getattr(static_model, 'resource_types', []) or [])
+
+        # #3: start activity names as a set — avoids rebuilding set(...) per step
+        self._start_names_set: set = set(config.start_policy.start_activity_names)
+
+        # #4: activity name → Activity dict — avoids O(A) scan in obligation injection
+        self._act_by_name: dict = {a.name: a for a in static_model.activities}
+
+        # #4: precedence constraints indexed by target_activity — avoids O(C) scan per step
+        self._prec_by_target: dict = {}
+        for con in static_model.constraints:
+            if con.constraint_type == 'precedence':
+                self._prec_by_target.setdefault(con.target_activity, []).append(con)
+
+        # #8: response constraints indexed by source_activity — avoids O(C) scan per event
+        self._response_by_source: dict = {}
+        for con in static_model.constraints:
+            if con.constraint_type == 'response':
+                self._response_by_source.setdefault(con.source_activity, []).append(con)
+
     def _trace(self, event: str, payload: dict) -> None:
         if self.trace_func is None:
             return
@@ -190,7 +212,7 @@ class Simulator:
 
         # Seed the start-event counter index so _start_event_count is maintained
         # correctly by record_event throughout the run.
-        state._start_activity_names = set(self.config.start_policy.start_activity_names)
+        state._start_activity_names = self._start_names_set
         state._resource_types = set(getattr(self.static_model, 'resource_types', []) or [])
 
         # Pre-populate resource pool objects so activities that bind resource
@@ -319,9 +341,9 @@ class Simulator:
         same activity can then compete for the same resource and queue when it
         is occupied.
         """
-        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        resource_types: set[str] = self._resource_types_set
         is_simulation_start = len(state.executed_events) == 0 and not state.in_progress
-        start_activity_names = set(self.config.start_policy.start_activity_names)
+        start_activity_names = self._start_names_set
         candidates: list[Candidate] = []
         seen_keys: set[tuple] = set()
 
@@ -402,14 +424,12 @@ class Simulator:
             for oid in active_ids:
                 if oid in in_progress_objects:
                     continue
-                # Temporarily restrict the active pool for this type to only this object
-                # so build_candidate_for_activity picks it specifically.
-                original_active = state._active_by_type.get(primary_type, set())
-                state._active_by_type[primary_type] = {oid}
-                try:
-                    candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
-                finally:
-                    state._active_by_type[primary_type] = original_active
+                # #6: pass force_object_id instead of mutating _active_by_type
+                candidate = build_candidate_for_activity(
+                    activity, state,
+                    resource_types=resource_types,
+                    force_object_id=oid,
+                )
 
                 if candidate is None:
                     continue
@@ -449,7 +469,7 @@ class Simulator:
         #    skip obligations whose target activity is blocked by precedence
         #    on the scope object without doing a full semantic check.
         if state._obligations_count and not is_simulation_start:
-            act_by_name = {a.name: a for a in self.static_model.activities}
+            act_by_name = self._act_by_name
 
             # B: index of (activity_name, scope_oid) already covered by normal pool
             pool_index: set[tuple] = set()
@@ -459,11 +479,7 @@ class Simulator:
                 if not c.participating_object_ids:
                     pool_index.add((c.activity_name, None))
 
-            # Pre-index precedence constraints by target activity for F
-            prec_by_target: dict[str, list] = {}
-            for con in self.static_model.constraints:
-                if con.constraint_type == 'precedence':
-                    prec_by_target.setdefault(con.target_activity, []).append(con)
+            prec_by_target: dict[str, list] = self._prec_by_target
 
             seen_obligation_keys: set = set()
             for (target_act, scope_oid), count in list(state._obligations_count.items()):
@@ -519,15 +535,10 @@ class Simulator:
                     continue
 
                 if scope_oid is not None:
-                    primary_type = scope_obj.object_type
-                    original_active = state._active_by_type.get(primary_type, set())
-                    state._active_by_type[primary_type] = {scope_oid}
-                    try:
-                        candidate = build_candidate_for_activity(
-                            activity, state, resource_types=resource_types
-                        )
-                    finally:
-                        state._active_by_type[primary_type] = original_active
+                    # #6: use force_object_id instead of mutating _active_by_type
+                    candidate = build_candidate_for_activity(
+                        activity, state, resource_types=resource_types, force_object_id=scope_oid
+                    )
                 else:
                     candidate = build_candidate_for_activity(
                         activity, state, resource_types=resource_types
@@ -563,11 +574,11 @@ class Simulator:
         seen_keys: set[tuple] = set()
 
         # Resource types bypass link-preference selection (shared across case chains)
-        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        resource_types: set[str] = self._resource_types_set
 
         # At simulation start (no events executed), only allow start activities
         is_simulation_start = len(state.executed_events) == 0
-        start_activity_names = set(self.config.start_policy.start_activity_names)
+        start_activity_names = self._start_names_set
 
         for activity in self.static_model.activities:
             candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
@@ -775,7 +786,7 @@ class Simulator:
         created_object_ids: list[str] = []
 
         attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
-        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        resource_types: set[str] = self._resource_types_set
 
         for object_type in candidate.object_types_to_create:
             # Resource types are never created by activities — they live in the
@@ -811,7 +822,7 @@ class Simulator:
         if activity is None:
             return
 
-        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        resource_types: set[str] = self._resource_types_set
 
         deactivated_types = {
             binding.object_type
@@ -861,12 +872,8 @@ class Simulator:
             state._obligations_count.pop((act, oid), None)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
-        for constraint in self.static_model.constraints:
-            if constraint.constraint_type != "response":
-                continue
-            if executed_event.activity_name != constraint.source_activity:
-                continue
-
+        # #8: use pre-indexed dict instead of scanning all constraints
+        for constraint in self._response_by_source.get(executed_event.activity_name, []):
             if constraint.scope.kind == "each":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event,
@@ -902,10 +909,8 @@ class Simulator:
         return scope_ids
 
     def _get_activity_by_name(self, activity_name: str) -> Optional[Activity]:
-        for activity in self.static_model.activities:
-            if activity.name == activity_name:
-                return activity
-        return None
+        # #1: O(1) dict lookup using cached _act_by_name built in __init__
+        return self._act_by_name.get(activity_name)
 
     def _get_candidate_scope_object_ids(
         self,
@@ -972,7 +977,7 @@ class Simulator:
         """Create objects-to-create, apply links, lock resources, push to heap."""
         created_object_ids: list[str] = []
         attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
-        resource_types: set[str] = set(getattr(self.static_model, "resource_types", []) or [])
+        resource_types: set[str] = self._resource_types_set
 
         for object_type in candidate.object_types_to_create:
             # Resource types come from the pre-populated pool only — never created mid-sim.
@@ -1093,10 +1098,31 @@ class Simulator:
             "step_count": state.step_count,
         })
 
-    def _des_try_start_waiting(self, state: SimulationState) -> None:
-        """After a resource is released, try to start any waiting candidates."""
+    def _des_try_start_waiting(self, state: SimulationState,
+                               completed_activity: str | None = None) -> None:
+        """After a resource is released, try to start any waiting candidates.
+
+        #9: Skip full semantic re-check for candidates whose activity is not
+        named in any constraint involving completed_activity. The only constraints
+        that could have changed state are those with completed_activity as source
+        or target — everything else is unaffected.
+        """
         if not state.waiting_queue:
             return
+
+        # Build set of activities that COULD be affected by the completed activity
+        # (i.e. activities that share a constraint with it).
+        if completed_activity is not None:
+            affected: set[str] | None = set()
+            for con in self.static_model.constraints:
+                if con.source_activity == completed_activity:
+                    affected.add(con.target_activity)
+                if con.target_activity == completed_activity:
+                    affected.add(con.source_activity)
+            affected.add(completed_activity)
+        else:
+            affected = None  # unknown — re-check everything
+
         still_waiting: list[WaitingCandidate] = []
         for wc in state.waiting_queue:
             cand = Candidate(
@@ -1104,10 +1130,11 @@ class Simulator:
                 participating_object_ids=wc.participating_object_ids,
                 object_types_to_create=wc.object_types_to_create,
             )
-            # Re-check semantic constraints: state may have changed since the
-            # candidate was queued (e.g. not_coexistence fired in the interim).
-            if not is_candidate_semantically_allowed(self.static_model, cand, state):
-                continue
+            # #9: only re-run semantic check if this candidate's activity could
+            # have been affected by the just-completed activity.
+            if affected is None or wc.candidate_activity_name in affected:
+                if not is_candidate_semantically_allowed(self.static_model, cand, state):
+                    continue
             available, held = self._des_resources_available(cand, state)
             if available:
                 if state.current_time is not None and wc.arrived_at is not None:
@@ -1130,7 +1157,7 @@ class Simulator:
         if state is None:
             state = SimulationState()
 
-        state._start_activity_names = set(self.config.start_policy.start_activity_names)
+        state._start_activity_names = self._start_names_set
         state._resource_types = set(getattr(self.static_model, 'resource_types', []) or [])
         state.current_time = self.config.start_timestamp
         state.last_generated_timestamp = self.config.start_timestamp
@@ -1146,7 +1173,7 @@ class Simulator:
                 state._active_by_type.setdefault(res_type, set()).add(oid)
                 state._type_of_object[oid] = res_type
 
-        start_activity_names = set(self.config.start_policy.start_activity_names)
+        start_activity_names = self._start_names_set
 
         while state.step_count < self.config.max_steps:
             # Early stop requested by the frontend (Stop button)
@@ -1158,7 +1185,7 @@ class Simulator:
             while state.in_progress and state.in_progress[0].complete_at <= state.current_time:
                 finishing = heapq.heappop(state.in_progress)
                 self._des_complete_activity(finishing, state)
-                self._des_try_start_waiting(state)
+                self._des_try_start_waiting(state, finishing.candidate_activity_name)
                 if state.step_count >= self.config.max_steps:
                     break
 

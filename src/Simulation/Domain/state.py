@@ -248,36 +248,28 @@ class SimulationState:
         # ── Maintain indexes ──────────────────────────────────────────────────
         self._events_by_activity.setdefault(activity_name, []).append(event)
 
-        # Capture previous activity per object BEFORE updating the index,
-        # so the streak cache can detect activity changes.
-        prev_activity_per_obj = {
-            oid: self._last_activity_per_object.get(oid)
-            for oid in participating_object_ids
-        }
-
         for oid in participating_object_ids:
+            # Capture previous activity before updating — needed for streak reset below
+            prev_act_for_oid = self._last_activity_per_object.get(oid)
             self._events_by_object.setdefault(oid, []).append(event)
             self._events_by_act_obj.setdefault((activity_name, oid), []).append(event)
             self._last_activity_per_object[oid] = activity_name
 
-        if activity_name in self._start_activity_names:
-            self._start_event_count += 1
-
-        # ── Maintain consecutive-streak caches ───────────────────────────────
-        # Global streak: reset when activity changes
-        if self._last_global_activity != activity_name:
-            self._global_streak.clear()
-            self._last_global_activity = activity_name
-        self._global_streak[activity_name] = self._global_streak.get(activity_name, 0) + 1
-
-        # Per-object streak
-        for oid in participating_object_ids:
-            last_for_obj = prev_activity_per_obj.get(oid)
-            if last_for_obj != activity_name:
-                prev_key = (last_for_obj, oid) if last_for_obj else None
+            # Per-object streak (#17: inlined, no dict allocation)
+            if prev_act_for_oid != activity_name:
+                prev_key = (prev_act_for_oid, oid) if prev_act_for_oid else None
                 if prev_key and prev_key in self._object_streak:
                     del self._object_streak[prev_key]
             key = (activity_name, oid)
             self._object_streak[key] = self._object_streak.get(key, 0) + 1
+
+        if activity_name in self._start_activity_names:
+            self._start_event_count += 1
+
+        # ── Global consecutive-streak cache ───────────────────────────────────
+        if self._last_global_activity != activity_name:
+            self._global_streak.clear()
+            self._last_global_activity = activity_name
+        self._global_streak[activity_name] = self._global_streak.get(activity_name, 0) + 1
 
         return event

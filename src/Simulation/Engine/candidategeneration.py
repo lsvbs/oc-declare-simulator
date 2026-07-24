@@ -95,7 +95,7 @@ def _find_objects_preferring_linked(
 
     for oid in existing_ids:
         neighbors = state._links_by_object.get(oid)
-        if neighbors and (neighbors & participating_set):
+        if neighbors and not neighbors.isdisjoint(participating_set):
             linked_ids.append(oid)
         else:
             unlinked_ids.append(oid)
@@ -110,17 +110,22 @@ def build_candidate_for_activity(
     activity: Activity,
     state: SimulationState,
     resource_types: set[str] | None = None,
+    force_object_id: str | None = None,
 ) -> Optional[Candidate]:
     """Build a candidate for ``activity`` from the global active-object pool.
 
-    ``resource_types`` is the set of object type names that are classified as
-    reusable resources (e.g. Forklift, Truck).  Resource-typed objects are
-    always selected globally (first-available), bypassing link-preference
-    synchronisation, because they are shared across all case chains.
+    ``resource_types`` is the set of object type names classified as reusable
+    resources. ``force_object_id`` pins the first non-creating, non-resource
+    binding to exactly that object, avoiding the temporary _active_by_type
+    mutation used in _generate_candidates_des (#6).
     """
     participating_object_ids: list[str] = []
     object_types_to_create: list[str] = []
     _resource_types = resource_types or set()
+    _forced_type: str | None = None
+    if force_object_id is not None:
+        obj = state.objects.get(force_object_id)
+        _forced_type = obj.object_type if obj else None
 
     for binding in activity.bindings:
         # Determine how many objects to fetch for link-preference selection.
@@ -136,6 +141,17 @@ def build_candidate_for_activity(
         else:
             fetch_limit = 8
         existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
+
+        # #6: if force_object_id pins this binding's type, replace the pool
+        # with just that one object — no _active_by_type mutation needed.
+        if (force_object_id is not None
+                and not binding.creates
+                and binding.object_type == _forced_type
+                and len(participating_object_ids) == 0):  # only for the first/primary binding
+            obj = state.objects.get(force_object_id)
+            if obj is None or not obj.active:
+                return None
+            existing_ids = [force_object_id]
 
         # Apply attribute guard: filter out objects that don't satisfy the guard.
         guard = getattr(binding, 'guard', None)

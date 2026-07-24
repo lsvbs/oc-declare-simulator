@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import random as _random  # #19: module-level import
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Protocol, Any, Dict
 
@@ -13,13 +14,7 @@ class TimePolicy(Protocol):
 
 @dataclass
 class DefaultTimePolicy:
-	"""Minimal default time policy.
-
-	- If there is a previously generated timestamp in state, use that as the base.
-	- Else if there are executed events with timestamps, use the latest one.
-	- Otherwise start from config.start_timestamp.
-	- Advance by config.default_time_delta for each newly generated event after the first.
-	"""
+	"""Minimal default time policy."""
 
 	def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
 		if getattr(state, "last_generated_timestamp", None) is not None:
@@ -38,18 +33,8 @@ class DefaultTimePolicy:
 		return config.start_timestamp
 
 
-def _sample_duration(dur: Any, rng: Any = None) -> float:
-	"""Sample a duration in seconds from an ActivityDuration specification.
-
-	Works with BOTH Python's ``random.Random`` (methods: lognormvariate,
-	normalvariate, expovariate) and numpy ``Generator`` (methods: lognormal,
-	normal, exponential). The simulator passes a stdlib ``random.Random``.
-
-	Supports dist_type in {"lognormal", "normal", "exponential", "fixed"}.
-	Falls back to mean_seconds when std is zero or parameters are degenerate.
-	"""
-	import random as _random
-
+def _sample_duration(dur: Any, rng: Any = None, numpy_api: bool | None = None) -> float:
+	"""Sample a duration in seconds from an ActivityDuration specification."""
 	mean  = float(getattr(dur, "mean_seconds", 3600.0))
 	std   = float(getattr(dur, "std_seconds",  600.0))
 	lo    = float(getattr(dur, "min_seconds",  0.0))
@@ -63,7 +48,6 @@ def _sample_duration(dur: Any, rng: Any = None) -> float:
 			x = min(hi_f, x)
 		return x
 
-	# Degenerate / deterministic cases
 	if mean <= 0:
 		return max(0.0, lo)
 	if dtype == "fixed" or std < 1e-9:
@@ -72,36 +56,32 @@ def _sample_duration(dur: Any, rng: Any = None) -> float:
 	if rng is None:
 		rng = _random.Random()
 
-	# numpy Generator exposes ``.lognormal``; stdlib Random does not.
-	numpy_api = hasattr(rng, "lognormal")
+	# #20: use pre-computed numpy_api flag when available
+	_numpy = numpy_api if numpy_api is not None else hasattr(rng, "lognormal")
 
 	if dtype == "exponential":
-		# numpy uses scale=mean; stdlib uses rate=1/mean
-		s = float(rng.exponential(scale=mean)) if numpy_api else float(rng.expovariate(1.0 / mean))
+		s = float(rng.exponential(scale=mean)) if _numpy else float(rng.expovariate(1.0 / mean))
 	elif dtype == "normal":
-		s = float(rng.normal(loc=mean, scale=std)) if numpy_api else float(rng.normalvariate(mean, std))
+		s = float(rng.normal(loc=mean, scale=std)) if _numpy else float(rng.normalvariate(mean, std))
 	else:  # lognormal (default)
-		# Convert empirical mean/std to log-space parameters (method of moments)
-		var = std ** 2
-		sigma_log = math.sqrt(math.log(1.0 + var / (mean ** 2)))
-		mu_log    = math.log(mean) - 0.5 * sigma_log ** 2
+		# #18: use pre-cached log-space params if available on dur object
+		mu_log    = getattr(dur, '_mu_log',    None)
+		sigma_log = getattr(dur, '_sigma_log', None)
+		if mu_log is None or sigma_log is None:
+			var = std ** 2
+			sigma_log = math.sqrt(math.log(1.0 + var / (mean ** 2)))
+			mu_log    = math.log(mean) - 0.5 * sigma_log ** 2
 		s = (
 			float(rng.lognormal(mean=mu_log, sigma=sigma_log))
-			if numpy_api
+			if _numpy
 			else float(rng.lognormvariate(mu_log, sigma_log))
 		)
 
 	return _clamp(s)
 
 
-def _sample_waiting(dur: Any, rng: Any = None) -> float:
-	"""Sample a pre-start process waiting time in seconds from ActivityDuration.
-
-	Uses ``waiting_mean`` and ``waiting_std`` (set by timing discovery).
-	Returns 0.0 when no waiting distribution is available.
-	"""
-	import random as _random
-
+def _sample_waiting(dur: Any, rng: Any = None, numpy_api: bool | None = None) -> float:
+	"""Sample a pre-start process waiting time in seconds from ActivityDuration."""
 	mean = getattr(dur, "waiting_mean", None)
 	std  = getattr(dur, "waiting_std",  None)
 
@@ -116,7 +96,8 @@ def _sample_waiting(dur: Any, rng: Any = None) -> float:
 	if rng is None:
 		rng = _random.Random()
 
-	numpy_api = hasattr(rng, "lognormal")
+	# #20: use pre-computed numpy_api flag when available
+	_numpy = numpy_api if numpy_api is not None else hasattr(rng, "lognormal")
 	var = std_f ** 2
 	if var <= 0 or mean <= 0:
 		return float(mean)
@@ -124,7 +105,7 @@ def _sample_waiting(dur: Any, rng: Any = None) -> float:
 	mu_log    = math.log(mean) - 0.5 * sigma_log ** 2
 	s = (
 		float(rng.lognormal(mean=mu_log, sigma=sigma_log))
-		if numpy_api
+		if _numpy
 		else float(rng.lognormvariate(mu_log, sigma_log))
 	)
 	return max(0.0, s)
@@ -132,28 +113,40 @@ def _sample_waiting(dur: Any, rng: Any = None) -> float:
 
 @dataclass
 class DistributionTimePolicy:
-    """Time policy that samples realistic durations from per-activity distributions.
-
-    Clock compression for concurrent activities
-    -------------------------------------------
-    When ``concurrency_probs`` is provided and the previous activity and the
-    current candidate have a stored concurrency probability above
-    ``concurrency_threshold``, the clock is not advanced — the new event is
-    assigned the same timestamp as the previous one, modelling the two
-    activities as firing simultaneously.
-
-    The probability is used as a Bernoulli draw: with probability p the clock
-    stays (concurrent), with probability 1-p it advances normally.
-    """
+    """Time policy that samples realistic durations from per-activity distributions."""
 
     durations: Dict[str, Any]  # activity_name -> ActivityDuration
     _fallback_delta: timedelta = timedelta(hours=1)
-    concurrency_probs: Dict[str, float] = None   # "A|||B" -> float
-    concurrency_threshold: float = 0.3           # minimum p to consider concurrent
+    concurrency_probs: Dict[str, float] = None
+    concurrency_threshold: float = 0.3
+
+    def __post_init__(self):
+        # #18: pre-compute lognormal log-space parameters for each activity
+        # so _sample_duration doesn't recompute them on every call
+        for act_name, dur in (self.durations or {}).items():
+            mean = float(getattr(dur, "mean_seconds", 3600.0))
+            std  = float(getattr(dur, "std_seconds",  600.0))
+            dtype = str(getattr(dur, "dist_type", "lognormal")).lower()
+            if dtype == "lognormal" and mean > 0 and std >= 1e-9:
+                var = std ** 2
+                try:
+                    sigma_log = math.sqrt(math.log(1.0 + var / (mean ** 2)))
+                    mu_log    = math.log(mean) - 0.5 * sigma_log ** 2
+                    object.__setattr__(dur, '_mu_log',    mu_log)    if hasattr(dur, '__dataclass_fields__') else setattr(dur, '_mu_log',    mu_log)
+                    object.__setattr__(dur, '_sigma_log', sigma_log) if hasattr(dur, '__dataclass_fields__') else setattr(dur, '_sigma_log', sigma_log)
+                except (ValueError, ZeroDivisionError):
+                    pass
+
+        # #20: cache numpy API detection once (rng not available here, set lazily)
+        self._numpy_api: bool | None = None
+
+    def _get_numpy_api(self, rng: Any) -> bool:
+        # #20: cache on first call
+        if self._numpy_api is None:
+            self._numpy_api = hasattr(rng, "lognormal")
+        return self._numpy_api
 
     def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
-        import random as _random
-
         base = (
             getattr(state, "last_generated_timestamp", None)
             or (
@@ -164,24 +157,24 @@ class DistributionTimePolicy:
 
         act = getattr(candidate, "activity_name", "")
 
-        # ── Clock compression check ───────────────────────────────────────────
         if self.concurrency_probs and state.executed_events:
             prev_act = state.executed_events[-1].activity_name
             if prev_act != act:
                 key = f"{prev_act}|||{act}"
                 p = self.concurrency_probs.get(key, 0.0)
                 if p >= self.concurrency_threshold:
-                    # Bernoulli draw: fire concurrently with probability p
                     _rng = rng if rng is not None else _random.Random()
                     roll = float(_rng.random()) if hasattr(_rng, "random") else float(_rng.uniform(0, 1))
                     if roll < p:
-                        return base  # same timestamp — concurrent
+                        return base
 
         dur = self.durations.get(act)
         if dur is None:
             return base + (getattr(config, "default_time_delta", self._fallback_delta))
 
-        seconds = _sample_duration(dur, rng)
+        # #20: pass cached numpy_api flag to avoid hasattr on every sample
+        numpy_api = self._get_numpy_api(rng) if rng is not None else None
+        seconds = _sample_duration(dur, rng, numpy_api=numpy_api)
         try:
             return base + timedelta(seconds=max(0.0, seconds))
         except OverflowError:
