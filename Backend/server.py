@@ -794,77 +794,75 @@ def run_simulation():
             initial_state.next_object_counter = {'products': 3, 'employees': 3}
         
         # Run simulation
-        from collections import deque
+        import tempfile, os
         _LOG_CAP = 500  # only keep last 500 steps in the response to avoid huge payloads
-        iteration_logs = deque(maxlen=_LOG_CAP)  # capped — sent inline with response
-        full_iteration_logs = []                 # unbounded — saved to disk, loaded on demand
-        # No upfront skipping — the deque's maxlen naturally keeps only the last 500
-        # entries, so early steps are evicted as the simulation progresses. This also
-        # ensures the trace is populated when the simulation stops before max_steps.
+        # Write full iteration trace directly to a temp file (JSONL) to avoid
+        # accumulating all entries in memory.
+        _iter_tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.jsonl', delete=False,
+            dir=str(METRICS_DIR), prefix='iteration_tmp_'
+        )
+        _iter_tmp_path = _iter_tmp.name
 
         def trace_func(event: str, payload: dict):
             if event == "iteration":
                 step = payload.get("step_count", "?")
-                candidates = payload.get("candidate_activity_names", [])
-                # Build per-candidate detail: prob + participating object IDs
                 candidates_detail = payload.get("candidates", [])
+                # Current timestamp from DES state is not directly available here,
+                # but we can read it from the last applied event in payload if present.
+                ts = payload.get("timestamp", None)
+                # Active object counts (from in-progress/waiting if provided)
+                in_prog = payload.get("in_progress_count", 0)
+                waiting = payload.get("waiting_count", 0)
                 candidates_with_probs = [
                     {
-                        "activity": a,
-                        "prob": _last_prob_map.get(a, None),
-                        "objects": next(
-                            (c.get("participating_object_ids", []) for c in candidates_detail
-                             if c.get("activity_name") == a),
-                            []
-                        ),
+                        "activity": c.get("activity_name", ""),
+                        "prob": _last_prob_map.get(c.get("activity_name", ""), None),
+                        "objects": c.get("participating_object_ids", []),
                     }
-                    for a in candidates
+                    for c in candidates_detail
                 ]
-                iteration_logs.append({
+                entry = {
                     "step": step,
                     "event": "candidates",
-                    "candidates": candidates,
-                    "candidates_with_probs": candidates_with_probs,
                     "num_candidates": payload.get("num_candidates", 0),
-                })
-                full_iteration_logs.append({
-                    "step": step,
-                    "event": "candidates",
-                    "candidates": candidates,
                     "candidates_with_probs": candidates_with_probs,
-                    "num_candidates": payload.get("num_candidates", 0),
-                })
+                    "in_progress": in_prog,
+                    "waiting": waiting,
+                    "timestamp": ts,
+                }
+                import json as _json
+                _iter_tmp.write(_json.dumps(entry) + '\n')
             elif event == "chosen":
                 activity = payload.get("activity_name", "?")
-                objects = payload.get("participating_object_ids", [])
-                creates = payload.get("object_types_to_create", [])
-                iteration_logs.append({
-                    "step": None,
+                entry = {
                     "event": "chosen",
                     "activity": activity,
                     "prob": _last_prob_map.get(activity, None),
-                    "objects": objects,
-                    "creates": creates,
-                })
-                full_iteration_logs.append({
-                    "step": None,
-                    "event": "chosen",
-                    "activity": activity,
-                    "prob": _last_prob_map.get(activity, None),
-                    "objects": objects,
-                    "creates": creates,
-                })
+                    "objects": payload.get("participating_object_ids", []),
+                    "creates": payload.get("object_types_to_create", []),
+                    "timestamp": payload.get("timestamp", None),
+                }
+                import json as _json
+                _iter_tmp.write(_json.dumps(entry) + '\n')
+            elif event == "applied":
+                entry = {
+                    "event": "applied",
+                    "activity": payload.get("activity_name", "?"),
+                    "timestamp": payload.get("timestamp", None),
+                    "objects": payload.get("object_ids", []),
+                }
+                import json as _json
+                _iter_tmp.write(_json.dumps(entry) + '\n')
             elif event == "stop":
-                iteration_logs.append({
+                entry = {
                     "step": payload.get("step_count", "?"),
                     "event": "stop",
                     "reason": payload.get("reason", "unknown"),
-                })
-                full_iteration_logs.append({
-                    "step": payload.get("step_count", "?"),
-                    "event": "stop",
-                    "reason": payload.get("reason", "unknown"),
-                })
+                }
+                import json as _json
+                _iter_tmp.write(_json.dumps(entry) + '\n')
+                _iter_tmp.flush()
 
         stop_event = threading.Event()
         simulator = Simulator(
@@ -892,9 +890,12 @@ def run_simulation():
             if run_id and run_id in _active_runs:
                 _active_runs[run_id]['done'] = True
 
+        import time as _time
+        _sim_start = _time.time()
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         t.join()  # Flask request stays open until done; frontend polls status in parallel
+        _sim_runtime_s = round(_time.time() - _sim_start, 1)
         final_state = result_holder[0]
 
         # Clean up run registry
@@ -938,13 +939,18 @@ def run_simulation():
         metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
         metrics_filename = os.path.basename(metrics_file)
 
-        # Save full iteration log to disk for on-demand loading
+        # Close temp file and rename to final iteration log path
         iteration_log_filename = output_filename.replace('log_', 'iteration_')
         iteration_log_path = METRICS_DIR / iteration_log_filename
         try:
-            with open(iteration_log_path, 'w', encoding='utf-8') as f:
-                json.dump(full_iteration_logs, f)
+            _iter_tmp.close()
+            import shutil
+            shutil.move(_iter_tmp_path, str(iteration_log_path))
         except Exception:
+            try:
+                os.unlink(_iter_tmp_path)
+            except Exception:
+                pass
             iteration_log_filename = None
 
         # Compute object lifecycle and activity participation audits
@@ -967,6 +973,7 @@ def run_simulation():
             'output_file':    output_filename,
             'metrics_file':   metrics_filename,
             'iteration_log_file': iteration_log_filename,
+            'runtime_s':      _sim_runtime_s,
             # store config snapshot so re-run can replay it
             'model_override': model_override,
             'prob_matrix_override': prob_matrix_override,
@@ -1027,7 +1034,6 @@ def run_simulation():
                 f"Created {len(final_state.objects)} objects",
                 f"Output saved to: {output_filename}"
             ],
-            'iteration_logs': list(iteration_logs)
         })
         
     except Exception as e:
@@ -1155,30 +1161,54 @@ def get_eventlog_events():
         log_path = EVENTLOG_DIR / filename
         if not log_path.exists():
             return jsonify({'error': f'Event log not found: {filename}'}), 404
-        with open(log_path, 'r', encoding='utf-8') as f:
-            ocel = json.load(f)
-        objects_raw = ocel.get('objects', [])
-        if isinstance(objects_raw, dict):
-            objects_raw = list(objects_raw.values())
-        obj_type_map = {obj.get('id', ''): obj.get('type', '') for obj in objects_raw}
-        events_raw = ocel.get('events', [])
-        if isinstance(events_raw, dict):
-            events_raw = list(events_raw.values())
-        result = []
-        for ev in events_raw:
-            rels = ev.get('relationships', []) or []
-            oids = [r['objectId'] for r in rels if r.get('objectId')]
-            result.append({'id': ev.get('id', ''), 'activity': ev.get('type', ''),
-                           'timestamp': ev.get('time', ''), 'object_ids': oids})
-        result.sort(key=lambda e: e['timestamp'])
+
+        # Support both JSON and XML OCEL formats
+        suffix = log_path.suffix.lower()
+        if suffix == '.xml':
+            from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2_xml
+            ocel = load_ocel2_xml(str(log_path))
+            # XML loader returns objects as dict {id: {type, attributes}}
+            objects_raw_dict = ocel.get('objects', {})
+            obj_type_map = {oid: info.get('type','') for oid, info in objects_raw_dict.items()}
+            events_dict = ocel.get('events', {})
+            result = []
+            for eid, ev in events_dict.items():
+                result.append({
+                    'id': eid,
+                    'activity': ev.get('activity', ''),
+                    'timestamp': ev.get('timestamp', ''),
+                    'object_ids': ev.get('omap', []),
+                })
+        else:
+            # JSON OCEL
+            content = log_path.read_text(encoding='utf-8').strip()
+            if not content:
+                return jsonify({'error': f'Event log file is empty: {filename}'}), 400
+            ocel = json.loads(content)
+            objects_raw = ocel.get('objects', [])
+            if isinstance(objects_raw, dict):
+                objects_raw = list(objects_raw.values())
+            obj_type_map = {obj.get('id', ''): obj.get('type', '') for obj in objects_raw}
+            events_raw = ocel.get('events', [])
+            if isinstance(events_raw, dict):
+                events_raw = list(events_raw.values())
+            result = []
+            for ev in events_raw:
+                rels = ev.get('relationships', []) or []
+                oids = [r['objectId'] for r in rels if r.get('objectId')]
+                result.append({'id': ev.get('id', ''), 'activity': ev.get('type', ''),
+                               'timestamp': ev.get('time', ''), 'object_ids': oids})
+
+        result.sort(key=lambda e: e.get('timestamp', ''))
         return jsonify({'events': result, 'count': len(result), 'object_types_map': obj_type_map})
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/run-history/<run_id>/iteration-log', methods=['GET'])
 def get_iteration_log(run_id):
-    """Return the full iteration log for a specific run."""
+    """Return the full iteration log for a specific run (JSONL format)."""
     history = _load_history()
     entry = next((e for e in history if e['id'] == run_id), None)
     if not entry:
@@ -1189,8 +1219,13 @@ def get_iteration_log(run_id):
     path = METRICS_DIR / ilf
     if not path.exists():
         return jsonify({'error': 'Iteration log file missing from disk'}), 404
+    # Support both legacy JSON array and new JSONL format
     with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+        content = f.read().strip()
+    if content.startswith('['):
+        data = json.loads(content)
+    else:
+        data = [json.loads(line) for line in content.splitlines() if line.strip()]
     return jsonify({'iteration_logs': data, 'count': len(data)})
 
 

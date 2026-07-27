@@ -1128,30 +1128,33 @@ function computeOCDeclareConformance(events, objectTypesMap, constraints) {
   // and does it satisfy them?
 
   // Temporal filter helper — given source event index i and constraint type,
-  // return which event indices are in the correct temporal position
+  // return which event indices are in the correct temporal position.
+  // For precedence(A→B): A is source, B is target. "A before B" means
+  // we look for B events AFTER A (ts >= srcTs).
+  // For response(A→B): A is source, B is target. Same — B must follow A.
   const temporalFilter = (srcIdx, ctype) => {
     const srcTs = events[srcIdx].timestamp;
     const result = [];
     for (let j = 0; j < n; j++) {
       if (j === srcIdx) continue;
       const ts = events[j].timestamp;
-      if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' || ctype === 'alternate_response') {
+      if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' ||
+          ctype === 'alternate_response' || ctype === 'precedence' || ctype === 'alternate_precedence') {
+        // Both precedence and response: target must come AFTER source
         if (ts >= srcTs) result.push(j);
-      } else if (ctype === 'precedence' || ctype === 'chain_precedence' || ctype === 'alternate_precedence') {
-        if (ts <= srcTs) result.push(j);
-      } else if (ctype === 'not_succession' || ctype === 'not_coexistence' || ctype === 'responded_existence') {
-        result.push(j); // no temporal restriction
-      } else {
+      } else if (ctype === 'chain_precedence') {
+        // handled below as immediately-before
         result.push(j);
+      } else {
+        result.push(j); // not_succession, not_coexistence, responded_existence — no temporal restriction
       }
     }
     // Chain constraints: only immediately adjacent
     if (ctype === 'chain_response') {
-      // Only the very next event after srcIdx
       return srcIdx + 1 < n ? [srcIdx + 1] : [];
     }
     if (ctype === 'chain_precedence') {
-      // Only the event immediately before srcIdx
+      // The event immediately before srcIdx must be the target
       return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
     }
     return result;
@@ -1526,7 +1529,7 @@ function computeConformance(objectTraces, constraints, activities) {
   };
 }
 
-function ConformanceSection({ results, activeModel, onConformanceSaved }) {
+function ConformanceSection({ results, activeModel, onConformanceSaved, onEventsLoadStart, onEventsLoadDone, onConformanceDone }) {
   const constraints  = activeModel?.constraints || [];
   const activities   = activeModel?.activities  || [];
   const objectTraces = results?.object_traces   || {};
@@ -1544,9 +1547,10 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
     ocdLoadedFor.current = runId;
     setOcdLoading(true);
     setOcdError(null);
+    onEventsLoadStart?.();
     axios.get(`/api/run-history/${encodeURIComponent(runId)}/events`)
-      .then(r => setOcdEvents(r.data.events || []))
-      .catch(e => setOcdError(e.response?.data?.error || e.message))
+      .then(r => { setOcdEvents(r.data.events || []); onEventsLoadDone?.(); })
+      .catch(e => { setOcdError(e.response?.data?.error || e.message); onEventsLoadDone?.(); })
       .finally(() => setOcdLoading(false));
   }, [runId]);
 
@@ -1563,6 +1567,8 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
     if (!ocdEvents || ocdEvents.length === 0) return null;
     return computeOCDeclareConformance(ocdEvents, fullTypesMap, constraints);
   }, [ocdEvents, fullTypesMap, constraints]);
+
+  React.useEffect(() => { if (ocdConf) onConformanceDone?.(); }, [ocdConf]);
 
   const conf = React.useMemo(
     () => computeConformance(objectTraces, constraints, activities),
@@ -1786,8 +1792,700 @@ function ConformanceSection({ results, activeModel, onConformanceSaved }) {
   );
 }
 
+// ── LogInspection ─────────────────────────────────────────────────────────────
+function LogInspection({ eventLogFiles, handleFileUpload }) {
+  const [selectedFile, setSelectedFile] = React.useState('');
+  const [loading,      setLoading]      = React.useState(false);
+  const [error,        setError]        = React.useState(null);
+  const [data,         setData]         = React.useState(null); // {objTypes, actNames, maxPerObj}
+  const [filterType,   setFilterType]   = React.useState('');
+  const [sortBy,       setSortBy]       = React.useState('id'); // 'id' | act name
+  const fileInputRef = React.useRef(null);
+  const loadedFor = React.useRef(null);
+
+  const load = async (file) => {
+    if (!file || loadedFor.current === file) return;
+    setLoading(true); setError(null); setData(null);
+    try {
+      const r = await axios.get(`/api/eventlog-events?file=${encodeURIComponent(file)}`);
+      const events  = r.data.events || [];
+      const typesMap = r.data.object_types_map || {};
+
+      // Per-object: count how many times each activity appeared
+      const objActCounts = {}; // {oid: {act: count}}
+      events.forEach(ev => {
+        const act = ev.activity;
+        (ev.object_ids || []).forEach(oid => {
+          if (!objActCounts[oid]) objActCounts[oid] = {};
+          objActCounts[oid][act] = (objActCounts[oid][act] || 0) + 1;
+        });
+      });
+
+      // All activity names (ordered by frequency)
+      const actFreq = {};
+      events.forEach(ev => { actFreq[ev.activity] = (actFreq[ev.activity] || 0) + 1; });
+      const actNames = Object.keys(actFreq).sort((a,b) => actFreq[b] - actFreq[a]);
+
+      // All object types
+      const objTypes = [...new Set(Object.values(typesMap))].sort();
+
+      // Max count per activity per object type (for column colouring)
+      const maxPerAct = {};
+      Object.entries(objActCounts).forEach(([oid, counts]) => {
+        Object.entries(counts).forEach(([act, cnt]) => {
+          maxPerAct[act] = Math.max(maxPerAct[act] || 0, cnt);
+        });
+      });
+
+      loadedFor.current = file;
+      setData({ objActCounts, actNames, actFreq, objTypes, maxPerAct, typesMap });
+    } catch(e) { setError(e.response?.data?.error || e.message); }
+    finally { setLoading(false); }
+  };
+
+  const handleSelect = (file) => {
+    setSelectedFile(file);
+    if (file) load(file);
+  };
+
+  const handleUpload = async (file) => {
+    if (!file) return;
+    await handleFileUpload?.(file, 'eventlog');
+    // After upload the file list updates; auto-select the uploaded file
+    setTimeout(() => handleSelect(file.name), 500);
+  };
+
+  const filtered = data ? Object.entries(data.objActCounts)
+    .filter(([oid]) => !filterType || data.typesMap[oid] === filterType)
+    .sort((a, b) => {
+      if (sortBy === 'id') return a[0].localeCompare(b[0]);
+      const ca = a[1][sortBy] || 0, cb = b[1][sortBy] || 0;
+      return cb - ca;
+    }) : [];
+
+  const fmtCell = (cnt, act, maxPerAct) => {
+    if (!cnt) return null;
+    const max = maxPerAct[act] || 1;
+    const intensity = Math.min(1, cnt / max);
+    const bg = `hsl(220,${Math.round(intensity*60+20)}%,${Math.round(95-intensity*30)}%)`;
+    return { cnt, bg };
+  };
+
+  return (
+    <Collapsible className="eval-section" title="Log Inspection" defaultOpen={false}>
+      {/* File selector — same style as discovery */}
+      <div style={{marginBottom:'0.75rem'}}>
+        <div className="file-selection-row" style={{alignItems:'center'}}>
+          <div className="form-group" style={{flex:1,marginBottom:0}}>
+            <label style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.2rem',display:'block'}}>
+              Event Log File (OCEL 2.0)
+            </label>
+            <div className="file-select-row">
+              <select value={selectedFile} onChange={e => handleSelect(e.target.value)}
+                disabled={loading} style={{flex:1}}>
+                <option value="">Select event log…</option>
+                {(eventLogFiles || []).map(f => <option key={f} value={f}>{f}</option>)}
+              </select>
+              <button className="browse-btn" onClick={() => fileInputRef.current?.click()} title="Browse and upload">📁</button>
+              <input ref={fileInputRef} type="file" accept=".json,.xml" style={{display:'none'}}
+                onChange={e => { if (e.target.files[0]) handleUpload(e.target.files[0]); e.target.value=''; }} />
+            </div>
+          </div>
+          {data && (
+            <div style={{display:'flex',gap:'0.5rem',alignItems:'center',marginTop:'1.1rem'}}>
+              <select className="model-params-select" value={filterType}
+                onChange={e => setFilterType(e.target.value)}>
+                <option value="">All object types</option>
+                {data.objTypes.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+          )}
+        </div>
+        {loading && <div style={{display:'flex',gap:'0.4rem',alignItems:'center',fontSize:'0.8rem',color:'#6366f1',marginTop:'0.4rem'}}><div className="spinner spinner-sm"/>Loading…</div>}
+        {error && <p style={{color:'#b91c1c',fontSize:'0.8rem',marginTop:'0.3rem'}}>⚠ {error}</p>}
+      </div>
+
+      {data && filtered.length > 0 && (() => {
+        const acts = data.actNames;
+        return (
+          <div style={{overflowX:'auto'}}>
+            <p style={{fontSize:'0.73rem',color:'#64748b',marginBottom:'0.4rem'}}>
+              Each cell shows the number of times that activity involved that object.
+              Colour intensity = relative frequency within the activity column.
+              Click a column header to sort by that activity.
+            </p>
+            <table className="metrics-table" style={{fontSize:'0.72rem',minWidth:`${180 + acts.length*70}px`}}>
+              <thead>
+                <tr>
+                  <th style={{minWidth:'120px',position:'sticky',left:0,background:'white',zIndex:1}}>
+                    <button style={{background:'none',border:'none',cursor:'pointer',fontWeight:600,color:'#475569',fontSize:'0.72rem'}}
+                      onClick={() => setSortBy('id')}>
+                      Object {sortBy==='id' ? '▼' : ''}
+                    </button>
+                  </th>
+                  <th style={{minWidth:'80px',color:'#94a3b8'}}>Type</th>
+                  {acts.map(act => (
+                    <th key={act} style={{minWidth:'65px',cursor:'pointer',whiteSpace:'nowrap',
+                      background: sortBy===act ? '#eef2ff' : undefined}}
+                      onClick={() => setSortBy(act)}
+                      title={`${act} — log total: ${data.actFreq[act]}`}>
+                      <span style={{display:'block',transform:'rotate(-35deg)',transformOrigin:'bottom left',
+                        marginLeft:'8px',marginBottom:'2px',fontSize:'0.65rem',width:'80px',overflow:'hidden',
+                        textOverflow:'ellipsis',color: sortBy===act ? '#6366f1' : '#475569'}}>
+                        {act}
+                      </span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map(([oid, counts]) => (
+                  <tr key={oid}>
+                    <td style={{fontFamily:'monospace',fontSize:'0.7rem',position:'sticky',left:0,background:'white',
+                      fontWeight:600,color:'#1e293b'}}>{oid}</td>
+                    <td style={{fontSize:'0.7rem',color:'#64748b'}}>{data.typesMap[oid] || '—'}</td>
+                    {acts.map(act => {
+                      const cell = fmtCell(counts[act], act, data.maxPerAct);
+                      return (
+                        <td key={act} style={{
+                          textAlign:'center',
+                          background: cell ? cell.bg : undefined,
+                          color: cell ? '#1e293b' : '#e2e8f0',
+                          fontWeight: cell && cell.cnt === data.maxPerAct[act] ? 700 : 400,
+                        }}>
+                          {cell ? cell.cnt : '·'}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })()}
+
+      {data && filtered.length === 0 && (
+        <p className="empty-notice">No objects match the current filter.</p>
+      )}
+    </Collapsible>
+  );
+}
+
+// ── ConstraintAnalysis ────────────────────────────────────────────────────────
+function ConstraintAnalysis({ activeModel, results }) {
+  const constraints  = activeModel?.constraints  || [];
+  const activities   = activeModel?.activities   || [];
+  const objectTraces = results?.object_traces    || {};
+  const resourceTypes = new Set(activeModel?.resource_types || []);
+
+  const analysis = React.useMemo(() => {
+    if (!constraints.length || !activities.length) return null;
+
+    const actNames = new Set(activities.map(a => a.name));
+    const actBindings = {};
+    activities.forEach(a => { actBindings[a.name] = a.bindings || []; });
+
+    // ── 1. SATISFIABILITY ────────────────────────────────────────────────────
+    // Check for direct contradictions that make the model unsatisfiable:
+    // a) Mutual blocking: A requires B before it (precedence), B requires A before it
+    // b) not_coexistence(A,B) + response(A→B) or response(B→A) — A must happen but then
+    //    blocks B, or triggers B which is forbidden
+    // c) An activity is required (response obligation) but also absence(nmax=0)
+    // d) Circular precedence chains
+
+    const satisfiabilityIssues = [];
+
+    // Build precedence graph: A→B means "A must fire before B"
+    const precEdges = {};  // target → [sources that must precede it]
+    const respEdges = {};  // source → [targets that must follow it]
+    const notCoex   = [];  // pairs that cannot coexist
+    const absences  = new Set(); // activities with absence nmax=0
+
+    constraints.forEach(c => {
+      const src = c.source_activity, tgt = c.target_activity;
+      if (c.constraint_type === 'precedence') {
+        (precEdges[tgt] = precEdges[tgt] || []).push(src);
+      } else if (c.constraint_type === 'response') {
+        (respEdges[src] = respEdges[src] || []).push(tgt);
+      } else if (c.constraint_type === 'not_coexistence') {
+        notCoex.push([src, tgt]);
+      } else if (c.constraint_type === 'absence' && (c.nmax === 0 || c.nmax === null)) {
+        absences.add(src || tgt);
+      }
+    });
+
+    // a) Mutual precedence cycle (A must precede B AND B must precede A)
+    const visited = new Set();
+    const detectCycle = (node, path, edges) => {
+      if (path.includes(node)) {
+        const cycle = [...path.slice(path.indexOf(node)), node];
+        return cycle;
+      }
+      if (visited.has(node)) return null;
+      visited.add(node);
+      for (const next of (edges[node] || [])) {
+        const result = detectCycle(next, [...path, node], edges);
+        if (result) return result;
+      }
+      return null;
+    };
+
+    // Build forward precedence: if A must precede B, edge A→B
+    const precFwd = {};
+    Object.entries(precEdges).forEach(([tgt, srcs]) => {
+      srcs.forEach(src => { (precFwd[src] = precFwd[src] || []).push(tgt); });
+    });
+    visited.clear();
+    for (const act of actNames) {
+      const cycle = detectCycle(act, [], precFwd);
+      if (cycle) {
+        satisfiabilityIssues.push({
+          type: 'cycle',
+          severity: 'error',
+          msg: `Precedence cycle: ${cycle.join(' → ')} — no valid ordering exists`,
+        });
+        break;
+      }
+    }
+
+    // b) not_coexistence + response contradiction
+    notCoex.forEach(([a, b]) => {
+      if ((respEdges[a] || []).includes(b)) {
+        satisfiabilityIssues.push({
+          type: 'coex_response',
+          severity: 'error',
+          msg: `not_coexistence(${a}, ${b}) conflicts with response(${a}→${b}): ${a} must trigger ${b} but ${b} is forbidden after ${a}`,
+        });
+      }
+      if ((respEdges[b] || []).includes(a)) {
+        satisfiabilityIssues.push({
+          type: 'coex_response',
+          severity: 'error',
+          msg: `not_coexistence(${a}, ${b}) conflicts with response(${b}→${a}): ${b} must trigger ${a} but they cannot coexist`,
+        });
+      }
+    });
+
+    // c) absence + response obligation
+    absences.forEach(act => {
+      Object.entries(respEdges).forEach(([src, tgts]) => {
+        if (tgts.includes(act)) {
+          satisfiabilityIssues.push({
+            type: 'absence_response',
+            severity: 'error',
+            msg: `absence(${act}) conflicts with response(${src}→${act}): ${act} is forbidden but ${src} is obligated to trigger it`,
+          });
+        }
+      });
+    });
+
+    // d) Dead activities: required by response but no binding can provide them
+    Object.entries(respEdges).forEach(([src, tgts]) => {
+      tgts.forEach(tgt => {
+        if (!actNames.has(tgt)) {
+          satisfiabilityIssues.push({
+            type: 'missing_activity',
+            severity: 'error',
+            msg: `response(${src}→${tgt}): target activity "${tgt}" does not exist in the model`,
+          });
+        }
+      });
+    });
+
+    // ── 2. CROSS-OBJECT INCONSISTENCY ────────────────────────────────────────
+    // Find constraints where the scope object type doesn't match any binding
+    // in the source or target activity — the constraint can never be evaluated
+    const crossObjectIssues = [];
+    constraints.forEach(c => {
+      if (c.scope?.kind !== 'each' || !c.scope?.object_type) return;
+      const stype = c.scope.object_type;
+      const src = c.source_activity, tgt = c.target_activity;
+
+      const srcBindings = actBindings[src] || [];
+      const tgtBindings = actBindings[tgt] || [];
+      const srcHasScope = srcBindings.some(b => b.object_type === stype);
+      const tgtHasScope = tgtBindings.some(b => b.object_type === stype);
+
+      if (!srcHasScope && actNames.has(src)) {
+        crossObjectIssues.push({
+          severity: 'warn',
+          msg: `${c.constraint_type}(${src}→${tgt}) scoped per ${stype}: source "${src}" has no binding for ${stype} — constraint is always vacuously satisfied (scope objects never present in source event)`,
+        });
+      }
+      if (!tgtHasScope && actNames.has(tgt) && !['not_coexistence','absence','exactly','init'].includes(c.constraint_type)) {
+        crossObjectIssues.push({
+          severity: 'warn',
+          msg: `${c.constraint_type}(${src}→${tgt}) scoped per ${stype}: target "${tgt}" has no binding for ${stype} — shared scope object can never appear in both events`,
+        });
+      }
+    });
+
+    // ── 3. VACUITY CONFORMANCE ───────────────────────────────────────────────
+    // A constraint is vacuously satisfied if no source event of the right type
+    // ever occurred in the simulation traces.
+    const vacuityIssues = [];
+    if (Object.keys(objectTraces).length > 0) {
+      // Build activity firing counts from traces
+      const firedActivities = new Set();
+      Object.values(objectTraces).forEach(trace => {
+        trace.forEach(act => firedActivities.add(act));
+      });
+
+      constraints.forEach(c => {
+        const src = c.source_activity;
+        if (!firedActivities.has(src)) {
+          // Source never fired — constraint was never tested
+          const tgt = c.target_activity;
+          vacuityIssues.push({
+            constraint: `${c.constraint_type}(${src}→${tgt})`,
+            reason: `Source activity "${src}" never fired in simulation — constraint was never evaluated, not genuinely satisfied`,
+            severity: 'warn',
+          });
+        }
+      });
+    }
+
+    return { satisfiabilityIssues, crossObjectIssues, vacuityIssues };
+  }, [constraints, activities, objectTraces, resourceTypes]);
+
+  if (!analysis) return null;
+  const { satisfiabilityIssues, crossObjectIssues, vacuityIssues } = analysis;
+  const totalIssues = satisfiabilityIssues.length + crossObjectIssues.length + vacuityIssues.length;
+
+  const IssueRow = ({ issue, idx }) => (
+    <div key={idx} style={{
+      display:'flex', gap:'0.5rem', alignItems:'flex-start',
+      padding:'0.4rem 0.5rem',
+      background: issue.severity === 'error' ? '#fff1f2' : '#fffbeb',
+      border: `1px solid ${issue.severity === 'error' ? '#fca5a5' : '#fde68a'}`,
+      borderRadius:'5px', marginBottom:'0.3rem', fontSize:'0.78rem',
+    }}>
+      <span style={{fontWeight:700, color: issue.severity === 'error' ? '#b91c1c' : '#b45309', flexShrink:0}}>
+        {issue.severity === 'error' ? '✕' : '⚠'}
+      </span>
+      <span style={{color:'#1e293b'}}>{issue.msg || issue.reason || issue.constraint}</span>
+    </div>
+  );
+
+  return (
+    <Collapsible
+      className="eval-section"
+      title="Constraint Analysis"
+      badge={totalIssues > 0 ? `${totalIssues} issue${totalIssues !== 1 ? 's' : ''}` : 'no issues'}
+      defaultOpen={false}
+    >
+      {/* Satisfiability */}
+      <Collapsible
+        className="eval-subsection"
+        title="Satisfiability"
+        badge={satisfiabilityIssues.length > 0 ? `${satisfiabilityIssues.length} issue${satisfiabilityIssues.length!==1?'s':''}` : '✓ satisfiable'}
+        defaultOpen={true}
+      >
+        <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+          Checks whether a valid trace satisfying all constraints simultaneously is theoretically possible.
+          Detects: precedence cycles, not_coexistence + response conflicts, absence + response conflicts.
+        </p>
+        {satisfiabilityIssues.length === 0
+          ? <p style={{fontSize:'0.8rem',color:'#166534',fontWeight:600}}>✓ No satisfiability contradictions detected — at least one valid trace exists.</p>
+          : satisfiabilityIssues.map((iss, i) => <IssueRow key={i} issue={iss} idx={i} />)}
+      </Collapsible>
+
+      {/* Cross-Object Inconsistency */}
+      <Collapsible
+        className="eval-subsection"
+        title="Cross-Object Inconsistency"
+        badge={crossObjectIssues.length > 0 ? `${crossObjectIssues.length} issue${crossObjectIssues.length!==1?'s':''}` : '✓ consistent'}
+        defaultOpen={false}
+      >
+        <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+          Checks whether EACH-scoped constraints can ever be evaluated — the scope object type must appear
+          in the bindings of both source and target activity for the constraint to be non-vacuous.
+        </p>
+        {crossObjectIssues.length === 0
+          ? <p style={{fontSize:'0.8rem',color:'#166534',fontWeight:600}}>✓ All scoped constraints have matching bindings.</p>
+          : crossObjectIssues.map((iss, i) => <IssueRow key={i} issue={iss} idx={i} />)}
+      </Collapsible>
+
+      {/* Vacuity Conformance */}
+      <Collapsible
+        className="eval-subsection"
+        title="Vacuity Conformance"
+        badge={vacuityIssues.length > 0 ? `${vacuityIssues.length} vacuous` : objectTraces && Object.keys(objectTraces).length > 0 ? '✓ all tested' : 'no trace data'}
+        defaultOpen={false}
+      >
+        <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
+          Flags constraints whose source activity never fired in the simulation. These were never
+          evaluated — a 100% confidence score for such constraints reflects vacuous truth, not genuine satisfaction.
+          Requires simulation trace data.
+        </p>
+        {Object.keys(objectTraces).length === 0
+          ? <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>Run a simulation to get trace data for vacuity checking.</p>
+          : vacuityIssues.length === 0
+            ? <p style={{fontSize:'0.8rem',color:'#166534',fontWeight:600}}>✓ All constraint source activities fired at least once — no vacuous conformance detected.</p>
+            : (
+              <table className="conf-detail-table">
+                <thead><tr><th>Constraint</th><th>Reason</th></tr></thead>
+                <tbody>
+                  {vacuityIssues.map((v, i) => (
+                    <tr key={i} className="audit-row-accumulating">
+                      <td style={{fontFamily:'monospace',fontSize:'0.75rem',whiteSpace:'nowrap'}}>{v.constraint}</td>
+                      <td style={{fontSize:'0.75rem',color:'#64748b'}}>{v.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+      </Collapsible>
+    </Collapsible>
+  );
+}
+
+// ── TraceHealth ───────────────────────────────────────────────────────────────
+function TraceHealth({ results }) {
+  const [loaded,  setLoaded]  = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const [trace,   setTrace]   = React.useState(null);
+  const [error,   setError]   = React.useState(null);
+  const loadedFor = React.useRef(null);
+
+  const load = async () => {
+    const runId = results?.output_file;
+    if (!runId || loadedFor.current === runId) { setLoaded(true); return; }
+    setLoading(true); setError(null);
+    try {
+      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+      const entries = r.data.iteration_logs || [];
+      loadedFor.current = runId;
+      setTrace(analyseTrace(entries));
+      setLoaded(true);
+    } catch(e) { setError(e.response?.data?.error || e.message); }
+    finally { setLoading(false); }
+  };
+
+  const analyseTrace = (entries) => {
+    const applied   = entries.filter(e => e.event === 'applied');
+    const candSteps = entries.filter(e => e.event === 'candidates');
+    if (!applied.length) return null;
+
+    // Activity counts
+    const actCounts = {};
+    applied.forEach(e => { actCounts[e.activity] = (actCounts[e.activity] || 0) + 1; });
+
+    // Pool size over time (sample every 50 steps to keep chart manageable)
+    const SAMPLE = Math.max(1, Math.floor(candSteps.length / 200));
+    const poolSeries = candSteps
+      .filter((_, i) => i % SAMPLE === 0)
+      .map(s => ({ step: s.step, pool: s.num_candidates, inProg: s.in_progress || 0 }));
+
+    // Empty pool events
+    const emptyPools = candSteps.filter(s => s.num_candidates === 0);
+
+    // In-progress accumulation — max recorded
+    const maxInProg = Math.max(...candSteps.map(s => s.in_progress || 0));
+
+    // Bottleneck detection:
+    // For each step, track which activities are IN the pool (obligation pending)
+    // vs actually firing. High pool-presence but low firing rate = bottleneck.
+    const poolPresence = {}; // act → steps present in pool
+    const poolProbs    = {}; // act → [probs when in pool]
+    candSteps.forEach(s => {
+      (s.candidates_with_probs || []).forEach(c => {
+        poolPresence[c.activity] = (poolPresence[c.activity] || 0) + 1;
+        if (c.prob != null) {
+          (poolProbs[c.activity] = poolProbs[c.activity] || []).push(c.prob);
+        }
+      });
+    });
+
+    // Bottleneck score: activity that appears in pool many times but fires rarely
+    // relative to its pool presence
+    const bottlenecks = Object.entries(poolPresence)
+      .map(([act, presence]) => {
+        const fired = actCounts[act] || 0;
+        const avgProb = poolProbs[act]?.length
+          ? poolProbs[act].reduce((s,v)=>s+v,0) / poolProbs[act].length : null;
+        // fire rate = how often it fires when it's in the pool
+        const fireRate = presence > 0 ? fired / presence : 0;
+        return { act, presence, fired, avgProb, fireRate };
+      })
+      .filter(x => x.presence > 10) // ignore activities that barely appeared
+      .sort((a, b) => a.fireRate - b.fireRate); // worst fire rate first
+
+    // Activity trend: split into 5 windows, count per window
+    const windowSize = Math.ceil(applied.length / 5);
+    const actTrend = {};
+    applied.forEach((e, i) => {
+      const w = Math.min(4, Math.floor(i / windowSize));
+      if (!actTrend[e.activity]) actTrend[e.activity] = [0,0,0,0,0];
+      actTrend[e.activity][w]++;
+    });
+
+    // Late-stage dominant activities (last 20% of steps)
+    const lateStart = Math.floor(applied.length * 0.8);
+    const lateCounts = {};
+    applied.slice(lateStart).forEach(e => { lateCounts[e.activity] = (lateCounts[e.activity]||0)+1; });
+
+    return { actCounts, poolSeries, emptyPools, maxInProg, bottlenecks, actTrend, lateCounts,
+             totalSteps: candSteps.length, totalEvents: applied.length };
+  };
+
+  const fmtPct = v => v == null ? '—' : `${(v*100).toFixed(1)}%`;
+
+  return (
+    <Collapsible className="eval-section" title="Trace Health" defaultOpen={false}>
+      {!loaded && !loading && (
+        <div>
+          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+            Analyses the iteration trace to identify bottlenecks, pool collapses, and stuck activities.
+            Load on demand — large traces may take a moment.
+          </p>
+          <button className="discovery-button"
+            style={{fontSize:'0.82rem',padding:'0.4rem 1rem',display:'inline-flex',alignItems:'center',gap:'0.5rem'}}
+            onClick={load} disabled={loading}>
+            {loading && <div className="spinner spinner-sm"/>}
+            Analyse Trace
+          </button>
+        </div>
+      )}
+      {loading && <div style={{display:'flex',gap:'0.5rem',alignItems:'center',fontSize:'0.82rem',color:'#6366f1'}}><div className="spinner spinner-sm"/>Loading trace…</div>}
+      {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
+      {loaded && trace && (
+        <div>
+          {/* Summary row */}
+          <div className="trace-health-summary">
+            <div className="trace-health-stat">
+              <span className="trace-health-val">{trace.totalSteps.toLocaleString()}</span>
+              <span className="trace-health-lbl">Total steps</span>
+            </div>
+            <div className="trace-health-stat">
+              <span className="trace-health-val">{trace.emptyPools.length.toLocaleString()}</span>
+              <span className={`trace-health-lbl ${trace.emptyPools.length > trace.totalSteps * 0.1 ? 'trace-warn' : ''}`}>Empty pool steps</span>
+            </div>
+            <div className="trace-health-stat">
+              <span className="trace-health-val">{trace.maxInProg}</span>
+              <span className="trace-health-lbl">Peak in-progress</span>
+            </div>
+            <div className="trace-health-stat">
+              <span className={`trace-health-val ${trace.emptyPools.length / trace.totalSteps > 0.1 ? 'conf-bad' : 'conf-good'}`}>
+                {(trace.emptyPools.length / trace.totalSteps * 100).toFixed(1)}%
+              </span>
+              <span className="trace-health-lbl">Pool stall rate</span>
+            </div>
+          </div>
+
+          {/* Pool size + in-progress chart */}
+          <div style={{marginBottom:'1rem'}}>
+            <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
+              Candidate pool size over time
+            </div>
+            {(() => {
+              const W = 600, H = 80, n = trace.poolSeries.length;
+              if (n === 0) return null;
+              const maxPool = Math.max(...trace.poolSeries.map(s => s.pool), 1);
+              const maxIP   = Math.max(...trace.poolSeries.map(s => s.inProg), 1);
+              return (
+                <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:'block',overflow:'visible'}}>
+                  {/* In-progress background bars */}
+                  {trace.poolSeries.map((s, i) => {
+                    const x = (i / n) * W;
+                    const w = W / n;
+                    const h = (s.inProg / maxIP) * (H - 4);
+                    return <rect key={i} x={x} y={H - h} width={w - 0.5} height={h} fill="#e0e7ff" />;
+                  })}
+                  {/* Pool size line */}
+                  <polyline
+                    fill="none" stroke="#6366f1" strokeWidth="1.5"
+                    points={trace.poolSeries.map((s, i) => {
+                      const x = (i / n) * W;
+                      const y = H - (s.pool / maxPool) * (H - 4) - 2;
+                      return `${x},${y}`;
+                    }).join(' ')}
+                  />
+                  {/* Zero-pool markers */}
+                  {trace.poolSeries.filter(s => s.pool === 0).map((s, i) => {
+                    const idx = trace.poolSeries.indexOf(s);
+                    const x = (idx / n) * W;
+                    return <rect key={i} x={x} y={0} width={Math.max(1.5, W/n)} height={H} fill="rgba(239,68,68,0.15)" />;
+                  })}
+                  {/* Legend */}
+                  <rect x={W-120} y={4} width={10} height={6} fill="#e0e7ff"/>
+                  <text x={W-108} y={11} fontSize="9" fill="#64748b">In-progress</text>
+                  <line x1={W-120} y1={21} x2={W-110} y2={21} stroke="#6366f1" strokeWidth="1.5"/>
+                  <text x={W-108} y={24} fontSize="9" fill="#64748b">Pool size</text>
+                  <rect x={W-120} y={30} width={10} height={6} fill="rgba(239,68,68,0.3)"/>
+                  <text x={W-108} y={37} fontSize="9" fill="#64748b">Empty pool</text>
+                </svg>
+              );
+            })()}
+          </div>
+
+          {/* Bottleneck table */}
+          <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
+            Bottleneck activities — low fire rate despite pool presence
+          </div>
+          <p style={{fontSize:'0.73rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
+            Fire rate = firings ÷ steps the activity was in the pool. Low = activity is stuck in pool but rarely chosen or always blocked.
+          </p>
+          <table className="conf-detail-table" style={{marginBottom:'0.75rem'}}>
+            <thead>
+              <tr>
+                <th>Activity</th>
+                <th className="audit-num">Pool steps</th>
+                <th className="audit-num">Fired</th>
+                <th className="audit-num">Fire rate</th>
+                <th className="audit-num">Avg prob</th>
+                <th>Diagnosis</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trace.bottlenecks.map(b => {
+                const cls = b.fireRate < 0.05 ? 'conf-bad' : b.fireRate < 0.2 ? 'conf-mid' : 'conf-good';
+                let diag = '';
+                if (b.fired === 0) diag = 'Never fired — permanently blocked by constraint or missing objects';
+                else if (b.avgProb !== null && b.avgProb < 0.05) diag = 'Very low probability weight — outcompeted by other activities';
+                else if (b.fireRate < 0.05) diag = 'Rarely fires despite being in pool — likely blocked most steps by precedence/O2O';
+                else if (b.fireRate < 0.2) diag = 'Fires infrequently — constraint or probability limiting';
+                else diag = 'Moderate fire rate';
+                return (
+                  <tr key={b.act} className={b.fireRate < 0.05 ? 'audit-row-accumulating' : ''}>
+                    <td style={{fontSize:'0.78rem'}}>{b.act}</td>
+                    <td className="audit-num">{b.presence.toLocaleString()}</td>
+                    <td className="audit-num">{b.fired.toLocaleString()}</td>
+                    <td className="audit-num"><span className={cls}>{fmtPct(b.fireRate)}</span></td>
+                    <td className="audit-num">{b.avgProb != null ? fmtPct(b.avgProb) : '—'}</td>
+                    <td style={{fontSize:'0.72rem',color:'#64748b'}}>{diag}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+
+          {/* Late-stage activity distribution */}
+          <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
+            Activity distribution in last 20% of steps
+          </div>
+          <div style={{display:'flex',flexWrap:'wrap',gap:'0.3rem',marginBottom:'0.5rem'}}>
+            {Object.entries(trace.lateCounts)
+              .sort((a,b) => b[1]-a[1])
+              .map(([act, cnt]) => (
+                <span key={act} style={{
+                  fontSize:'0.72rem',padding:'0.15rem 0.5rem',
+                  borderRadius:'20px',background:'#f1f5f9',color:'#334155',
+                  border:'1px solid #e2e8f0',
+                }}>
+                  {act} <strong>{cnt}</strong>
+                </span>
+              ))}
+          </div>
+        </div>
+      )}
+    </Collapsible>
+  );
+}
+
 // ── ActivityGanttChart (Canvas-based for performance) ────────────────────────
-function ActivityGanttChart({ results, orderedActivities, simMetrics }) {
+function ActivityGanttChart({ results, orderedActivities, simMetrics, onLoadStart, onLoadDone }) {
   const [loaded,  setLoaded]  = React.useState(false);
   const [loading, setLoading] = React.useState(false);
   const [events,  setEvents]  = React.useState(null);
@@ -1810,14 +2508,16 @@ function ActivityGanttChart({ results, orderedActivities, simMetrics }) {
 
   const load = async () => {
     const runId = results?.output_file;
-    if (!runId || loadedFor.current === runId) { setLoaded(true); return; }
+    if (!runId || loadedFor.current === runId) { setLoaded(true); onLoadDone?.(); return; }
     setLoading(true); setError(null);
+    onLoadStart?.();
     try {
       const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/events`);
       setEvents(r.data.events || []);
       loadedFor.current = runId;
       setLoaded(true);
-    } catch(e) { setError(e.response?.data?.error || e.message); }
+      onLoadDone?.();
+    } catch(e) { setError(e.response?.data?.error || e.message); onLoadDone?.(); }
     finally { setLoading(false); }
   };
 
@@ -2008,18 +2708,23 @@ function ActivityGanttChart({ results, orderedActivities, simMetrics }) {
 
   return (
     <Collapsible className="eval-section" title="Activity Timeline (Gantt)" defaultOpen={false}>
-      {!loaded && !loading && (
+      {!loaded && (
         <div>
           <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
             Each firing is shown as a bar sized by mean service time. Click a bar to see start/end
             and highlight overlapping activities in red. Canvas-rendered for performance.
           </p>
-          <button className="discovery-button" style={{fontSize:'0.82rem',padding:'0.4rem 1rem'}} onClick={load}>
-            Load Timeline
+          <button
+            className="discovery-button"
+            style={{fontSize:'0.82rem',padding:'0.4rem 1rem',display:'inline-flex',alignItems:'center',gap:'0.5rem'}}
+            onClick={load}
+            disabled={loading}
+          >
+            {loading && <div className="spinner spinner-sm" />}
+            {loading ? 'Loading timeline…' : 'Load Timeline'}
           </button>
         </div>
       )}
-      {loading && <div style={{display:'flex',gap:'0.5rem',alignItems:'center',fontSize:'0.82rem',color:'#6366f1'}}><div className="spinner spinner-sm"></div>Loading events…</div>}
       {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
       {loaded && events && (
         <div style={{overflowX:'scroll',overflowY:'visible',position:'relative',border:'1px solid #e2e8f0',borderRadius:'6px'}}>
@@ -2149,11 +2854,25 @@ function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities
   );
 }
 
-function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved }) {
+function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
   const logDurations = activeModel?.activity_durations || {};
   const o2oRules = activeModel?.o2o_rules || [];
   const otNames = (activeModel?.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+
+  // ── Evaluation progress tracking ─────────────────────────────────────────
+  const EVAL_STEPS = [
+    { key: 'timing',      label: 'Output log timing discovery' },
+    { key: 'events',      label: 'Loading event log for conformance' },
+    { key: 'conformance', label: 'OC-Declare conformance check' },
+  ];
+  const [stepsDone, setStepsDone] = React.useState({});
+  const [stepsLoading, setStepsLoading] = React.useState({ timing: true });
+  const markDone  = k => { setStepsDone(p => ({...p, [k]: true}));  setStepsLoading(p => ({...p, [k]: false})); };
+  const markStart = k => setStepsLoading(p => ({...p, [k]: true}));
+  const doneCount   = EVAL_STEPS.filter(s => stepsDone[s.key]).length;
+  const loadingStep = EVAL_STEPS.find(s => stepsLoading[s.key]);
+  const allDone     = doneCount === EVAL_STEPS.length;
 
   // ── Timing discovery on output log ───────────────────────────────────────
   const [simDiscovered, setSimDiscovered] = React.useState(null);   // discovered metrics for output log
@@ -2163,14 +2882,18 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
 
   React.useEffect(() => {
     const outputFile = results?.output_file;
-    if (!outputFile || discoveredForFile.current === outputFile) return;
+    if (!outputFile || discoveredForFile.current === outputFile) {
+      if (!outputFile) markDone('timing');
+      return;
+    }
     discoveredForFile.current = outputFile;
     setSimDiscovered(null);
     setSimDiscoverError(null);
     setSimDiscovering(true);
+    markStart('timing');
     axios.post('/api/discover-timing-output', { outputFile, serviceTimeMode })
-      .then(r => { setSimDiscovered(r.data.metrics || {}); })
-      .catch(e => { setSimDiscoverError(e.response?.data?.error || e.message); })
+      .then(r => { setSimDiscovered(r.data.metrics || {}); markDone('timing'); })
+      .catch(e => { setSimDiscoverError(e.response?.data?.error || e.message); markDone('timing'); })
       .finally(() => setSimDiscovering(false));
   }, [results?.output_file, serviceTimeMode]);
 
@@ -2261,51 +2984,172 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
         <p>Comparison of input event log vs simulation output</p>
       </div>
 
+      {/* ── Progress bar ── */}
+      {!allDone && (
+        <div className="eval-progress-wrap">
+          <div className="eval-progress-bar-outer">
+            <div className="eval-progress-bar-inner" style={{width: `${(doneCount / EVAL_STEPS.length) * 100}%`}} />
+          </div>
+          <div className="eval-progress-status">
+            {loadingStep ? (
+              <><div className="spinner spinner-sm" style={{display:'inline-block',marginRight:'0.4rem'}} />{loadingStep.label}…</>
+            ) : (
+              doneCount < EVAL_STEPS.length
+                ? <><div className="spinner spinner-sm" style={{display:'inline-block',marginRight:'0.4rem'}} />Preparing…</>
+                : null
+            )}
+            <span className="eval-progress-count">{doneCount} / {EVAL_STEPS.length}</span>
+          </div>
+          <div className="eval-progress-steps">
+            {EVAL_STEPS.map(s => (
+              <span key={s.key} className={`eval-step-chip ${stepsDone[s.key] ? 'eval-step-done' : stepsLoading[s.key] ? 'eval-step-loading' : 'eval-step-pending'}`}>
+                {stepsDone[s.key] ? '✓ ' : stepsLoading[s.key] ? '⏳ ' : '○ '}{s.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* ── Simulation Result ── */}
       {Object.keys(simMetrics).length > 0 && (
         <Collapsible className="eval-section" title="Simulation Result" defaultOpen={true}>
-          <p className="sim-compare-hint">
-            Proportional share of total events (simulation vs log). Difference column shows sim − log in percentage points.
-          </p>
-          <table className="metrics-table sim-compare-table">
-            <thead>
-              <tr>
-                <th>Activity</th>
-                <th title="Times fired in simulation">Sim count</th>
-                <th title="Times fired in input log">Log count</th>
-                <th title="Share of simulated events">Sim %</th>
-                <th title="Share of log events">Log %</th>
-                <th title="Sim % − Log %">Diff</th>
-                <th title="Mean firings per object in log">Log /obj</th>
-                <th title="Mean firings per object in simulation">Sim /obj</th>
-              </tr>
-            </thead>
-            <tbody>
-              {orderedActivities.map(act => {
-                const simCount = simMetrics[act]?.execution_count ?? 0;
-                const logCount = logCounts[act] ?? 0;
-                const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
-                const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
-                const diff = simPct - logPct;
-                const logMeanObj = logRepeat[act]?.mean ?? null;
-                const simObjEvts = simActivityObjectCounts?.[act] ?? null;
-                const simMeanObj = simObjEvts > 0 ? (simCount / simObjEvts).toFixed(2) : null;
-                const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
-                return (
-                  <tr key={act}>
-                    <td className="metrics-act-name">{act}</td>
-                    <td>{simCount || '—'}</td>
-                    <td>{logCount || '—'}</td>
-                    <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                    <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                    <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                    <td>{logMeanObj ?? '—'}</td>
-                    <td>{simMeanObj ?? '—'}</td>
+          {/* Service time summary */}
+          {(() => {
+            const fmtS = v => {
+              if (v == null || v === 0) return '—';
+              if (v >= 86400) return `${(v/86400).toFixed(1)} d`;
+              if (v >= 3600)  return `${(v/3600).toFixed(1)} h`;
+              if (v >= 60)    return `${Math.round(v/60)} min`;
+              return `${Math.round(v)} s`;
+            };
+            // Total accumulated service time across all activities
+            const totalSvcS = orderedActivities.reduce((s, act) => {
+              const m = simMetrics[act];
+              if (!m) return s;
+              return s + (m.mean_service_s || 0) * (m.execution_count || 0);
+            }, 0);
+            return (
+              <table className="metrics-table sim-compare-table">
+                <thead>
+                  <tr>
+                    <th>Activity</th>
+                    <th title="Times fired in simulation">Sim count</th>
+                    <th title="Times fired in input log">Log count</th>
+                    <th title="Share of simulated events">Sim %</th>
+                    <th title="Share of log events">Log %</th>
+                    <th title="Sim % − Log %">Diff</th>
+                    <th title="Mean service time per firing">Mean svc</th>
+                    <th title="Total accumulated service time (mean × count)">Total svc</th>
+                    <th title="Share of total accumulated service time across all activities">Time share</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                </thead>
+                <tbody>
+                  {orderedActivities.map(act => {
+                    const m = simMetrics[act] || {};
+                    const simCount = m.execution_count ?? 0;
+                    const logCount = logCounts[act] ?? 0;
+                    const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                    const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                    const diff = simPct - logPct;
+                    const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
+                    const meanSvc = m.mean_service_s ?? null;
+                    const totalSvc = meanSvc != null ? meanSvc * simCount : null;
+                    const timeShare = totalSvcS > 0 && totalSvc != null ? totalSvc / totalSvcS * 100 : null;
+                    return (
+                      <tr key={act}>
+                        <td className="metrics-act-name">{act}</td>
+                        <td>{simCount || '—'}</td>
+                        <td>{logCount || '—'}</td>
+                        <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                        <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                        <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
+                        <td>{fmtS(meanSvc)}</td>
+                        <td>{fmtS(totalSvc)}</td>
+                        <td>
+                          {timeShare != null ? (
+                            <span style={{display:'inline-flex',alignItems:'center',gap:'0.3rem'}}>
+                              <span style={{fontSize:'0.78rem',fontWeight:600,minWidth:'36px'}}>{timeShare.toFixed(1)}%</span>
+                              <span style={{
+                                display:'inline-block', height:'8px',
+                                width:`${Math.max(2, timeShare * 1.2)}px`,
+                                maxWidth:'80px',
+                                background:`hsl(${220 - timeShare * 1.8},70%,55%)`,
+                                borderRadius:'3px', flexShrink:0
+                              }}/>
+                            </span>
+                          ) : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            );
+          })()}
+
+          {/* Log /obj and Sim /obj — collapsible */}
+          <Collapsible className="conf-detail-collapsible" title="Firings per object" defaultOpen={false}>
+            <table className="conf-detail-table">
+              <thead>
+                <tr>
+                  <th>Activity</th>
+                  <th className="audit-num" title="Mean firings per object in log">Log /obj</th>
+                  <th className="audit-num" title="Mean firings per object in simulation">Sim /obj</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orderedActivities.map(act => {
+                  const simCount = simMetrics[act]?.execution_count ?? 0;
+                  const logMeanObj = logRepeat[act]?.mean ?? null;
+                  const simObjEvts = simActivityObjectCounts?.[act] ?? null;
+                  const simMeanObj = simObjEvts > 0 ? (simCount / simObjEvts).toFixed(2) : null;
+                  return (
+                    <tr key={act}>
+                      <td style={{fontSize:'0.78rem'}}>{act}</td>
+                      <td className="audit-num">{logMeanObj ?? '—'}</td>
+                      <td className="audit-num">{simMeanObj ?? '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </Collapsible>
+
+          {/* ── Confidence Score (Conformance) — inline summary + collapsible detail ── */}
+          <div style={{marginTop:'0.75rem'}}>
+            <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'0.4rem',flexWrap:'wrap'}}>
+              <span style={{fontSize:'0.88rem',fontWeight:700,color:'#1e293b'}}>Confidence Score</span>
+              {results?.conformance && (
+                <>
+                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
+                    Fitness: <strong className={results.conformance.fitness >= 0.8 ? 'conf-good' : results.conformance.fitness >= 0.5 ? 'conf-mid' : 'conf-bad'}>
+                      {results.conformance.fitness != null ? `${(results.conformance.fitness*100).toFixed(1)}%` : '—'}
+                    </strong>
+                  </span>
+                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
+                    Con. Fitness: <strong className={results.conformance.constraint_fitness >= 0.8 ? 'conf-good' : results.conformance.constraint_fitness >= 0.5 ? 'conf-mid' : 'conf-bad'}>
+                      {results.conformance.constraint_fitness != null ? `${(results.conformance.constraint_fitness*100).toFixed(1)}%` : '—'}
+                    </strong>
+                  </span>
+                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
+                    Precision: <strong className={results.conformance.precision >= 0.8 ? 'conf-good' : results.conformance.precision >= 0.5 ? 'conf-mid' : 'conf-bad'}>
+                      {results.conformance.precision != null ? `${(results.conformance.precision*100).toFixed(1)}%` : '—'}
+                    </strong>
+                  </span>
+                  {!results.conformance.fitness && <span style={{fontSize:'0.72rem',color:'#94a3b8',fontStyle:'italic'}}>Open Evaluation tab to compute</span>}
+                </>
+              )}
+              {!results?.conformance && <span style={{fontSize:'0.72rem',color:'#94a3b8',fontStyle:'italic'}}>Open Evaluation tab to compute</span>}
+            </div>
+            <ConformanceSection
+              results={results}
+              activeModel={activeModel}
+              onConformanceSaved={onConformanceSaved}
+              onEventsLoadStart={() => markStart('events')}
+              onEventsLoadDone={() => markDone('events')}
+              onConformanceDone={() => markDone('conformance')}
+            />
+          </div>
         </Collapsible>
       )}
 
@@ -2483,14 +3327,20 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           logDurations={logDurations}
           orderedActivities={orderedActivities}
         />
+
+        {/* Activity Timeline moved inside Time Comparison */}
+        <ActivityGanttChart
+          results={results}
+          orderedActivities={orderedActivities}
+          simMetrics={simMetrics}
+        />
       </Collapsible>
 
-      {/* ── Activity Gantt Chart ── */}
-      <ActivityGanttChart
-        results={results}
-        orderedActivities={orderedActivities}
-        simMetrics={simMetrics}
-      />
+      {/* ── Trace Health ── */}
+      <TraceHealth results={results} />
+
+      {/* ── Constraint Analysis ── */}
+      <ConstraintAnalysis activeModel={activeModel} results={results} />
 
       {/* ── O2O Comparison ── */}
       <Collapsible className="eval-section" title="O2O Rules Comparison" defaultOpen={false}>
@@ -2510,8 +3360,8 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
         </div>
       </Collapsible>
 
-      {/* ── Conformance ── */}
-      <ConformanceSection results={results} activeModel={activeModel} onConformanceSaved={onConformanceSaved} />
+      {/* ── Log Inspection — always last ── */}
+      <LogInspection eventLogFiles={eventLogFiles} handleFileUpload={handleFileUpload} />
     </div>
   );
 }
@@ -2697,30 +3547,37 @@ function PerObjectBoundsChecker({ events, typesMap, constraints, onBoundsResults
 }
 
 // ── LogModelConformance ───────────────────────────────────────────────────────
-function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsResults }) {
+function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsResults, autoRunTrigger }) {
   const [events,    setEvents]    = React.useState(null);
   const [typesMap,  setTypesMap]  = React.useState({});
   const [loading,   setLoading]   = React.useState(false);
   const [error,     setError]     = React.useState(null);
-  const [checked,   setChecked]   = React.useState(false);
-  const [progress,  setProgress]  = React.useState({ done: 0, total: 0 }); // constraint progress
+  const [progress,  setProgress]  = React.useState({ done: 0, total: 0 });
   const [conf,      setConf]      = React.useState(null);
-  const loadedFor = React.useRef(null);
-  const computing = React.useRef(false);
+  const loadedFor   = React.useRef(null); // tracks which file+constraintCount was last run
+  const computing   = React.useRef(false);
 
   const constraints = activeModel?.constraints || [];
   const hasModel = activeModel && !Array.isArray(activeModel) && constraints.length > 0;
+  // Key that identifies the current file+model — only re-run when this changes
+  const runKey = eventLogFile + '|' + constraints.length;
+
+  // Auto-run when triggered from runAllDiscoveries, but only if not already done for this file+model
+  React.useEffect(() => {
+    if (autoRunTrigger > 0 && eventLogFile && hasModel && loadedFor.current !== runKey) {
+      run();
+    }
+  }, [autoRunTrigger]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const run = async () => {
     if (!eventLogFile || !hasModel) return;
-    setChecked(true);
     setConf(null);
     setProgress({ done: 0, total: 0 });
     computing.current = true;
 
     let evts = events;
     let tmap = typesMap;
-    if (loadedFor.current !== eventLogFile || !evts) {
+    if (!evts || loadedFor.current?.split('|')[0] !== eventLogFile) {
       setLoading(true);
       setError(null);
       try {
@@ -2729,7 +3586,6 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
         tmap = r.data.object_types_map || {};
         setEvents(evts);
         setTypesMap(tmap);
-        loadedFor.current = eventLogFile;
       } catch(e) {
         setError(e.response?.data?.error || e.message);
         setLoading(false);
@@ -2740,13 +3596,10 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
       }
     }
 
-    // Run constraint-by-constraint with progress updates using setTimeout
-    // to yield to the browser between each constraint
     const n = evts.length;
     const total = constraints.length;
     setProgress({ done: 0, total });
 
-    // Build the satisfies function inline (same logic as computeOCDeclareConformance)
     const eventObjs = evts.map(e => new Set(e.object_ids || []));
     const temporalFilter = (srcIdx, ctype) => {
       const srcTs = evts[srcIdx].timestamp;
@@ -2756,10 +3609,9 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
       for (let j = 0; j < n; j++) {
         if (j === srcIdx) continue;
         const ts = evts[j].timestamp;
-        if (['response','chain_response','succession','alternate_response'].includes(ctype)) {
+        if (['response','chain_response','succession','alternate_response',
+             'precedence','alternate_precedence'].includes(ctype)) {
           if (ts >= srcTs) result.push(j);
-        } else if (['precedence','chain_precedence','alternate_precedence'].includes(ctype)) {
-          if (ts <= srcTs) result.push(j);
         } else {
           result.push(j);
         }
@@ -2793,13 +3645,11 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
       return true;
     };
 
-    // Evaluate constraints one by one, yielding between each
     const results = [];
     let globalSatisfied = new Array(n).fill(true);
 
     const evalNext = (idx) => {
       if (!computing.current || idx >= total) {
-        // Done — compute global
         const globalCount = globalSatisfied.filter(Boolean).length;
         const result = {
           constraintResults: results,
@@ -2810,6 +3660,7 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
         setConf(result);
         setProgress({ done: total, total });
         onResults?.(result);
+        loadedFor.current = runKey; // mark as done for this file+model
         computing.current = false;
         return;
       }
@@ -2836,21 +3687,13 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
   const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
   const cls = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
   const progressPct = progress.total > 0 ? Math.round(progress.done / progress.total * 100) : 0;
-  const isComputing = checked && progress.done < progress.total && progress.total > 0;
+  const isComputing = progress.done < progress.total && progress.total > 0;
 
+  // Render content directly (no Collapsible wrapper — parent tab handles visibility)
   return (
-    <Collapsible className="log-model-conf-collapsible" title="OC-Declare Model Check" defaultOpen={false}>
-      <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
-        Checks whether every event in the input OCEL satisfies the constraints of the loaded OC-Declare model
-        (Definition 9 confidence). A low confidence on a constraint means the log regularly violates it.
-      </p>
+    <div className="log-model-conf-content">
       {!hasModel && (
         <p style={{fontSize:'0.78rem',color:'#b45309'}}>⚠ No OC-Declare model loaded or no constraints defined.</p>
-      )}
-      {hasModel && !checked && (
-        <button className="discovery-button" style={{fontSize:'0.82rem',padding:'0.4rem 1rem'}} onClick={run}>
-          Check model against log
-        </button>
       )}
       {loading && (
         <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#6366f1'}}>
@@ -2859,7 +3702,6 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
       )}
       {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
 
-      {/* Progress bar while computing */}
       {isComputing && (
         <div style={{marginBottom:'0.75rem'}}>
           <div style={{display:'flex',justifyContent:'space-between',fontSize:'0.75rem',color:'#64748b',marginBottom:'0.25rem'}}>
@@ -2870,6 +3712,12 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
             <div className="ocd-progress-fill" style={{width:`${progressPct}%`}} />
           </div>
         </div>
+      )}
+
+      {hasModel && !conf && !isComputing && !loading && !error && (
+        <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>
+          Runs automatically with "Run Discoveries".
+        </p>
       )}
 
       {conf && !isComputing && (
@@ -2885,7 +3733,7 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
               </span>
             </div>
             <button className="discovery-button" style={{fontSize:'0.75rem',padding:'0.3rem 0.7rem',marginLeft:'auto'}}
-              onClick={() => { setChecked(false); setConf(null); setProgress({done:0,total:0}); setEvents(null); loadedFor.current = null; computing.current = false; onResults?.(null); }}>
+              onClick={() => { loadedFor.current = null; setConf(null); setProgress({done:0,total:0}); setEvents(null); computing.current = false; onResults?.(null); run(); }}>
               ↺ Re-check
             </button>
           </div>
@@ -2911,8 +3759,6 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
               </tbody>
             </table>
           )}
-
-          {/* Per-object bounds checker */}
           {conf && events && (
             <PerObjectBoundsChecker
               events={events}
@@ -2923,7 +3769,7 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
           )}
         </>
       )}
-    </Collapsible>
+    </div>
   );
 }
 
@@ -2992,14 +3838,8 @@ function App() {
   const [results, setResults] = useState(null);
   const [healthResult, setHealthResult] = useState(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
-  const [iterationLogs, setIterationLogs] = useState([]);
-  const [iterationLogsOpen, setIterationLogsOpen] = useState(false);
   const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
   const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
-  const iterationStepCount = useMemo(
-    () => iterationLogs.filter(e => e.event === 'candidates').length,
-    [iterationLogs]
-  );
   const [error, setError] = useState(null);
 
   // ── On-demand object metrics — declared here so memos below can reference it ──
@@ -3070,7 +3910,6 @@ function App() {
     setIsLoadingFullIterationLog(true);
     try {
       const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-      setIterationLogs(r.data.iteration_logs || []);
       setFullIterationLogLoaded(true);
     } catch {
       // keep existing capped logs on failure
@@ -3109,12 +3948,17 @@ function App() {
   });
   const [activeDiscoveryTab, setActiveDiscoveryTab] = useState('lifecycle');
   const [isRunningDiscoveries, setIsRunningDiscoveries] = useState(false);
+  const [discoveryElapsed, setDiscoveryElapsed] = useState(null);
+  const discStartRef = useRef(null);
+  const discTimerRef = useRef(null);
   const [healthCheckSteps, setHealthCheckSteps] = useState(500);
   const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
   // OC-Declare model check results (from First Log Insights panel)
   const [logConfResults, setLogConfResults] = useState(null); // null = not run yet
   const [logBoundsResults, setLogBoundsResults] = useState(null); // per-object bounds check results
+  // Trigger for model check from runAllDiscoveries
+  const [modelCheckTrigger, setModelCheckTrigger] = useState(0);
   // Whether to drop 0%-confidence constraints before Run Discoveries
   const [dropZeroConfConstraints, setDropZeroConfConstraints] = useState(false);
   // Whether to set nmax to max observed for unbounded constraints
@@ -3129,19 +3973,19 @@ function App() {
 
   // ── Automated post-processing state ───────────────────────────────────────
   const [autoConfig, setAutoConfig] = useState({
-    cycleEnabled:            true,
+    cycleEnabled:            false,
     cycleNminThreshold:      1,
-    weakEnabled:             true,
+    weakEnabled:             false,
     weakThreshold:           25,
-    chainEnabled:            true,
+    chainEnabled:            false,
     chainBlockThreshold:     5,
-    o2oEnabled:              true,
-    nmaxEnabled:             true,   // raise nmax caps that are hit
-    createsMissingEnabled:   true,   // suggest creates=True for never-attempted activities
-    startRecEnabled:         true,   // recommend start activities when pool empty at step 0
-    redundantEnabled:        true,   // remove weaker of duplicate/implied constraints
-    unconstrainedEnabled:    true,   // suggest predecessor for activities with no input arcs
-    noInputBindingEnabled:   true,   // suggest adding an object binding to activities with no non-creating input
+    o2oEnabled:              false,
+    nmaxEnabled:             false,
+    createsMissingEnabled:   false,
+    startRecEnabled:         false,
+    redundantEnabled:        false,
+    unconstrainedEnabled:    false,
+    noInputBindingEnabled:   false,
   });
   const [autoConfigOpen, setAutoConfigOpen] = useState(false);
   const [autoSuggestions, setAutoSuggestions] = useState([]);
@@ -3544,8 +4388,6 @@ function App() {
     setError(null);
     setResults(null);
     setLogs([]);
-    setIterationLogs([]);
-    setIterationLogsOpen(false);
     setFullIterationLogLoaded(false);
 
     // Start polling the live step counter every second
@@ -3575,7 +4417,6 @@ function App() {
 
       setResults(response.data.results);
       setLogs(response.data.logs || []);
-      setIterationLogs(response.data.iteration_logs || []);
 
       // Push a snapshot to session history for replay
       if (response.data.success !== false) {
@@ -3687,6 +4528,13 @@ function App() {
   const runAllDiscoveries = useCallback(async () => {
     if (!discoveryConfig.eventLogFile) return;
     setIsRunningDiscoveries(true);
+    // Start discovery elapsed timer
+    discStartRef.current = Date.now();
+    setDiscoveryElapsed(0);
+    if (discTimerRef.current) clearInterval(discTimerRef.current);
+    discTimerRef.current = setInterval(() => {
+      setDiscoveryElapsed(Math.floor((Date.now() - discStartRef.current) / 1000));
+    }, 1000);
 
     // If checkbox is on and model check was run, drop 0%-confidence constraints first
     if (dropZeroConfConstraints && logConfResults?.constraintResults) {
@@ -3715,15 +4563,27 @@ function App() {
       { key: 'startProb', label: 'Start Activity + Probability', fn: applyStartProbability },
     ];
     const steps = allSteps.filter(s => discoveryChecks[s.key]);
-    const total = steps.length;
+    // +2 for health check + model check (always run)
+    const total = steps.length + 2;
 
     try {
       for (let i = 0; i < steps.length; i++) {
         setDiscoveryProgress({ current: i + 1, total, currentName: steps[i].label });
         await steps[i].fn();
       }
+      setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'Constraint Health Check' });
       await runHealthCheck();
+      // Run OC-Declare model check as the final fixed step
+      setDiscoveryProgress({ current: steps.length + 2, total, currentName: 'OC-Declare Model Check' });
+      setActiveDiscoveryTab('modelCheck');
+      setLogConfResults(null);
+      setLogBoundsResults(null);
+      // Trigger model check via flag — LogModelConformance watches modelCheckTrigger
+      setModelCheckTrigger(t => t + 1);
     } finally {
+      clearInterval(discTimerRef.current);
+      discTimerRef.current = null;
+      setDiscoveryElapsed(Math.floor((Date.now() - (discStartRef.current || Date.now())) / 1000));
       setIsRunningDiscoveries(false);
       setDiscoveryProgress({ current: 0, total: 0, currentName: '' });
     }
@@ -4854,14 +5714,6 @@ function App() {
                             </tbody>
                           </table>
                         )}
-
-                        {/* Model conformance check against input log */}
-                        <LogModelConformance
-                          eventLogFile={discoveryConfig.eventLogFile}
-                          activeModel={activeModel}
-                          onResults={setLogConfResults}
-                          onBoundsResults={setLogBoundsResults}
-                        />
                       </Collapsible>
                     );
                   })()}
@@ -4879,14 +5731,20 @@ function App() {
                     { key: 'o2o',       label: 'O2O' },
                     { key: 'startProb', label: 'Start Activity + Probability' },
                   ];
+                  // Non-removable extra tab
+                  const EXTRA_TABS = [
+                    { key: 'modelCheck', label: 'OC-Declare Model Check' },
+                  ];
                   // Ensure activeDiscoveryTab is one of the defined keys; default to first
-                  const activeKey = DISC_ITEMS.some(d => d.key === activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
+                  const allTabKeys = [...DISC_ITEMS.map(d=>d.key), ...EXTRA_TABS.map(d=>d.key)];
+                  const activeKey = allTabKeys.includes(activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
                   const resultBadge = key => {
                     if (key === 'lifecycle' && lifecycleResult && !lifecycleResult.error) return lifecycleResult.method === 'ocel' ? '✓' : '⚠';
                     if (key === 'resources' && resourceResult) return '✓';
                     if (key === 'timing' && timingDiscoveryResult) return '✓';
                     if (key === 'o2o' && o2oResult) return '✓';
                     if (key === 'startProb' && startProbApplied) return '✓';
+                    if (key === 'modelCheck' && logConfResults) return '✓';
                     return null;
                   };
                   return (
@@ -4896,7 +5754,7 @@ function App() {
                         <p>Tick tabs to include in the run. Click a tab to configure it.</p>
                       </div>
 
-                      {/* Tab bar — one tab per discovery */}
+                      {/* Tab bar — checkable discovery tabs + non-removable extra tabs */}
                       <div className="disc-tab-bar">
                         {DISC_ITEMS.map(({ key, label }) => {
                           const badge = resultBadge(key);
@@ -4912,6 +5770,21 @@ function App() {
                                 onClick={e => e.stopPropagation()}
                                 onChange={e => setDiscoveryChecks(p => ({ ...p, [key]: e.target.checked }))}
                               />
+                              {label}
+                              {badge && <span className={`disc-tab-badge ${badge === '⚠' ? 'badge-warn' : 'badge-ok'}`}>{badge}</span>}
+                            </button>
+                          );
+                        })}
+                        {/* Non-removable extra tabs — no checkbox */}
+                        {EXTRA_TABS.map(({ key, label }) => {
+                          const badge = resultBadge(key);
+                          return (
+                            <button
+                              key={key}
+                              className={`disc-tab-btn disc-tab-btn-fixed${activeKey === key ? ' active' : ''}`}
+                              onClick={() => setActiveDiscoveryTab(key)}
+                              title="Always runs as part of discoveries"
+                            >
                               {label}
                               {badge && <span className={`disc-tab-badge ${badge === '⚠' ? 'badge-warn' : 'badge-ok'}`}>{badge}</span>}
                             </button>
@@ -5046,6 +5919,24 @@ function App() {
                             </div>
                           );
                         })()}
+
+                        {/* OC-Declare Model Check tab — non-removable */}
+                        {activeKey === 'modelCheck' && (
+                          <div>
+                            <p className="disc-tab-desc">
+                              Check whether every event in the input OCEL satisfies the loaded OC-Declare constraints
+                              (Definition 9 confidence). Runs automatically after discoveries complete.
+                              Low confidence on a constraint means the log violates it — consider removing or adjusting it.
+                            </p>
+                            <LogModelConformance
+                              eventLogFile={discoveryConfig.eventLogFile}
+                              activeModel={activeModel}
+                              onResults={setLogConfResults}
+                              onBoundsResults={setLogBoundsResults}
+                              autoRunTrigger={modelCheckTrigger}
+                            />
+                          </div>
+                        )}
                       </div>
 
                       <div className="disc-steps-row">
@@ -5082,10 +5973,21 @@ function App() {
                           <span className="disc-progress-label">
                             {discoveryProgress.currentName}… ({discoveryProgress.current}/{discoveryProgress.total})
                           </span>
+                          <span className="sim-elapsed-timer" style={{fontSize:'0.85rem',marginLeft:'auto'}}>
+                            {(() => {
+                              const s = discoveryElapsed ?? 0;
+                              return `⏱ ${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
+                            })()}
+                          </span>
                           <div className="disc-progress-bar">
                             <div className="disc-progress-fill" style={{width:`${(discoveryProgress.current/discoveryProgress.total)*100}%`}} />
                           </div>
                         </div>
+                      )}
+                      {!isRunningDiscoveries && discoveryElapsed != null && (
+                        <span className="sim-duration-badge" style={{marginTop:'0.35rem',display:'inline-flex'}}>
+                          ⏱ {Math.floor(discoveryElapsed/60).toString().padStart(2,'0')}:{(discoveryElapsed%60).toString().padStart(2,'0')}
+                        </span>
                       )}
                     </div>
                   );
@@ -5120,7 +6022,7 @@ function App() {
                         className="health-report-box"
                         title={<span className={titleClass}>🩺 Constraint Health Report</span>}
                         badge={badge}
-                        defaultOpen={hasErrors || hasWarnings}
+                        defaultOpen={false}
                       >
                         {healthResult.no_input_activities?.length > 0 && (
                           <Collapsible
@@ -6154,6 +7056,14 @@ function App() {
                         </div>
                       )}
 
+                      {/* ── Run Result collapsible ── */}
+                      {results && (
+                        <Collapsible
+                          className="logs-box"
+                          title="Run Result"
+                          defaultOpen={false}
+                        >
+
                       {results.object_types && (
                         <Collapsible
                           className="object-types"
@@ -6224,19 +7134,6 @@ function App() {
                             )}
                           </div>
                         </Collapsible>
-                      )}
-
-                      {results.output_file && (
-                        <div className="download-row">
-                          <button className="download-button" onClick={downloadEventLog}>
-                            Download Event Log
-                          </button>
-                          {results.metrics_file && (
-                            <button className="download-button download-button-secondary" onClick={downloadMetrics}>
-                              Download Metrics
-                            </button>
-                          )}
-                        </div>
                       )}
 
                       {/* ── Timing Metrics Panel ── */}
@@ -6366,6 +7263,10 @@ function App() {
                           )}
                         </>
                       )}
+
+                        </Collapsible>
+                      )}{/* end Run Result */}
+
                     </div>
                   )}
 
@@ -6377,6 +7278,19 @@ function App() {
                           <div key={idx} className="log-entry">{log}</div>
                         ))}
                       </div>
+                    </div>
+                  )}
+
+                  {results?.output_file && (
+                    <div className="download-row" style={{marginTop:'0.5rem'}}>
+                      <button className="download-button" onClick={downloadEventLog}>
+                        Download Event Log
+                      </button>
+                      {results.metrics_file && (
+                        <button className="download-button download-button-secondary" onClick={downloadMetrics}>
+                          Download Metrics
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -6400,94 +7314,28 @@ function App() {
                     </Collapsible>
                   )}
 
-                  {iterationLogs.length > 0 && (
-                    <div className="logs-box">
-                      <h4
-                        className="collapsible-header"
-                        onClick={() => setIterationLogsOpen(o => !o)}
-                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                  {results?.iteration_log_file && (
+                    <div style={{marginTop:'0.5rem'}}>
+                      <button
+                        className="download-button download-button-secondary"
+                        onClick={async () => {
+                          const runId = results.output_file;
+                          const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+                          const lines = (r.data.iteration_logs || []).map(e => JSON.stringify(e)).join('\n');
+                          const blob = new Blob([lines], {type:'application/x-ndjson'});
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url; a.download = `iteration_${runId}.jsonl`;
+                          document.body.appendChild(a); a.click();
+                          document.body.removeChild(a);
+                          URL.revokeObjectURL(url);
+                        }}
                       >
-                        {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps
-                        {fullIterationLogLoaded ? ', full' : ', last 500'})
-                      </h4>
-                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.3rem'}}>
-                        {!fullIterationLogLoaded && results?.iteration_log_file && (
-                          <button
-                            className="download-button download-button-secondary"
-                            disabled={isLoadingFullIterationLog}
-                            onClick={loadFullIterationLog}
-                          >
-                            {isLoadingFullIterationLog ? 'Loading…' : '⬇ Load Full Trace'}
-                          </button>
-                        )}
-                        {fullIterationLogLoaded && (
-                          <span style={{fontSize:'0.75rem',color:'#15803d'}}>✓ Full trace loaded ({iterationStepCount} steps)</span>
-                        )}
-                        {results?.iteration_log_file && (
-                          <button
-                            className="download-button download-button-secondary"
-                            onClick={async () => {
-                              const runId = results.output_file;
-                              const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-                              const blob = new Blob([JSON.stringify(r.data.iteration_logs, null, 2)], {type:'application/json'});
-                              const url = URL.createObjectURL(blob);
-                              const a = document.createElement('a');
-                              a.href = url;
-                              a.download = `iteration_${runId}`;
-                              document.body.appendChild(a); a.click();
-                              document.body.removeChild(a);
-                              URL.revokeObjectURL(url);
-                            }}
-                          >
-                            ⬇ Download Trace
-                          </button>
-                        )}
-                      </div>
-                      {iterationLogsOpen && (
-                        <div className="logs-content iteration-trace">
-                          {(() => {
-                            const items = [];
-                            for (let i = 0; i < iterationLogs.length; i++) {
-                              const entry = iterationLogs[i];
-                              if (entry.event === 'candidates') {
-                                const next = iterationLogs[i + 1];
-                                const chosen = next?.event === 'chosen' ? next : null;
-                                const withProbs = entry.candidates_with_probs || entry.candidates.map(a => ({ activity: a, prob: null }));
-                                items.push(
-                                  <div key={i} className="iteration-step">
-                                    <span className="iter-step-label">Step {entry.step}</span>
-                                    <span className="iter-candidates">
-                                      Pool [{entry.num_candidates}]:{' '}
-                                      {withProbs.map((c, ci) => (
-                                        <span key={ci} className={chosen?.activity === c.activity ? 'iter-pool-chosen' : 'iter-pool-item'}>
-                                          {c.activity}
-                                          {c.prob !== null && <span className="iter-prob"> ({(c.prob * 100).toFixed(1)}%)</span>}
-                                          {c.objects?.length > 0 && <span className="iter-objects"> [{c.objects.join(', ')}]</span>}
-                                          {ci < withProbs.length - 1 ? ', ' : ''}
-                                        </span>
-                                      ))}
-                                    </span>
-                                    {chosen && (
-                                      <span className="iter-chosen">
-                                        → <strong>{chosen.activity}</strong>
-                                        {chosen.prob !== null && <span className="iter-prob"> ({(chosen.prob * 100).toFixed(1)}%)</span>}
-                                        {chosen.creates?.length > 0 && ` (creates: ${chosen.creates.join(', ')})`}
-                                      </span>
-                                    )}
-                                  </div>
-                                );
-                              } else if (entry.event === 'stop') {
-                                items.push(
-                                  <div key={i} className="iteration-step iter-stop">
-                                    Stopped at step {entry.step}: {entry.reason}
-                                  </div>
-                                );
-                              }
-                            }
-                            return items;
-                          })()}
-                        </div>
-                      )}
+                        ⬇ Download Iteration Trace
+                      </button>
+                      <span style={{fontSize:'0.72rem',color:'#94a3b8',marginLeft:'0.5rem'}}>
+                        JSONL — one entry per step: candidates, weights, chosen activity, timestamp
+                      </span>
                     </div>
                   )}
 
@@ -6496,7 +7344,7 @@ function App() {
                     <div style={{ marginTop: '1.5rem', display: 'flex', gap: '0.75rem' }}>
                       <button
                         className="discovery-button"
-                        onClick={() => { setResults(null); setLogs([]); setIterationLogs([]); }}
+                        onClick={() => { setResults(null); setLogs([]); }}
                       >
                         ↺ Run Again
                       </button>
@@ -6525,6 +7373,8 @@ function App() {
                     serviceTimeMode={serviceTimeMode}
                     simActivityObjectCounts={simActivityObjectCounts}
                     onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {})}
+                    eventLogFiles={eventLogFiles}
+                    handleFileUpload={handleFileUpload}
                   />
                 )}
               </div>
@@ -8105,94 +8955,27 @@ function App() {
             </Collapsible>
           )}
 
-          {iterationLogs.length > 0 && (
-            <div className="logs-box">
-              <h4
-                className="collapsible-header"
-                onClick={() => setIterationLogsOpen(o => !o)}
-                style={{ cursor: 'pointer', userSelect: 'none' }}
+          {results?.iteration_log_file && (
+            <div style={{marginTop:'0.5rem'}}>
+              <button
+                className="download-button download-button-secondary"
+                onClick={async () => {
+                  const runId = results.output_file;
+                  const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
+                  const lines = (r.data.iteration_logs || []).map(e => JSON.stringify(e)).join('\n');
+                  const blob = new Blob([lines], {type:'application/x-ndjson'});
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url; a.download = `iteration_${runId}.jsonl`;
+                  document.body.appendChild(a); a.click();
+                  document.body.removeChild(a); URL.revokeObjectURL(url);
+                }}
               >
-                {iterationLogsOpen ? '▼' : '▶'} Iteration Trace ({iterationStepCount} steps
-                {fullIterationLogLoaded ? ', full' : ', last 500'})
-              </h4>
-              <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.3rem'}}>
-                {!fullIterationLogLoaded && results?.iteration_log_file && (
-                  <button
-                    className="download-button download-button-secondary"
-                    disabled={isLoadingFullIterationLog}
-                    onClick={loadFullIterationLog}
-                  >
-                    {isLoadingFullIterationLog ? 'Loading…' : '⬇ Load Full Trace'}
-                  </button>
-                )}
-                {fullIterationLogLoaded && (
-                  <span style={{fontSize:'0.75rem',color:'#15803d'}}>✓ Full trace loaded ({iterationStepCount} steps)</span>
-                )}
-                {results?.iteration_log_file && (
-                  <button
-                    className="download-button download-button-secondary"
-                    onClick={async () => {
-                      const runId = results.output_file;
-                      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-                      const blob = new Blob([JSON.stringify(r.data.iteration_logs, null, 2)], {type:'application/json'});
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = `iteration_${runId}`;
-                      document.body.appendChild(a); a.click();
-                      document.body.removeChild(a);
-                      URL.revokeObjectURL(url);
-                    }}
-                  >
-                    ⬇ Download Trace
-                  </button>
-                )}
-              </div>
-              {iterationLogsOpen && (
-                <div className="logs-content iteration-trace">
-                  {(() => {
-                    const items = [];
-                    for (let i = 0; i < iterationLogs.length; i++) {
-                      const entry = iterationLogs[i];
-                      if (entry.event === 'candidates') {
-                        const next = iterationLogs[i + 1];
-                        const chosen = next?.event === 'chosen' ? next : null;
-                        const withProbs = entry.candidates_with_probs || entry.candidates.map(a => ({ activity: a, prob: null }));
-                        items.push(
-                          <div key={i} className="iteration-step">
-                            <span className="iter-step-label">Step {entry.step}</span>
-                            <span className="iter-candidates">
-                              Pool [{entry.num_candidates}]:{' '}
-                              {withProbs.map((c, ci) => (
-                                <span key={ci} className={chosen?.activity === c.activity ? 'iter-pool-chosen' : 'iter-pool-item'}>
-                                  {c.activity}
-                                  {c.prob !== null && <span className="iter-prob"> ({(c.prob * 100).toFixed(1)}%)</span>}
-                                  {c.objects?.length > 0 && <span className="iter-objects"> [{c.objects.join(', ')}]</span>}
-                                  {ci < withProbs.length - 1 ? ', ' : ''}
-                                </span>
-                              ))}
-                            </span>
-                            {chosen && (
-                              <span className="iter-chosen">
-                                → <strong>{chosen.activity}</strong>
-                                {chosen.prob !== null && <span className="iter-prob"> ({(chosen.prob * 100).toFixed(1)}%)</span>}
-                                {chosen.creates?.length > 0 && ` (creates: ${chosen.creates.join(', ')})`}
-                              </span>
-                            )}
-                          </div>
-                        );
-                      } else if (entry.event === 'stop') {
-                        items.push(
-                          <div key={i} className="iteration-step iter-stop">
-                            Stopped at step {entry.step}: {entry.reason}
-                          </div>
-                        );
-                      }
-                    }
-                    return items;
-                  })()}
-                </div>
-              )}
+                ⬇ Download Iteration Trace
+              </button>
+              <span style={{fontSize:'0.72rem',color:'#94a3b8',marginLeft:'0.5rem'}}>
+                JSONL — candidates, weights, chosen activity, timestamps
+              </span>
             </div>
           )}
           {/* ── Re-run placeholder ── */}
@@ -8242,6 +9025,7 @@ function App() {
                       <th>Events</th>
                       <th>Objects</th>
                       <th>Seed</th>
+                      <th title="Simulation wall-clock runtime">Runtime</th>
                       {showConf && <th className="audit-num rh-conf-col" title="Object-Replay Fitness">Fitness</th>}
                       {showConf && <th className="audit-num rh-conf-col" title="Declarative Constraint Fitness">Con. Fitness</th>}
                       {showConf && <th className="audit-num rh-conf-col" title="Declarative Precision">Precision</th>}
@@ -8263,6 +9047,14 @@ function App() {
                           <td>{run.events_count}</td>
                           <td>{run.objects_count}</td>
                           <td>{run.seed}</td>
+                          <td style={{fontVariantNumeric:'tabular-nums',fontSize:'0.78rem'}}>
+                            {run.runtime_s != null ? (() => {
+                              const s = run.runtime_s;
+                              const m = Math.floor(s/60).toString().padStart(2,'0');
+                              const sec = Math.floor(s%60).toString().padStart(2,'0');
+                              return `${m}:${sec}`;
+                            })() : '—'}
+                          </td>
                           {showConf && (
                             <td className="audit-num rh-conf-col">
                               <span className={confClass(run.conformance?.fitness)}>{pct(run.conformance?.fitness)}</span>
@@ -8290,7 +9082,7 @@ function App() {
                         </tr>
                         {expandedRunId === run.id && runMetrics[run.id] && (
                           <tr className="run-history-metrics-row">
-                            <td colSpan={showConf ? 11 : 8}>
+                            <td colSpan={showConf ? 12 : 9}>
                               <div className="rh-metrics-expand">
                                 <strong>Activity timing</strong>
                                 <table className="metrics-table rh-metrics-table">

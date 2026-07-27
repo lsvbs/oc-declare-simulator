@@ -1331,17 +1331,18 @@
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1rem;
-  margin-bottom: 2rem;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 0.5rem;
+  margin-bottom: 1rem;
 }
 
 .stat-card {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   color: white;
-  padding: 1.5rem;
-  border-radius: 8px;
+  padding: 0.55rem 0.6rem;
+  border-radius: 6px;
   text-align: center;
+  min-width: 0;
 }
 
 .stat-card-warn {
@@ -1353,20 +1354,25 @@
 }
 
 .stat-value {
-  font-size: 2.5rem;
+  font-size: clamp(0.85rem, 3vw, 1.4rem);
   font-weight: bold;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.15rem;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .stat-value-denom {
-  font-size: 1.2rem;
+  font-size: 0.7rem;
   font-weight: 400;
   opacity: 0.8;
 }
 
 .stat-label {
-  font-size: 0.9rem;
+  font-size: 0.62rem;
   opacity: 0.9;
+  line-height: 1.2;
 }
 
 .sim-coverage-warning {
@@ -3629,4 +3635,81 @@
   color: #475569;
   font-variant-numeric: tabular-nums;
   margin-left: 0.5rem;
+}
+
+/* ── Evaluation progress bar ─────────────────────────────────────────────── */
+.eval-progress-wrap {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.25rem;
+}
+.eval-progress-bar-outer {
+  height: 6px;
+  background: #e2e8f0;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 0.4rem;
+}
+.eval-progress-bar-inner {
+  height: 100%;
+  background: #6366f1;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.eval-progress-status {
+  display: flex;
+  align-items: center;
+  font-size: 0.78rem;
+  color: #475569;
+  margin-bottom: 0.4rem;
+}
+.eval-progress-count {
+  margin-left: auto;
+  font-weight: 600;
+  color: #6366f1;
+}
+.eval-progress-steps {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+.eval-step-chip {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 20px;
+  border: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+.eval-step-done    { background: #f0fdf4; border-color: #86efac; color: #166534; }
+.eval-step-loading { background: #eef2ff; border-color: #a5b4fc; color: #4338ca; }
+.eval-step-pending { background: #f8fafc; color: #94a3b8; }
+
+/* ── Trace Health ────────────────────────────────────────────────────────── */
+.trace-health-summary {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 1rem;
+}
+.trace-health-stat { display: flex; flex-direction: column; align-items: center; gap: 0.15rem; }
+.trace-health-val  { font-size: 1.3rem; font-weight: 700; color: #1e293b; }
+.trace-health-lbl  { font-size: 0.68rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; }
+.trace-warn        { color: #b91c1c !important; }
+
+/* ── Fixed (non-removable) discovery tab ────────────────────────────────── */
+.disc-tab-btn-fixed {
+  border-left: 2px solid #6366f1;
+  background: #f5f3ff;
+  color: #4338ca;
+}
+.disc-tab-btn-fixed.active {
+  background: #eef2ff;
+  border-color: #6366f1;
+  color: #4338ca;
 }

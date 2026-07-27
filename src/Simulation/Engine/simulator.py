@@ -190,6 +190,9 @@ class Simulator:
             if con.constraint_type == 'response':
                 self._response_by_source.setdefault(con.source_activity, []).append(con)
 
+        # Reusable set for obligation dedup — cleared each step, avoids per-step allocation
+        self._seen_obligation_keys: set = set()
+
     def _trace(self, event: str, payload: dict) -> None:
         if self.trace_func is None:
             return
@@ -412,17 +415,8 @@ class Simulator:
             primary_type = primary_bindings[0].object_type
             active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
 
-            # Build a set of objects already in-progress for this activity so we
-            # don't start a second concurrent instance on the same object — this
-            # would bypass not_coexistence and similar per-object constraints
-            # because the first firing hasn't been recorded yet.
-            in_progress_objects: set[str] = set()
-            for ip in state.in_progress:
-                if ip.candidate_activity_name == activity.name:
-                    in_progress_objects.update(ip.participating_object_ids)
-
             for oid in active_ids:
-                if oid in in_progress_objects:
+                if (activity.name, oid) in state._in_progress_objects:
                     continue
                 # #6: pass force_object_id instead of mutating _active_by_type
                 candidate = build_candidate_for_activity(
@@ -479,9 +473,15 @@ class Simulator:
                 if not c.participating_object_ids:
                     pool_index.add((c.activity_name, None))
 
+            # Build in-progress index to prevent starting an obligated activity
+            # on an object that is already in-progress for that same activity.
+            # Uses state._in_progress_objects maintained in _des_start/complete_activity.
+            in_progress_index = state._in_progress_objects
+
             prec_by_target: dict[str, list] = self._prec_by_target
 
-            seen_obligation_keys: set = set()
+            seen_obligation_keys = self._seen_obligation_keys
+            seen_obligation_keys.clear()
             for (target_act, scope_oid), count in list(state._obligations_count.items()):
                 if count <= 0:
                     continue
@@ -497,6 +497,12 @@ class Simulator:
                 else:
                     if (target_act, None) in pool_index:
                         continue
+
+                # Skip if the obligated activity is already in-progress on this
+                # scope object — prevents concurrent duplicate starts that bypass
+                # the event-count check (record_event hasn't run yet for in-progress)
+                if scope_oid is not None and (target_act, scope_oid) in in_progress_index:
+                    continue
 
                 # Scope object must exist and be active
                 if scope_oid is not None:
@@ -1005,24 +1011,17 @@ class Simulator:
         # step start from current_time, not from each other's completion times.
         state.last_generated_timestamp = saved_ts
 
-        # Record pure service time (sampled work duration only, before waiting is added)
+        # Record pure service time (sampled work duration only)
         if started_at is not None and complete_at is not None:
             svc = (complete_at - started_at).total_seconds()
             if svc >= 0:
                 state.activity_service_s.setdefault(candidate.activity_name, []).append(svc)
 
-        # Add process waiting time to advance the clock to realistic calendar scale.
-        # This reproduces inter-event gaps (lead times, batching, admin delays) that
-        # are not explicitly modelled. It only advances complete_at — the service
-        # metric above is already recorded and correct.
-        dur = getattr(self.time_policy, 'durations', {}).get(candidate.activity_name)
-        if dur is not None:
-            from src.Simulation.Engine.timepolicy import _sample_waiting
-            wait_s = _sample_waiting(dur, self.rng)
-            if wait_s > 0:
-                from datetime import timedelta as _td
-                complete_at = complete_at + _td(seconds=wait_s)
-                state.process_wait_s.setdefault(candidate.activity_name, []).append(wait_s)
+        # Process waiting time from discovery (waiting_mean) is a descriptive metric
+        # from the real log — it is NOT added to complete_at. Waiting in the simulation
+        # emerges naturally from resource contention (resource_wait_s) and pool wait
+        # (candidate_wait_s). Adding sampled waiting to the clock would inflate
+        # simulation time artificially and has been removed.
 
         # Do NOT update last_generated_timestamp here in DES mode —
         # concurrent activities all start from current_time, not from
@@ -1040,6 +1039,9 @@ class Simulator:
             created_object_ids=created_object_ids,
         )
         heapq.heappush(state.in_progress, in_prog)
+        # Maintain _in_progress_objects index
+        for oid in in_prog.participating_object_ids:
+            state._in_progress_objects.add((in_prog.candidate_activity_name, oid))
 
         self._trace("des_started", {
             "activity_name": candidate.activity_name,
@@ -1054,6 +1056,9 @@ class Simulator:
     def _des_complete_activity(self, in_prog: InProgressActivity, state: SimulationState) -> None:
         """Write the ExecutedEvent, update indexes, release resources."""
         self._des_release_resources(in_prog.held_resource_ids, state)
+        # Remove from _in_progress_objects index
+        for oid in in_prog.participating_object_ids:
+            state._in_progress_objects.discard((in_prog.candidate_activity_name, oid))
 
         activity = self._get_activity_by_name(in_prog.candidate_activity_name)
         resource_types = state._resource_types

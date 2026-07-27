@@ -208,7 +208,7 @@ const CONSTRAINT_HELP = {
   chain_precedence:     'B must be immediately preceded by A on the scope object — no other event for that object may occur in between.',
   chain_response:       'Once A fires, every other activity is blocked for the scope object until B fires next.',
   responded_existence:  'If A occurs, B must also occur (before or after). Post-hoc obligation only — not enforced eagerly during simulation.',
-  absence:              'A must never occur (set n≤ = 0) or at most n≤ times. Set source = target = the activity to restrict.',
+  absence:              'Activity must never occur (n≤ = 0) or at most n≤ times per scope object.',
   exactly:              'A must occur exactly n≥ times. Block further firings after n≥. Set source = target = the activity.',
   init:                 'A must be the first activity to fire. All other activities are blocked until A has fired at least once.',
   exclusive_choice:     'Exactly one of A or B may occur. Once one fires, the other is permanently blocked.',
@@ -326,7 +326,12 @@ export default function ModelEditor({
   };
 
   const addConstraint = () => {
-    if (!newCon.source_activity || !newCon.target_activity) return;
+    const isUnary = ['absence', 'exactly', 'init'].includes(newCon.constraint_type);
+    if (isUnary) {
+      if (!newCon.source_activity) return;
+    } else {
+      if (!newCon.source_activity || !newCon.target_activity) return;
+    }
     if (newCon.scope.kind !== 'global' && !newCon.scope.object_type) return;
     onModelChange({ ...model, constraints: [...constraints, { ...newCon, support: 1.0, confidence: 1.0 }] });
     setNewCon(EMPTY_CONSTRAINT);
@@ -1138,17 +1143,28 @@ export default function ModelEditor({
               {CONSTRAINT_HELP[newCon.constraint_type] && (
                 <HelpTip text={CONSTRAINT_HELP[newCon.constraint_type]} />
               )}
-              <select value={newCon.source_activity}
-                onChange={e => setNewCon(p => ({ ...p, source_activity: e.target.value }))}>
-                <option value="">source…</option>
-                {actNames.map(a => <option key={a} value={a}>{a}</option>)}
-              </select>
-              <span className="add-form-sep">→</span>
-              <select value={newCon.target_activity}
-                onChange={e => setNewCon(p => ({ ...p, target_activity: e.target.value }))}>
-                <option value="">target…</option>
-                {actNames.map(a => <option key={a} value={a}>{a}</option>)}
-              </select>
+              {/* For unary constraints (absence, exactly, init): single activity picker */}
+              {['absence', 'exactly', 'init'].includes(newCon.constraint_type) ? (
+                <select value={newCon.source_activity}
+                  onChange={e => setNewCon(p => ({ ...p, source_activity: e.target.value, target_activity: e.target.value }))}>
+                  <option value="">activity…</option>
+                  {actNames.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+              ) : (
+                <>
+                  <select value={newCon.source_activity}
+                    onChange={e => setNewCon(p => ({ ...p, source_activity: e.target.value }))}>
+                    <option value="">source…</option>
+                    {actNames.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                  <span className="add-form-sep">→</span>
+                  <select value={newCon.target_activity}
+                    onChange={e => setNewCon(p => ({ ...p, target_activity: e.target.value }))}>
+                    <option value="">target…</option>
+                    {actNames.map(a => <option key={a} value={a}>{a}</option>)}
+                  </select>
+                </>
+              )}
               <select value={newCon.scope.kind}
                 onChange={e => setNewCon(p => ({ ...p, scope: { ...p.scope, kind: e.target.value, object_type: e.target.value === 'global' ? '' : p.scope.object_type } }))}>
                 {SCOPE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}

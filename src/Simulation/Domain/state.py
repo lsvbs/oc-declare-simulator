@@ -101,6 +101,12 @@ class SimulationState:
     # object_id -> set of object_ids it is directly linked to (undirected)
     _links_by_object: dict[str, set] = field(default_factory=dict)
 
+    # ── In-progress index (maintained by _des_start_activity / _des_complete_activity) ──
+    # (activity_name, object_id) -> True for every object currently in-progress
+    # for that activity. Prevents obligation injection from starting a second
+    # concurrent instance before the first has recorded its event.
+    _in_progress_objects: set = field(default_factory=set)
+
     # ── Active-objects-by-type index (maintained by add_object / deactivate) ──
     # object_type -> set of object_ids that are currently active
     _active_by_type: dict[str, set] = field(default_factory=dict)
