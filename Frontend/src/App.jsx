@@ -1529,7 +1529,7 @@ function computeConformance(objectTraces, constraints, activities) {
   };
 }
 
-function ConformanceSection({ results, activeModel, onConformanceSaved, onEventsLoadStart, onEventsLoadDone, onConformanceDone }) {
+function ConformanceSection({ results, activeModel, onConformanceSaved, onEventsLoadStart, onEventsLoadDone, onConformanceDone, onScoresComputed, inputLogConfResults, inputEventLogFile }) {
   const constraints  = activeModel?.constraints || [];
   const activities   = activeModel?.activities  || [];
   const objectTraces = results?.object_traces   || {};
@@ -1541,6 +1541,33 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
   const [ocdLoading,     setOcdLoading]     = React.useState(false);
   const [ocdError,       setOcdError]       = React.useState(null);
   const ocdLoadedFor = React.useRef(null);
+
+  // Input log conformance — load events from input OCEL for comparison
+  const [inputLogEvents,    setInputLogEvents]    = React.useState(null);
+  const [inputLogTypesMap,  setInputLogTypesMap]  = React.useState({});
+  const [inputLogObjTraces, setInputLogObjTraces] = React.useState({});
+  const inputLogLoadedFor = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!inputEventLogFile || inputLogLoadedFor.current === inputEventLogFile) return;
+    inputLogLoadedFor.current = inputEventLogFile;
+    axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
+      .then(r => {
+        const evts = r.data.events || [];
+        const tmap = r.data.object_types_map || {};
+        setInputLogEvents(evts);
+        setInputLogTypesMap(tmap);
+        // Build per-object traces for fitness/precision
+        const traces = {};
+        evts.forEach(e => {
+          (e.object_ids || []).forEach(oid => {
+            (traces[oid] = traces[oid] || []).push(e.activity);
+          });
+        });
+        setInputLogObjTraces(traces);
+      })
+      .catch(() => {});
+  }, [inputEventLogFile]);
 
   React.useEffect(() => {
     if (!runId || ocdLoadedFor.current === runId) return;
@@ -1570,10 +1597,31 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
 
   React.useEffect(() => { if (ocdConf) onConformanceDone?.(); }, [ocdConf]);
 
+  // Input log OC-Declare conformance (from already-loaded events)
+  const inputOcdConf = React.useMemo(() => {
+    if (!inputLogEvents || inputLogEvents.length === 0) return null;
+    return computeOCDeclareConformance(inputLogEvents, inputLogTypesMap, constraints);
+  }, [inputLogEvents, inputLogTypesMap, constraints]);
+
+  // Input log fitness/precision (from per-object traces built from input OCEL)
+  const inputConf = React.useMemo(
+    () => Object.keys(inputLogObjTraces).length > 0
+      ? computeConformance(inputLogObjTraces, constraints, activities)
+      : null,
+    [inputLogObjTraces, constraints, activities]
+  );
+
   const conf = React.useMemo(
     () => computeConformance(objectTraces, constraints, activities),
     [objectTraces, constraints, activities]
   );
+
+  // Propagate scores to parent for inline display as soon as computed
+  React.useEffect(() => {
+    if (conf.fitness != null) {
+      onScoresComputed?.({ fitness: conf.fitness, constraint_fitness: conf.constraintFitness, precision: conf.precision });
+    }
+  }, [conf.fitness, conf.constraintFitness, conf.precision]);
 
   // Persist scores back to run history once computed
   const persistedRef = React.useRef(null);
@@ -1588,7 +1636,8 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
   }, [runId, conf.fitness, conf.constraintFitness, conf.precision]);
 
   const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
-  const MetricRow = ({ label, value, explanation }) => (
+  const cls = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
+  const MetricRow = ({ label, value, explanation, formula }) => (
     <div className="conf-metric-row">
       <div className="conf-metric-main">
         <span className="conf-metric-label">{label}</span>
@@ -1597,6 +1646,160 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
         </span>
       </div>
       <p className="conf-metric-explanation">{explanation}</p>
+      {formula && (
+        <details className="formula-details">
+          <summary className="formula-summary">Formula</summary>
+          <div className="formula-body">{formula}</div>
+        </details>
+      )}
+    </div>
+  );
+  // Split row: label | input log score | sim score
+  const MetricRowSplit = ({ label, logValue, simValue, explanation }) => (
+    <div className="conf-metric-row">
+      <div className="conf-metric-main" style={{gap:'0'}}>
+        <span className="conf-metric-label" style={{flex:1}}>{label}</span>
+        <div style={{display:'flex',gap:'0.75rem',alignItems:'center'}}>
+          <div style={{textAlign:'center',minWidth:'60px'}}>
+            <div style={{fontSize:'0.6rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.04em'}}>Input log</div>
+            <span className={`conf-metric-value ${cls(logValue)}`} style={{fontSize:'1rem'}}>{pct(logValue)}</span>
+          </div>
+          <div style={{fontSize:'0.8rem',color:'#cbd5e1'}}>→</div>
+          <div style={{textAlign:'center',minWidth:'60px'}}>
+            <div style={{fontSize:'0.6rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.04em'}}>Simulation</div>
+            <span className={`conf-metric-value ${cls(simValue)}`} style={{fontSize:'1rem'}}>{pct(simValue)}</span>
+          </div>
+        </div>
+      </div>
+      <p className="conf-metric-explanation">{explanation}</p>
+    </div>
+  );
+
+  // Helper to render one conformance column
+  const ConfColumn = ({ label, ocdC, fitC, hasLog }) => (
+    <div className="conf-col">
+      <div className="conf-col-header">{label}</div>
+
+      {/* OC-Declare Confidence */}
+      <Collapsible
+        className="eval-subsection"
+        title={
+          <span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+            OC-Declare Confidence
+            {ocdC?.globalConformance != null && (
+              <span className={cls(ocdC.globalConformance)} style={{fontSize:'0.9rem',fontWeight:700}}>
+                {(ocdC.globalConformance*100).toFixed(1)}%
+              </span>
+            )}
+          </span>
+        }
+        defaultOpen={true}
+      >
+        {!ocdC && !hasLog && <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>Loading…</p>}
+        {ocdC && (
+          <>
+            <MetricRow label="Confidence" value={ocdC.globalConformance}
+              explanation={`${ocdC.globalSatisfied} of ${ocdC.totalEvents} events satisfy all constraints.`}
+              formula={<>
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
+                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Confidence =</span>
+                  <span className="formula-frac">
+                    <span className="formula-num">events satisfying all constraints</span>
+                    <span className="formula-den">total events</span>
+                  </span>
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
+                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Per constraint =</span>
+                  <span className="formula-frac">
+                    <span className="formula-num">satisfied source events</span>
+                    <span className="formula-den">total source events</span>
+                  </span>
+                </div>
+                <div style={{fontSize:'0.68rem',color:'#64748b',marginTop:'0.25rem'}}>Def 8: for each scope object o in event e, count target events after e involving o — must be in [nmin, nmax]</div>
+              </>} />
+            {ocdC.constraintResults.length > 0 && (
+              <Collapsible className="conf-detail-collapsible" title="Per-constraint" defaultOpen={false}>
+                <table className="conf-detail-table">
+                  <thead><tr><th>Constraint</th><th className="audit-num">Confidence</th></tr></thead>
+                  <tbody>
+                    {ocdC.constraintResults.slice().sort((a,b)=>a.confidence-b.confidence).map(r => (
+                      <tr key={r.label} className={r.confidence < 0.5 ? 'audit-row-accumulating':''}>
+                        <td style={{fontFamily:'monospace',fontSize:'0.72rem'}}>{r.label}</td>
+                        <td className="audit-num"><span className={cls(r.confidence)}>{(r.confidence*100).toFixed(1)}%</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Collapsible>
+            )}
+          </>
+        )}
+      </Collapsible>
+
+      {/* Fitness */}
+      <Collapsible
+        className="eval-subsection"
+        title={<span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+          Fitness
+          {fitC?.fitness != null && <span className={cls(fitC.fitness)} style={{fontSize:'0.9rem',fontWeight:700}}>{(fitC.fitness*100).toFixed(1)}%</span>}
+          {fitC?.constraintFitness != null && <span style={{fontSize:'0.75rem',color:'#64748b'}}>Con: <span className={cls(fitC.constraintFitness)} style={{fontWeight:600}}>{(fitC.constraintFitness*100).toFixed(1)}%</span></span>}
+        </span>}
+        defaultOpen={false}
+      >
+        {fitC
+          ? <>
+              <MetricRow label="Object-Replay Fitness" value={fitC.fitness}
+                explanation={`${fitC.fitnessEnabled ?? '—'} of ${fitC.fitnessTotal ?? '—'} events were enabled across all objects.`}
+                formula={<>
+                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
+                    <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Fitness =</span>
+                    <span className="formula-frac">
+                      <span className="formula-num">enabled events</span>
+                      <span className="formula-den">total events</span>
+                    </span>
+                  </div>
+                  <div style={{fontSize:'0.68rem',color:'#64748b'}}>Enabled = all precedence constraints on this activity were satisfied on this object at this point (source_count ≥ nmin)</div>
+                </>} />
+              <MetricRow label="Declarative Constraint Fitness" value={fitC.constraintFitness}
+                explanation={`${fitC.constraintSatisfied ?? '—'} of ${fitC.constraintTotal ?? '—'} constraint-trace pairs satisfied.`}
+                formula={<>
+                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
+                    <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Con. Fitness =</span>
+                    <span className="formula-frac">
+                      <span className="formula-num">satisfied (constraint, object) pairs</span>
+                      <span className="formula-den">evaluated (constraint, object) pairs</span>
+                    </span>
+                  </div>
+                  <div style={{fontSize:'0.68rem',color:'#64748b'}}>Evaluated at end of each object trace: response → target followed source? precedence → source preceded target? not_coexistence → only one occurred?</div>
+                </>} />
+            </>
+          : <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No object traces available.</p>}
+      </Collapsible>
+
+      {/* Precision */}
+      <Collapsible
+        className="eval-subsection"
+        title={<span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+          Precision
+          {fitC?.precision != null && <span className={cls(fitC.precision)} style={{fontSize:'0.9rem',fontWeight:700}}>{(fitC.precision*100).toFixed(1)}%</span>}
+        </span>}
+        defaultOpen={false}
+      >
+        {fitC
+          ? <MetricRow label="Declarative Precision" value={fitC.precision}
+              explanation={`${fitC.precisionAllowed ?? '—'} of ${fitC.precisionTotal ?? '—'} transitions were in the allowed set.`}
+              formula={<>
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
+                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Precision =</span>
+                  <span className="formula-frac">
+                    <span className="formula-num">transitions where next activity ∈ allowed set</span>
+                    <span className="formula-den">total observed transitions</span>
+                  </span>
+                </div>
+                <div style={{fontSize:'0.68rem',color:'#64748b'}}>Allowed set = activities not blocked by any active precedence / not_coexistence / not_succession constraint given current trace state</div>
+              </>} />
+          : <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No object traces available.</p>}
+      </Collapsible>
     </div>
   );
 
@@ -1605,188 +1808,21 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
       {Object.keys(objectTraces).length === 0 ? (
         <p className="empty-notice">No object traces recorded — run simulation with a larger step count.</p>
       ) : (
-        <>
-          {/* ── OC-Declare Conformance (Def 8 & 9) — per event ── */}
-          <Collapsible className="eval-subsection" title="OC-Declare Conformance (per event)" defaultOpen={true}>
-            <p className="conf-metric-explanation" style={{marginBottom:'0.75rem'}}>
-              <strong>Definition 8 — Per-event satisfaction:</strong> An event of source activity <em>s</em> satisfies
-              constraint <em>D</em> if, for every combination of EACH-scoped objects in the event, filtering the log
-              to target-activity events in the correct temporal position that share those objects yields a count
-              within [n_min, n_max]. Events of any other activity trivially satisfy D.
-              <br/><br/>
-              <strong>Definition 9 — Confidence:</strong> Per constraint = satisfied source events ÷ total source events.
-              Global = events satisfying all constraints simultaneously ÷ total events.
-            </p>
-
-            {ocdLoading && (
-              <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#6366f1'}}>
-                <div className="spinner spinner-sm"></div> Loading event log for conformance check…
-              </div>
-            )}
-            {ocdError && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {ocdError}</p>}
-
-            {ocdConf && (
-              <>
-                {/* Global score */}
-                <MetricRow
-                  label="Global OC-Declare Conformance"
-                  value={ocdConf.globalConformance}
-                  explanation={`${ocdConf.globalSatisfied} of ${ocdConf.totalEvents} events satisfy every constraint in the model simultaneously. Formula: events satisfying all constraints ÷ total events.`}
-                />
-
-                {/* Per-constraint confidence */}
-                {ocdConf.constraintResults.length > 0 && (
-                  <Collapsible className="conf-detail-collapsible" title="Per-constraint confidence" defaultOpen={false}>
-                    <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
-                      For each constraint: confidence = source-activity events that satisfy it ÷ total source-activity events (Definition 9).
-                    </p>
-                    <table className="conf-detail-table">
-                      <thead>
-                        <tr>
-                          <th>Constraint</th>
-                          <th className="audit-num">Source events</th>
-                          <th className="audit-num">Satisfied</th>
-                          <th className="audit-num">Confidence</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {ocdConf.constraintResults
-                          .slice()
-                          .sort((a, b) => a.confidence - b.confidence)
-                          .map(r => {
-                            const cls = r.confidence >= 0.8 ? 'conf-good' : r.confidence >= 0.5 ? 'conf-mid' : 'conf-bad';
-                            return (
-                              <tr key={r.label} className={r.confidence < 0.5 ? 'audit-row-accumulating' : ''}>
-                                <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{r.label}</td>
-                                <td className="audit-num">{r.total}</td>
-                                <td className="audit-num">{r.satisfied}</td>
-                                <td className="audit-num"><span className={cls}>{(r.confidence * 100).toFixed(1)}%</span></td>
-                              </tr>
-                            );
-                          })}
-                      </tbody>
-                    </table>
-                  </Collapsible>
-                )}
-              </>
-            )}
-
-            {!ocdLoading && !ocdConf && !ocdError && (
-              <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>Loading event data…</p>
-            )}
-          </Collapsible>
-
-          {/* ── Fitness ── */}
-          <Collapsible className="eval-subsection" title="Fitness" defaultOpen={true}>
-            <MetricRow
-              label="Object-Replay Fitness"
-              value={conf.fitness}
-              explanation={`For each object, each event in its trace is checked: was that activity enabled at that point (all precedence constraints already met)? Fitness = enabled events ÷ total events. ${conf.fitnessEnabled} of ${conf.fitnessTotal} events were enabled across ${Object.keys(objectTraces).length} objects.`}
-            />
-
-            {/* Per-object breakdown */}
-            {Object.keys(conf.fitnessPerObject).length > 0 && (
-              <Collapsible className="conf-detail-collapsible" title="Per-object breakdown" defaultOpen={false}>
-                {/* Per-object-type summary */}
-                <PerObjectTypeBreakdown
-                  fitnessPerObject={conf.fitnessPerObject}
-                  objectTypesMap={results?.object_types_map || {}}
-                />
-              </Collapsible>
-            )}
-
-            <MetricRow
-              label="Declarative Constraint Fitness"
-              value={conf.constraintFitness}
-              explanation={`For each (constraint, object) pair where the constraint is relevant: is the constraint satisfied at the end of the object's trace? Counts response constraints (did the target follow the source?), precedence (did the source precede the target?), and not_coexistence/not_succession violations. ${conf.constraintSatisfied} of ${conf.constraintTotal} constraint-trace pairs satisfied.`}
-            />
-
-            {/* Per-constraint fitness breakdown */}
-            {Object.keys(conf.constraintDetail).length > 0 && (
-              <Collapsible className="conf-detail-collapsible" title="Per-constraint breakdown" defaultOpen={false}>
-                <table className="conf-detail-table">
-                  <thead>
-                    <tr>
-                      <th>Constraint</th>
-                      <th className="audit-num">Evaluated</th>
-                      <th className="audit-num">Satisfied</th>
-                      <th className="audit-num">Rate</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(conf.constraintDetail)
-                      .sort((a, b) => (a[1].satisfied / a[1].total) - (b[1].satisfied / b[1].total))
-                      .map(([label, d]) => (
-                        <tr key={label} className={d.satisfied / d.total < 0.5 ? 'audit-row-accumulating' : ''}>
-                          <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{label}</td>
-                          <td className="audit-num">{d.total}</td>
-                          <td className="audit-num">{d.satisfied}</td>
-                          <td className="audit-num">
-                            <span className={d.satisfied/d.total >= 0.8 ? 'conf-good' : d.satisfied/d.total >= 0.5 ? 'conf-mid' : 'conf-bad'}>
-                              {(d.satisfied / d.total * 100).toFixed(0)}%
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              </Collapsible>
-            )}
-          </Collapsible>
-
-          {/* ── Precision ── */}
-          <Collapsible className="eval-subsection" title="Precision" defaultOpen={true}>
-            <MetricRow
-              label="Declarative Precision"
-              value={conf.precision}
-              explanation={`At each step in every object trace, the set of activities not blocked by any constraint at that point is computed (the "allowed" set). Precision = transitions where the observed next activity was in the allowed set ÷ total observed transitions. ${conf.precisionAllowed} of ${conf.precisionTotal} transitions were allowed. High precision means the model tightly constrains the process — few alternatives were open at each step.`}
-            />
-
-            {/* Per-constraint precision breakdown */}
-            {Object.keys(conf.precisionDetail).length > 0 && (
-              <Collapsible className="conf-detail-collapsible" title="Per-constraint breakdown" defaultOpen={false}>
-                <p style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.5rem'}}>
-                  For each constraint: how many times was it actively blocking at least one candidate (Total), and how many of those times did it block the activity that actually fired next (Blocked observed). A high blocked-observed rate means this constraint frequently prevented the simulation from taking a step it was about to take.
-                </p>
-                <table className="conf-detail-table">
-                  <thead>
-                    <tr>
-                      <th>Constraint</th>
-                      <th className="audit-num">Active at step</th>
-                      <th className="audit-num">Blocked observed</th>
-                      <th className="audit-num">Block rate</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(conf.precisionDetail)
-                      .sort((a, b) => (b[1].blocked_observed / Math.max(b[1].total, 1)) - (a[1].blocked_observed / Math.max(a[1].total, 1)))
-                      .map(([label, d]) => {
-                        const rate = d.total > 0 ? d.blocked_observed / d.total : 0;
-                        return (
-                          <tr key={label} className={rate > 0.5 ? 'audit-row-accumulating' : ''}>
-                            <td style={{fontFamily:'monospace',fontSize:'0.78rem'}}>{label}</td>
-                            <td className="audit-num">{d.total}</td>
-                            <td className="audit-num">{d.blocked_observed}</td>
-                            <td className="audit-num">
-                              <span className={rate <= 0.1 ? 'conf-good' : rate <= 0.4 ? 'conf-mid' : 'conf-bad'}>
-                                {(rate * 100).toFixed(0)}%
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
-              </Collapsible>
-            )}
-
-            <MetricRow
-              label="Object-Centric Precision"
-              value={null}
-              explanation="Coming soon — will measure how specifically the model constrains object interactions (e.g. whether it over-permits concurrent object combinations that never appeared in the log)."
-            />
-          </Collapsible>
-        </>
+        <div className="conf-split-layout">
+          <ConfColumn
+            label="Input Log"
+            ocdC={inputOcdConf}
+            fitC={inputConf}
+            hasLog={!!inputEventLogFile}
+          />
+          <div className="conf-split-divider" />
+          <ConfColumn
+            label="Simulation"
+            ocdC={ocdConf}
+            fitC={conf}
+            hasLog={true}
+          />
+        </div>
       )}
     </Collapsible>
   );
@@ -2789,7 +2825,7 @@ function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities
   if (acts.length === 0) return null;
 
   return (
-    <Collapsible className="eval-subsection" title="Sim Metrics vs Log Discovery" defaultOpen={false}>
+    <Collapsible className="eval-subsection" title="Sim Metrics vs Log Discovery" defaultOpen={true}>
       <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
         Compares the simulation run's measured metrics (from activity_metrics) directly against the
         input log's discovered timing values. Left = input log discovered, Right = sim output metrics.
@@ -2854,9 +2890,10 @@ function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities
   );
 }
 
-function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload }) {
+function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
   const logDurations = activeModel?.activity_durations || {};
+  const [inlineConfScores, setInlineConfScores] = React.useState(null); // live conformance scores
   const o2oRules = activeModel?.o2o_rules || [];
   const otNames = (activeModel?.object_types || []).map(t => typeof t === 'string' ? t : t.name);
 
@@ -2874,11 +2911,42 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
   const loadingStep = EVAL_STEPS.find(s => stepsLoading[s.key]);
   const allDone     = doneCount === EVAL_STEPS.length;
 
+  // Evaluation elapsed timer
+  const [evalElapsed, setEvalElapsed] = React.useState(null);
+  const evalStartRef = React.useRef(null);
+  const evalTimerRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!allDone && doneCount === 0 && Object.values(stepsLoading).some(Boolean)) {
+      // Starting — begin timer
+      if (!evalStartRef.current) {
+        evalStartRef.current = Date.now();
+        setEvalElapsed(0);
+        evalTimerRef.current = setInterval(() => {
+          setEvalElapsed(Math.floor((Date.now() - evalStartRef.current) / 1000));
+        }, 1000);
+      }
+    } else if (allDone) {
+      clearInterval(evalTimerRef.current);
+      evalTimerRef.current = null;
+    }
+  }, [allDone, doneCount, stepsLoading]);
+  React.useEffect(() => () => clearInterval(evalTimerRef.current), []);
+  // Reset timer when results change
+  React.useEffect(() => {
+    evalStartRef.current = null;
+    setEvalElapsed(null);
+    clearInterval(evalTimerRef.current);
+    evalTimerRef.current = null;
+  }, [results?.output_file]);
+
   // ── Timing discovery on output log ───────────────────────────────────────
   const [simDiscovered, setSimDiscovered] = React.useState(null);   // discovered metrics for output log
   const [simDiscovering, setSimDiscovering] = React.useState(false);
   const [simDiscoverError, setSimDiscoverError] = React.useState(null);
   const discoveredForFile = React.useRef(null); // track which output_file we already ran for
+
+  // Reset inline conf scores when simulation result changes
+  React.useEffect(() => { setInlineConfScores(null); }, [results?.output_file]);
 
   React.useEffect(() => {
     const outputFile = results?.output_file;
@@ -2998,7 +3066,14 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                 ? <><div className="spinner spinner-sm" style={{display:'inline-block',marginRight:'0.4rem'}} />Preparing…</>
                 : null
             )}
-            <span className="eval-progress-count">{doneCount} / {EVAL_STEPS.length}</span>
+            <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:'0.75rem'}}>
+              {evalElapsed != null && (
+                <span className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                  ⏱ {Math.floor(evalElapsed/60).toString().padStart(2,'0')}:{(evalElapsed%60).toString().padStart(2,'0')}
+                </span>
+              )}
+              <span className="eval-progress-count">{doneCount} / {EVAL_STEPS.length}</span>
+            </span>
           </div>
           <div className="eval-progress-steps">
             {EVAL_STEPS.map(s => (
@@ -3119,27 +3194,22 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           <div style={{marginTop:'0.75rem'}}>
             <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'0.4rem',flexWrap:'wrap'}}>
               <span style={{fontSize:'0.88rem',fontWeight:700,color:'#1e293b'}}>Confidence Score</span>
-              {results?.conformance && (
-                <>
-                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
-                    Fitness: <strong className={results.conformance.fitness >= 0.8 ? 'conf-good' : results.conformance.fitness >= 0.5 ? 'conf-mid' : 'conf-bad'}>
-                      {results.conformance.fitness != null ? `${(results.conformance.fitness*100).toFixed(1)}%` : '—'}
-                    </strong>
-                  </span>
-                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
-                    Con. Fitness: <strong className={results.conformance.constraint_fitness >= 0.8 ? 'conf-good' : results.conformance.constraint_fitness >= 0.5 ? 'conf-mid' : 'conf-bad'}>
-                      {results.conformance.constraint_fitness != null ? `${(results.conformance.constraint_fitness*100).toFixed(1)}%` : '—'}
-                    </strong>
-                  </span>
-                  <span style={{fontSize:'0.82rem',color:'#64748b'}}>
-                    Precision: <strong className={results.conformance.precision >= 0.8 ? 'conf-good' : results.conformance.precision >= 0.5 ? 'conf-mid' : 'conf-bad'}>
-                      {results.conformance.precision != null ? `${(results.conformance.precision*100).toFixed(1)}%` : '—'}
-                    </strong>
-                  </span>
-                  {!results.conformance.fitness && <span style={{fontSize:'0.72rem',color:'#94a3b8',fontStyle:'italic'}}>Open Evaluation tab to compute</span>}
-                </>
-              )}
-              {!results?.conformance && <span style={{fontSize:'0.72rem',color:'#94a3b8',fontStyle:'italic'}}>Open Evaluation tab to compute</span>}
+              {(() => {
+                // Use live computed scores if available, fall back to persisted
+                const scores = inlineConfScores || results?.conformance;
+                const cls = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
+                const fmt = v => v != null ? `${(v*100).toFixed(1)}%` : '—';
+                if (scores?.fitness != null || scores?.precision != null) {
+                  return (
+                    <>
+                      <span style={{fontSize:'0.82rem',color:'#64748b'}}>Fitness: <strong className={cls(scores.fitness)}>{fmt(scores.fitness)}</strong></span>
+                      <span style={{fontSize:'0.82rem',color:'#64748b'}}>Con. Fitness: <strong className={cls(scores.constraint_fitness)}>{fmt(scores.constraint_fitness)}</strong></span>
+                      <span style={{fontSize:'0.82rem',color:'#64748b'}}>Precision: <strong className={cls(scores.precision)}>{fmt(scores.precision)}</strong></span>
+                    </>
+                  );
+                }
+                return null;
+              })()}
             </div>
             <ConformanceSection
               results={results}
@@ -3148,6 +3218,9 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
               onEventsLoadStart={() => markStart('events')}
               onEventsLoadDone={() => markDone('events')}
               onConformanceDone={() => markDone('conformance')}
+              onScoresComputed={scores => setInlineConfScores(scores)}
+              inputLogConfResults={inputLogConfResults}
+              inputEventLogFile={inputEventLogFile}
             />
           </div>
         </Collapsible>
@@ -3173,8 +3246,15 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           )}
         </div>
 
+        {/* Sim Metrics vs Log Discovery — above service time */}
+        <SimVsDiscoveredComparison
+          simMetrics={simMetrics}
+          logDurations={logDurations}
+          orderedActivities={orderedActivities}
+        />
+
         {/* Service time chart */}
-        <Collapsible className="eval-subsection" title="Service Time per Activity" defaultOpen={true}>
+        <Collapsible className="eval-subsection" title="Service Time per Activity" defaultOpen={false}>
           <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
             Both sides use the <strong>{modeLabel[serviceTimeMode] || serviceTimeMode}</strong> discovery method.
             Left: input OCEL log (from Parameter tab discovery). Right: simulated output log (discovered now).
@@ -3206,7 +3286,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
         </Collapsible>
 
         {/* Timing Discovery Comparison table */}
-        <Collapsible className="eval-subsection" title="Timing Discovery Comparison" defaultOpen={true}>
+        <Collapsible className="eval-subsection" title="Timing Discovery Comparison" defaultOpen={false}>
           {(() => {
             const fmtS = v => {
               if (v == null || v === 0) return '—';
@@ -3320,13 +3400,6 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
             );
           })()}
         </Collapsible>
-
-        {/* Sim Metrics vs Log Discovery */}
-        <SimVsDiscoveredComparison
-          simMetrics={simMetrics}
-          logDurations={logDurations}
-          orderedActivities={orderedActivities}
-        />
 
         {/* Activity Timeline moved inside Time Comparison */}
         <ActivityGanttChart
@@ -3724,7 +3797,7 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
         <>
           <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'0.75rem',flexWrap:'wrap'}}>
             <div>
-              <span style={{fontSize:'0.72rem',color:'#94a3b8',fontWeight:600,textTransform:'uppercase'}}>Global conformance</span>
+              <span style={{fontSize:'0.72rem',color:'#94a3b8',fontWeight:600,textTransform:'uppercase'}}>Confidence</span>
               <div style={{fontSize:'1.4rem',fontWeight:700}} className={cls(conf.globalConformance)}>
                 {pct(conf.globalConformance)}
               </div>
@@ -3958,7 +4031,7 @@ function App() {
   const [logConfResults, setLogConfResults] = useState(null); // null = not run yet
   const [logBoundsResults, setLogBoundsResults] = useState(null); // per-object bounds check results
   // Trigger for model check from runAllDiscoveries
-  const [modelCheckTrigger, setModelCheckTrigger] = useState(0);
+  // Trigger for model check (reserved for future use)
   // Whether to drop 0%-confidence constraints before Run Discoveries
   const [dropZeroConfConstraints, setDropZeroConfConstraints] = useState(false);
   // Whether to set nmax to max observed for unbounded constraints
@@ -4487,12 +4560,11 @@ function App() {
     const selected = discoveryConfig.startActivityProbSelected;
     if (!selected?.length) return;
     setConfig(prev => {
-      // Only update if the selection actually differs to avoid unnecessary re-renders
       const same = prev.startActivities.length === selected.length &&
         selected.every(a => prev.startActivities.includes(a));
       return same ? prev : { ...prev, startActivities: [...selected] };
     });
-  }, [discoveryConfig.startActivityProbSelected]);
+  }, [discoveryConfig.startActivityProbSelected, externalTab]); // also re-sync when switching to simulation tab
 
   // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)
   const applyStartProbability = useCallback(async () => {
@@ -4564,7 +4636,7 @@ function App() {
     ];
     const steps = allSteps.filter(s => discoveryChecks[s.key]);
     // +2 for health check + model check (always run)
-    const total = steps.length + 2;
+    const total = steps.length + 1; // +1 for health check
 
     try {
       for (let i = 0; i < steps.length; i++) {
@@ -4573,13 +4645,6 @@ function App() {
       }
       setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'Constraint Health Check' });
       await runHealthCheck();
-      // Run OC-Declare model check as the final fixed step
-      setDiscoveryProgress({ current: steps.length + 2, total, currentName: 'OC-Declare Model Check' });
-      setActiveDiscoveryTab('modelCheck');
-      setLogConfResults(null);
-      setLogBoundsResults(null);
-      // Trigger model check via flag — LogModelConformance watches modelCheckTrigger
-      setModelCheckTrigger(t => t + 1);
     } finally {
       clearInterval(discTimerRef.current);
       discTimerRef.current = null;
@@ -5731,12 +5796,8 @@ function App() {
                     { key: 'o2o',       label: 'O2O' },
                     { key: 'startProb', label: 'Start Activity + Probability' },
                   ];
-                  // Non-removable extra tab
-                  const EXTRA_TABS = [
-                    { key: 'modelCheck', label: 'OC-Declare Model Check' },
-                  ];
                   // Ensure activeDiscoveryTab is one of the defined keys; default to first
-                  const allTabKeys = [...DISC_ITEMS.map(d=>d.key), ...EXTRA_TABS.map(d=>d.key)];
+                  const allTabKeys = DISC_ITEMS.map(d=>d.key);
                   const activeKey = allTabKeys.includes(activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
                   const resultBadge = key => {
                     if (key === 'lifecycle' && lifecycleResult && !lifecycleResult.error) return lifecycleResult.method === 'ocel' ? '✓' : '⚠';
@@ -5744,7 +5805,6 @@ function App() {
                     if (key === 'timing' && timingDiscoveryResult) return '✓';
                     if (key === 'o2o' && o2oResult) return '✓';
                     if (key === 'startProb' && startProbApplied) return '✓';
-                    if (key === 'modelCheck' && logConfResults) return '✓';
                     return null;
                   };
                   return (
@@ -5775,21 +5835,7 @@ function App() {
                             </button>
                           );
                         })}
-                        {/* Non-removable extra tabs — no checkbox */}
-                        {EXTRA_TABS.map(({ key, label }) => {
-                          const badge = resultBadge(key);
-                          return (
-                            <button
-                              key={key}
-                              className={`disc-tab-btn disc-tab-btn-fixed${activeKey === key ? ' active' : ''}`}
-                              onClick={() => setActiveDiscoveryTab(key)}
-                              title="Always runs as part of discoveries"
-                            >
-                              {label}
-                              {badge && <span className={`disc-tab-badge ${badge === '⚠' ? 'badge-warn' : 'badge-ok'}`}>{badge}</span>}
-                            </button>
-                          );
-                        })}
+
                       </div>
 
                       {/* Active tab panel */}
@@ -5920,23 +5966,6 @@ function App() {
                           );
                         })()}
 
-                        {/* OC-Declare Model Check tab — non-removable */}
-                        {activeKey === 'modelCheck' && (
-                          <div>
-                            <p className="disc-tab-desc">
-                              Check whether every event in the input OCEL satisfies the loaded OC-Declare constraints
-                              (Definition 9 confidence). Runs automatically after discoveries complete.
-                              Low confidence on a constraint means the log violates it — consider removing or adjusting it.
-                            </p>
-                            <LogModelConformance
-                              eventLogFile={discoveryConfig.eventLogFile}
-                              activeModel={activeModel}
-                              onResults={setLogConfResults}
-                              onBoundsResults={setLogBoundsResults}
-                              autoRunTrigger={modelCheckTrigger}
-                            />
-                          </div>
-                        )}
                       </div>
 
                       <div className="disc-steps-row">
@@ -6001,7 +6030,7 @@ function App() {
                     const s = healthResult.summary || {};
                     return s.errors > 0 ? `${s.errors} errors` : s.warnings > 0 ? `${s.warnings} warnings` : 'healthy';
                   })() : null}
-                  defaultOpen={true}
+                  defaultOpen={false}
                 >
                   <p style={{fontSize:'0.82rem',color:'#64748b',margin:'0 0 0.75rem'}}>Health check runs automatically after discoveries complete</p>
 
@@ -7375,6 +7404,8 @@ function App() {
                     onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {})}
                     eventLogFiles={eventLogFiles}
                     handleFileUpload={handleFileUpload}
+                    inputLogConfResults={logConfResults}
+                    inputEventLogFile={discoveryConfig.eventLogFile}
                   />
                 )}
               </div>

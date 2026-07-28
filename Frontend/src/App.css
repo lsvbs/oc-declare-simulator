@@ -3713,3 +3713,92 @@
   border-color: #6366f1;
   color: #4338ca;
 }
+
+/* ── Conformance split layout ────────────────────────────────────────────── */
+.conf-split-layout {
+  display: flex;
+  gap: 0;
+  align-items: flex-start;
+}
+.conf-col {
+  flex: 1;
+  min-width: 0;
+  padding: 0 0.75rem;
+}
+.conf-col:first-child { padding-left: 0; }
+.conf-col:last-child  { padding-right: 0; }
+.conf-col-header {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  text-align: center;
+  padding: 0.3rem 0;
+  margin-bottom: 0.4rem;
+  border-bottom: 2px solid #e2e8f0;
+}
+.conf-split-divider {
+  width: 1px;
+  background: #e2e8f0;
+  align-self: stretch;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+/* ── Formula collapsible ─────────────────────────────────────────────────── */
+.formula-details {
+  margin-top: 0.35rem;
+}
+.formula-summary {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: #6366f1;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.formula-summary::-webkit-details-marker { display: none; }
+.formula-summary::before { content: '▶ '; font-size: 0.6rem; }
+details[open] .formula-summary::before { content: '▼ '; }
+.formula-body {
+  margin-top: 0.3rem;
+  padding: 0.5rem 0.65rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  font-size: 0.73rem;
+  line-height: 1.6;
+  color: #1e293b;
+}
+.formula-body code {
+  display: block;
+  font-family: monospace;
+  font-size: 0.8rem;
+  color: #4338ca;
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+}
+
+/* ── Fraction notation ───────────────────────────────────────────────────── */
+.formula-frac {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  vertical-align: middle;
+  font-size: 0.72rem;
+  font-family: monospace;
+  color: #1e293b;
+}
+.formula-num {
+  border-bottom: 1.5px solid #4338ca;
+  padding: 0 0.3rem 0.1rem;
+  color: #4338ca;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.formula-den {
+  padding: 0.1rem 0.3rem 0;
+  color: #475569;
+  white-space: nowrap;
+}
