@@ -3894,11 +3894,21 @@ function App() {
   const [config, setConfig] = useState({
     ocdeclareFile: '',
     maxSteps: 200,
+    limitBySteps: true,
+    limitByTime: false,
+    limitByTraces: false,
+    maxSimTimeValue: '',
+    maxSimTimeUnit: 'days',
+    useTimeLimit: false,
+    useTraceLimit: false,
+    maxTraces: '',
     seed: 42,
     startActivities: [],
   });
   const [isSimulating, setIsSimulating] = useState(false);
   const [liveStepCount, setLiveStepCount] = useState(null);
+  const [liveSimTime,   setLiveSimTime]   = useState(null); // simulated time in seconds
+  const [liveTraces,    setLiveTraces]    = useState(null); // completed object traces
   const [activeRunId,   setActiveRunId]   = useState(null);
   const [simElapsed,    setSimElapsed]    = useState(null); // seconds elapsed during last run
   const [lastRunDuration, setLastRunDuration] = useState(null); // seconds for completed run
@@ -4463,12 +4473,21 @@ function App() {
     setLogs([]);
     setFullIterationLogLoaded(false);
 
+    // Reset live counters
+    setLiveSimTime(null);
+    setLiveTraces(null);
+
     // Start polling the live step counter every second
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     pollIntervalRef.current = setInterval(async () => {
       try {
         const r = await axios.get(`/api/simulate/status/${runId}`);
         setLiveStepCount(r.data.step_count ?? 0);
+        setLiveTraces(r.data.completed_traces ?? 0);
+        if (r.data.last_timestamp && r.data.start_timestamp) {
+          const elapsed = (new Date(r.data.last_timestamp) - new Date(r.data.start_timestamp)) / 1000;
+          setLiveSimTime(elapsed >= 0 ? elapsed : null);
+        }
         if (r.data.done) {
           clearInterval(pollIntervalRef.current);
           pollIntervalRef.current = null;
@@ -4477,10 +4496,26 @@ function App() {
     }, 1000);
 
     try {
+      // Compute max_sim_time_s from useTimeLimit settings
+      const unitToS = { seconds: 1, minutes: 60, hours: 3600, days: 86400, weeks: 604800 };
+      // Steps: use a very large cap if not limiting by steps
+      const effectiveMaxSteps = config.limitBySteps !== false
+        ? (parseInt(config.maxSteps) || 200)
+        : 10_000_000;
+      const maxSimTimeS = config.limitByTime && config.maxSimTimeValue !== ''
+        ? parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400)
+        : null;
+      const maxTraces = config.limitByTraces && config.maxTraces !== ''
+        ? (parseInt(config.maxTraces) || null)
+        : null;
+
       const simulationData = {
         ...config,
+        maxSteps: effectiveMaxSteps,
         runId,
         eventLogFile: discoveryConfig.eventLogFile,
+        maxSimTimeS,
+        maxTraces,
         // Send editor overrides so the server uses the edited model/probs
         ...(activeModel      ? { modelOverride:       activeModel }      : {}),
         ...(activeProbMatrix ? { probMatrixOverride: activeProbMatrix } : {}),
@@ -5429,7 +5464,7 @@ function App() {
           {discoveryResults && !isDiscovering && (
             <div className="discovery-results">
               <h3>Discovery Complete</h3>
-              
+
               <div className="stat-grid">
                 <div className="stat-card">
                   <div className="stat-value">{discoveryResults.activity_count}</div>
@@ -5442,6 +5477,44 @@ function App() {
                 <div className="stat-card">
                   <div className="stat-value">{discoveryResults.transition_count}</div>
                   <div className="stat-label">Transitions</div>
+                </div>
+              </div>
+
+              {/* Log Insights */}
+              <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:'8px',padding:'0.65rem 0.9rem',marginBottom:'0.75rem',marginTop:'0.25rem'}}>
+                <div style={{fontSize:'0.7rem',fontWeight:700,color:'#0369a1',textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'0.45rem'}}>
+                  Log Insights
+                </div>
+                <div style={{display:'flex',gap:'1.5rem',flexWrap:'wrap'}}>
+                  {discoveryResults.log_object_trace_count != null && (
+                    <div style={{display:'flex',flexDirection:'column',gap:'0.1rem'}}>
+                      <span style={{fontSize:'1rem',fontWeight:700,color:'#0c4a6e'}}>{discoveryResults.log_object_trace_count}</span>
+                      <span style={{fontSize:'0.7rem',color:'#0369a1'}}>Object traces</span>
+                    </div>
+                  )}
+                  {discoveryResults.ocel_first_timestamp && discoveryResults.ocel_last_timestamp && (
+                    <div style={{display:'flex',flexDirection:'column',gap:'0.1rem'}}>
+                      <span style={{fontSize:'0.82rem',fontWeight:600,color:'#0c4a6e'}}>
+                        {discoveryResults.ocel_first_timestamp.replace('T',' ')} → {discoveryResults.ocel_last_timestamp.replace('T',' ')}
+                      </span>
+                      <span style={{fontSize:'0.7rem',color:'#0369a1'}}>First to last timestamp</span>
+                    </div>
+                  )}
+                  {!discoveryResults.ocel_first_timestamp && discoveryResults.ocel_time_span_s != null && (
+                    <div style={{display:'flex',flexDirection:'column',gap:'0.1rem'}}>
+                      <span style={{fontSize:'0.82rem',fontWeight:600,color:'#0c4a6e'}}>
+                        {(() => {
+                          const s = discoveryResults.ocel_time_span_s;
+                          if (s < 60) return `${Math.round(s)}s`;
+                          if (s < 3600) return `${Math.floor(s/60)}m`;
+                          if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                          const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                          return h > 0 ? `${d}d ${h}h` : `${d}d`;
+                        })()}
+                      </span>
+                      <span style={{fontSize:'0.7rem',color:'#0369a1'}}>First to last timestamp</span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -6669,18 +6742,89 @@ function App() {
                       )}
                     </div>
 
-                    <div className="form-row">
-                      <div className="form-group">
-                        <label>Max Steps</label>
-                        <input
-                          type="number"
-                          value={config.maxSteps}
-                          onChange={(e) => handleConfigChange('maxSteps', parseInt(e.target.value))}
-                          min="1"
-                          max="1000"
-                          disabled={isSimulating}
-                        />
+                    {/* Stop conditions — any combination, first hit stops */}
+                    <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
+                      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
+                        Stop conditions <span style={{fontWeight:400,color:'#94a3b8'}}>(first reached stops simulation)</span>
                       </div>
+                      <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                        {/* Steps */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
+                            <input type="checkbox" checked={config.limitBySteps !== false}
+                              onChange={e => handleConfigChange('limitBySteps', e.target.checked)}
+                              disabled={isSimulating} />
+                            Max steps
+                          </label>
+                          <input type="text" inputMode="numeric"
+                            value={config.maxSteps}
+                            onChange={e => handleConfigChange('maxSteps', parseInt(e.target.value.replace(/\D/,''))||1)}
+                            disabled={isSimulating || config.limitBySteps === false}
+                            style={{width:'90px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
+                              opacity: config.limitBySteps === false ? 0.4 : 1}} />
+                          {discoveryResults?.total_events != null && (
+                            <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{discoveryResults.total_events}</span>
+                          )}
+                        </div>
+                        {/* Simulated time */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
+                            <input type="checkbox" checked={!!config.limitByTime}
+                              onChange={e => handleConfigChange('limitByTime', e.target.checked)}
+                              disabled={isSimulating} />
+                            Simulated time
+                          </label>
+                          <input type="text" inputMode="numeric"
+                            value={config.maxSimTimeValue ?? ''}
+                            placeholder="e.g. 450"
+                            onChange={e => handleConfigChange('maxSimTimeValue', e.target.value === '' ? '' : parseFloat(e.target.value))}
+                            disabled={isSimulating || !config.limitByTime}
+                            style={{width:'70px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
+                              opacity: !config.limitByTime ? 0.4 : 1}} />
+                          <select value={config.maxSimTimeUnit ?? 'days'}
+                            onChange={e => handleConfigChange('maxSimTimeUnit', e.target.value)}
+                            disabled={isSimulating || !config.limitByTime}
+                            style={{fontSize:'0.82rem',padding:'0.2rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',
+                              opacity: !config.limitByTime ? 0.4 : 1}}>
+                            <option value="seconds">seconds</option>
+                            <option value="minutes">minutes</option>
+                            <option value="hours">hours</option>
+                            <option value="days">days</option>
+                            <option value="weeks">weeks</option>
+                          </select>
+                          {discoveryResults?.ocel_time_span_s != null && (() => {
+                            const s = discoveryResults.ocel_time_span_s;
+                            let label;
+                            if (s < 60) label = `${Math.round(s)}s`;
+                            else if (s < 3600) label = `${Math.floor(s/60)}m`;
+                            else if (s < 86400) label = `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                            else { const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600); label = h > 0 ? `${d}d ${h}h` : `${d}d`; }
+                            return <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{label}</span>;
+                          })()}
+                        </div>
+                        {/* Object traces */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
+                            <input type="checkbox" checked={!!config.limitByTraces}
+                              onChange={e => handleConfigChange('limitByTraces', e.target.checked)}
+                              disabled={isSimulating} />
+                            Completed traces
+                          </label>
+                          <input type="text" inputMode="numeric"
+                            value={config.maxTraces ?? ''}
+                            placeholder="e.g. 100"
+                            onChange={e => handleConfigChange('maxTraces', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
+                            disabled={isSimulating || !config.limitByTraces}
+                            style={{width:'90px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
+                              opacity: !config.limitByTraces ? 0.4 : 1}} />
+                          {discoveryResults?.log_object_trace_count != null && (
+                            <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{discoveryResults.log_object_trace_count}</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="form-row">
 
                       <div className="form-group">
                         <label>Random Seed</label>
@@ -6736,9 +6880,37 @@ function App() {
                       <p>
                         Running simulation…{' '}
                         <span className="sim-step-counter">
-                          step {liveStepCount ?? 0} / {config.maxSteps}
+                          {config.limitBySteps !== false
+                            ? `step ${liveStepCount ?? 0} / ${config.maxSteps}`
+                            : `step ${liveStepCount ?? 0}`}
                         </span>
                       </p>
+                      {(config.limitByTime || liveSimTime != null) && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                          {'🕐 sim '}
+                          {(() => {
+                            const s = liveSimTime ?? 0;
+                            if (s < 60) return `${Math.floor(s)}s`;
+                            if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
+                            if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                            const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                            return `${d}d ${h}h`;
+                          })()}
+                          {config.limitByTime && config.maxSimTimeValue !== '' && (() => {
+                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                            const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
+                            const val = config.maxSimTimeValue;
+                            const unit = config.maxSimTimeUnit ?? 'days';
+                            return ` / ${val} ${unit}`;
+                          })()}
+                        </p>
+                      )}
+                      {(config.limitByTraces || liveTraces != null) && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                          {'📦 traces: '}{liveTraces ?? 0}
+                          {config.limitByTraces && config.maxTraces !== '' ? ` / ${config.maxTraces}` : ''}
+                        </p>
+                      )}
                       <p className="sim-elapsed-timer">
                         {(() => {
                           const s = simElapsed ?? 0;
@@ -6789,6 +6961,28 @@ function App() {
                               <div className="stat-value">{results.objects_count}</div>
                               <div className="stat-label">Objects Created</div>
                             </div>
+                            {results.sim_time_s != null && (
+                              <div className="stat-card">
+                                <div className="stat-value">
+                                  {(() => {
+                                    const s = results.sim_time_s;
+                                    if (s < 60) return `${Math.round(s)}s`;
+                                    if (s < 3600) return `${Math.floor(s/60)}m`;
+                                    if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                                    const d = Math.floor(s/86400);
+                                    const h = Math.floor((s%86400)/3600);
+                                    return h > 0 ? `${d}d ${h}h` : `${d}d`;
+                                  })()}
+                                </div>
+                                <div className="stat-label">Simulation Time</div>
+                              </div>
+                            )}
+                            {results.completed_traces != null && (
+                              <div className="stat-card">
+                                <div className="stat-value">{results.completed_traces}</div>
+                                <div className="stat-label">Object Traces</div>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}

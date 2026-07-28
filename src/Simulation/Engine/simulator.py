@@ -332,8 +332,26 @@ class Simulator:
        #         state.add_object(object_type=object_type)
 
     def _should_stop(self, state: SimulationState) -> bool:
-        return state.step_count >= self.config.max_steps
-        # later add: no more candidates, all obligations fulfilled, end state reached, etc.
+        # Step limit (always applies as safety cap)
+        if state.step_count >= self.config.max_steps:
+            return True
+        # Time-based limit
+        max_time = getattr(self.config, 'max_sim_time_s', None)
+        if max_time is not None and state.last_generated_timestamp is not None:
+            elapsed = (state.last_generated_timestamp - self.config.start_timestamp).total_seconds()
+            if elapsed >= max_time:
+                return True
+        # Trace-based limit: count non-resource deactivated objects
+        max_tr = getattr(self.config, 'max_traces', None)
+        if max_tr is not None:
+            resource_types = state._resource_types or set()
+            completed = sum(
+                1 for obj in state.objects.values()
+                if not obj.active and obj.object_type not in resource_types
+            )
+            if completed >= max_tr:
+                return True
+        return False
 
     def _generate_candidates_des(self, state: SimulationState) -> list[Candidate]:
         """Generate one candidate per (activity, non-resource object) combination for DES mode.
@@ -1092,6 +1110,7 @@ class Simulator:
             timestamp=in_prog.complete_at,
         )
         state.current_time = in_prog.complete_at
+        state.last_generated_timestamp = in_prog.complete_at
 
         self._update_obligations_after_event(executed_event, state)
 
@@ -1186,6 +1205,11 @@ class Simulator:
                 self._trace("stop", {"reason": "user_stopped", "step_count": state.step_count})
                 break
 
+            # Time / trace stop conditions (checked once per outer loop iteration)
+            if self._should_stop(state):
+                self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count})
+                break
+
             # ── Complete all activities due at or before current_time ──────────
             while state.in_progress and state.in_progress[0].complete_at <= state.current_time:
                 finishing = heapq.heappop(state.in_progress)
@@ -1193,8 +1217,13 @@ class Simulator:
                 self._des_try_start_waiting(state, finishing.candidate_activity_name)
                 if state.step_count >= self.config.max_steps:
                     break
+                if self._should_stop(state):
+                    break
 
             if state.step_count >= self.config.max_steps:
+                break
+            if self._should_stop(state):
+                self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count})
                 break
 
             # ── Generate candidates at current_time ───────────────────────────

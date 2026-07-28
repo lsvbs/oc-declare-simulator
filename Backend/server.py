@@ -88,6 +88,40 @@ def _compute_ocel_time_span(ocel_source) -> float | None:
     return None
 
 
+def _compute_ocel_time_range(ocel_source):
+    """Return (first_iso, last_iso, span_s) for an OCEL log, or (None, None, None)."""
+    if not ocel_source or not isinstance(ocel_source, dict):
+        return None, None, None
+    events_raw = ocel_source.get('events', {})
+    events_list = list(events_raw.values()) if isinstance(events_raw, dict) else (events_raw or [])
+    timestamps = []
+    for e in events_list:
+        ts = e.get('time') or e.get('timestamp') or e.get('ocel:timestamp')
+        if ts:
+            timestamps.append(str(ts))
+    if len(timestamps) < 2:
+        return None, None, None
+    timestamps.sort()
+    try:
+        from datetime import datetime
+        def _parse(s):
+            for fmt in ('%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S+00:00',
+                        '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+                try:
+                    return datetime.strptime(s[:19], fmt[:len(s[:19])])
+                except Exception:
+                    pass
+            return None
+        t0 = _parse(timestamps[0])
+        t1 = _parse(timestamps[-1])
+        if t0 and t1:
+            span = round((t1 - t0).total_seconds(), 1)
+            return timestamps[0][:19], timestamps[-1][:19], span
+    except Exception:
+        pass
+    return None, None, None
+
+
 def _load_history() -> list:
     """Load run history from disk, or return empty list."""
     try:
@@ -420,8 +454,12 @@ def run_discovery():
                     src: {tgt: round(float(cnt), 4) for tgt, cnt in tgts.items()}
                     for src, tgts in prob_matrix.items()
                 },
-                'ocel_time_span_s': _compute_ocel_time_span(ocel_source),
-            },
+            } | (lambda tr: {
+                'ocel_time_span_s':        tr[2],
+                'ocel_first_timestamp':    tr[0],
+                'ocel_last_timestamp':     tr[1],
+                'log_object_trace_count':  total_objects,
+            })(_compute_ocel_time_range(ocel_source)),
             'logs': [
                 f"Loaded event log: {event_log_file}",
                 f"Discovered {len(activities)} unique activities",
@@ -630,11 +668,26 @@ def simulation_status(run_id):
     if not run:
         return jsonify({'error': 'unknown run_id'}), 404
     state = run['state']
+    resource_types = set(getattr(state, '_resource_types', set()) or set()) if state else set()
+    completed_traces = sum(
+        1 for obj in state.objects.values()
+        if not obj.active and obj.object_type not in resource_types
+    ) if state else 0
+    last_ts = None
+    if state and state.last_generated_timestamp:
+        try:
+            last_ts = state.last_generated_timestamp.isoformat()
+        except Exception:
+            pass
+    start_ts = run.get('start_timestamp')
     return jsonify({
-        'step_count': state.step_count if state else 0,
-        'events_count': len(state.executed_events) if state else 0,
-        'objects_count': len(state.objects) if state else 0,
-        'done': run['done'],
+        'step_count':       state.step_count if state else 0,
+        'events_count':     len(state.executed_events) if state else 0,
+        'objects_count':    len(state.objects) if state else 0,
+        'completed_traces': completed_traces,
+        'last_timestamp':   last_ts,
+        'start_timestamp':  start_ts,
+        'done':             run['done'],
     })
 
 
@@ -659,6 +712,19 @@ def run_simulation():
         run_id         = data.get('runId')          # optional: enables live status/stop
         max_steps = int(data.get('maxSteps', 50))
         print(f"[simulate] maxSteps received: {max_steps}", flush=True)
+        # Time-based limit: simulated seconds to advance (None = use steps only)
+        max_sim_time_s = data.get('maxSimTimeS')
+        if max_sim_time_s is not None:
+            try:
+                max_sim_time_s = float(max_sim_time_s)
+            except (TypeError, ValueError):
+                max_sim_time_s = None
+        max_traces = data.get('maxTraces')
+        if max_traces is not None:
+            try:
+                max_traces = int(max_traces)
+            except (TypeError, ValueError):
+                max_traces = None
         seed = int(data.get('seed', 42))
         # Accept either startActivities (list, new) or startActivity (string, legacy)
         start_activities = data.get('startActivities')
@@ -732,6 +798,8 @@ def run_simulation():
         
         config = SimulationConfig(
             max_steps=max_steps,
+            max_sim_time_s=max_sim_time_s,
+            max_traces=max_traces,
             seed=seed,
             start_policy=start_policy,
             anchor_object_types=[ot.name for ot in static_model.object_types]
@@ -882,6 +950,7 @@ def run_simulation():
                 'state': initial_state,
                 'stop_event': stop_event,
                 'done': False,
+                'start_timestamp': config.start_timestamp.isoformat() if config.start_timestamp else None,
             }
 
         result_holder = [None]
@@ -965,6 +1034,7 @@ def run_simulation():
             'event_log_file': event_log_file,
             'ocdeclare_file': ocdeclare_file or '(editor override)',
             'max_steps':      max_steps,
+            'max_sim_time_s': max_sim_time_s,
             'seed':           seed,
             'start_activities': start_activities,
             'steps_executed': final_state.step_count,
@@ -1023,6 +1093,14 @@ def run_simulation():
                 'audit': audit,
                 'concurrency_pairs': concurrency_pairs,
                 'resource_types': list(static_model.resource_types or []),
+                'completed_traces': sum(
+                    1 for obj in final_state.objects.values()
+                    if not obj.active and obj.object_type not in (static_model.resource_types or set())
+                ),
+                'sim_time_s': (
+                    (final_state.last_generated_timestamp - config.start_timestamp).total_seconds()
+                    if final_state.last_generated_timestamp else None
+                ),
             },
             'logs': [
                 f"Loaded model: {ocdeclare_file}",
