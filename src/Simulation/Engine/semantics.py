@@ -139,12 +139,21 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             if constraint.scope.object_type not in (candidate.object_types_to_create or []):
                 return False
 
+        prec_satisfied = getattr(state, '_prec_satisfied', None)
+        cache_key_base = (source, target, 'each')
+
         for oid in scope_ids:
+            # Fast path: already cached as permanently satisfied for this object
+            if prec_satisfied is not None and (cache_key_base + (oid,)) in prec_satisfied:
+                continue
             a_count = _count_activity_for_object(state, source, oid)
-            if nmin > 0 and a_count == 0:
+            if nmin > 0 and a_count < nmin:
                 return False
             if nmax is not None and a_count > nmax:
                 return False
+            # Cache if permanently satisfied: nmin met and no nmax upper bound
+            if prec_satisfied is not None and a_count >= max(nmin, 1) and nmax is None:
+                prec_satisfied.add(cache_key_base + (oid,))
 
         return True
 

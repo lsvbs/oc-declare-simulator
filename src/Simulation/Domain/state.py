@@ -145,6 +145,17 @@ class SimulationState:
     waiting_queue: list = field(default_factory=list)
     # activity_name -> list of resource-wait durations in seconds
     resource_wait_s: dict[str, list[float]] = field(default_factory=dict)
+    # Parallelism: number of concurrently in-progress activities sampled at each completion
+    parallelism_samples: list[int] = field(default_factory=list)
+    # Cumulative counters for iteration log delta tracking
+    total_deactivations: int = 0
+    total_obligations_fulfilled: int = 0   # target activity actually fired
+    total_obligations_cancelled: int = 0   # cleared because scope object deactivated
+    # Precedence satisfied cache: set of (source_activity, target_activity, scope_kind, object_id)
+    # Once a precedence is permanently satisfied for an object it is never rechecked.
+    # Only cached when nmax is None (no upper bound) — nmax constraints can become
+    # violated again if the source fires too many times, so they cannot be cached.
+    _prec_satisfied: set = field(default_factory=set)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -195,6 +206,10 @@ class SimulationState:
         keys_to_remove = [k for k in self._obligations_count if k[1] == object_id]
         for k in keys_to_remove:
             del self._obligations_count[k]
+        self.total_deactivations += 1
+        self.total_obligations_cancelled += len(keys_to_remove)
+        # Clear precedence satisfied cache entries for this object
+        self._prec_satisfied = {k for k in self._prec_satisfied if k[-1] != object_id}
 
         # Free resource neighbors whose case-object links are all now inactive.
         resource_types: set = getattr(self, '_resource_types', set()) or set()

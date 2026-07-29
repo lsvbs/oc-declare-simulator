@@ -680,14 +680,27 @@ def simulation_status(run_id):
         except Exception:
             pass
     start_ts = run.get('start_timestamp')
+    # Active objects (all types including resources)
+    active_objects = sum(1 for obj in state.objects.values() if obj.active) if state else 0
+    # Pending obligations (number of distinct (target, scope) pairs)
+    total_obligations = len(state._obligations_count) if state else 0
+    # Cumulative deactivation and fulfillment counters
+    total_deactivations = getattr(state, 'total_deactivations', 0) if state else 0
+    total_oblig_fulfilled = getattr(state, 'total_obligations_fulfilled', 0) if state else 0
+    total_oblig_cancelled = getattr(state, 'total_obligations_cancelled', 0) if state else 0
     return jsonify({
-        'step_count':       state.step_count if state else 0,
-        'events_count':     len(state.executed_events) if state else 0,
-        'objects_count':    len(state.objects) if state else 0,
-        'completed_traces': completed_traces,
-        'last_timestamp':   last_ts,
-        'start_timestamp':  start_ts,
-        'done':             run['done'],
+        'step_count':               state.step_count if state else 0,
+        'events_count':             len(state.executed_events) if state else 0,
+        'objects_count':            len(state.objects) if state else 0,
+        'active_objects':           active_objects,
+        'total_obligations':        total_obligations,
+        'total_deactivations':      total_deactivations,
+        'total_oblig_fulfilled':    total_oblig_fulfilled,
+        'total_oblig_cancelled':    total_oblig_cancelled,
+        'completed_traces':         completed_traces,
+        'last_timestamp':           last_ts,
+        'start_timestamp':          start_ts,
+        'done':                     run['done'],
     })
 
 
@@ -876,10 +889,7 @@ def run_simulation():
             if event == "iteration":
                 step = payload.get("step_count", "?")
                 candidates_detail = payload.get("candidates", [])
-                # Current timestamp from DES state is not directly available here,
-                # but we can read it from the last applied event in payload if present.
                 ts = payload.get("timestamp", None)
-                # Active object counts (from in-progress/waiting if provided)
                 in_prog = payload.get("in_progress_count", 0)
                 waiting = payload.get("waiting_count", 0)
                 candidates_with_probs = [
@@ -897,7 +907,16 @@ def run_simulation():
                     "candidates_with_probs": candidates_with_probs,
                     "in_progress": in_prog,
                     "waiting": waiting,
-                    "timestamp": ts,
+                    "sim_time": payload.get("sim_time", None),
+                    # Diagnostic fields for bottleneck analysis
+                    "active_objects":                 payload.get("active_objects", {}),
+                    "total_obligations":              payload.get("total_obligations", 0),
+                    "obligated_activities":           payload.get("obligated_activities", []),
+                    "deactivations_this_step":         payload.get("deactivations_this_step", 0),
+                    "obligations_fulfilled_this_step": payload.get("obligations_fulfilled_this_step", 0),
+                    "total_deactivations":             payload.get("total_deactivations", 0),
+                    "total_obligations_fulfilled":     payload.get("total_obligations_fulfilled", 0),
+                    "total_obligations_cancelled":     payload.get("total_obligations_cancelled", 0),
                 }
                 import json as _json
                 _iter_tmp.write(_json.dumps(entry) + '\n')
@@ -1101,6 +1120,22 @@ def run_simulation():
                     (final_state.last_generated_timestamp - config.start_timestamp).total_seconds()
                     if final_state.last_generated_timestamp else None
                 ),
+                # Aggregate trace lifetime: mean of (last_event - first_event) per non-resource object
+                'avg_trace_lifetime_s': (lambda om: (
+                    round(sum(v['lifetime_s'] for v in om.values() if v.get('lifetime_s') is not None) /
+                          max(1, sum(1 for v in om.values() if v.get('lifetime_s') is not None)), 1)
+                    if any(v.get('lifetime_s') is not None for v in om.values()) else None
+                ))(metrics.get('object_metrics') or {}),
+                # Aggregate avg wait time: execution-count-weighted mean of mean_wait_in_pool_s
+                'avg_wait_s': (lambda am: (
+                    round(sum((am[a].get('mean_wait_in_pool_s') or 0) * (am[a].get('execution_count') or 0) for a in am) /
+                          max(1, sum(am[a].get('execution_count') or 0 for a in am)), 1)
+                    if am else None
+                ))(metrics.get('activity_metrics') or {}),
+                # Parallelism: mean number of concurrently in-progress activities (sampled at each completion)
+                'avg_parallelism': (lambda s: (
+                    round(sum(s) / len(s), 2) if s else None
+                ))(getattr(final_state, 'parallelism_samples', [])),
             },
             'logs': [
                 f"Loaded model: {ocdeclare_file}",
@@ -1472,6 +1507,164 @@ def constraint_health():
             pass  # annotation is best-effort — never break the health check
 
         return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/analyze-blocking', methods=['POST'])
+def analyze_blocking():
+    """Dry-run simulation + static obligation saturation check to find blocking constraints."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+        from src.Simulation.Engine.simulator import Simulator
+        from src.Simulation.Domain.config import SimulationConfig, StartPolicy
+        from src.Simulation.Domain.state import SimulationState
+        from datetime import datetime
+
+        data = request.json or {}
+        model_override   = data.get('modelOverride')
+        ocdeclare_file   = data.get('ocdeclareFile')
+        start_activities = data.get('startActivities') or []
+        prob_matrix      = data.get('probMatrixOverride') or {}
+        dry_run_steps    = int(data.get('steps', 300))
+        seed             = int(data.get('seed', 42))
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+
+        # Load model
+        if model_override:
+            model_dict = model_override
+        elif ocdeclare_file:
+            mp = OCDECLARE_DIR / ocdeclare_file
+            if not mp.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(mp) as f:
+                model_dict = json.load(f)
+        else:
+            return jsonify({'error': 'modelOverride or ocdeclareFile required'}), 400
+
+        if isinstance(model_dict, list):
+            static_model = parse_ocdeclare_list(model_dict)
+        else:
+            static_model = parse_ocdeclare_dict(model_dict)
+
+        # ── 1. Static obligation saturation check ────────────────────────────
+        # For each response constraint, check whether the target activity can
+        # realistically fire: it needs at least one binding that either creates
+        # its own object, uses a resource, or has an object created by another activity.
+        creators: dict[str, list[str]] = {}  # object_type -> [activity names that create it]
+        for a in static_model.activities:
+            for b in a.bindings:
+                if b.creates:
+                    creators.setdefault(b.object_type, []).append(a.name)
+
+        resource_types = set(static_model.resource_types or [])
+        saturated: list[dict] = []
+        for c in static_model.constraints:
+            if c.constraint_type not in ('response', 'chain_response'):
+                continue
+            tgt = c.target_activity
+            tgt_act = next((a for a in static_model.activities if a.name == tgt), None)
+            if not tgt_act:
+                continue
+            non_creating = [b for b in tgt_act.bindings
+                            if not b.creates and b.object_type not in resource_types]
+            unsatisfied = [b for b in non_creating
+                           if b.object_type not in creators]
+            if unsatisfied:
+                saturated.append({
+                    'constraint_type': c.constraint_type,
+                    'source': getattr(c, 'source_activity', None) or getattr(c, 'source', '?'),
+                    'target': tgt,
+                    'reason': f"Target needs {', '.join(b.object_type for b in unsatisfied)} but no activity creates it",
+                    'severity': 'high',
+                })
+
+        # ── 2. Dry-run with constraint rejection tracking ─────────────────────
+        # Instrument: monkey-patch _generate_candidates_des to record rejections
+        rejection_counts: dict[str, int] = {}
+        blocking_pairs: dict[tuple, int] = {}  # (constraint_type, source, target) -> count
+
+        original_gen = Simulator._generate_candidates_des
+
+        def _instrumented_gen(self_s, state):
+            candidates = original_gen(self_s, state)
+            # Track which activities had candidates blocked by constraint checks
+            # We compare activities in model vs activities in candidate pool
+            pool_acts = {c.activity_name for c in candidates}
+            for act in self_s.static_model.activities:
+                if act.name not in pool_acts and state.objects:
+                    rejection_counts[act.name] = rejection_counts.get(act.name, 0) + 1
+            return candidates
+
+        Simulator._generate_candidates_des = _instrumented_gen
+
+        try:
+            cfg = SimulationConfig(
+                max_steps=dry_run_steps,
+                seed=seed,
+                start_policy=StartPolicy(start_activity_names=start_activities),
+                start_timestamp=datetime(2025, 1, 1, 9, 0, 0),
+            )
+            sim = Simulator(static_model, cfg,
+                            transition_matrix=prob_matrix,
+                            start_counts={})
+            sim.run_des(state=SimulationState())
+        finally:
+            Simulator._generate_candidates_des = original_gen
+
+        # Build blocking list: activities that were absent from pool >20% of steps
+        # and have response obligations pointing at them
+        total_steps = max(dry_run_steps, 1)
+        pressure_threshold = 0.15  # absent >15% of steps = potentially blocking
+
+        # Map constraint targets
+        response_targets = {
+            (getattr(c, 'source_activity', None) or getattr(c, 'source', ''), c.target_activity): c.constraint_type
+            for c in static_model.constraints
+            if c.constraint_type in ('response', 'chain_response', 'precedence', 'chain_precedence')
+        }
+
+        blocking: list[dict] = []
+        for act_name, blocked_steps in sorted(rejection_counts.items(), key=lambda x: -x[1]):
+            pressure = blocked_steps / total_steps
+            if pressure < pressure_threshold:
+                continue
+            # Find which constraints may be causing it
+            related = [
+                {'constraint_type': ctype, 'source': src, 'target': tgt}
+                for (src, tgt), ctype in response_targets.items()
+                if tgt == act_name or src == act_name
+            ]
+            blocking.append({
+                'activity': act_name,
+                'blocked_steps': blocked_steps,
+                'pressure': round(pressure, 3),
+                'severity': 'high' if pressure > 0.5 else 'medium',
+                'related_constraints': related,
+                'reason': 'dry-run',
+            })
+
+        # Add static saturation findings (avoid duplicates)
+        seen_tgts = {b['activity'] for b in blocking}
+        for s in saturated:
+            if s['target'] not in seen_tgts:
+                blocking.append({
+                    'activity': s['target'],
+                    'blocked_steps': None,
+                    'pressure': None,
+                    'severity': s['severity'],
+                    'related_constraints': [{'constraint_type': s['constraint_type'],
+                                             'source': s['source'], 'target': s['target']}],
+                    'reason': 'static: ' + s['reason'],
+                })
+
+        return jsonify({'blocking': blocking, 'total_steps': total_steps})
 
     except Exception as e:
         import traceback

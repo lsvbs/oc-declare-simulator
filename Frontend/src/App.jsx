@@ -3893,7 +3893,7 @@ function App() {
   const [startActivityCandidates, setStartActivityCandidates] = useState([]);
   const [config, setConfig] = useState({
     ocdeclareFile: '',
-    maxSteps: 200,
+    maxSteps: '',
     limitBySteps: true,
     limitByTime: false,
     limitByTraces: false,
@@ -3909,18 +3909,26 @@ function App() {
   const [liveStepCount, setLiveStepCount] = useState(null);
   const [liveSimTime,   setLiveSimTime]   = useState(null); // simulated time in seconds
   const [liveTraces,    setLiveTraces]    = useState(null); // completed object traces
+  const [liveActiveObjects,   setLiveActiveObjects]   = useState(null);
+  const [liveObligations,     setLiveObligations]     = useState(null);
+  const [liveDeactivPerStep,  setLiveDeactivPerStep]  = useState(null);
+  const [liveObligFulfilledPerStep, setLiveObligFulfilledPerStep] = useState(null);
   const [activeRunId,   setActiveRunId]   = useState(null);
   const [simElapsed,    setSimElapsed]    = useState(null); // seconds elapsed during last run
   const [lastRunDuration, setLastRunDuration] = useState(null); // seconds for completed run
+  const [lastCompletedMode, setLastCompletedMode] = useState(null); // 'asis' | 'tobe'
   const simStartRef = useRef(null);
   const simTimerRef = useRef(null);
   const pollIntervalRef = useRef(null);
+  const prevPollRef = useRef({ deactivations: 0, obligFulfilled: 0, step: 0 });
   const ocelFileRef    = useRef(null);
   const ocdeclFileRef  = useRef(null);
   const paramsFileRef  = useRef(null);
   const [results, setResults] = useState(null);
   const [healthResult, setHealthResult] = useState(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
+  const [blockingResult, setBlockingResult] = useState(null);
+  const [isAnalyzingBlocking, setIsAnalyzingBlocking] = useState(false);
   const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
   const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
   const [error, setError] = useState(null);
@@ -3957,6 +3965,9 @@ function App() {
   // Populated on OC-Declare discovery or when the user picks an existing file.
   const [activeModel,      setActiveModel]      = useState(null);
   const [activeProbMatrix, setActiveProbMatrix] = useState(null);
+  // Keep refs in sync for use inside async callbacks where closure values are stale
+  React.useEffect(() => { activeModelRef.current = activeModel; }, [activeModel]);
+  React.useEffect(() => { activeProbMatrixRef.current = activeProbMatrix; }, [activeProbMatrix]);
   // Tracks whether the user changed the model via the Model Editor since it was
   // last loaded. Used to label a simulation run as using custom inputs.
   const [modelEdited,      setModelEdited]      = useState(false);
@@ -4019,13 +4030,21 @@ function App() {
 
   // ── Workflow mode ─────────────────────────────────────────────────────────
   const [workflowMode, setWorkflowMode] = useState(null);
+  const [landingDragOver, setLandingDragOver] = useState(false);
   // null = not chosen yet | 'internal' | 'external-ocel' | 'external-empty'
   const [paramDiscoveryEnabled, setParamDiscoveryEnabled] = useState({
     probability: true, lifecycle: true, time: true,
   });
 
   // ── External OC-Declare + OCEL tab state ──────────────────────────────────
-  const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'simulation' | 'evaluation'
+  const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'behavior' | 'scenario' | 'results' | 'evaluation'
+  const [behaviorSection, setBehaviorSection] = useState('activities'); // left nav in Model Behavior
+  const [modelBase, setModelBase] = useState(null);        // immutable discovered model snapshot
+  const [modelToBe, setModelToBe] = useState(null);        // editable scenario model
+  const [probMatrixBase, setProbMatrixBase] = useState(null);
+  const [probMatrixToBe, setProbMatrixToBe] = useState(null);
+  const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
+  const [resultsToBe, setResultsToBe] = useState(null);    // Run To-Be results
   const [discoveryChecks, setDiscoveryChecks] = useState({
     lifecycle: true, timing: true, resources: true, o2o: true, startProb: true,
   });
@@ -4034,6 +4053,8 @@ function App() {
   const [discoveryElapsed, setDiscoveryElapsed] = useState(null);
   const discStartRef = useRef(null);
   const discTimerRef = useRef(null);
+  const activeModelRef = useRef(null);      // always current activeModel, safe in callbacks
+  const activeProbMatrixRef = useRef(null); // always current activeProbMatrix
   const [healthCheckSteps, setHealthCheckSteps] = useState(500);
   const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
@@ -4097,10 +4118,8 @@ function App() {
 
       // Only set defaults when not preserving current selections
       if (!preserveSelections) {
-        if (ocdeclareFiles.length > 0) {
-          setConfig(prev => ({ ...prev, ocdeclareFile: ocdeclareFiles[0] }));
-        }
-        // Event log file is intentionally left blank on load — user must select explicitly
+        // Don't auto-select OC-Declare — user should pick it explicitly on the landing page
+        // (previously auto-selected ocdeclareFiles[0] here)
       }
     } catch (err) {
       setDiscoveryError('Failed to load available files. Make sure the backend server is running.');
@@ -4455,8 +4474,11 @@ function App() {
     try { await axios.post(`/api/simulate/stop/${activeRunId}`); } catch {}
   }, [activeRunId]);
 
-  const runSimulation = async () => {
+  const runSimulation = async (mode = 'tobe') => {
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    // Pick model/matrix based on mode
+    const simModel  = mode === 'asis' ? modelBase  : (modelToBe  ?? activeModel);
+    const simMatrix = mode === 'asis' ? probMatrixBase : (probMatrixToBe ?? activeProbMatrix);
     setIsSimulating(true);
     setLiveStepCount(0);
     setActiveRunId(runId);
@@ -4464,6 +4486,7 @@ function App() {
     simStartRef.current = Date.now();
     setSimElapsed(0);
     setLastRunDuration(null);
+    setLastCompletedMode(null);
     if (simTimerRef.current) clearInterval(simTimerRef.current);
     simTimerRef.current = setInterval(() => {
       setSimElapsed(Math.floor((Date.now() - simStartRef.current) / 1000));
@@ -4476,6 +4499,11 @@ function App() {
     // Reset live counters
     setLiveSimTime(null);
     setLiveTraces(null);
+    setLiveActiveObjects(null);
+    setLiveObligations(null);
+    setLiveDeactivPerStep(null);
+    setLiveObligFulfilledPerStep(null);
+    prevPollRef.current = { deactivations: 0, obligFulfilled: 0, step: 0 };
 
     // Start polling the live step counter every second
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -4484,6 +4512,19 @@ function App() {
         const r = await axios.get(`/api/simulate/status/${runId}`);
         setLiveStepCount(r.data.step_count ?? 0);
         setLiveTraces(r.data.completed_traces ?? 0);
+        setLiveActiveObjects(r.data.active_objects ?? null);
+        setLiveObligations(r.data.total_obligations ?? null);
+        // Compute per-poll deltas (proxy for per-step rates)
+        const curStep  = r.data.step_count ?? 0;
+        const curDeact = r.data.total_deactivations ?? 0;
+        const curOblig = r.data.total_oblig_fulfilled ?? 0;
+        const prev = prevPollRef.current;
+        const stepDelta = Math.max(1, curStep - prev.step);
+        setLiveDeactivPerStep(prev.step > 0 ? ((curDeact - prev.deactivations) / stepDelta).toFixed(2) : null);
+        const curObligCancelled = r.data.total_oblig_cancelled ?? 0;
+        const curObligRemoved = curOblig + curObligCancelled;
+        setLiveObligFulfilledPerStep(prev.step > 0 ? ((curObligRemoved - (prev.obligFulfilled)) / stepDelta).toFixed(2) : null);
+        prevPollRef.current = { deactivations: curDeact, obligFulfilled: curObligRemoved, step: curStep };
         if (r.data.last_timestamp && r.data.start_timestamp) {
           const elapsed = (new Date(r.data.last_timestamp) - new Date(r.data.start_timestamp)) / 1000;
           setLiveSimTime(elapsed >= 0 ? elapsed : null);
@@ -4496,17 +4537,17 @@ function App() {
     }, 1000);
 
     try {
-      // Compute max_sim_time_s from useTimeLimit settings
+      // Compute max_sim_time_s — active when value is filled in (no checkbox needed)
       const unitToS = { seconds: 1, minutes: 60, hours: 3600, days: 86400, weeks: 604800 };
-      // Steps: use a very large cap if not limiting by steps
-      const effectiveMaxSteps = config.limitBySteps !== false
-        ? (parseInt(config.maxSteps) || 200)
+      // Steps: active when maxSteps has a value, else safety cap
+      const effectiveMaxSteps = config.maxSteps && parseInt(config.maxSteps) > 0
+        ? parseInt(config.maxSteps)
         : 10_000_000;
-      const maxSimTimeS = config.limitByTime && config.maxSimTimeValue !== ''
+      const maxSimTimeS = config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && !isNaN(parseFloat(config.maxSimTimeValue))
         ? parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400)
         : null;
-      const maxTraces = config.limitByTraces && config.maxTraces !== ''
-        ? (parseInt(config.maxTraces) || null)
+      const maxTraces = config.maxTraces !== '' && config.maxTraces != null && parseInt(config.maxTraces) > 0
+        ? parseInt(config.maxTraces)
         : null;
 
       const simulationData = {
@@ -4516,15 +4557,20 @@ function App() {
         eventLogFile: discoveryConfig.eventLogFile,
         maxSimTimeS,
         maxTraces,
-        // Send editor overrides so the server uses the edited model/probs
-        ...(activeModel      ? { modelOverride:       activeModel }      : {}),
-        ...(activeProbMatrix ? { probMatrixOverride: activeProbMatrix } : {}),
+        // Send model/probs for the chosen mode
+        ...(simModel  ? { modelOverride:       simModel }  : {}),
+        ...(simMatrix ? { probMatrixOverride: simMatrix } : {}),
       };
 
       const response = await axios.post('/api/simulate', simulationData);
 
       setResults(response.data.results);
       setLogs(response.data.logs || []);
+      // Store in mode-specific state and navigate to results
+      if (mode === 'asis') setResultsAsIs(response.data.results);
+      else setResultsToBe(response.data.results);
+      setLastCompletedMode(mode);
+      // Do NOT auto-navigate — show completion banner with button instead
 
       // Push a snapshot to session history for replay
       if (response.data.success !== false) {
@@ -4581,7 +4627,33 @@ function App() {
     }
   };
 
-  // Ref always holds the latest startActivityProbSelected so applyStartProbability
+  const runBlockingAnalysis = React.useCallback(async (model, matrix, startActs) => {
+    if (!model || !startActs?.length) return;
+    setIsAnalyzingBlocking(true);
+    try {
+      const res = await axios.post('/api/analyze-blocking', {
+        modelOverride:       model,
+        probMatrixOverride:  matrix || {},
+        startActivities:     startActs,
+        steps:               300,
+        seed:                42,
+      });
+      setBlockingResult(res.data);
+    } catch (e) {
+      setBlockingResult({ error: e.response?.data?.error || 'Analysis failed.' });
+    } finally {
+      setIsAnalyzingBlocking(false);
+    }
+  }, []);
+
+  // Auto-run blocking analysis whenever the To-Be model changes
+  React.useEffect(() => {
+    if (!modelToBe || !config.startActivities?.length) return;
+    const t = setTimeout(() => {
+      runBlockingAnalysis(modelToBe, probMatrixToBe, config.startActivities);
+    }, 800); // debounce 800ms
+    return () => clearTimeout(t);
+  }, [modelToBe, probMatrixToBe, config.startActivities, runBlockingAnalysis]);
   // never reads a stale closure value.
   const startActivityProbSelectedRef = React.useRef(discoveryConfig.startActivityProbSelected);
   React.useEffect(() => {
@@ -4680,6 +4752,14 @@ function App() {
       }
       setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'Constraint Health Check' });
       await runHealthCheck();
+      // Snapshot discovered model as immutable base using refs (not stale closure values)
+      const snapModel  = activeModelRef.current  ? JSON.parse(JSON.stringify(activeModelRef.current))  : null;
+      const snapMatrix = activeProbMatrixRef.current ? JSON.parse(JSON.stringify(activeProbMatrixRef.current)) : null;
+      setModelBase(snapModel);
+      setModelToBe(snapModel  ? JSON.parse(JSON.stringify(snapModel))  : null);
+      setProbMatrixBase(snapMatrix);
+      setProbMatrixToBe(snapMatrix ? JSON.parse(JSON.stringify(snapMatrix)) : null);
+      setExternalTab('behavior');
     } finally {
       clearInterval(discTimerRef.current);
       discTimerRef.current = null;
@@ -5357,27 +5437,21 @@ function App() {
         <p>Object-centric declarative process simulation</p>
       </header>
 
-      {/* ── Main tab bar — attached directly below header when a mode is chosen ── */}
-      {workflowMode === 'external-ocel' && (
+      {/* ── Main tab bar — only shown after landing page is complete ── */}
+      {workflowMode === 'external-ocel' && externalTab !== 'parameter' && (
         <div className="main-tab-bar">
-          <button
-            className={`main-tab-btn${externalTab === 'parameter' ? ' active' : ''}`}
-            onClick={() => setExternalTab('parameter')}
-          >
-            Parameters
-          </button>
-          <button
-            className={`main-tab-btn${externalTab === 'simulation' ? ' active' : ''}`}
-            onClick={() => setExternalTab('simulation')}
-          >
-            Simulation
-          </button>
-          <button
-            className={`main-tab-btn${externalTab === 'evaluation' ? ' active' : ''}`}
-            onClick={() => setExternalTab('evaluation')}
-          >
-            Evaluation
-          </button>
+          {[
+            { key: 'behavior',   label: 'Model Behavior' },
+            { key: 'scenario',   label: 'Scenario Builder' },
+            { key: 'results',    label: 'Results' },
+            { key: 'evaluation', label: 'Evaluation' },
+          ].map(t => (
+            <button key={t.key}
+              className={`main-tab-btn${externalTab === t.key ? ' active' : ''}`}
+              onClick={() => setExternalTab(t.key)}>
+              {t.label}
+            </button>
+          ))}
         </div>
       )}
 
@@ -5738,1864 +5812,1134 @@ function App() {
       {workflowMode === 'external-ocel' && (
           <div className="ext-ocel-tabs">
 
-            {/* ── PARAMETER TAB ── */}
+            {/* ── LANDING PAGE (replaces Parameters tab) ── */}
             {externalTab === 'parameter' && (
-              <div className="ext-ocel-tab-content">
+              <div className="landing-page">
+                <h1>Declarative OC Simulator</h1>
 
-                {/* A: File Selection — OCEL + OC-Declare side by side */}
-                <div className="discovery-section">
-                  <div className="section-header">
-                    <h2>Parameter Discovery</h2>
-                    <p>Select an OCEL log and an OC-Declare model to begin</p>
-                  </div>
-                  <div className="file-selection-row">
-                    <div className="form-group" style={{flex:1}}>
-                      <label>Event Log File (OCEL 2.0)</label>
-                      <div className="file-select-row">
-                        <select
-                          value={discoveryConfig.eventLogFile}
-                          onChange={(e) => {
-                            handleDiscoveryConfigChange('eventLogFile', e.target.value);
-                            if (e.target.value && workflowMode === 'external-ocel') {
-                              setTimeout(() => runDiscovery(e.target.value), 0);
-                            }
-                          }}
-                          disabled={isDiscovering}
-                        >
-                          <option value="">Select event log...</option>
-                          {eventLogFiles.map(file => (
-                            <option key={file} value={file}>{file}</option>
-                          ))}
-                        </select>
-                        <button className="browse-btn" onClick={() => ocelFileRef.current?.click()} title="Browse and upload a file">📁</button>
-                        <input ref={ocelFileRef} type="file" accept=".json,.xml" style={{display:'none'}}
-                          onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
-                      </div>
-                    </div>
-                    <div className="form-group" style={{flex:1}}>
-                      <label>OC-Declare Model</label>
-                      <div className="file-select-row">
-                        <select
-                          value={config.ocdeclareFile}
-                          onChange={(e) => {
-                            handleConfigChange('ocdeclareFile', e.target.value);
-                            if (e.target.value && discoveryConfig.eventLogFile && workflowMode === 'external-ocel') {
-                              setTimeout(() => runDiscovery(discoveryConfig.eventLogFile), 0);
-                            }
-                          }}
-                        >
-                          <option value="">Select OC-Declare file...</option>
-                          {ocdeclareFiles.map(f => <option key={f} value={f}>{f}</option>)}
-                        </select>
-                        <button className="browse-btn" onClick={() => ocdeclFileRef.current?.click()} title="Browse and upload a file">📁</button>
-                        <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
-                          onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
-                      </div>
-                    </div>
-                  </div>
-
-                  {discoveryError && (
-                    <div className="error-box">
-                      <h3>Discovery Error</h3>
-                      <p>{discoveryError}</p>
-                    </div>
-                  )}
-                  {isDiscovering && (
-                    <div className="loading-box">
-                      <div className="spinner"></div>
-                      <p>Running parameter discovery...</p>
-                    </div>
-                  )}
-
-                  {/* First Log Insights — collapsible, directly below file selectors */}
-                  {discoveryResults && !isDiscovering && (() => {
-                    const dr = discoveryResults;
-                    return (
-                      <Collapsible
-                        className="first-log-insights"
-                        title="First Log Insights"
-                        badge={`${dr.activity_count} activities · ${dr.total_events} events`}
-                        defaultOpen={true}
-                      >
-                        <div className="stat-grid" style={{marginBottom:'0.75rem'}}>
-                          <div className="stat-card">
-                            <div className="stat-value">{dr.activity_count}</div>
-                            <div className="stat-label">Activities Found</div>
-                          </div>
-                          <div className="stat-card">
-                            <div className="stat-value">{dr.total_events}</div>
-                            <div className="stat-label">Events Analyzed</div>
-                          </div>
-                          <div className="stat-card">
-                            <div className="stat-value">{dr.transition_count}</div>
-                            <div className="stat-label">Transitions</div>
-                          </div>
-                          {dr.object_type_stats && (
-                            <div className="stat-card">
-                              <div className="stat-value">{Object.keys(dr.object_type_stats).length}</div>
-                              <div className="stat-label">Discovered Objects</div>
-                            </div>
-                          )}
+                {/* OCEL Drop Zone */}
+                <div
+                  className={`ocel-drop-zone${landingDragOver ? ' drag-over' : ''}${discoveryConfig.eventLogFile ? ' loaded' : ''}`}
+                  onClick={e => { if (!e.target.closest('.landing-discovery-options')) ocelFileRef.current?.click(); }}
+                  onDragOver={e => { e.preventDefault(); setLandingDragOver(true); }}
+                  onDragLeave={() => setLandingDragOver(false)}
+                  onDrop={e => {
+                    e.preventDefault(); setLandingDragOver(false);
+                    const f = e.dataTransfer.files[0];
+                    if (f) handleFileUpload(f, 'eventlog');
+                  }}
+                >
+                  {/* File info top-left */}
+                  {discoveryConfig.eventLogFile && (
+                    <div className="ocel-drop-zone-info">
+                      <div className="file-name">{discoveryConfig.eventLogFile}</div>
+                      {(isDiscovering) && <div className="file-meta">Loading…</div>}
+                      {discoveryResults && !isDiscovering && (
+                        <div className="file-meta">
+                          {discoveryResults.total_events != null && `${discoveryResults.total_events.toLocaleString()} events`}
+                          {discoveryResults.log_object_trace_count != null && ` · ${discoveryResults.log_object_trace_count.toLocaleString()} objects`}
                         </div>
-                        {dr.object_type_stats && Object.keys(dr.object_type_stats).length > 0 && (
-                          <table className="object-type-stats-table">
-                            <thead><tr><th>Object Type</th><th className="octs-num">Instances</th><th className="octs-num">Max reuse</th><th>Attributes</th></tr></thead>
-                            <tbody>
-                              {Object.entries(dr.object_type_stats).map(([type, info]) => (
-                                <tr key={type}>
-                                  <td className="octs-type">{type}</td>
-                                  <td className="octs-num">{info.count.toLocaleString()}</td>
-                                  <td className="octs-num" title={info.mean_max_reuse != null ? `Mean: ${info.mean_max_reuse}` : undefined}>{info.max_reuse != null ? info.max_reuse : '—'}</td>
-                                  <td className="octs-attrs">{info.attributes.length > 0 ? info.attributes.map(a => <span key={a} className="octs-attr-badge">{a}</span>) : <span className="octs-no-attrs">—</span>}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Drop prompt */}
+                  {!discoveryConfig.eventLogFile && (
+                    <div className="ocel-drop-prompt">
+                      <div className="ocel-drop-icon">📂</div>
+                      <div className="ocel-drop-label">Drop event log here</div>
+                      <div className="ocel-drop-sub">or click to browse (.json, .xml)</div>
+                    </div>
+                  )}
+                  {discoveryConfig.eventLogFile && isDiscovering && (
+                    <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:'0.75rem',padding:'1rem 0'}}>
+                      <div className="spinner"></div>
+                      <span style={{fontSize:'0.85rem',color:'#64748b'}}>Analysing log…</span>
+                    </div>
+                  )}
+
+                  {/* Discovery options — shown after log is loaded */}
+                  {discoveryConfig.eventLogFile && discoveryResults && !isDiscovering && (
+                    <div className="landing-discovery-options" onClick={e => e.stopPropagation()}>
+
+                      {/* Start Activity toggle pills */}
+                      <div className="landing-option-group">
+                        <label className="landing-option-label">Start Activity</label>
+                        <div style={{display:'flex',flexDirection:'column',gap:'0.25rem',marginTop:'0.25rem',maxHeight:'160px',overflowY:'auto',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.3rem'}}>
+                          {(() => {
+                            const likely = discoveryResults.likely_start_activities || [];
+                            const others = Object.keys(discoveryResults.activity_counts || {})
+                              .filter(a => !likely.includes(a))
+                              .sort((a,b) => (discoveryResults.activity_counts[b]||0)-(discoveryResults.activity_counts[a]||0));
+                            const candidates = [...likely, ...others];
+                            const selected = new Set(discoveryConfig.startActivityProbSelected ?? []);
+                            return candidates.map((a, i) => {
+                              const isSelected = selected.has(a);
+                              return (
+                                <button key={a}
+                                  onClick={() => {
+                                    const next = new Set(selected);
+                                    isSelected ? next.delete(a) : next.add(a);
+                                    setDiscoveryConfig(p => ({ ...p, startActivityProbSelected: [...next] }));
+                                  }}
+                                  style={{
+                                    textAlign:'left',
+                                    padding:'0.3rem 0.6rem',
+                                    fontSize:'0.82rem',
+                                    borderRadius:'4px',
+                                    border:'none',
+                                    background: isSelected ? '#1e293b' : 'transparent',
+                                    color: isSelected ? 'white' : '#475569',
+                                    cursor:'pointer',
+                                    fontWeight: isSelected ? 600 : 400,
+                                    transition:'background 0.1s, color 0.1s',
+                                  }}>
+                                  {a}
+                                </button>
+                              );
+                            });
+                          })()}
+                        </div>
+                        {!(discoveryConfig.startActivityProbSelected?.length > 0) && (
+                          <div style={{fontSize:'0.7rem',color:'#b91c1c',marginTop:'0.25rem'}}>Select at least one</div>
                         )}
-                      </Collapsible>
-                    );
-                  })()}
+                      </div>
+
+                      {/* Right column: Timing + Resource threshold */}
+                      <div style={{display:'flex',flexDirection:'column',gap:'1rem',flex:1}}>
+                        {/* Timing mode */}
+                        <div className="landing-option-group">
+                          <label className="landing-option-label">Timing Discovery</label>
+                          <div style={{display:'flex',flexDirection:'column',gap:'0.3rem'}}>
+                            {[
+                              { value: 'minimum', label: 'Minimum' },
+                              { value: 'p25',     label: 'P25 (25th percentile)' },
+                              { value: 'p50',     label: 'P50 (median)' },
+                            ].map(opt => (
+                              <label key={opt.value} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.82rem',cursor:'pointer'}}>
+                                <input type="radio" name="landingTimingMode" value={opt.value}
+                                  checked={serviceTimeMode === opt.value}
+                                  onChange={() => setServiceTimeMode(opt.value)} />
+                                {opt.label}
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Resource threshold */}
+                        <div className="landing-option-group">
+                          <label className="landing-option-label">Resource Threshold</label>
+                          <input type="number" min={1} value={resourceThreshold}
+                            onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))}
+                            style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                          <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>avg events/instance</div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Hidden file input */}
+                  <input ref={ocelFileRef} type="file" accept=".json,.xml" style={{display:'none'}}
+                    onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
                 </div>
 
-                {/* Space between file selection and discoveries */}
-                <div style={{height:'1.5rem'}} />
-
-                {/* B: Discoveries */}
-                {discoveryResults && (() => {
-                  const DISC_ITEMS = [
-                    { key: 'lifecycle', label: 'Object Constraints' },
-                    { key: 'resources', label: 'Resource Objects' },
-                    { key: 'timing',    label: 'Timing' },
-                    { key: 'o2o',       label: 'O2O' },
-                    { key: 'startProb', label: 'Start Activity + Probability' },
-                  ];
-                  // Ensure activeDiscoveryTab is one of the defined keys; default to first
-                  const allTabKeys = DISC_ITEMS.map(d=>d.key);
-                  const activeKey = allTabKeys.includes(activeDiscoveryTab) ? activeDiscoveryTab : DISC_ITEMS[0].key;
-                  const resultBadge = key => {
-                    if (key === 'lifecycle' && lifecycleResult && !lifecycleResult.error) return lifecycleResult.method === 'ocel' ? '✓' : '⚠';
-                    if (key === 'resources' && resourceResult) return '✓';
-                    if (key === 'timing' && timingDiscoveryResult) return '✓';
-                    if (key === 'o2o' && o2oResult) return '✓';
-                    if (key === 'startProb' && startProbApplied) return '✓';
-                    return null;
-                  };
-                  return (
-                    <div className="discovery-section">
-                      <div className="section-header">
-                        <h2>Discoveries</h2>
-                        <p>Tick tabs to include in the run. Click a tab to configure it.</p>
-                      </div>
-
-                      {/* Tab bar — checkable discovery tabs + non-removable extra tabs */}
-                      <div className="disc-tab-bar">
-                        {DISC_ITEMS.map(({ key, label }) => {
-                          const badge = resultBadge(key);
-                          return (
-                            <button
-                              key={key}
-                              className={`disc-tab-btn${activeKey === key ? ' active' : ''}${discoveryChecks[key] ? ' checked' : ''}`}
-                              onClick={() => setActiveDiscoveryTab(key)}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={discoveryChecks[key]}
-                                onClick={e => e.stopPropagation()}
-                                onChange={e => setDiscoveryChecks(p => ({ ...p, [key]: e.target.checked }))}
-                              />
-                              {label}
-                              {badge && <span className={`disc-tab-badge ${badge === '⚠' ? 'badge-warn' : 'badge-ok'}`}>{badge}</span>}
-                            </button>
-                          );
-                        })}
-
-                      </div>
-
-                      {/* Active tab panel */}
-                      <div className="disc-tab-panel">
-                        {activeKey === 'lifecycle' && (
-                          <div>
-                            <p className="disc-tab-desc">Infer <code>creates</code>/<code>deactivates</code> flags for each activity binding from the OCEL log.</p>
-                            {lifecycleResult && !lifecycleResult.error && (
-                              <>
-                                <span className={`ext-disc-badge ${lifecycleResult.method === 'ocel' ? 'badge-ok' : 'badge-warn'}`}>
-                                  {lifecycleResult.method === 'ocel' ? '✓ OCEL log' : '⚠ arc heuristic'}
-                                </span>
-                                <ul style={{fontSize:'0.78rem',marginTop:'0.4rem',color:'#475569',paddingLeft:'1.25rem'}}>
-                                  {(lifecycleResult.summary||[]).slice(1).map((s,i) => <li key={i}>{s}</li>)}
-                                </ul>
-                              </>
-                            )}
-                            {lifecycleError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{lifecycleError}</p>}
-                          </div>
-                        )}
-
-                        {activeKey === 'resources' && (
-                          <div>
-                            <p className="disc-tab-desc">Classify object types as reusable resources based on average event participation.</p>
-                            <label className="resource-threshold-label">
-                              Threshold (avg events/instance):
-                              <input type="number" className="resource-threshold-input" value={resourceThreshold} min={1}
-                                onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))} />
-                            </label>
-                            {resourceResult && (
-                              <table className="resource-discover-table" style={{marginTop:'0.6rem'}}>
-                                <thead><tr><th>Type</th><th className="octs-num">Instances</th></tr></thead>
-                                <tbody>{resourceResult.map(r => <tr key={r.type}><td>{r.type}</td><td className="octs-num">{r.instance_count.toLocaleString()}</td></tr>)}</tbody>
-                              </table>
-                            )}
-                            {resourceError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{resourceError}</p>}
-                          </div>
-                        )}
-
-                        {activeKey === 'timing' && (
-                          <div>
-                            <p className="disc-tab-desc">
-                              Derive service time for each activity from its sojourn time distribution in the OCEL log.
-                              No manual input required — choose how the estimate is computed:
-                            </p>
-                            <div className="timing-mode-options">
-                              {[
-                                { value: 'minimum', label: 'Minimum', desc: 'Use the lowest observed sojourn time — tightest lower bound on service time' },
-                                { value: 'p25',     label: 'P25 (25th percentile)', desc: 'Use the 25th percentile sojourn — filters out outliers while staying conservative' },
-                                { value: 'p50',     label: 'P50 (median)',           desc: 'Use the median sojourn — balanced estimate, includes typical waiting time' },
-                              ].map(opt => (
-                                <label key={opt.value} className={`timing-mode-option${serviceTimeMode === opt.value ? ' active' : ''}`}>
-                                  <input
-                                    type="radio"
-                                    name="serviceTimeMode"
-                                    value={opt.value}
-                                    checked={serviceTimeMode === opt.value}
-                                    onChange={() => setServiceTimeMode(opt.value)}
-                                  />
-                                  <div>
-                                    <span className="timing-mode-option-label">{opt.label}</span>
-                                    <span className="timing-mode-option-desc">{opt.desc}</span>
-                                  </div>
-                                </label>
-                              ))}
-                            </div>
-                            {timingDiscoveryResult && (
-                              <p style={{fontSize:'0.78rem',color:'#15803d',marginTop:'0.5rem'}}>
-                                ✓ {Object.keys(timingDiscoveryResult).length} activities discovered
-                              </p>
-                            )}
-                            {timingError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{timingError}</p>}
-                          </div>
-                        )}
-
-                        {activeKey === 'o2o' && (
-                          <div>
-                            <p className="disc-tab-desc">Discover object-to-object cardinality rules from co-occurring objects in events.</p>
-                            {o2oResult && (
-                              <span className="ext-disc-badge badge-ok">✓ {o2oResult.count} rule{o2oResult.count !== 1 ? 's' : ''} applied to model</span>
-                            )}
-                            {o2oError && <p style={{color:'#b91c1c',fontSize:'0.78rem',marginTop:'0.4rem'}}>{o2oError}</p>}
-                            {activeModel && !Array.isArray(activeModel) && (activeModel.o2o_rules||[]).length > 0 && (
-                              <div style={{marginTop:'0.75rem'}}>
-                                <O2ODiagram
-                                  rules={activeModel.o2o_rules}
-                                  otNames={(activeModel.object_types||[]).map(t => typeof t === 'string' ? t : t.name)}
-                                />
-                              </div>
-                            )}
-                          </div>
-                        )}
-
-                        {activeKey === 'startProb' && (() => {
-                          const countTotal = Object.values(discoveryResults.activity_counts||{}).reduce((s,v)=>s+v,0);
-                          const candidates = [
-                            ...(discoveryResults.likely_start_activities||[]),
-                            ...Object.keys(discoveryResults.activity_counts||{})
-                              .filter(a => !(discoveryResults.likely_start_activities||[]).includes(a))
-                              .sort((a,b)=>(discoveryResults.activity_counts[b]||0)-(discoveryResults.activity_counts[a]||0)),
-                          ];
-                          const selected = new Set(discoveryConfig.startActivityProbSelected ?? []);
-                          const toggle = a => {
-                            const next = new Set(selected);
-                            next.has(a) ? next.delete(a) : next.add(a);
-                            setDiscoveryConfig(p => ({ ...p, startActivityProbSelected: [...next] }));
-                          };
-                          return (
-                            <div>
-                              <p className="disc-tab-desc">Apply each selected activity's log frequency as its transition probability from all sources, preserving ratios between existing targets.</p>
-                              <p style={{fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem',fontWeight:600}}>
-                                Select at least one start activity <span style={{color:'#b91c1c'}}>(required)</span>:
-                              </p>
-                              <div className="start-prob-checklist">
-                                {candidates.map((a, i) => (
-                                  <label key={a} className={`start-prob-check-item${selected.has(a) ? ' spc-checked' : ''}`}>
-                                    <input type="checkbox" checked={selected.has(a)} onChange={() => toggle(a)} />
-                                    {i === 0 && <span className="sa-top-badge">★</span>}
-                                    <span className="spc-name">{a}</span>
-                                    <span className="spc-pct">{((discoveryResults.activity_counts[a]||0)/countTotal*100).toFixed(1)}%</span>
-                                  </label>
-                                ))}
-                              </div>
-                              {selected.size === 0 && (
-                                <p style={{fontSize:'0.75rem',color:'#b91c1c',marginTop:'0.35rem'}}>⚠ Select at least one activity to enable this discovery.</p>
-                              )}
-                            </div>
-                          );
-                        })()}
-
-                      </div>
-
-                      <div className="disc-steps-row">
-                        <label className="disc-steps-label">
-                          Health check steps:
-                          <input
-                            type="number"
-                            className="disc-steps-input"
-                            min={10}
-                            max={10000}
-                            value={healthCheckSteps}
-                            onChange={e => setHealthCheckSteps(Math.max(10, parseInt(e.target.value) || 500))}
-                          />
-                        </label>
-                      </div>
-
-                      <button
-                        className="discovery-button"
-                        style={{marginTop:'0.75rem'}}
-                        disabled={
-                          isRunningDiscoveries || !config.ocdeclareFile || !discoveryConfig.eventLogFile ||
-                          (discoveryChecks.startProb && (!discoveryConfig.startActivityProbSelected || discoveryConfig.startActivityProbSelected.length === 0))
-                        }
-                        onClick={runAllDiscoveries}
-                        title={discoveryChecks.startProb && (!discoveryConfig.startActivityProbSelected || discoveryConfig.startActivityProbSelected.length === 0)
-                          ? 'Select at least one start activity in the Start Activity Probability tab'
-                          : undefined}
-                      >
-                        {isRunningDiscoveries ? 'Running discoveries...' : 'Run Discoveries'}
-                      </button>
-                      {isRunningDiscoveries && discoveryProgress.total > 0 && (
-                        <div className="disc-progress">
-                          <div className="spinner spinner-sm"></div>
-                          <span className="disc-progress-label">
-                            {discoveryProgress.currentName}… ({discoveryProgress.current}/{discoveryProgress.total})
-                          </span>
-                          <span className="sim-elapsed-timer" style={{fontSize:'0.85rem',marginLeft:'auto'}}>
-                            {(() => {
-                              const s = discoveryElapsed ?? 0;
-                              return `⏱ ${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`;
-                            })()}
-                          </span>
-                          <div className="disc-progress-bar">
-                            <div className="disc-progress-fill" style={{width:`${(discoveryProgress.current/discoveryProgress.total)*100}%`}} />
-                          </div>
-                        </div>
-                      )}
-                      {!isRunningDiscoveries && discoveryElapsed != null && (
-                        <span className="sim-duration-badge" style={{marginTop:'0.35rem',display:'inline-flex'}}>
-                          ⏱ {Math.floor(discoveryElapsed/60).toString().padStart(2,'0')}:{(discoveryElapsed%60).toString().padStart(2,'0')}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })()}
-
-                {/* C: Post-Processing Result (health check + suggestions) */}
-                <Collapsible
-                  className="postprocessing-result-section"
-                  title="Post-Processing"
-                  badge={healthResult && !healthResult.error ? (() => {
-                    const s = healthResult.summary || {};
-                    return s.errors > 0 ? `${s.errors} errors` : s.warnings > 0 ? `${s.warnings} warnings` : 'healthy';
-                  })() : null}
-                  defaultOpen={false}
-                >
-                  <p style={{fontSize:'0.82rem',color:'#64748b',margin:'0 0 0.75rem'}}>Health check runs automatically after discoveries complete</p>
-
-                  {isCheckingHealth && (
-                    <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginBottom:'0.5rem'}}>
-                      <div className="spinner spinner-sm"></div> Running health check…
-                    </div>
-                  )}
-
-                  {healthResult && !healthResult.error && (() => {
-                    const s = healthResult.summary || {};
-                    const hasErrors   = s.errors > 0;
-                    const hasWarnings = s.warnings > 0;
-                    const badge = `${s.errors} error${s.errors !== 1 ? 's' : ''}, ${s.warnings} warning${s.warnings !== 1 ? 's' : ''}`;
-                    const titleClass = hasErrors ? 'health-title-error' : hasWarnings ? 'health-title-warn' : 'health-title-ok';
-                    return (
-                      <Collapsible
-                        className="health-report-box"
-                        title={<span className={titleClass}>🩺 Constraint Health Report</span>}
-                        badge={badge}
-                        defaultOpen={false}
-                      >
-                        {healthResult.no_input_activities?.length > 0 && (
-                          <Collapsible
-                            className="health-section health-warn"
-                            title={<span className="health-section-title">⚠ Activities with no input constraints</span>}
-                            badge={healthResult.no_input_activities.length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.no_input_activities.map((a, i) => (
-                              <div key={i} className="health-item health-no-input-item">
-                                <span className={`health-badge-${a.is_pure_start ? 'error' : 'warn'}`}>
-                                  {a.is_pure_start ? 'START' : 'NO INPUT'}
-                                </span>
-                                <strong>{a.activity}</strong>
-                                {a.input_bindings.length > 0 ? (
-                                  <ul className="health-no-input-bindings">
-                                    {a.input_bindings.map((b, j) => (
-                                      <li key={j}>
-                                        <code>{b.object_type}</code>
-                                        {b.is_resource && <span className="health-excl-hint"> (resource)</span>}
-                                        {b.created_by.length > 0 && (
-                                          <span className="health-excl-hint"> — created by: <em>{b.created_by.join(', ')}</em></span>
-                                        )}
-                                        {b.deactivated_by.length > 0 && (
-                                          <span className="health-excl-hint"> · deactivated by: <em>{b.deactivated_by.join(', ')}</em></span>
-                                        )}
-                                        {b.created_by.length === 0 && !b.is_resource && (
-                                          <span className="health-excl-hint" style={{color:'#b91c1c'}}> — no activity creates this type</span>
-                                        )}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                ) : (
-                                  <span className="health-reason"> — no input bindings (pure start activity)</span>
-                                )}
-                              </div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {healthResult.cycles?.length > 0 && (
-                          <Collapsible
-                            className="health-section health-error"
-                            title={<span className="health-section-title">🔴 Dependency cycles (deadlock)</span>}
-                            badge={healthResult.cycles.length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.cycles.map((cy, i) => (
-                              <div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {healthResult.permanently_blocked?.length > 0 && (
-                          <Collapsible
-                            className="health-section health-error"
-                            title={<span className="health-section-title">🔴 Activities never reaching the pool</span>}
-                            badge={healthResult.permanently_blocked.length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.permanently_blocked.map((b, i) => (
-                              <div key={i} className="health-item">
-                                <span className="health-badge-error">BLOCKED</span>
-                                <strong>{b.activity}</strong>
-                                {b.exclusion_reason === 'no_objects' && b.exclusion_detail?.[0] && (
-                                  <span className="health-reason health-excl-reason">
-                                    {' '}← no active <code>{b.exclusion_detail[0].binding_type}</code> objects
-                                    {(() => {
-                                      const det = b.exclusion_detail[0];
-                                      const creators    = det.created_by    || [];
-                                      const deactivators = det.deactivated_by || [];
-                                      if (!creators.length && !deactivators.length)
-                                        return <span className="health-excl-hint"> (no activity creates this type or all were deactivated)</span>;
-                                      return (
-                                        <span className="health-excl-hint">
-                                          {' '}(
-                                          {creators.length > 0 && <>created by: <em>{creators.join(', ')}</em></>}
-                                          {creators.length > 0 && deactivators.length > 0 && ' · '}
-                                          {deactivators.length > 0 && <>deactivated by: <em>{deactivators.join(', ')}</em></>}
-                                          )
-                                        </span>
-                                      );
-                                    })()}
-                                  </span>
-                                )}
-                                {b.exclusion_reason === 'guard_filtered' && b.exclusion_detail?.[0] && (
-                                  <span className="health-reason health-excl-reason">
-                                    {' '}← attribute guard filtered all <code>{b.exclusion_detail[0].binding_type}</code> objects
-                                    <span className="health-excl-hint"> (no object satisfies the guard condition)</span>
-                                  </span>
-                                )}
-                                {!b.exclusion_reason && b.top_blocker && b.top_blocker !== 'never attempted' && (
-                                  <span className="health-reason"> ← {b.top_blocker}</span>
-                                )}
-                                {!b.exclusion_reason && (!b.top_blocker || b.top_blocker === 'never attempted') && (
-                                  <span className="health-reason health-never-attempted"> — never attempted (check start activities)</span>
-                                )}
-                              </div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {healthResult.top_blocking_constraints?.filter(c => c.is_chain).length > 0 && (
-                          <Collapsible
-                            className="health-section health-warn"
-                            title={<span className="health-section-title">⚠ Chain constraints (common deadlock source)</span>}
-                            badge={healthResult.top_blocking_constraints.filter(c => c.is_chain).length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.top_blocking_constraints.filter(c => c.is_chain).map((c, i) => (
-                              <div key={i} className="health-item">
-                                <span className="health-badge-warn">{c.count}×</span>
-                                <code className="health-constraint-label">{c.label}</code>
-                                <span className="health-reason"> blocks: {c.blocks.join(', ')}</span>
-                              </div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {healthResult.weak_precedences?.length > 0 && (
-                          <Collapsible
-                            className="health-section health-warn"
-                            title={<span className="health-section-title">⚠ Weak precedences (alternative paths in log)</span>}
-                            badge={healthResult.weak_precedences.length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.weak_precedences.map((wp, i) => (
-                              <div key={i} className="health-item">
-                                <span className="health-badge-warn">{wp.co_occurrence_pct}%</span>
-                                <code className="health-constraint-label">precedence({wp.source}→{wp.target}) each {wp.scope_type}</code>
-                                <span className="health-reason"> {wp.message}</span>
-                              </div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {healthResult.top_blocking_constraints?.filter(c => !c.is_chain).length > 0 && (
-                          <Collapsible
-                            className="health-section health-info"
-                            title={<span className="health-section-title">ℹ Top non-chain blocking constraints</span>}
-                            badge={healthResult.top_blocking_constraints.filter(c => !c.is_chain).length}
-                            defaultOpen={false}
-                          >
-                            {healthResult.top_blocking_constraints.filter(c => !c.is_chain).slice(0, 8).map((c, i) => (
-                              <div key={i} className="health-item">
-                                <span className="health-badge-info">{c.count}×</span>
-                                <code className="health-constraint-label">{c.label}</code>
-                              </div>
-                            ))}
-                          </Collapsible>
-                        )}
-                        {!hasErrors && !hasWarnings && (
-                          <div className="health-ok-msg">✓ No issues detected — model looks healthy.</div>
-                        )}
-                      </Collapsible>
-                    );
-                  })()}
-
-                  {healthResult?.error && (
-                    <div className="error-box" style={{ marginTop: '0.5rem' }}>
-                      <p>Health check error: {healthResult.error}</p>
-                    </div>
-                  )}
-
-                  {/* ── Automated Post-Processing ── */}
-                  <div className="automation-section">
-                    <div className="section-header">
-                      <h2>Automated Post-Processing</h2>
-                      <p>Configure thresholds, generate suggestions from the health check, then selectively apply fixes.</p>
-                    </div>
-
-                    {/* Configuration — collapsible */}
-                    <div className="auto-config-collapsible">
-                      <button className="auto-config-toggle" onClick={() => setAutoConfigOpen(o => !o)}>
-                        <span>{autoConfigOpen ? '▼' : '▶'}</span> Configuration
-                        <span className="auto-config-toggle-hint">
-                          {[
-                            autoConfig.cycleEnabled && 'cycles',
-                            autoConfig.weakEnabled && 'weak',
-                            autoConfig.chainEnabled && 'chain',
-                            autoConfig.o2oEnabled && 'O2O',
-                            autoConfig.nmaxEnabled && 'nmax',
-                            autoConfig.createsMissingEnabled && 'creates',
-                            autoConfig.startRecEnabled && 'start',
-                            autoConfig.redundantEnabled && 'redundant',
-                            autoConfig.unconstrainedEnabled && 'unconstrained',
-                            autoConfig.noInputBindingEnabled && 'no-binding',
-                          ].filter(Boolean).join(' · ')}
-                        </span>
-                      </button>
-                      {autoConfigOpen && (
-                      <div className="auto-config-panel">
-                        <div className="auto-config-row" style={{marginBottom:'0.4rem'}}>
-                          <button className="auto-sel-btn" onClick={() => setAutoConfig(p => ({
-                            ...p, cycleEnabled:true, weakEnabled:true, chainEnabled:true, o2oEnabled:true,
-                            nmaxEnabled:true, createsMissingEnabled:true, startRecEnabled:true,
-                            redundantEnabled:true, unconstrainedEnabled:true, noInputBindingEnabled:true,
-                          }))}>Select all</button>
-                          <button className="auto-sel-btn" style={{marginLeft:'0.3rem'}} onClick={() => setAutoConfig(p => ({
-                            ...p, cycleEnabled:false, weakEnabled:false, chainEnabled:false, o2oEnabled:false,
-                            nmaxEnabled:false, createsMissingEnabled:false, startRecEnabled:false,
-                            redundantEnabled:false, unconstrainedEnabled:false, noInputBindingEnabled:false,
-                          }))}>Deselect all</button>
-                        </div>
-                        {/* Zero-confidence constraint removal — first option */}
-                        <div className="auto-config-row" style={{paddingBottom:'0.4rem',borderBottom:'1px solid #f1f5f9',marginBottom:'0.3rem'}}>
-                          <label
-                            className={`auto-config-label${!logConfResults ? ' disc-option-disabled' : ''}`}
-                            style={{cursor: logConfResults ? 'pointer' : 'not-allowed'}}
-                            title={!logConfResults ? 'Run the OC-Declare Model Check in First Log Insights first' : ''}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={dropZeroConfConstraints}
-                              disabled={!logConfResults}
-                              onChange={e => setDropZeroConfConstraints(e.target.checked)}
-                            />
-                            {' '}Remove 0%-confidence constraints (model check)
-                          </label>
-                          {!logConfResults
-                            ? <span style={{fontSize:'0.68rem',color:'#94a3b8',fontStyle:'italic'}}>run OC-Declare Model Check first</span>
-                            : (() => {
-                                const z = (logConfResults.constraintResults || []).filter(r => r.confidence === 0).length;
-                                return z > 0
-                                  ? <span style={{fontSize:'0.68rem',color:'#b91c1c',fontWeight:600}}>{z} at 0%</span>
-                                  : <span style={{fontSize:'0.68rem',color:'#166534'}}>none at 0%</span>;
-                              })()
-                          }
-                        </div>
-                        {/* Set nmax from bounds check */}
-                        <div className="auto-config-row" style={{paddingBottom:'0.4rem',borderBottom:'1px solid #f1f5f9',marginBottom:'0.3rem'}}>
-                          <label
-                            className={`auto-config-label${!logBoundsResults ? ' disc-option-disabled' : ''}`}
-                            style={{cursor: logBoundsResults ? 'pointer' : 'not-allowed'}}
-                            title={!logBoundsResults ? 'Run the OC-Declare Model Check in First Log Insights first' : ''}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={setNmaxFromBounds}
-                              disabled={!logBoundsResults}
-                              onChange={e => setSetNmaxFromBounds(e.target.checked)}
-                            />
-                            {' '}Set nmax to max observed for unbounded constraints (bounds check)
-                          </label>
-                          {!logBoundsResults
-                            ? <span style={{fontSize:'0.68rem',color:'#94a3b8',fontStyle:'italic'}}>run OC-Declare Model Check first</span>
-                            : (() => {
-                                const n = (logBoundsResults || []).filter(r => !r.hasNmax && r.maxObserved > 0).length;
-                                return n > 0
-                                  ? <span style={{fontSize:'0.68rem',color:'#6366f1',fontWeight:600}}>{n} unbounded with data</span>
-                                  : <span style={{fontSize:'0.68rem',color:'#166534'}}>none applicable</span>;
-                              })()
-                          }
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.cycleEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, cycleEnabled: e.target.checked }))} />
-                            {' '}Cycle removal — remove constraints with nmin ≤
-                          </label>
-                          <input type="number" min={0} max={10} className="auto-config-input"
-                            value={autoConfig.cycleNminThreshold}
-                            disabled={!autoConfig.cycleEnabled}
-                            onChange={e => setAutoConfig(p => ({ ...p, cycleNminThreshold: parseInt(e.target.value) || 0 }))}
-                          />
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.weakEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, weakEnabled: e.target.checked }))} />
-                            {' '}Weak precedences — flag if co-occurrence below
-                          </label>
-                          <input type="number" min={0} max={100} className="auto-config-input"
-                            value={autoConfig.weakThreshold}
-                            disabled={!autoConfig.weakEnabled}
-                            onChange={e => setAutoConfig(p => ({ ...p, weakThreshold: parseInt(e.target.value) || 0 }))}
-                          />
-                          <span className="auto-config-unit">%</span>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.chainEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, chainEnabled: e.target.checked }))} />
-                            {' '}Chain constraints — downgrade if rejection count ≥
-                          </label>
-                          <input type="number" min={1} max={999} className="auto-config-input"
-                            value={autoConfig.chainBlockThreshold}
-                            disabled={!autoConfig.chainEnabled}
-                            onChange={e => setAutoConfig(p => ({ ...p, chainBlockThreshold: parseInt(e.target.value) || 1 }))}
-                          />
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.o2oEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, o2oEnabled: e.target.checked }))} />
-                            {' '}O2O max_links relaxation — suggest fixes when O2O caps block activities
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.nmaxEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, nmaxEnabled: e.target.checked }))} />
-                            {' '}nmax cap — raise/remove response nmax when cap is hit
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.createsMissingEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, createsMissingEnabled: e.target.checked }))} />
-                            {' '}Missing creates — suggest creates=true when no activity creates a required type
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.startRecEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, startRecEnabled: e.target.checked }))} />
-                            {' '}Start activity recommendation — suggest when all activities are blocked at step 0
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.redundantEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, redundantEnabled: e.target.checked }))} />
-                            {' '}Redundant constraints — remove weaker constraints implied by stronger ones
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.unconstrainedEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, unconstrainedEnabled: e.target.checked }))} />
-                            {' '}Unconstrained activities — suggest predecessor constraints for activities with no input arcs
-                          </label>
-                        </div>
-                        <div className="auto-config-row">
-                          <label className="auto-config-label">
-                            <input type="checkbox" checked={autoConfig.noInputBindingEnabled}
-                              onChange={e => setAutoConfig(p => ({ ...p, noInputBindingEnabled: e.target.checked }))} />
-                            {' '}No input binding — suggest adding an object binding to activities that only create objects
-                          </label>
-                        </div>
-                      </div>
-                      )}
-                    </div>
-
-                    {/* Generate button */}
-                    <button
-                      className="auto-generate-btn"
-                      disabled={!healthResult || !!healthResult.error || !activeModel}
-                      onClick={() => {
-                        const suggs = generateSuggestions(healthResult, activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints, logBoundsResults, setNmaxFromBounds);
-                        setAutoSuggestions(suggs);
-                        setAutoSelected(new Set(suggs.map((_, i) => i)));
+                {/* OC-Declare section — shown after OCEL loaded */}
+                {discoveryConfig.eventLogFile && (
+                  <div className="landing-ocdecl-section">
+                    <div
+                      className={`ocel-drop-zone${config.ocdeclareFile ? ' loaded' : ''}`}
+                      style={{minHeight:'70px',padding:'1rem 1.25rem'}}
+                      onClick={e => { if (!e.target.closest('select')) ocdeclFileRef.current?.click(); }}
+                      onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
+                      onDragLeave={e => e.currentTarget.classList.remove('drag-over')}
+                      onDrop={e => {
+                        e.preventDefault(); e.currentTarget.classList.remove('drag-over');
+                        const f = e.dataTransfer.files[0];
+                        if (f) handleFileUpload(f, 'ocdeclare');
                       }}
                     >
-                      {!healthResult || healthResult.error
-                        ? '▶ Run health check first'
-                        : `▶ Generate Suggestions`}
-                    </button>
-
-                    {/* Suggestion list */}
-                    {autoSuggestions.length > 0 && (
-                      <div className="auto-suggestions">
-                        <div className="auto-suggestions-header">
-                          <span className="auto-suggestions-count">{autoSuggestions.length} suggestion{autoSuggestions.length !== 1 ? 's' : ''}</span>
-                          <button className="auto-sel-btn" onClick={() => setAutoSelected(new Set(autoSuggestions.map((_, i) => i)))}>Select all</button>
-                          <button className="auto-sel-btn" onClick={() => setAutoSelected(new Set())}>Select none</button>
+                      {/* File info top-left */}
+                      {config.ocdeclareFile && (
+                        <div className="ocel-drop-zone-info">
+                          <div className="file-name">{config.ocdeclareFile}</div>
+                          {activeModel && !Array.isArray(activeModel) && discoveryResults?.activities && (() => {
+                            const logActs = new Set(discoveryResults.activities);
+                            const modelActs = (activeModel.activities || []).map(a => typeof a === 'string' ? a : a.name);
+                            const missing = modelActs.filter(a => !logActs.has(a));
+                            return (
+                              <div className="file-meta">
+                                {missing.length === 0
+                                  ? <span style={{color:'#15803d'}}>✓ All activities match</span>
+                                  : <span style={{color:'#b45309'}}>⚠ {missing.length} not in log</span>}
+                              </div>
+                            );
+                          })()}
                         </div>
-                        <ul className="auto-suggestion-list">
-                          {autoSuggestions.map((s, i) => (
-                            <li key={s.id} className={`auto-suggestion-item ${autoSelected.has(i) ? 'selected' : ''}`}>
-                              <label className="auto-suggestion-check">
-                                <input type="checkbox"
-                                  checked={autoSelected.has(i)}
-                                  onChange={e => {
-                                    const next = new Set(autoSelected);
-                                    e.target.checked ? next.add(i) : next.delete(i);
-                                    setAutoSelected(next);
-                                  }}
-                                />
-                                <span className={`auto-badge auto-badge-${s.type.toLowerCase()}`}>{s.badgeLabel}</span>
-                                <span className="auto-suggestion-label">{s.label}</span>
-                              </label>
-                              <span className="auto-suggestion-desc">{s.desc}</span>
-                              {s.type === 'ADD_CONSTRAINT' && s.actionFactory && (
-                                <div className="auto-pred-row">
-                                  <label className="auto-pred-label">Predecessor activity:</label>
-                                  <select className="auto-pred-select"
-                                    value={autoConstraintPreds[s.id] || ''}
-                                    onChange={e => setAutoConstraintPreds(p => ({ ...p, [s.id]: e.target.value }))}>
-                                    <option value="">— choose —</option>
-                                    {(activeModel?.activities || [])
-                                      .filter(a => a.name !== s.targetActivity)
-                                      .map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
-                                  </select>
-                                  <span className="auto-pred-hint">→ creates precedence + response</span>
-                                </div>
-                              )}
-                              {s.type === 'ADD_BINDING' && s.actionFactory && (
-                                <div className="auto-pred-row">
-                                  <label className="auto-pred-label">Object type to bind:</label>
-                                  <select className="auto-pred-select"
-                                    value={autoBindingTypes[s.id] || ''}
-                                    onChange={e => setAutoBindingTypes(p => ({ ...p, [s.id]: e.target.value }))}>
-                                    <option value="">— choose —</option>
-                                    {(s.candidateTypes || []).map(t => {
-                                      const creator = s.typeCreatorActivity?.[t];
-                                      return <option key={t} value={t}>{t}{creator ? ` (created by: ${creator})` : ''}</option>;
-                                    })}
-                                  </select>
-                                  <span className="auto-pred-hint">→ adds binding + precedence from creator</span>
-                                </div>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                        <button
-                          className="auto-apply-btn"
-                          disabled={autoSelected.size === 0}
-                          onClick={() => {
-                            let model = { ...activeModel };
-                            autoSuggestions.forEach((s, i) => {
-                              if (!autoSelected.has(i)) return;
-                              if (s.type === 'ADD_CONSTRAINT' && s.actionFactory) {
-                                const pred = autoConstraintPreds[s.id] || '';
-                                model = s.actionFactory(pred)(model);
-                              } else if (s.type === 'ADD_BINDING' && s.actionFactory) {
-                                const otype = autoBindingTypes[s.id] || '';
-                                model = s.actionFactory(otype)(model);
-                              } else {
-                                model = s.action(model);
-                              }
-                            });
-                            handleModelEdit(model);
-                            setAutoSuggestions([]);
-                            setAutoSelected(new Set());
-                            setAutoConstraintPreds({});
-                            setAutoBindingTypes({});
-                          }}
-                        >
-                          ✓ Apply {autoSelected.size} selected change{autoSelected.size !== 1 ? 's' : ''}
-                        </button>
+                      )}
+
+                      {/* Drop prompt or loaded state */}
+                      <div style={{display:'flex',alignItems:'center',justifyContent:'center',paddingTop: config.ocdeclareFile ? '1.5rem' : '0'}}>
+                        {!config.ocdeclareFile && (
+                          <div className="ocel-drop-prompt" style={{gap:'0.2rem'}}>
+                            <div style={{fontSize:'1.4rem'}}>📋</div>
+                            <div className="ocel-drop-label" style={{fontSize:'0.9rem'}}>Drop OC-Declare file here</div>
+                            <div className="ocel-drop-sub">or click to browse (.json)</div>
+                          </div>
+                        )}
                       </div>
-                    )}
 
-                    {autoSuggestions.length === 0 && healthResult && !healthResult.error && (
-                      <p className="auto-no-suggestions">No suggestions — adjust thresholds or review the health report above.</p>
-                    )}
-                  </div>
-                </Collapsible>{/* end Post-Processing collapsible */}
-
-                {/* D: Model Editor — mirrored with simulation tab */}
-                <div style={{marginTop:'1.5rem'}}>
-                  <ModelEditor
-                    model={activeModel && !Array.isArray(activeModel) ? activeModel : null}
-                    probMatrix={activeProbMatrix || {}}
-                    onModelChange={handleModelEdit}
-                    onProbMatrixChange={setActiveProbMatrix}
-                    sourceFile={config.ocdeclareFile}
-                    parameterFiles={parameterFiles}
-                    onLoadParameters={handleLoadParameters}
-                    onSaveParameters={handleSaveParameters}
-                    nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
-                    eventLogFile={discoveryConfig.eventLogFile || ''}
-                    hideParameterButtons={true}
-                    startActivities={config.startActivities}
-                    onUseParameters={() => setExternalTab('simulation')}
-                  />
-                  {(!activeModel || Array.isArray(activeModel)) && (
-                    <div className="model-editor-empty-hint">
-                      Run discoveries or load a parameter file to populate the Model Editor.
+                      <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
+                        onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
                     </div>
-                  )}
-                  {/* Hidden file input for browsing parameter files from ModelEditor */}
-                  <input ref={paramsFileRef} type="file" accept=".json" style={{display:'none'}}
-                    onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'parameters'); e.target.value=''; }} />
-                </div>
-
-              </div>
-            )}{/* end parameter tab */}
-
-            {/* ── SIMULATION TAB ── */}
-            {externalTab === 'simulation' && (
-              <div className="ext-ocel-tab-content">
-
-                {/* Model Editor */}
-                {activeModel && !Array.isArray(activeModel) && (
-                  <ModelEditor
-                    model={activeModel}
-                    probMatrix={activeProbMatrix || {}}
-                    onModelChange={handleModelEdit}
-                    onProbMatrixChange={setActiveProbMatrix}
-                    sourceFile={config.ocdeclareFile}
-                    parameterFiles={parameterFiles}
-                    onLoadParameters={handleLoadParameters}
-                    onSaveParameters={handleSaveParameters}
-                    nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
-                    eventLogFile={discoveryConfig.eventLogFile || ''}
-                    hideParameterButtons={true}
-                  />
+                  </div>
                 )}
 
-                {/* Inline model warnings — compact chips, visible even when editor is collapsed */}
-                {activeModel && !Array.isArray(activeModel) && (() => {
-                  const constraints = activeModel.constraints || [];
-                  const hasIncoming = new Set(constraints.map(c => c.target_activity || c.target));
-                  const startActs = new Set(config.startActivities || []);
-                  const warnings = [];
-                  (activeModel.activities || []).forEach(a => {
-                    const nonCreating = (a.bindings || []).filter(b => !b.creates);
-                    if (nonCreating.length === 0 && !hasIncoming.has(a.name) && !startActs.has(a.name)) {
-                      warnings.push({ label: `No input: "${a.name}"`, tab: 'activities' });
-                    }
-                  });
-                  (activeModel.activities || []).forEach(a => {
-                    if (!(a.bindings || []).length) {
-                      warnings.push({ label: `No bindings: "${a.name}"`, tab: 'activities' });
-                    }
-                  });
-                  if (!warnings.length) return null;
-                  return (
-                    <div className="sim-model-warnings">
-                      {warnings.map((w, i) => (
-                        <span
-                          key={i}
-                          className="sim-model-warn-chip"
-                          title="Click to open Model Editor"
-                          onClick={() => {
-                            // ModelEditor manages its own collapsed state internally;
-                            // scrolling to it is the best we can do from outside
-                            document.querySelector('.model-editor-header')?.click();
-                            document.querySelector('.model-editor-section')?.scrollIntoView({ behavior: 'smooth' });
-                          }}
-                        >
-                          ⚠ {w.label}
-                        </span>
-                      ))}
-                    </div>
-                  );
-                })()}
-
-                {/* Simulation config + run button + results */}
-                <div className={`simulation-section`}>
-                  <div className="section-header">
-                    <h2>Run Simulation</h2>
-                    <p>Configure and run the object-centric simulation</p>
-                  </div>
-
-                  <div className="simulation-config">
-                    {/* Start Activities — collapsed summary if already set, full picker otherwise */}
-                    <div className="form-group">
-                      <label>
-                        Start Activities
-                        <span className="start-activity-hint"> — which activities can initiate new cases</span>
-                      </label>
-                      {config.startActivities.length > 0 ? (
-                        <div className="sa-summary">
-                          {config.startActivities.map(a => (
-                            <span key={a} className="sa-summary-chip">{a}</span>
-                          ))}
-                          <button
-                            className="sa-summary-change"
-                            onClick={() => setConfig(p => ({ ...p, startActivities: [] }))}
-                            title="Clear selection to choose again"
-                          >
-                            ✕ Change
-                          </button>
-                        </div>
-                      ) : ((() => {
-                        const disabled = isSimulating;
-                        const modelActivities = !Array.isArray(activeModel)
-                          ? (activeModel?.activities || []).map(a => ({ activity: a.name, count: null, pct: null }))
-                          : [];
-                        const displayCandidates = startActivityCandidates.length > 0
-                          ? startActivityCandidates
-                          : availableActivities.length > 0
-                          ? availableActivities.map(a => ({ activity: a, count: null, pct: null }))
-                          : modelActivities;
-                        if (displayCandidates.length === 0) {
-                          return <p className="start-activity-empty">Load a model or run discovery to see candidates</p>;
-                        }
-                        const toggle = (act, on) => setConfig(prev => ({
-                          ...prev,
-                          startActivities: on
-                            ? [...prev.startActivities, act]
-                            : prev.startActivities.filter(a => a !== act)
-                        }));
-                        return (
-                          <div className={`start-activity-list ${disabled ? 'sa-disabled' : ''}`}>
-                            <div className="start-activity-controls">
-                              <button className="sa-ctrl-btn" disabled={disabled}
-                                onClick={() => setConfig(prev => ({ ...prev, startActivities: displayCandidates.map(c => c.activity) }))}>
-                                All
-                              </button>
-                              <button className="sa-ctrl-btn" disabled={disabled}
-                                onClick={() => setConfig(prev => ({ ...prev, startActivities: [] }))}>
-                                None
-                              </button>
-                              <span className="sa-selection-count">
-                                {config.startActivities.length} selected
-                              </span>
-                            </div>
-                            <div className="start-activity-items">
-                              {displayCandidates.map((c, i) => {
-                                const checked = config.startActivities.includes(c.activity);
-                                const isTop = i === 0 && c.pct !== null;
-                                return (
-                                  <label key={c.activity} className={`start-activity-item${checked ? ' sa-checked' : ''}`}>
-                                    <input type="checkbox" checked={checked} disabled={disabled}
-                                      onChange={e => toggle(c.activity, e.target.checked)} />
-                                    <span className="sa-name">{c.activity}</span>
-                                    {isTop && <span className="sa-top-badge">★ top</span>}
-                                    {c.pct !== null && <span className="sa-pct">{c.pct}%</span>}
-                                  </label>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        );
-                      })()
-                      )}
-                    </div>
-
-                    {/* Stop conditions — any combination, first hit stops */}
-                    <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
-                      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
-                        Stop conditions <span style={{fontWeight:400,color:'#94a3b8'}}>(first reached stops simulation)</span>
-                      </div>
-                      <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                        {/* Steps */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
-                            <input type="checkbox" checked={config.limitBySteps !== false}
-                              onChange={e => handleConfigChange('limitBySteps', e.target.checked)}
-                              disabled={isSimulating} />
-                            Max steps
-                          </label>
-                          <input type="text" inputMode="numeric"
-                            value={config.maxSteps}
-                            onChange={e => handleConfigChange('maxSteps', parseInt(e.target.value.replace(/\D/,''))||1)}
-                            disabled={isSimulating || config.limitBySteps === false}
-                            style={{width:'90px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
-                              opacity: config.limitBySteps === false ? 0.4 : 1}} />
-                          {discoveryResults?.total_events != null && (
-                            <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{discoveryResults.total_events}</span>
-                          )}
-                        </div>
-                        {/* Simulated time */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
-                            <input type="checkbox" checked={!!config.limitByTime}
-                              onChange={e => handleConfigChange('limitByTime', e.target.checked)}
-                              disabled={isSimulating} />
-                            Simulated time
-                          </label>
-                          <input type="text" inputMode="numeric"
-                            value={config.maxSimTimeValue ?? ''}
-                            placeholder="e.g. 450"
-                            onChange={e => handleConfigChange('maxSimTimeValue', e.target.value === '' ? '' : parseFloat(e.target.value))}
-                            disabled={isSimulating || !config.limitByTime}
-                            style={{width:'70px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
-                              opacity: !config.limitByTime ? 0.4 : 1}} />
-                          <select value={config.maxSimTimeUnit ?? 'days'}
-                            onChange={e => handleConfigChange('maxSimTimeUnit', e.target.value)}
-                            disabled={isSimulating || !config.limitByTime}
-                            style={{fontSize:'0.82rem',padding:'0.2rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',
-                              opacity: !config.limitByTime ? 0.4 : 1}}>
-                            <option value="seconds">seconds</option>
-                            <option value="minutes">minutes</option>
-                            <option value="hours">hours</option>
-                            <option value="days">days</option>
-                            <option value="weeks">weeks</option>
-                          </select>
-                          {discoveryResults?.ocel_time_span_s != null && (() => {
-                            const s = discoveryResults.ocel_time_span_s;
-                            let label;
-                            if (s < 60) label = `${Math.round(s)}s`;
-                            else if (s < 3600) label = `${Math.floor(s/60)}m`;
-                            else if (s < 86400) label = `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-                            else { const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600); label = h > 0 ? `${d}d ${h}h` : `${d}d`; }
-                            return <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{label}</span>;
-                          })()}
-                        </div>
-                        {/* Object traces */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <label style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.82rem',minWidth:'110px',cursor:'pointer'}}>
-                            <input type="checkbox" checked={!!config.limitByTraces}
-                              onChange={e => handleConfigChange('limitByTraces', e.target.checked)}
-                              disabled={isSimulating} />
-                            Completed traces
-                          </label>
-                          <input type="text" inputMode="numeric"
-                            value={config.maxTraces ?? ''}
-                            placeholder="e.g. 100"
-                            onChange={e => handleConfigChange('maxTraces', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
-                            disabled={isSimulating || !config.limitByTraces}
-                            style={{width:'90px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem',
-                              opacity: !config.limitByTraces ? 0.4 : 1}} />
-                          {discoveryResults?.log_object_trace_count != null && (
-                            <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}}>{discoveryResults.log_object_trace_count}</span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="form-row">
-
-                      <div className="form-group">
-                        <label>Random Seed</label>
-                        <input
-                          type="number"
-                          value={config.seed}
-                          onChange={(e) => handleConfigChange('seed', parseInt(e.target.value))}
-                          disabled={isSimulating}
-                        />
-                      </div>
-                    </div>
-
-                    <button
-                      className="simulate-button"
-                      onClick={runSimulation}
-                      disabled={isSimulating || (!config.ocdeclareFile && !activeModel) || config.startActivities.length === 0 || (hasModelWarnings && !modelEdited)}
-                    >
-                      {isSimulating ? 'Simulating...' : 'Run Simulation'}
-                    </button>
-                    {results && !isSimulating && (
-                      <button
-                        className="run-evaluation-btn"
-                        onClick={() => setExternalTab('evaluation')}
-                      >
-                        ▶ Run Evaluation
-                      </button>
-                    )}
-                    {results && !isSimulating && lastRunDuration != null && (
-                      <span className="sim-duration-badge">
-                        ⏱ {Math.floor(lastRunDuration/60).toString().padStart(2,'0')}:{(lastRunDuration%60).toString().padStart(2,'0')}
+                {/* Progress display while running discoveries */}
+                {isRunningDiscoveries && (
+                  <div style={{marginTop:'1rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem'}}>
+                    <div className="disc-progress">
+                      <div className="spinner spinner-sm"></div>
+                      <span className="disc-progress-label">
+                        {discoveryProgress.currentName}… ({discoveryProgress.current}/{discoveryProgress.total + 1})
                       </span>
-                    )}
-                    {hasModelWarnings && (
-                      <div className="model-warnings-notice">
-                        ⚠ Simulation blocked — {bindingWarnings.length} activit{bindingWarnings.length === 1 ? 'y has' : 'ies have'} no object bindings:{' '}
-                        <strong>{bindingWarnings.map(a => a.name).join(', ')}</strong>.
-                        Open the Model Editor → Activities tab to fix.
+                      <div className="disc-progress-bar" style={{flex:1}}>
+                        <div className="disc-progress-fill"
+                          style={{width:`${((discoveryProgress.current)/(discoveryProgress.total+1))*100}%`}} />
                       </div>
-                    )}
+                    </div>
                   </div>
+                )}
 
-                  {/* Simulation Results */}
-                  {error && (
-                    <div className="error-box">
-                      <h3>Simulation Error</h3>
-                      <p>{error}</p>
+                {/* Actions */}
+                <div className="landing-actions">
+                  <button className="start-over-link" onClick={() => {
+                    setWorkflowMode(null);
+                    handleConfigChange('ocdeclareFile', '');
+                    handleDiscoveryConfigChange('eventLogFile', '');
+                    setDiscoveryResults(null);
+                    setExternalTab('parameter');
+                  }}>
+                    ← Start Over
+                  </button>
+                  <button
+                    className="simulate-button"
+                    disabled={!discoveryConfig.eventLogFile || isRunningDiscoveries || isDiscovering || !(discoveryConfig.startActivityProbSelected?.length > 0)}
+                    onClick={runAllDiscoveries}
+                    style={{minWidth:'260px'}}
+                  >
+                    {isRunningDiscoveries ? 'Discovering…' : 'Discover Parameters & Simulation Model →'}
+                  </button>
+                </div>
+
+                {/* Hidden inputs needed elsewhere */}
+                <input ref={paramsFileRef} type="file" accept=".json" style={{display:'none'}}
+                  onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'parameters'); e.target.value=''; }} />
+              </div>
+            )}{/* end landing page */}
+
+            {/* ── MODEL BEHAVIOR TAB ── */}
+            {externalTab === 'behavior' && (
+              <div className="ext-ocel-tab-content">
+                {/* Stat strip */}
+                <div className="behavior-stat-strip">
+                  {[
+                    { label: 'Events Analyzed', val: discoveryResults?.total_events?.toLocaleString() },
+                    { label: 'Object Traces',   val: discoveryResults?.log_object_trace_count?.toLocaleString() },
+                    { label: 'Activity Types',  val: discoveryResults?.activity_count },
+                    { label: 'Transitions',     val: discoveryResults?.transition_count },
+                    { label: 'Log Time Span',   val: (() => {
+                        const s = discoveryResults?.ocel_time_span_s;
+                        if (!s) return null;
+                        if (s < 60) return s + 's';
+                        if (s < 3600) return Math.floor(s/60) + 'm';
+                        if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+                        const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                        return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+                      })() },
+                  ].filter(c => c.val != null).map((c, i) => (
+                    <div key={i} className="behavior-stat-card">
+                      <div className="behavior-stat-val">{c.val}</div>
+                      <div className="behavior-stat-label">{c.label}</div>
                     </div>
-                  )}
+                  ))}
+                </div>
 
-                  {isSimulating && (
-                    <div className="loading-box">
-                      <div className="spinner"></div>
-                      <p>
-                        Running simulation…{' '}
-                        <span className="sim-step-counter">
-                          {config.limitBySteps !== false
-                            ? `step ${liveStepCount ?? 0} / ${config.maxSteps}`
-                            : `step ${liveStepCount ?? 0}`}
-                        </span>
-                      </p>
-                      {(config.limitByTime || liveSimTime != null) && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                          {'🕐 sim '}
-                          {(() => {
-                            const s = liveSimTime ?? 0;
-                            if (s < 60) return `${Math.floor(s)}s`;
-                            if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
-                            if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-                            const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
-                            return `${d}d ${h}h`;
-                          })()}
-                          {config.limitByTime && config.maxSimTimeValue !== '' && (() => {
-                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
-                            const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
-                            const val = config.maxSimTimeValue;
-                            const unit = config.maxSimTimeUnit ?? 'days';
-                            return ` / ${val} ${unit}`;
-                          })()}
-                        </p>
-                      )}
-                      {(config.limitByTraces || liveTraces != null) && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                          {'📦 traces: '}{liveTraces ?? 0}
-                          {config.limitByTraces && config.maxTraces !== '' ? ` / ${config.maxTraces}` : ''}
-                        </p>
-                      )}
-                      <p className="sim-elapsed-timer">
-                        {(() => {
-                          const s = simElapsed ?? 0;
-                          const m = Math.floor(s / 60).toString().padStart(2,'0');
-                          const sec = (s % 60).toString().padStart(2,'0');
-                          return `⏱ ${m}:${sec}`;
-                        })()}
-                      </p>
-                      <button className="sim-stop-btn" onClick={stopSimulation}>
-                        ⏹ Stop
-                      </button>
-                    </div>
-                  )}
+                {!modelBase ? (
+                  <div style={{padding:'2rem',textAlign:'center',color:'#94a3b8'}}>No model loaded yet.</div>
+                ) : (
+                  <div className="behavior-body">
+                    <nav className="behavior-nav">
+                      {[
+                        ['activities',    'Activities'],
+                        ['time',          'Time'],
+                        ['probabilities', 'Probabilities'],
+                        ['constraints',   'Constraints'],
+                        ['o2o',           'O2O Rules'],
+                        ['objects',       'Objects'],
+                      ].map(([key, label]) => (
+                        <button key={key}
+                          className={'behavior-nav-item' + (behaviorSection === key ? ' active' : '')}
+                          onClick={() => setBehaviorSection(key)}>
+                          {label}
+                        </button>
+                      ))}
+                    </nav>
+                    <div className="behavior-content">
 
-                  {results && !isSimulating && (
-                    <div className="results-box">
-                      <h3>Simulation Complete</h3>
-
-                      {(() => {
-                        const firedTypes = results.activity_sequence
-                          ? [...new Set(results.activity_sequence)]
-                          : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
-                        const discoveredTypes = discoveryResults?.activities || [];
-                        const missingTypes = discoveredTypes.filter(a => !firedTypes.includes(a));
-                        const totalEvents = results.events_count;
-                        const coverage = discoveredTypes.length > 0
-                          ? firedTypes.filter(a => discoveredTypes.includes(a)).length
-                          : firedTypes.length;
-
-                        return (
-                          <div className="stat-grid">
-                            <div className="stat-card">
-                              <div className="stat-value">{results.steps_executed}</div>
-                              <div className="stat-label">Steps Executed</div>
-                            </div>
-                            <div className="stat-card">
-                              <div className="stat-value">{totalEvents}</div>
-                              <div className="stat-label">Events Fired</div>
-                            </div>
-                            <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
-                              <div className="stat-value">
-                                {coverage}
-                                {discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}
-                              </div>
-                              <div className="stat-label">Activity Types Fired</div>
-                            </div>
-                            <div className="stat-card">
-                              <div className="stat-value">{results.objects_count}</div>
-                              <div className="stat-label">Objects Created</div>
-                            </div>
-                            {results.sim_time_s != null && (
-                              <div className="stat-card">
-                                <div className="stat-value">
-                                  {(() => {
-                                    const s = results.sim_time_s;
-                                    if (s < 60) return `${Math.round(s)}s`;
-                                    if (s < 3600) return `${Math.floor(s/60)}m`;
-                                    if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-                                    const d = Math.floor(s/86400);
-                                    const h = Math.floor((s%86400)/3600);
-                                    return h > 0 ? `${d}d ${h}h` : `${d}d`;
-                                  })()}
-                                </div>
-                                <div className="stat-label">Simulation Time</div>
-                              </div>
-                            )}
-                            {results.completed_traces != null && (
-                              <div className="stat-card">
-                                <div className="stat-value">{results.completed_traces}</div>
-                                <div className="stat-label">Object Traces</div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-
-                      {/* ── Evaluation ── */}
-                      {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
-                        <Collapsible
-                          className="logs-box"
-                          title="📋 Evaluation"
-                          badge={null}
-                          defaultOpen={false}
-                        >
-
-                      {/* ── sim-coverage-warning ── */}
-                      {(() => {
-                        const _firedTypes = results.activity_sequence
-                          ? [...new Set(results.activity_sequence)]
-                          : (results.metrics?.activity_metrics ? Object.keys(results.metrics.activity_metrics) : []);
-                        const _discoveredTypes = discoveryResults?.activities || [];
-                        const missingTypes = _discoveredTypes.filter(a => !_firedTypes.includes(a));
-                        return missingTypes.length > 0 ? (
-                          <Collapsible
-                            className="sim-coverage-warning"
-                            title={<span className="sim-coverage-warning-title">⚠ {missingTypes.length} activity type{missingTypes.length > 1 ? 's' : ''} never fired</span>}
-                            badge={null}
-                            defaultOpen={false}
-                          >
-                            <ul className="sim-coverage-missing-list">
-                              {missingTypes.map(a => {
-                                const reasons = results.audit?.activity_participation_audit?.[a]?.issues || [];
-                                return (
-                                  <li key={a}>
-                                    <span className="sim-coverage-missing-name">{a}</span>
-                                    {reasons.length > 0 && (
-                                      <ul className="sim-coverage-missing-reasons">
-                                        {reasons.map((r, i) => <li key={i}>{r}</li>)}
-                                      </ul>
-                                    )}
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          </Collapsible>
-                        ) : null;
-                      })()}
-
-                      {/* ── Activity distribution comparison: simulation vs log ── */}
-                      {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
-                        <Collapsible
-                          className="logs-box sim-compare-box"
-                          title="📊 Activity Distribution vs Log"
-                          badge={null}
-                          defaultOpen={false}
-                        >
-                          {() => {
-                            const simMetrics = results.metrics.activity_metrics;
-                            const logCounts = discoveryResults.activity_counts || {};
-                            const logRepeat = discoveryResults.activity_repeat_stats || {};
-                            const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
-                            const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                            const actSeq = results.activity_sequence
-                              ? [...new Set(results.activity_sequence)]
-                              : Object.keys(simMetrics);
-                            const idxOf = {};
-                            actSeq.forEach((n, i) => { idxOf[n] = i; });
-                            const trans = {};
-                            Object.values(results.object_traces || {}).forEach(seq => {
-                              seq.forEach((name, i) => {
-                                if (i < seq.length - 1) {
-                                  const key = `${name} → ${seq[i + 1]}`;
-                                  trans[key] = (trans[key] || 0) + 1;
-                                }
-                              });
-                            });
-                            const preds = {};
-                            actSeq.forEach(n => { preds[n] = []; });
-                            Object.keys(trans).forEach(key => {
-                              const [f, t] = key.split(' → ');
-                              if (f === t || idxOf[f] === undefined || idxOf[t] === undefined) return;
-                              if (idxOf[f] < idxOf[t]) preds[t].push(f);
-                            });
-                            const flowRank = {};
-                            actSeq.forEach(n => {
-                              flowRank[n] = preds[n].length ? Math.max(...preds[n].map(p => flowRank[p] + 1)) : 0;
-                            });
-                            const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                              .sort((a, b) => {
-                                const ra = a in flowRank ? flowRank[a] : 999999;
-                                const rb = b in flowRank ? flowRank[b] : 999999;
-                                return ra !== rb ? ra - rb : a.localeCompare(b);
-                              });
-                            return (
-                              <>
-                                <p className="sim-compare-hint">
-                                  Proportional share of total events (simulation vs log). Identical proportions would mean
-                                  perfect routing fidelity. Difference column shows sim − log in percentage points.
-                                </p>
-                                <table className="metrics-table sim-compare-table">
-                                  <thead>
-                                    <tr>
-                                      <th>Activity</th>
-                                      <th title="Times fired in this simulation run">Sim count</th>
-                                      <th title="Times fired in the input event log">Log count</th>
-                                      <th title="Share of all simulated events">Sim %</th>
-                                      <th title="Share of all log events">Log %</th>
-                                      <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
-                                      <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
-                                      <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {allActs.map(act => {
-                                      const simCount = simMetrics[act]?.execution_count ?? 0;
-                                      const logCount = logCounts[act] ?? 0;
-                                      const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
-                                      const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
-                                      const diff = simPct - logPct;
-                                      const logMeanObj = logRepeat[act]?.mean ?? null;
-                                      const simObjEvents = simActivityObjectCounts[act] ?? null;
-                                      const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
-                                      const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
-                                        : diff > 0 ? 'cmp-over' : 'cmp-under';
-                                      return (
-                                        <tr key={act}>
-                                          <td className="metrics-act-name">{act}</td>
-                                          <td>{simCount || '—'}</td>
-                                          <td>{logCount || '—'}</td>
-                                          <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                                          <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                                          <td className={`cmp-diff ${diffClass}`}>
-                                            {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
-                                          </td>
-                                          <td>{logMeanObj ?? '—'}</td>
-                                          <td>{simMeanObj ?? '—'}</td>
+                      {behaviorSection === 'activities' && (
+                        <div>
+                          <div className="behavior-section-title">Activities</div>
+                          {(modelBase.activities||[]).length > 0 ? (
+                            <table className="behavior-table">
+                              <thead><tr><th>Activity</th><th>Object Type</th><th>Min</th><th>Max</th><th>Creates</th><th>Deactivates</th></tr></thead>
+                              <tbody>
+                                {(modelBase.activities||[]).flatMap(a =>
+                                  (a.bindings||[]).length > 0
+                                    ? (a.bindings||[]).map((b, bi) => (
+                                        <tr key={a.name + '-' + bi}>
+                                          {bi === 0 ? <td rowSpan={(a.bindings||[]).length} style={{fontWeight:600}}>{a.name}</td> : null}
+                                          <td>{b.object_type}</td>
+                                          <td>{b.min_count ?? 1}</td>
+                                          <td>{b.max_count ?? 1}</td>
+                                          <td style={{textAlign:'center'}}>{b.creates ? '✓' : ''}</td>
+                                          <td style={{textAlign:'center'}}>{b.deactivates ? '✓' : ''}</td>
                                         </tr>
-                                      );
-                                    })}
-                                  </tbody>
-                                </table>
-                              </>
-                            );
-                          }}
-                        </Collapsible>
-                      )}
-
-                      {/* ── Object Lifecycle Audit ── */}
-                      {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
-                        <Collapsible
-                          className="logs-box"
-                          title="🔬 Object Lifecycle Audit"
-                          badge={(() => {
-                            const a = results.audit.object_lifecycle_audit;
-                            const resourceTypeSet = new Set(results.resource_types || []);
-                            const issues = Object.entries(a).filter(([otype, v]) => {
-                              if (resourceTypeSet.has(otype) && v.classification === 'accumulating') return false;
-                              return v.classification !== 'healthy';
-                            }).length;
-                            return issues > 0 ? `${issues} issue${issues !== 1 ? 's' : ''}` : 'healthy';
-                          })()}
-                          defaultOpen={false}
-                        >
-                          <table className="audit-table">
-                            <thead>
-                              <tr>
-                                <th>Object Type</th>
-                                <th className="audit-num">Created</th>
-                                <th className="audit-num">Active</th>
-                                <th className="audit-num">Deactivated</th>
-                                <th className="audit-num">Zero-event</th>
-                                <th className="audit-num">Events/instance</th>
-                                <th>Status</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {Object.entries(results.audit.object_lifecycle_audit).map(([otype, a]) => {
-                                const isResource = (results.resource_types || []).includes(otype);
-                                const effectiveClass = isResource && a.classification === 'accumulating' ? 'healthy' : a.classification;
-                                const reuseCount = isResource
-                                  ? Math.round(a.event_count_stats.mean)
-                                  : null;
-                                return (
-                                <tr key={otype} className={`audit-row-${effectiveClass}`}>
-                                  <td className="audit-type">
-                                    {otype}
-                                    {isResource && <span className="binding-resource-badge" style={{marginLeft:'0.3rem',fontSize:'0.68rem'}}>R</span>}
-                                  </td>
-                                  <td className="audit-num">{a.instance_count}</td>
-                                  <td className="audit-num">{a.active_count}</td>
-                                  <td className="audit-num">{a.deactivated_count}</td>
-                                  <td className="audit-num">{a.zero_event_count > 0 ? <span className="audit-warn">{a.zero_event_count}</span> : '0'}</td>
-                                  <td className="audit-num">{a.event_count_stats.min}–{a.event_count_stats.max} (avg {a.event_count_stats.mean})</td>
-                                  <td>
-                                    {isResource && a.classification === 'accumulating' ? (
-                                      <>
-                                        <span className="audit-badge audit-badge-healthy">resource</span>
-                                        <div className="audit-issue" style={{color:'#475569'}}>
-                                          Reused avg {reuseCount}× per instance (resource pool — always active by design)
-                                        </div>
-                                      </>
-                                    ) : (
-                                      <>
-                                        <span className={`audit-badge audit-badge-${effectiveClass}`}>
-                                          {effectiveClass.replace(/_/g, ' ')}
-                                        </span>
-                                        {a.issues.map((iss, i) => (
-                                          <div key={i} className="audit-issue">{iss}</div>
-                                        ))}
-                                      </>
-                                    )}
-                                  </td>
-                                </tr>
-                                );
-                              })}
-                            </tbody>
-                          </table>
-                        </Collapsible>
-                      )}
-
-                      {/* ── Activity Participation Audit ── */}
-                      {results.audit?.activity_participation_audit && Object.keys(results.audit.activity_participation_audit).length > 0 && (
-                        <Collapsible
-                          className="logs-box"
-                          title="🎯 Activity Participation Audit"
-                          badge={(() => {
-                            const a = results.audit.activity_participation_audit;
-                            const issues = Object.values(a).filter(v => v.classification !== 'healthy' && v.classification !== 'never_fired').length;
-                            const neverFired = Object.values(a).filter(v => v.classification === 'never_fired').length;
-                            const parts = [];
-                            if (issues > 0) parts.push(`${issues} issue${issues !== 1 ? 's' : ''}`);
-                            if (neverFired > 0) parts.push(`${neverFired} never fired`);
-                            return parts.length ? parts.join(', ') : 'healthy';
-                          })()}
-                          defaultOpen={false}
-                        >
-                          <table className="audit-table">
-                            <thead>
-                              <tr>
-                                <th>Activity</th>
-                                <th className="audit-num">Firings</th>
-                                <th className="audit-num">Unique objects</th>
-                                <th className="audit-num">Obj/firing</th>
-                                <th className="audit-num">Reuse rate</th>
-                                <th>Status</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {Object.entries(results.audit.activity_participation_audit).map(([act, a]) => (
-                                <tr key={act} className={`audit-row-${a.classification}`}>
-                                  <td className="audit-type">{act}</td>
-                                  <td className="audit-num">{a.execution_count}</td>
-                                  <td className="audit-num">{a.unique_objects ?? '—'}</td>
-                                  <td className="audit-num">
-                                    {a.objects_per_firing
-                                      ? `${a.objects_per_firing.min}–${a.objects_per_firing.max}`
-                                      : '—'}
-                                  </td>
-                                  <td className="audit-num">
-                                    {a.reuse_rate != null
-                                      ? <span className={a.reuse_rate > 0.8 ? 'audit-warn' : ''}>{(a.reuse_rate * 100).toFixed(0)}%</span>
-                                      : '—'}
-                                  </td>
-                                  <td>
-                                    <span className={`audit-badge audit-badge-${a.classification}`}>
-                                      {a.classification.replace(/_/g, ' ')}
-                                    </span>
-                                    {a.dominant_object && (
-                                      <div className="audit-issue">
-                                        Dominated by <code>{a.dominant_object.object_id}</code> ({a.dominant_object.pct}% of firings)
-                                      </div>
-                                    )}
-                                    {a.issues.map((iss, i) => (
-                                      <div key={i} className="audit-issue">{iss}</div>
-                                    ))}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </Collapsible>
-                      )}
-
-                        </Collapsible>
-                      )}{/* end Evaluation */}
-
-                      {results.activity_sequence && results.activity_sequence.length > 0 && (
-                        <div className="flow-chart-section">
-                          <h4>Process Flow</h4>
-                          <FlowChart
-                            activitySequence={results.activity_sequence}
-                            objectTraces={results.object_traces || {}}
-                            objectTypesMap={results.object_types_map || {}}
-                            activityMetrics={results.metrics && results.metrics.activity_metrics ? results.metrics.activity_metrics : null}
-                          />
+                                      ))
+                                    : [<tr key={a.name}><td style={{fontWeight:600}}>{a.name}</td><td colSpan={5} style={{color:'#94a3b8'}}>no bindings</td></tr>]
+                                )}
+                              </tbody>
+                            </table>
+                          ) : <p className="behavior-empty">No activities in model.</p>}
                         </div>
                       )}
 
-                      {/* ── Run Result collapsible ── */}
-                      {results && (
-                        <Collapsible
-                          className="logs-box"
-                          title="Run Result"
-                          defaultOpen={false}
-                        >
-
-                      {results.object_types && (
-                        <Collapsible
-                          className="object-types"
-                          title="Object Type Breakdown"
-                          badge={Object.keys(results.object_types).length}
-                        >
-                          {(() => {
-                            const logStats = discoveryResults?.object_type_stats || {};
-                            const hasLogData = Object.keys(logStats).length > 0;
-                            const allTypes = new Set([
-                              ...Object.keys(results.object_types),
-                              ...Object.keys(logStats),
-                            ]);
-                            return (
-                              <table className="object-type-stats-table">
-                                <thead>
-                                  <tr>
-                                    <th>Object Type</th>
-                                    <th className="octs-num">Simulated</th>
-                                    {hasLogData && <th className="octs-num">In Log</th>}
-                                    {hasLogData && <th className="octs-num" title="Simulated ÷ Log instances">Ratio</th>}
+                      {behaviorSection === 'time' && (
+                        <div>
+                          <div className="behavior-section-title">Time</div>
+                          {modelBase.activity_durations && Object.keys(modelBase.activity_durations).length > 0 ? (
+                            <table className="behavior-table">
+                              <thead><tr><th>Activity</th><th>Distribution</th><th>Mean (s)</th><th>Std (s)</th><th>Min (s)</th><th>Max (s)</th></tr></thead>
+                              <tbody>
+                                {Object.entries(modelBase.activity_durations).map(([act, d]) => (
+                                  <tr key={act}>
+                                    <td>{act}</td>
+                                    <td>{d.dist_type || '—'}</td>
+                                    <td>{d.mean_seconds != null ? Math.round(d.mean_seconds) : '—'}</td>
+                                    <td>{d.std_seconds  != null ? Math.round(d.std_seconds)  : '—'}</td>
+                                    <td>{d.min_seconds  != null ? Math.round(d.min_seconds)  : '—'}</td>
+                                    <td>{d.max_seconds  != null ? Math.round(d.max_seconds)  : '—'}</td>
                                   </tr>
-                                </thead>
-                                <tbody>
-                                  {[...allTypes].sort().map(type => {
-                                    const simCount = results.object_types[type] || 0;
-                                    const logCount = logStats[type]?.count || 0;
-                                    const ratio    = logCount > 0 ? simCount / logCount : null;
-                                    const ratioClass = ratio === null ? '' :
-                                      ratio > 1.5 ? 'ratio-high' : ratio < 0.5 ? 'ratio-low' : 'ratio-ok';
-                                    return (
-                                      <tr key={type}>
-                                        <td className="octs-type">{type}</td>
-                                        <td className="octs-num">{simCount.toLocaleString()}</td>
-                                        {hasLogData && <td className="octs-num">{logCount ? logCount.toLocaleString() : '—'}</td>}
-                                        {hasLogData && (
-                                          <td className="octs-num">
-                                            {ratio !== null
-                                              ? <span className={`obj-ratio ${ratioClass}`}>{ratio.toFixed(2)}×</span>
-                                              : '—'}
-                                          </td>
-                                        )}
-                                      </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                            );
-                          })()}
-                        </Collapsible>
+                                ))}
+                              </tbody>
+                            </table>
+                          ) : <p className="behavior-empty">No timing data discovered.</p>}
+                        </div>
                       )}
 
-                      {results.activity_sequence && results.activity_sequence.length > 0 && (
-                        <Collapsible
-                          className="activity-sequence"
-                          title="Activity Sequence"
-                          badge={results.activity_sequence.length}
-                          defaultOpen={false}
-                        >
-                          <div className="sequence-list">
-                            {results.activity_sequence.slice(0, 200).map((activity, idx) => (
-                              <span key={idx} className="activity-badge">{activity}</span>
-                            ))}
-                            {results.activity_sequence.length > 200 && (
-                              <span className="activity-badge" style={{ borderColor: '#94a3b8', color: '#94a3b8' }}>
-                                … +{results.activity_sequence.length - 200} more
-                              </span>
-                            )}
-                          </div>
-                        </Collapsible>
+                      {behaviorSection === 'probabilities' && (
+                        <div>
+                          <div className="behavior-section-title">Transition Probabilities</div>
+                          {probMatrixBase && Object.keys(probMatrixBase).length > 0 ? (
+                            <table className="behavior-table">
+                              <thead><tr><th>From</th><th>To</th><th>Probability</th></tr></thead>
+                              <tbody>
+                                {Object.entries(probMatrixBase).flatMap(([src, targets]) =>
+                                  Object.entries(targets || {}).filter(([, p]) => p > 0.001).map(([tgt, p], i) => (
+                                    <tr key={src + '-' + tgt}>
+                                      {i === 0 ? <td rowSpan={Object.entries(targets||{}).filter(([,p2])=>p2>0.001).length} style={{fontWeight:600}}>{src}</td> : null}
+                                      <td>{tgt}</td>
+                                      <td>{(p * 100).toFixed(1)}%</td>
+                                    </tr>
+                                  ))
+                                )}
+                              </tbody>
+                            </table>
+                          ) : <p className="behavior-empty">No probability data.</p>}
+                        </div>
                       )}
 
-                      {/* ── Timing Metrics Panel ── */}
-                      {results.metrics && (
-                        <>
-                          {/* Per-Activity */}
-                          {results.metrics.activity_metrics && Object.keys(results.metrics.activity_metrics).length > 0 && (
-                            <Collapsible
-                              className="logs-box timing-metrics-box"
-                              title="⏱ Activity Timing"
-                              badge={Object.keys(results.metrics.activity_metrics).length}
-                              defaultOpen={false}
-                            >
-                              {/* ── Concurrency indicator ── */}
-                              {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
-                                <div className="concurrency-summary">
-                                  <span className="concurrency-summary-title">⚡ Concurrent activity pairs (from log)</span>
-                                  <div className="concurrency-pills">
-                                    {results.concurrency_pairs.map(({ a, b, p }) => (
-                                      <span key={`${a}|||${b}`} className="concurrency-pill" title={`${a} and ${b} fire concurrently ${Math.round(p * 100)}% of the time`}>
-                                        <span className="concurrency-pill-acts">{a} ∥ {b}</span>
-                                        <span className="concurrency-pill-p">{Math.round(p * 100)}%</span>
-                                      </span>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-                              <table className="metrics-table">
-                                <thead>
-                                  <tr>
-                                    <th>Activity</th>
-                                    <th>Count</th>
-                                    <th title="Sampled service duration at each firing">Mean service</th>
-                                    <th>Min service</th>
-                                    <th>Max service</th>
-                                    <th title="Pre-start process waiting time sampled from discovered distribution (DES only)">Mean process wait</th>
-                                    <th title="Longest pre-start process wait">Max process wait</th>
-                                    <th title="Service + process wait (total elapsed per firing)">Mean sojourn</th>
-                                    <th title="Resource-contention wait (time in queue for a busy resource, DES only)">Mean resource wait</th>
-                                    <th title="Mean time the activity was in the candidate pool before being chosen (non-DES only)">Mean wait in pool</th>
+                      {behaviorSection === 'constraints' && (
+                        <div>
+                          <div className="behavior-section-title">Constraints</div>
+                          {(modelBase.constraints||[]).length > 0 ? (
+                            <table className="behavior-table">
+                              <thead><tr><th>Type</th><th>Source</th><th>Target</th><th>Scope</th><th>n≥</th><th>n≤</th></tr></thead>
+                              <tbody>
+                                {(modelBase.constraints||[]).map((c, i) => (
+                                  <tr key={i}>
+                                    <td><span className={'con-type-badge'}>{c.constraint_type}</span></td>
+                                    <td>{c.source_activity || c.source || '—'}</td>
+                                    <td>{c.target_activity || c.target || '—'}</td>
+                                    <td>{c.scope_object_type || '—'}</td>
+                                    <td>{c.nmin ?? '—'}</td>
+                                    <td>{c.nmax ?? '—'}</td>
                                   </tr>
-                                </thead>
+                                ))}
+                              </tbody>
+                            </table>
+                          ) : <p className="behavior-empty">No constraints in model.</p>}
+                        </div>
+                      )}
+
+                      {behaviorSection === 'o2o' && (
+                        <div>
+                          <div className="behavior-section-title">O2O Rules</div>
+                          {(modelBase.o2o_rules||[]).length > 0 ? (
+                            <>
+                              <table className="behavior-table" style={{marginBottom:'1rem'}}>
+                                <thead><tr><th>Source Type</th><th>Target Type</th><th>Min</th><th>Max</th><th>Direction</th></tr></thead>
                                 <tbody>
-                                  {Object.entries(results.metrics.activity_metrics).map(([act, m]) => (
-                                    <tr key={act}>
-                                      <td className="metrics-act-name">{act}</td>
-                                      <td>{m.execution_count}</td>
-                                      <td>{fmtSeconds(m.mean_service_s)}</td>
-                                      <td>{fmtSeconds(m.min_service_s)}</td>
-                                      <td>{fmtSeconds(m.max_service_s)}</td>
-                                      <td>{fmtSeconds(m.mean_process_wait_s)}</td>
-                                      <td>{fmtSeconds(m.max_process_wait_s)}</td>
-                                      <td>{fmtSeconds(m.mean_sojourn_s)}</td>
-                                      <td>{fmtSeconds(m.mean_resource_wait_s)}</td>
-                                      <td>{fmtSeconds(m.mean_wait_in_pool_s)}</td>
+                                  {(modelBase.o2o_rules||[]).map((r, i) => (
+                                    <tr key={i}>
+                                      <td>{r.source_type}</td><td>{r.target_type}</td>
+                                      <td>{r.min_links ?? '—'}</td><td>{r.max_links ?? '—'}</td>
+                                      <td>{r.bidirectional ? '↔' : '→'}</td>
                                     </tr>
                                   ))}
                                 </tbody>
                               </table>
-                            </Collapsible>
-                          )}
-
-                          {/* Per-Object */}
-                          {results.metrics_file && (
-                            <Collapsible
-                              className="logs-box timing-metrics-box"
-                              title="📦 Object Lifetimes"
-                              badge={objectMetricsData ? Object.keys(objectMetricsData).length : results.objects_count}
-                              defaultOpen={false}
-                            >
-                              {() => !objectMetricsData ? (
-                                <div style={{ padding: '0.75rem 0' }}>
-                                  <p style={{ fontSize: '0.82rem', color: '#64748b', marginBottom: '0.5rem' }}>
-                                    Object lifetime data is stored separately to keep the page responsive.
-                                    Click to load ({results.objects_count.toLocaleString()} objects).
-                                  </p>
-                                  <button
-                                    className="timing-discover-btn"
-                                    style={{ fontSize: '0.82rem', padding: '0.4rem 1rem' }}
-                                    disabled={isLoadingObjMetrics}
-                                    onClick={loadObjectMetrics}
-                                  >
-                                    {isLoadingObjMetrics ? 'Loading…' : '⬇ Load Object Lifetimes'}
-                                  </button>
-                                </div>
-                              ) : (
-                                objectMetricsByType.map(([otype, items]) => (
-                                  <Collapsible
-                                    key={otype}
-                                    className="metrics-type-group"
-                                    title={otype}
-                                    badge={items.length}
-                                    defaultOpen={false}
-                                  >
-                                    <table className="metrics-table">
-                                      <thead>
-                                        <tr>
-                                          <th>Object</th>
-                                          <th>Events</th>
-                                          <th>Lifetime</th>
-                                          <th>First event</th>
-                                          <th>Last event</th>
-                                          <th>Activities</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {items.map(([oid, m]) => (
-                                          <tr key={oid}>
-                                            <td className="metrics-act-name">{oid}</td>
-                                            <td>{m.event_count}</td>
-                                            <td>{fmtSeconds(m.lifetime_s)}</td>
-                                            <td className="metrics-ts">{m.first_event_time ? m.first_event_time.replace('T', ' ').slice(0, 19) : '—'}</td>
-                                            <td className="metrics-ts">{m.last_event_time  ? m.last_event_time.replace('T', ' ').slice(0, 19)  : '—'}</td>
-                                            <td className="metrics-acts">
-                                              {m.activities.length > 8
-                                                ? m.activities.slice(0, 8).join(' → ') + ` … +${m.activities.length - 8} more`
-                                                : m.activities.join(' → ')}
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </Collapsible>
-                                ))
-                              )}
-                            </Collapsible>
-                          )}
-                        </>
+                              <O2ODiagram
+                                rules={modelBase.o2o_rules}
+                                otNames={(modelBase.object_types||[]).map(t => typeof t === 'string' ? t : t.name)}
+                              />
+                            </>
+                          ) : <p className="behavior-empty">No O2O rules discovered.</p>}
+                        </div>
                       )}
 
-                        </Collapsible>
-                      )}{/* end Run Result */}
+                      {behaviorSection === 'objects' && (
+                        <div>
+                          <div className="behavior-section-title">Objects</div>
+                          <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
+                            <div style={{flex:1,minWidth:'180px'}}>
+                              <div className="behavior-sub-title">Resources</div>
+                              {(modelBase.resource_types||[]).length > 0 ? (
+                                <table className="behavior-table">
+                                  <thead><tr><th>Type</th><th>Pool Size</th></tr></thead>
+                                  <tbody>
+                                    {(modelBase.resource_types||[]).map(r => (
+                                      <tr key={r}><td>{r}</td><td>{(modelBase.resource_pool_sizes||{})[r] ?? 1}</td></tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              ) : <p className="behavior-empty">No resource types.</p>}
+                            </div>
+                            <div style={{flex:1,minWidth:'180px'}}>
+                              <div className="behavior-sub-title">Attributes</div>
+                              {Object.keys(modelBase.attribute_defaults||{}).length > 0 ? (
+                                <table className="behavior-table">
+                                  <thead><tr><th>Object Type</th><th>Attribute</th><th>Default</th></tr></thead>
+                                  <tbody>
+                                    {Object.entries(modelBase.attribute_defaults||{}).flatMap(([ot, attrs]) =>
+                                      Object.entries(attrs||{}).map(([attr, val], i) => (
+                                        <tr key={ot+'-'+attr}>
+                                          {i===0?<td rowSpan={Object.keys(attrs||{}).length} style={{fontWeight:600}}>{ot}</td>:null}
+                                          <td>{attr}</td><td>{String(val)}</td>
+                                        </tr>
+                                      ))
+                                    )}
+                                  </tbody>
+                                </table>
+                              ) : <p className="behavior-empty">No attributes defined.</p>}
+                            </div>
+                          </div>
+                          <div className="behavior-sub-title">Object Flow</div>
+                          {(modelBase.activities||[]).map(a => {
+                            const bound = (a.bindings||[]);
+                            if (!bound.length) return null;
+                            return bound.map(b => ({ act: a.name, ot: b.object_type, creates: b.creates, deactivates: b.deactivates }));
+                          }).filter(Boolean).flat().reduce((acc, row) => {
+                            (acc[row.ot] = acc[row.ot] || []).push(row);
+                            return acc;
+                          }, {}) && (() => {
+                            const byType = {};
+                            (modelBase.activities||[]).forEach(a => (a.bindings||[]).forEach(b => {
+                              (byType[b.object_type] = byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});
+                            }));
+                            return Object.entries(byType).map(([ot, nodes]) => (
+                              <div key={ot} className="object-flow-type">
+                                <div className="object-flow-type-label">{ot}</div>
+                                <div className="object-flow-track">
+                                  {nodes.map(n => (
+                                    <div key={n.act} className="flow-node">
+                                      <span className="flow-node-name">{n.act}</span>
+                                      {n.creates && <span className="flow-node-badge flow-node-creates">+</span>}
+                                      {n.deactivates && <span className="flow-node-badge flow-node-deactivates">✕</span>}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ));
+                          })()}
+                        </div>
+                      )}
 
                     </div>
-                  )}
+                  </div>
+                )}
+              </div>
+            )}{/* end behavior tab */}
 
-                  {logs.length > 0 && (
-                    <div className="logs-box">
-                      <h4>Simulation Logs</h4>
-                      <div className="logs-content">
-                        {logs.map((log, idx) => (
-                          <div key={idx} className="log-entry">{log}</div>
-                        ))}
+            {/* ── SCENARIO BUILDER TAB ── */}
+            {externalTab === 'scenario' && (
+              <div className="ext-ocel-tab-content">
+                <div className="scenario-layout">
+
+                  {/* LEFT: Model Editor — bound to modelToBe */}
+                  <div className="scenario-editor-col">
+                    <div className="behavior-section-title" style={{marginBottom:'0.5rem'}}>
+                      Model Editor <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>(To-Be — editable)</span>
+                    </div>
+                    {modelToBe ? (
+                      <ModelEditor
+                        model={modelToBe}
+                        probMatrix={probMatrixToBe || {}}
+                        onModelChange={m => { setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
+                        onProbMatrixChange={m => { setProbMatrixToBe(m); setActiveProbMatrix(m); }}
+                        sourceFile={config.ocdeclareFile}
+                        parameterFiles={parameterFiles}
+                        onLoadParameters={handleLoadParameters}
+                        onSaveParameters={handleSaveParameters}
+                        nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
+                        eventLogFile={discoveryConfig.eventLogFile || ''}
+                        hideParameterButtons={true}
+                        startActivities={config.startActivities}
+                        onStartActivitiesChange={acts => setConfig(p => ({...p, startActivities: acts}))}
+                      />
+                    ) : (
+                      <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'2rem',textAlign:'center'}}>Run discoveries first to populate the model.</div>
+                    )}
+
+                    {/* OC-DFG — auto-updates when model/matrix changes */}
+                    {modelToBe && probMatrixToBe && Object.keys(probMatrixToBe).length > 0 && (
+                      <div style={{marginTop:'1.5rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
+                        <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
+                          OC-DFG <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— updates on model changes</span>
+                        </div>
+                        <TransitionFlowChart
+                          matrix={probMatrixToBe}
+                          activityCounts={discoveryResults?.activity_counts || {}}
+                          startActivities={config.startActivities}
+                          traceEndProb={discoveryResults?.trace_end_prob || {}}
+                          likelyEndActivities={discoveryResults?.likely_end_activities || []}
+                          tracePosition={discoveryResults?.trace_position || {}}
+                        />
+                        {/* Constraints — collapsible */}
+                        {(modelToBe.constraints||[]).length > 0 && (
+                          <Collapsible
+                            title={`Constraints (${modelToBe.constraints.length})`}
+                            defaultOpen={false}
+                          >
+                            <div style={{display:'flex',flexDirection:'column',gap:'0.25rem',maxHeight:'180px',overflowY:'auto'}}>
+                              {(modelToBe.constraints||[]).map((c,i) => (
+                                <div key={i} style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.78rem',color:'#334155'}}>
+                                  <span className={`con-type-badge con-${(c.constraint_type||'').toLowerCase().replace(/_/g,'-')}`} style={{flexShrink:0}}>
+                                    {c.constraint_type}
+                                  </span>
+                                  <span>{c.source_activity||c.source||'—'}</span>
+                                  <span style={{color:'#94a3b8'}}>→</span>
+                                  <span>{c.target_activity||c.target||'—'}</span>
+                                  {c.scope_object_type && <span style={{color:'#94a3b8',fontSize:'0.7rem'}}>({c.scope_object_type})</span>}
+                                </div>
+                              ))}
+                            </div>
+                          </Collapsible>
+                        )}
+
+                        {/* Blocking analysis — auto-updates on model change */}
+                        <Collapsible
+                          title={isAnalyzingBlocking ? '🔍 Analyzing blocking constraints…' : `🔍 Blocking Constraints${blockingResult?.blocking?.length ? ` (${blockingResult.blocking.length})` : ''}`}
+                          defaultOpen={false}
+                          badge={blockingResult?.blocking?.length > 0 ? blockingResult.blocking.length : null}
+                        >
+                          {isAnalyzingBlocking && (
+                            <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',padding:'0.5rem 0'}}>
+                              <div className="spinner spinner-sm"></div> Running dry-run analysis…
+                            </div>
+                          )}
+                          {!isAnalyzingBlocking && blockingResult?.error && (
+                            <div style={{fontSize:'0.78rem',color:'#dc2626'}}>{blockingResult.error}</div>
+                          )}
+                          {!isAnalyzingBlocking && blockingResult?.blocking?.length === 0 && (
+                            <div style={{fontSize:'0.82rem',color:'#16a34a',padding:'0.4rem 0'}}>✓ No blocking constraints detected</div>
+                          )}
+                          {!isAnalyzingBlocking && blockingResult?.blocking?.length > 0 && (
+                            <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                              <div style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.25rem'}}>
+                                Based on {blockingResult.total_steps}-step dry run + static check. Pressure = fraction of steps where activity was absent from candidate pool.
+                              </div>
+                              {blockingResult.blocking.map((b, i) => (
+                                <div key={i} style={{background: b.severity==='high'?'#fff1f2':'#fffbeb', border:`1px solid ${b.severity==='high'?'#fecdd3':'#fde68a'}`, borderRadius:'6px', padding:'0.5rem 0.75rem'}}>
+                                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.25rem'}}>
+                                    <span style={{fontWeight:700,fontSize:'0.85rem',color: b.severity==='high'?'#be123c':'#92400e'}}>{b.activity}</span>
+                                    {b.pressure != null && (
+                                      <span style={{fontSize:'0.72rem',background:'#f1f5f9',borderRadius:'4px',padding:'0.1rem 0.4rem',color:'#475569'}}>
+                                        {Math.round(b.pressure*100)}% blocked
+                                      </span>
+                                    )}
+                                    <span style={{fontSize:'0.7rem',color: b.severity==='high'?'#be123c':'#92400e',marginLeft:'auto'}}>{b.severity}</span>
+                                  </div>
+                                  {b.reason?.startsWith('static:') && (
+                                    <div style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.2rem'}}>{b.reason.replace('static: ','')}</div>
+                                  )}
+                                  {(b.related_constraints||[]).length > 0 && (
+                                    <div style={{display:'flex',flexDirection:'column',gap:'0.15rem',marginTop:'0.2rem'}}>
+                                      {b.related_constraints.map((rc,j) => (
+                                        <div key={j} style={{fontSize:'0.72rem',color:'#475569',display:'flex',gap:'0.35rem',alignItems:'center'}}>
+                                          <span className={`con-type-badge con-${(rc.constraint_type||'').toLowerCase().replace(/_/g,'-')}`} style={{fontSize:'0.65rem'}}>{rc.constraint_type}</span>
+                                          <span>{rc.source}</span><span style={{color:'#94a3b8'}}>→</span><span>{rc.target}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </Collapsible>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* RIGHT: Simulation */}
+                  <div className="scenario-sim-col">
+                    <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
+
+                    {/* Run buttons */}
+                    <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem'}}>
+                      <button className="simulate-button" style={{flex:1,fontSize:'0.9rem',padding:'0.7rem',background:'#334155'}}
+                        disabled={isSimulating || !modelBase}
+                        onClick={() => runSimulation('asis')}>
+                        {isSimulating ? 'Running…' : '▶ Run As-Is'}
+                      </button>
+                      <button className="simulate-button" style={{flex:1,fontSize:'0.9rem',padding:'0.7rem'}}
+                        disabled={isSimulating || !modelToBe || config.startActivities.length === 0 || !resultsAsIs}
+                        title={!resultsAsIs ? 'Run As-Is first to establish a baseline' : undefined}
+                        onClick={() => runSimulation('tobe')}>
+                        {isSimulating ? 'Running…' : '▶ Run To-Be'}
+                      </button>
+                    </div>
+
+                    {/* Start Activities */}
+                    <div className="form-group" style={{marginBottom:'0.75rem'}}>
+                      <label>Start Activities</label>
+                      <div className="sa-picker">
+                        {(() => {
+                          const candidates = startActivityCandidates.length > 0 ? startActivityCandidates
+                            : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
+                            : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
+                          return (<>
+                            <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginTop:'0.3rem'}}>
+                              {candidates.map((c, i) => {
+                                const selected = config.startActivities.includes(c.activity);
+                                return (
+                                  <button key={c.activity}
+                                    onClick={() => {
+                                      const n = selected
+                                        ? config.startActivities.filter(a => a !== c.activity)
+                                        : [...config.startActivities, c.activity];
+                                      setConfig(p => ({...p, startActivities: n}));
+                                    }}
+                                    style={{
+                                      padding:'0.3rem 0.7rem',
+                                      fontSize:'0.82rem',
+                                      borderRadius:'20px',
+                                      border: selected ? '2px solid #1e293b' : '1px solid #cbd5e1',
+                                      background: selected ? '#1e293b' : 'white',
+                                      color: selected ? 'white' : '#475569',
+                                      cursor:'pointer',
+                                      fontWeight: selected ? 600 : 400,
+                                      transition:'all 0.12s',
+                                    }}>
+                                    {i === 0 && c.pct !== null && '★ '}{c.activity}
+                                    {c.pct !== null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </>);
+                        })()}
                       </div>
                     </div>
-                  )}
 
-                  {results?.output_file && (
-                    <div className="download-row" style={{marginTop:'0.5rem'}}>
-                      <button className="download-button" onClick={downloadEventLog}>
-                        Download Event Log
-                      </button>
-                      {results.metrics_file && (
-                        <button className="download-button download-button-secondary" onClick={downloadMetrics}>
-                          Download Metrics
-                        </button>
-                      )}
+                    {/* Stop conditions */}
+                    <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
+                      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
+                        Stop conditions
+                      </div>
+                      <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                        {/* Max steps */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max steps</span>
+                          <input type="text" inputMode="numeric" value={config.maxSteps ?? ''}
+                            placeholder="e.g. 500"
+                            onChange={e => handleConfigChange('maxSteps', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
+                            disabled={isSimulating}
+                            style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                          {discoveryResults?.total_events != null && (
+                            <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>{discoveryResults.total_events.toLocaleString()} in log</span>
+                          )}
+                        </div>
+                        {/* Simulated time */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
+                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Simulated time</span>
+                          <input type="text" inputMode="numeric" value={config.maxSimTimeValue ?? ''}
+                            placeholder="e.g. 450"
+                            onChange={e => handleConfigChange('maxSimTimeValue', e.target.value === '' ? '' : parseFloat(e.target.value))}
+                            disabled={isSimulating}
+                            style={{width:'60px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                          <select value={config.maxSimTimeUnit ?? 'days'}
+                            onChange={e => handleConfigChange('maxSimTimeUnit', e.target.value)}
+                            disabled={isSimulating}
+                            style={{fontSize:'0.82rem',padding:'0.2rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px'}}>
+                            <option value="seconds">sec</option><option value="minutes">min</option>
+                            <option value="hours">hrs</option><option value="days">days</option><option value="weeks">wks</option>
+                          </select>
+                          {/* Suggestion from log time span */}
+                          {discoveryResults?.ocel_time_span_s != null && (() => {
+                            const s = discoveryResults.ocel_time_span_s;
+                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                            const unit = config.maxSimTimeUnit ?? 'days';
+                            const val = Math.round(s / unitToS[unit] * 10) / 10;
+                            return (
+                              <button
+                                style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                                onClick={() => handleConfigChange('maxSimTimeValue', val)}
+                                disabled={isSimulating}
+                                title="Use log duration as limit"
+                              >
+                                ↑ log: {val} {unit}
+                              </button>
+                            );
+                          })()}
+                        </div>
+                        {/* Completed traces */}
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Completed traces</span>
+                          <input type="text" inputMode="numeric" value={config.maxTraces ?? ''}
+                            placeholder="e.g. 100"
+                            onChange={e => handleConfigChange('maxTraces', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
+                            disabled={isSimulating}
+                            style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                          {discoveryResults?.log_object_trace_count != null && (
+                            <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>{discoveryResults.log_object_trace_count.toLocaleString()} in log</span>
+                          )}
+                        </div>
+                        <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
+                      </div>
                     </div>
-                  )}
 
-                  {results && results.object_links && (
+                    {/* Seed */}
+                    <div className="form-row" style={{marginBottom:'0.75rem'}}>
+                      <div className="form-group">
+                        <label>Random Seed</label>
+                        <input type="number" value={config.seed} onChange={e => handleConfigChange('seed', parseInt(e.target.value))} disabled={isSimulating} />
+                      </div>
+                    </div>
+
+                    {/* Progress */}
+                    {isSimulating && (
+                      <div className="loading-box" style={{padding:'1.5rem'}}>
+                        <div className="spinner"></div>
+                        <p>Running… <span className="sim-step-counter">step {liveStepCount ?? 0}</span></p>
+                        {liveSimTime != null && (
+                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                            {'🕐 sim '}
+                            {(() => {
+                              const s = liveSimTime;
+                              if (s < 60) return `${Math.floor(s)}s`;
+                              if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
+                              if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                              const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                              return `${d}d ${h}h`;
+                            })()}
+                            {config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && (() => {
+                              const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                              const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
+                              return ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}`;
+                            })()}
+                          </p>
+                        )}
+                        {liveTraces != null && liveTraces > 0 && (
+                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                            {'📦 traces: '}{liveTraces}
+                            {config.maxTraces !== '' && config.maxTraces != null ? ` / ${config.maxTraces}` : ''}
+                          </p>
+                        )}
+                        <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `⏱ ${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
+                        {liveActiveObjects != null && (
+                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>🟢 {liveActiveObjects.toLocaleString()} active objects</p>
+                        )}
+                        {liveObligations != null && (
+                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem',color: liveObligations > 100 ? '#dc2626' : liveObligations > 20 ? '#d97706' : '#64748b'}}>
+                            🔗 {liveObligations.toLocaleString()} pending obligations
+                          </p>
+                        )}
+                        {liveDeactivPerStep != null && (
+                          <p className="sim-elapsed-timer" style={{fontSize:'0.78rem',color:'#64748b'}}>
+                            📤 {liveDeactivPerStep}/step deactivated · ✅ {liveObligFulfilledPerStep ?? 0}/step obligations removed
+                          </p>
+                        )}
+                        <button className="sim-stop-btn" onClick={stopSimulation}>⏹ Stop</button>
+                      </div>
+                    )}
+
+                    {/* Completion banner */}
+                    {!isSimulating && lastCompletedMode && (
+                      <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:'8px',padding:'0.9rem 1rem',display:'flex',alignItems:'center',justifyContent:'space-between',gap:'1rem',marginBottom:'0.75rem'}}>
+                        <div>
+                          <div style={{fontWeight:700,color:'#166534',fontSize:'0.9rem'}}>
+                            ✓ {lastCompletedMode === 'asis' ? 'As-Is' : 'To-Be'} simulation complete
+                          </div>
+                          {lastRunDuration != null && (
+                            <div style={{fontSize:'0.75rem',color:'#15803d',marginTop:'0.15rem'}}>
+                              ⏱ {Math.floor(lastRunDuration/60).toString().padStart(2,'0')}:{(lastRunDuration%60).toString().padStart(2,'0')} wall-clock
+                            </div>
+                          )}
+                        </div>
+                        <button
+                          className="simulate-button"
+                          style={{width:'auto',padding:'0.5rem 1.1rem',fontSize:'0.85rem',background:'#166534'}}
+                          onClick={() => setExternalTab('results')}
+                        >
+                          View Results →
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Model diff */}
+                    {modelBase && modelToBe && (() => {
+                      const diffC = (modelToBe.constraints||[]).length - (modelBase.constraints||[]).length;
+                      const diffO = (modelToBe.o2o_rules||[]).length - (modelBase.o2o_rules||[]).length;
+                      const baseActs = JSON.stringify((modelBase.activities||[]).map(a=>a.name).sort());
+                      const tobeActs = JSON.stringify((modelToBe.activities||[]).map(a=>a.name).sort());
+                      const actChanged = baseActs !== tobeActs;
+                      if (diffC === 0 && diffO === 0 && !actChanged) return null;
+                      return (
+                        <div className="model-diff-summary">
+                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#92400e',marginBottom:'0.3rem'}}>Changes vs Base Model</div>
+                          <div style={{display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
+                            {diffC !== 0 && <span className={'diff-badge '+(diffC>0?'diff-add':'diff-rem')}>{diffC>0?'+':''}{diffC} constraints</span>}
+                            {diffO !== 0 && <span className={'diff-badge '+(diffO>0?'diff-add':'diff-rem')}>{diffO>0?'+':''}{diffO} O2O rules</span>}
+                            {actChanged && <span className="diff-badge diff-mod">activities changed</span>}
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    {/* Post-Processing */}
                     <Collapsible
-                      className="logs-box object-tracer-box"
-                      title="🔗 Object Tracer"
-                      badge={`${results.object_links.length} links`}
+                      className="postprocessing-result-section"
+                      title="Post-Processing"
+                      badge={healthResult && !healthResult.error ? (() => {
+                        const s = healthResult.summary || {};
+                        return s.errors > 0 ? `${s.errors} errors` : s.warnings > 0 ? `${s.warnings} warnings` : 'healthy';
+                      })() : null}
                       defaultOpen={false}
                     >
-                      <p className="tracer-intro">
-                        For each seed object (one not created from another object), this shows the
-                        chain of objects that were linked to it during the run.
-                      </p>
-                      <ObjectTracer
-                        links={results.object_links}
-                        typesMap={results.object_types_map || {}}
-                        objectMetrics={objectMetricsData || {}}
-                        resourceTypes={results.resource_types || []}
-                      />
+                      <p style={{fontSize:'0.82rem',color:'#64748b',margin:'0 0 0.75rem'}}>Health check ran automatically after discoveries</p>
+                      {isCheckingHealth && <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b'}}><div className="spinner spinner-sm"></div> Running…</div>}
+                      {healthResult && !healthResult.error && (() => {
+                        const s = healthResult.summary || {};
+                        const hasErr = s.errors > 0; const hasWarn = s.warnings > 0;
+                        const badge = `${s.errors} error${s.errors!==1?'s':''}, ${s.warnings} warning${s.warnings!==1?'s':''}`;
+                        return (
+                          <Collapsible className="health-report-box"
+                            title={<span className={hasErr?'health-title-error':hasWarn?'health-title-warn':'health-title-ok'}>🩺 Constraint Health Report</span>}
+                            badge={badge} defaultOpen={hasErr||hasWarn}>
+                            {healthResult.cycles?.length > 0 && <div className="health-section health-error"><div className="health-section-title">🔴 Cycles</div>{healthResult.cycles.map((cy,i)=><div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>)}</div>}
+                            {healthResult.no_input_activities?.length > 0 && <div className="health-section health-warn"><div className="health-section-title">⚠ No input constraints</div>{healthResult.no_input_activities.map((a,i)=><div key={i} className="health-item"><span className={`health-badge-${a.is_pure_start?'error':'warn'}`}>{a.is_pure_start?'START':'NO INPUT'}</span><strong>{a.activity}</strong></div>)}</div>}
+                            {healthResult.weak_precedences?.length > 0 && <div className="health-section health-warn"><div className="health-section-title">⚠ Weak precedences</div>{healthResult.weak_precedences.map((wp,i)=><div key={i} className="health-item"><span className="health-badge-warn">WEAK</span>{wp.description}</div>)}</div>}
+                            {!hasErr && !hasWarn && <div style={{color:'#15803d',fontSize:'0.82rem',padding:'0.5rem'}}>✓ No issues found</div>}
+                          </Collapsible>
+                        );
+                      })()}
+                      {healthResult?.error && <div className="error-box"><p>{healthResult.error}</p></div>}
+                      {healthResult && !healthResult.error && (
+                        <div style={{marginTop:'0.75rem',display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
+                          <button className="run-button" onClick={() => {
+                            const suggs = generateSuggestions(healthResult, modelToBe||activeModel, autoConfig, config.startActivities, logConfResults, dropZeroConfConstraints, logBoundsResults, setNmaxFromBounds);
+                            setAutoSuggestions(suggs);
+                            setAutoSelected(new Set(suggs.map((_,i)=>i)));
+                          }}>Generate Suggestions</button>
+                          {autoSuggestions.length > 0 && (
+                            <button className="run-button" onClick={() => {
+                              let model = { ...(modelToBe||activeModel) };
+                              autoSuggestions.forEach((s,i) => {
+                                if (!autoSelected.has(i)) return;
+                                if (s.type==='ADD_CONSTRAINT'&&s.actionFactory) model=s.actionFactory('')(model);
+                                else if (s.type==='ADD_BINDING'&&s.actionFactory) model=s.actionFactory('')(model);
+                                else if (s.action) model=s.action(model);
+                              });
+                              setModelToBe(model); setActiveModel(model); handleModelEdit(model);
+                              setAutoSuggestions([]); setAutoSelected(new Set());
+                            }}>Apply Selected ({[...autoSelected].length})</button>
+                          )}
+                        </div>
+                      )}
+                      {autoSuggestions.length > 0 && (
+                        <div className="auto-suggestions-list" style={{marginTop:'0.5rem'}}>
+                          {autoSuggestions.map((s,i) => (
+                            <label key={i} style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',padding:'0.3rem 0',borderBottom:'1px solid #f1f5f9'}}>
+                              <input type="checkbox" checked={autoSelected.has(i)} onChange={() => setAutoSelected(prev => { const n=new Set(prev); n.has(i)?n.delete(i):n.add(i); return n; })} />
+                              <span className={`auto-badge auto-badge-${(s.type||'').toLowerCase()}`}>{s.type}</span>
+                              <span>{s.label || s.description || s.desc}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )}
                     </Collapsible>
-                  )}
 
-                  {results?.iteration_log_file && (
-                    <div style={{marginTop:'0.5rem'}}>
-                      <button
-                        className="download-button download-button-secondary"
-                        onClick={async () => {
-                          const runId = results.output_file;
-                          const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-                          const lines = (r.data.iteration_logs || []).map(e => JSON.stringify(e)).join('\n');
-                          const blob = new Blob([lines], {type:'application/x-ndjson'});
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url; a.download = `iteration_${runId}.jsonl`;
-                          document.body.appendChild(a); a.click();
-                          document.body.removeChild(a);
-                          URL.revokeObjectURL(url);
-                        }}
-                      >
-                        ⬇ Download Iteration Trace
-                      </button>
-                      <span style={{fontSize:'0.72rem',color:'#94a3b8',marginLeft:'0.5rem'}}>
-                        JSONL — one entry per step: candidates, weights, chosen activity, timestamp
-                      </span>
-                    </div>
-                  )}
-
-                  {/* ── Re-run placeholder ── */}
-                  {results && (
-                    <div style={{ marginTop: '1.5rem', display: 'flex', gap: '0.75rem' }}>
-                      <button
-                        className="discovery-button"
-                        onClick={() => { setResults(null); setLogs([]); }}
-                      >
-                        ↺ Run Again
-                      </button>
-                    </div>
-                  )}
-                </div>{/* end simulation-section (ext-ocel) */}
-
+                  </div>
+                </div>
               </div>
-            )}{/* end simulation tab */}
+            )}{/* end scenario tab */}
+
+            {/* ── RESULTS TAB ── */}
+            {externalTab === 'results' && (
+              <div className="ext-ocel-tab-content">
+
+                {/* ── Comparison header (only when both runs exist) ── */}
+                {resultsAsIs && resultsToBe && (() => {
+                  const fmtDur = s => {
+                    if (s == null) return '—';
+                    if (s < 60) return Math.round(s) + 's';
+                    if (s < 3600) return Math.floor(s/60) + 'm ' + Math.floor(s%60) + 's';
+                    if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+                    const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                    return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+                  };
+                  const pct = (asis, tobe) => {
+                    if (asis == null || tobe == null || asis === 0) return null;
+                    return Math.round((tobe - asis) / Math.abs(asis) * 100);
+                  };
+                  const metrics = [
+                    {
+                      label: 'Avg Trace Duration',
+                      asis: resultsAsIs.avg_trace_lifetime_s,
+                      tobe: resultsToBe.avg_trace_lifetime_s,
+                      fmt: fmtDur,
+                      lowerIsBetter: true,
+                    },
+                    {
+                      label: 'Avg Wait Time',
+                      asis: resultsAsIs.avg_wait_s,
+                      tobe: resultsToBe.avg_wait_s,
+                      fmt: fmtDur,
+                      lowerIsBetter: true,
+                    },
+                    {
+                      label: 'Avg Parallelism',
+                      asis: resultsAsIs.avg_parallelism,
+                      tobe: resultsToBe.avg_parallelism,
+                      fmt: v => v == null ? '—' : v.toFixed(2),
+                      lowerIsBetter: false,
+                    },
+                    {
+                      label: 'Steps',
+                      asis: resultsAsIs.steps_executed,
+                      tobe: resultsToBe.steps_executed,
+                      fmt: v => v == null ? '—' : v.toLocaleString(),
+                      lowerIsBetter: null,
+                    },
+                    {
+                      label: 'Object Traces',
+                      asis: resultsAsIs.completed_traces,
+                      tobe: resultsToBe.completed_traces,
+                      fmt: v => v == null ? '—' : v.toLocaleString(),
+                      lowerIsBetter: null,
+                    },
+                  ];
+                  return (
+                    <div className="results-comparison-header">
+                      {metrics.map(m => {
+                        const p = pct(m.asis, m.tobe);
+                        const diff = m.tobe != null && m.asis != null ? m.tobe - m.asis : null;
+                        const better = m.lowerIsBetter === null ? null
+                          : (m.lowerIsBetter ? diff < 0 : diff > 0);
+                        const color = diff === 0 || diff == null || m.lowerIsBetter === null ? '#64748b'
+                          : better ? '#16a34a' : '#dc2626';
+                        return (
+                          <div key={m.label} className="compare-metric-card">
+                            <div className="compare-metric-label">{m.label}</div>
+                            <div className="compare-metric-asis">{m.fmt(m.asis)}</div>
+                            <div className="compare-metric-tobe" style={{color}}>
+                              {m.fmt(m.tobe)}
+                              {p !== null && (
+                                <span className="compare-metric-pct" style={{color}}>
+                                  {' '}{p > 0 ? '+' : ''}{p}%
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+
+                <div className="results-compare-layout">
+                  {[{label:'As-Is', r:resultsAsIs}, {label:'To-Be', r:resultsToBe}].map(({label, r}) => (
+                    <div key={label} className="run-result-panel">
+                      <div className="run-result-panel-header">{label}</div>
+                      {!r ? (
+                        <div className="run-result-placeholder">Run {label} to see results here</div>
+                      ) : (() => {
+                        const firedTypes = r.activity_sequence ? [...new Set(r.activity_sequence)] : Object.keys(r.metrics?.activity_metrics||{});
+                        const discoveredTypes = discoveryResults?.activities || [];
+                        const coverage = discoveredTypes.length > 0 ? firedTypes.filter(a=>discoveredTypes.includes(a)).length : firedTypes.length;
+                        return (
+                          <div style={{padding:'1rem'}}>
+                            <div className="stat-grid" style={{marginBottom:'1rem'}}>
+                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Steps</div></div>
+                              <div className="stat-card"><div className="stat-value">{r.events_count}</div><div className="stat-label">Events</div></div>
+                              <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')}>
+                                <div className="stat-value">{coverage}{discoveredTypes.length>0&&<span className="stat-value-denom"> / {discoveredTypes.length}</span>}</div>
+                                <div className="stat-label">Activity Types</div>
+                              </div>
+                              <div className="stat-card"><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
+                              {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
+                              {r.completed_traces!=null&&<div className="stat-card"><div className="stat-value">{r.completed_traces}</div><div className="stat-label">Traces</div></div>}
+                            </div>
+                            {r.audit?.object_lifecycle_audit&&(
+                              <Collapsible title="🔬 Object Lifecycle" defaultOpen={false}>
+                                <table className="behavior-table">
+                                  <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
+                                  <tbody>{Object.entries(r.audit.object_lifecycle_audit).map(([ot,a])=>(
+                                    <tr key={ot}><td>{ot}</td><td>{a.instance_count}</td><td>{a.active_count}</td><td>{a.deactivated_count}</td><td><span className={`audit-badge audit-badge-${a.classification}`}>{a.classification}</span></td></tr>
+                                  ))}</tbody>
+                                </table>
+                              </Collapsible>
+                            )}
+                            {label === 'As-Is' && r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
+                              const simMetrics = r.metrics.activity_metrics;
+                              const logCounts = discoveryResults.activity_counts || {};
+                              const logRepeat = discoveryResults.activity_repeat_stats || {};
+                              const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+                              const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+                              // Sort by first appearance in object traces
+                              const flowRank = {};
+                              Object.values(r.object_traces || {}).forEach(trace =>
+                                trace.forEach((act, i) => { if (!(act in flowRank)) flowRank[act] = i; })
+                              );
+                              const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
+                                .sort((a, b) => {
+                                  const ra = a in flowRank ? flowRank[a] : 999999;
+                                  const rb = b in flowRank ? flowRank[b] : 999999;
+                                  return ra !== rb ? ra - rb : a.localeCompare(b);
+                                });
+                              return (
+                                <Collapsible className="logs-box sim-compare-box" title="📊 Activity Distribution vs Log" defaultOpen={false}>
+                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points.</p>
+                                  <table className="metrics-table sim-compare-table">
+                                    <thead>
+                                      <tr>
+                                        <th>Activity</th>
+                                        <th>Sim count</th>
+                                        <th>Log count</th>
+                                        <th>Sim %</th>
+                                        <th>Log %</th>
+                                        <th>Diff</th>
+                                        <th>Log mean /obj</th>
+                                        <th>Sim mean /obj</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {allActs.map(act => {
+                                        const simCount = simMetrics[act]?.execution_count ?? 0;
+                                        const logCount = logCounts[act] ?? 0;
+                                        const simPct = simTotal > 0 ? simCount / simTotal * 100 : 0;
+                                        const logPct = logTotal > 0 ? logCount / logTotal * 100 : 0;
+                                        const diff = simPct - logPct;
+                                        const logMeanObj = logRepeat[act]?.mean ?? null;
+                                        const simObjEvents = simActivityObjectCounts[act] ?? null;
+                                        const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                                        const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
+                                        return (
+                                          <tr key={act}>
+                                            <td className="metrics-act-name">{act}</td>
+                                            <td>{simCount || '—'}</td>
+                                            <td>{logCount || '—'}</td>
+                                            <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                                            <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                                            <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
+                                            <td>{logMeanObj ?? '—'}</td>
+                                            <td>{simMeanObj ?? '—'}</td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </Collapsible>
+                              );
+                            })()}
+                            {r.metrics?.activity_metrics&&(
+                              <Collapsible title="⏱ Activity Timing" defaultOpen={false}>
+                                <table className="behavior-table">
+                                  <thead><tr><th>Activity</th><th>Count</th><th>Mean (s)</th></tr></thead>
+                                  <tbody>{Object.entries(r.metrics.activity_metrics).map(([act,m])=>(
+                                    <tr key={act}><td>{act}</td><td>{m.execution_count}</td><td>{m.mean_service_s!=null?Math.round(m.mean_service_s):'—'}</td></tr>
+                                  ))}</tbody>
+                                </table>
+                              </Collapsible>
+                            )}
+                            {r.output_file && (
+                              <div style={{marginTop:'0.75rem',display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
+                                <a className="download-button"
+                                  href={`/api/download/${encodeURIComponent(r.output_file)}`}
+                                  download={r.output_file}>
+                                  ⬇ Download Event Log
+                                </a>
+                                {r.metrics_file && (
+                                  <a className="download-button download-button-secondary"
+                                    href={`/api/download-metrics/${encodeURIComponent(r.metrics_file)}`}
+                                    download={r.metrics_file}>
+                                    ⬇ Download Metrics
+                                  </a>
+                                )}
+                                {r.iteration_log_file && (
+                                  <button className="download-button download-button-secondary"
+                                    onClick={async () => {
+                                      try {
+                                        const res = await axios.get(`/api/run-history/${encodeURIComponent(r.output_file)}/iteration-log`);
+                                        const blob = new Blob([JSON.stringify(res.data, null, 2)], {type:'application/json'});
+                                        const url = URL.createObjectURL(blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = r.iteration_log_file;
+                                        a.click();
+                                        URL.revokeObjectURL(url);
+                                      } catch {}
+                                    }}>
+                                    ⬇ Download Iteration Trace
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}{/* end results tab */}
 
             {/* ── EVALUATION TAB ── */}
             {externalTab === 'evaluation' && (
               <div className="ext-ocel-tab-content">
-                {!results ? (
+                {!(resultsToBe||resultsAsIs||results) ? (
                   <div className="discovery-section">
-                    <div className="section-header">
-                      <h2>Evaluation</h2>
-                      <p>Run a simulation first to see evaluation results here.</p>
-                    </div>
+                    <div className="section-header"><h2>Evaluation</h2><p>Run a simulation first.</p></div>
                   </div>
                 ) : (
                   <EvaluationTab
-                    results={results}
+                    results={resultsToBe ?? resultsAsIs ?? results}
                     discoveryResults={discoveryResults}
                     activeModel={activeModel}
                     serviceTimeMode={serviceTimeMode}
                     simActivityObjectCounts={simActivityObjectCounts}
-                    onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs || [])).catch(() => {})}
+                    onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs||[])).catch(()=>{})}
                     eventLogFiles={eventLogFiles}
                     handleFileUpload={handleFileUpload}
                     inputLogConfResults={logConfResults}
@@ -7933,8 +7277,7 @@ function App() {
 
         {/* ── Session History ── */}
         {sessionHistory.length > 0 && (
-          <div className="session-history-panel">
-            <h3>🕘 Session History</h3>
+          <Collapsible title="🕘 Session History" badge={sessionHistory.length} defaultOpen={false}>
             <div className="history-list">
               {[...sessionHistory].reverse().map(entry => (
                 <div key={entry.id} className="history-entry">
@@ -7960,7 +7303,7 @@ function App() {
                 </div>
               ))}
             </div>
-          </div>
+          </Collapsible>
         )}
 
         {/* ── Post-Processing section ── */}

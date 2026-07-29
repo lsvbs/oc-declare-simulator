@@ -234,6 +234,7 @@ export default function ModelEditor({
   nmaxSuggestions = {}, eventLogFile = '',
   hideParameterButtons = false,
   startActivities = [],
+  onStartActivitiesChange = null,
   onUseParameters = null,
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
@@ -524,16 +525,11 @@ export default function ModelEditor({
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className={`model-editor ${collapsed ? 'collapsed' : ''}`}>
+    <div className="model-editor">
       {/* ── Header + Tabs ── */}
       <div className="model-editor-header">
         <div className="model-editor-title-row">
-          <h3
-            className="model-editor-toggle"
-            onClick={() => setCollapsed(c => !c)}
-            title={collapsed ? 'Expand the Model Editor' : 'Collapse the Model Editor'}
-          >
-            <span className="model-editor-caret">{collapsed ? '▶' : '▼'}</span>
+          <h3 className="model-editor-toggle">
             Model Editor
           </h3>
           {onUseParameters && (
@@ -577,8 +573,7 @@ export default function ModelEditor({
             </button>
           </div>
         </div>
-        {!collapsed && (
-          <div className="editor-tabs">
+        <div className="editor-tabs">
             {TABS.map(t => (
               <button key={t.id}
                 className={`editor-tab ${activeTab === t.id ? 'active' : ''}`}
@@ -589,11 +584,9 @@ export default function ModelEditor({
               </button>
             ))}
           </div>
-        )}
       </div>
 
       {/* ── Body ── */}
-      {!collapsed && (
       <div className="editor-body">
 
         {/* ━━ ACTIVITIES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
@@ -637,6 +630,21 @@ export default function ModelEditor({
                 <div className="activity-header" onClick={() => toggleAct(act.name)}>
                   <span className={`activity-expand ${expandedActs.has(act.name) ? 'open' : ''}`}>▶</span>
                   <span className="activity-name">{act.name}</span>
+                  {onStartActivitiesChange && (
+                    <button
+                      className={`sa-toggle-label${startActivities.includes(act.name) ? ' active' : ''}`}
+                      onClick={e => {
+                        e.stopPropagation();
+                        const next = startActivities.includes(act.name)
+                          ? startActivities.filter(a => a !== act.name)
+                          : [...startActivities, act.name];
+                        onStartActivitiesChange(next);
+                      }}
+                      title={startActivities.includes(act.name) ? 'Remove as start activity' : 'Mark as start activity'}
+                    >
+                      {startActivities.includes(act.name) ? '★ start' : '☆ start'}
+                    </button>
+                  )}
                   {(act.bindings || []).length === 0 && (
                     <span className="binding-warning-badge" title="This activity has no object bindings and will never fire.">
                       ⚠ No bindings
@@ -1694,7 +1702,6 @@ export default function ModelEditor({
         )}
 
       </div>
-      )}
     </div>
   );
 }

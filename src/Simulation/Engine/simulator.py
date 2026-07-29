@@ -192,6 +192,9 @@ class Simulator:
 
         # Reusable set for obligation dedup — cleared each step, avoids per-step allocation
         self._seen_obligation_keys: set = set()
+        # Delta tracking for iteration log: last-seen cumulative counters
+        self._last_deactivations: int = 0
+        self._last_obligations_fulfilled: int = 0
 
     def _trace(self, event: str, payload: dict) -> None:
         if self.trace_func is None:
@@ -890,10 +893,12 @@ class Simulator:
     def _fulfill_response_obligations(self, executed_event, state: SimulationState) -> None:
         act = executed_event.activity_name
         # Discharge unscoped obligations for this target activity
-        state._obligations_count.pop((act, None), None)
+        if state._obligations_count.pop((act, None), None) is not None:
+            state.total_obligations_fulfilled += 1
         # Discharge scoped obligations for each scope object in this event
         for oid in executed_event.object_ids:
-            state._obligations_count.pop((act, oid), None)
+            if state._obligations_count.pop((act, oid), None) is not None:
+                state.total_obligations_fulfilled += 1
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
         # #8: use pre-indexed dict instead of scanning all constraints
@@ -906,10 +911,15 @@ class Simulator:
                 )
                 for scope_object_id in scope_object_ids:
                     key = (constraint.target_activity, scope_object_id)
-                    state._obligations_count[key] = state._obligations_count.get(key, 0) + 1
+                    # Only create if not already pending — one outstanding obligation
+                    # per (target, scope_object) is sufficient. Re-firing the source
+                    # does not stack additional obligations.
+                    if key not in state._obligations_count:
+                        state._obligations_count[key] = 1
             else:
                 key = (constraint.target_activity, None)
-                state._obligations_count[key] = state._obligations_count.get(key, 0) + 1
+                if key not in state._obligations_count:
+                    state._obligations_count[key] = 1
 
     def _get_event_scope_object_ids(
         self,
@@ -1073,6 +1083,8 @@ class Simulator:
 
     def _des_complete_activity(self, in_prog: InProgressActivity, state: SimulationState) -> None:
         """Write the ExecutedEvent, update indexes, release resources."""
+        # Sample parallelism before releasing (counts this activity + any still running)
+        state.parallelism_samples.append(len(state.in_progress) + 1)
         self._des_release_resources(in_prog.held_resource_ids, state)
         # Remove from _in_progress_objects index
         for oid in in_prog.participating_object_ids:
@@ -1244,12 +1256,38 @@ class Simulator:
                     ],
                     "in_progress_count": len(state.in_progress),
                     "waiting_count": len(state.waiting_queue),
+                    # Active objects per type (counts only, for size tracking)
+                    "active_objects": {
+                        ot: len(ids)
+                        for ot, ids in state._active_by_type.items()
+                        if ids
+                    },
+                    # Obligation summary: target_activity -> number of scope objects with pending obligations
+                    "obligations": (lambda obl: {
+                        act: sum(1 for (a, _) in obl if a == act)
+                        for act in {a for (a, _) in obl}
+                    })(list(state._obligations_count.keys())) if state._obligations_count else {},
+                    # Distinct obligated activities (targets with at least one pending)
+                    "obligated_activities": list({t for (t, _) in state._obligations_count}),
+                    # Total pending obligations count
+                    "total_obligations": len(state._obligations_count),
+                    # Simulated clock time
+                    "sim_time": state.current_time.isoformat() if state.current_time else None,
+                    # Per-step delta counters
+                    "deactivations_this_step":         state.total_deactivations - self._last_deactivations,
+                    "obligations_fulfilled_this_step":  state.total_obligations_fulfilled - self._last_obligations_fulfilled,
+                    "total_deactivations":             state.total_deactivations,
+                    "total_obligations_fulfilled":     state.total_obligations_fulfilled,
+                    "total_obligations_cancelled":     state.total_obligations_cancelled,
                 })
 
             # ── Try to start each feasible candidate (greedy, probabilistic order)
             is_simulation_start = len(state.executed_events) == 0 and not state.in_progress
 
             # Order by transition probability so highest-probability activity starts first
+            # Update delta baseline after tracing so next step's deltas are correct
+            self._last_deactivations = state.total_deactivations
+            self._last_obligations_fulfilled = state.total_obligations_fulfilled
             ordered = list(candidates)
             if len(ordered) > 1:
                 try:
