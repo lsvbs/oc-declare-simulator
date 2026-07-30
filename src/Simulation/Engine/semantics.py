@@ -151,6 +151,13 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
                 return False
             if nmax is not None and a_count > nmax:
                 return False
+            # nmax on a precedence also caps how many times the TARGET may fire:
+            # e.g. precedence(OEC → PUEC, nmax=1) means PUEC fires at most nmax times
+            # per nmax firings of OEC for this object.
+            if nmax is not None:
+                t_count = _count_activity_for_object(state, target, oid)
+                if t_count >= nmax:
+                    return False
             # Cache if permanently satisfied: nmin met and no nmax upper bound
             if prec_satisfied is not None and a_count >= max(nmin, 1) and nmax is None:
                 prec_satisfied.add(cache_key_base + (oid,))

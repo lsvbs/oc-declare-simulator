@@ -15,6 +15,7 @@ from src.Simulation.Engine.candidategeneration import (
     build_candidate_for_object_and_activity,
     is_candidate_semantically_allowed,
 )
+from src.Simulation.Engine.semantics import _count_activity_for_object
 
 
 def _apply_attribute_update(obj, upd: dict) -> None:
@@ -335,25 +336,20 @@ class Simulator:
        #         state.add_object(object_type=object_type)
 
     def _should_stop(self, state: SimulationState) -> bool:
-        # Step limit (always applies as safety cap)
-        if state.step_count >= self.config.max_steps:
-            return True
-        # Time-based limit
+        # Time-based limit (primary)
         max_time = getattr(self.config, 'max_sim_time_s', None)
         if max_time is not None and state.last_generated_timestamp is not None:
             elapsed = (state.last_generated_timestamp - self.config.start_timestamp).total_seconds()
             if elapsed >= max_time:
                 return True
-        # Trace-based limit: count non-resource deactivated objects
+        # Trace-based limit (primary)
         max_tr = getattr(self.config, 'max_traces', None)
         if max_tr is not None:
-            resource_types = state._resource_types or set()
-            completed = sum(
-                1 for obj in state.objects.values()
-                if not obj.active and obj.object_type not in resource_types
-            )
-            if completed >= max_tr:
+            if state.completed_trace_count >= max_tr:
                 return True
+        # Event/step cap (safety backstop — always applies)
+        if state.step_count >= self.config.max_steps:
+            return True
         return False
 
     def _generate_candidates_des(self, state: SimulationState) -> list[Candidate]:
@@ -373,9 +369,15 @@ class Simulator:
 
         max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
         max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
+        no_parallel: set = getattr(self.static_model, "no_parallel_activities", set()) or set()
+        # Pre-compute which no-parallel activities are currently in-progress
+        in_progress_acts: set = {ip.candidate_activity_name for ip in state.in_progress} if no_parallel else set()
 
         for activity in self.static_model.activities:
             if is_simulation_start and activity.name not in start_activity_names:
+                continue
+            # Skip if activity disallows parallelism and is already running
+            if activity.name in no_parallel and activity.name in in_progress_acts:
                 continue
 
             # Find the primary non-resource input binding (first creates=False, non-resource type)
@@ -1126,6 +1128,31 @@ class Simulator:
 
         self._update_obligations_after_event(executed_event, state)
 
+        # Populate precedence satisfied cache on firing: for every precedence
+        # with this activity as target, mark it satisfied for each participating
+        # object so future candidate checks skip the constraint for these objects.
+        prec_satisfied = getattr(state, '_prec_satisfied', None)
+        if prec_satisfied is not None:
+            fired_act = in_prog.candidate_activity_name
+            resource_types = self._resource_types_set
+            for con in self._prec_by_target.get(fired_act, []):
+                if con.scope.kind != 'each':
+                    continue
+                nmax = getattr(con, 'nmax', None)
+                if nmax is not None:
+                    continue  # nmax constraints can be re-violated; don't cache
+                source = con.source_activity
+                nmin = getattr(con, 'nmin', 0)
+                cache_key_base = (source, fired_act, 'each')
+                for oid in in_prog.participating_object_ids:
+                    obj = state.objects.get(oid)
+                    if obj is None or obj.object_type in resource_types:
+                        continue
+                    if obj.object_type != con.scope.object_type:
+                        continue
+                    if _count_activity_for_object(state, source, oid) >= max(nmin, 1):
+                        prec_satisfied.add(cache_key_base + (oid,))
+
         self._trace("applied", {
             "event_id": executed_event.event_id,
             "activity_name": executed_event.activity_name,
@@ -1211,13 +1238,13 @@ class Simulator:
 
         start_activity_names = self._start_names_set
 
-        while state.step_count < self.config.max_steps:
+        while True:
             # Early stop requested by the frontend (Stop button)
             if self.stop_event is not None and self.stop_event.is_set():
                 self._trace("stop", {"reason": "user_stopped", "step_count": state.step_count})
                 break
 
-            # Time / trace stop conditions (checked once per outer loop iteration)
+            # All stop conditions: time (primary), traces (primary), events/steps (safety cap)
             if self._should_stop(state):
                 self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count})
                 break
@@ -1227,13 +1254,9 @@ class Simulator:
                 finishing = heapq.heappop(state.in_progress)
                 self._des_complete_activity(finishing, state)
                 self._des_try_start_waiting(state, finishing.candidate_activity_name)
-                if state.step_count >= self.config.max_steps:
-                    break
                 if self._should_stop(state):
                     break
 
-            if state.step_count >= self.config.max_steps:
-                break
             if self._should_stop(state):
                 self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count})
                 break
@@ -1334,6 +1357,6 @@ class Simulator:
 
             state.current_time = state.in_progress[0].complete_at
 
-        self._trace("stop", {"reason": "max_steps", "step_count": state.step_count,
-                              "max_steps": self.config.max_steps})
+        self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count,
+                              "max_events": self.config.max_steps})
         return state

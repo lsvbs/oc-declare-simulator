@@ -251,6 +251,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             for k, v in (data.get("max_consecutive_per_object") or {}).items()
             if v is not None
         },
+        no_parallel_activities=set(data.get("no_parallel_activities") or []),
         activity_durations=_parse_activity_durations(data.get("activity_durations") or {}),
         attribute_defaults={
             str(k): dict(v)

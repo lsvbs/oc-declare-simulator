@@ -669,10 +669,7 @@ def simulation_status(run_id):
         return jsonify({'error': 'unknown run_id'}), 404
     state = run['state']
     resource_types = set(getattr(state, '_resource_types', set()) or set()) if state else set()
-    completed_traces = sum(
-        1 for obj in state.objects.values()
-        if not obj.active and obj.object_type not in resource_types
-    ) if state else 0
+    completed_traces = getattr(state, 'completed_trace_count', 0) if state else 0
     last_ts = None
     if state and state.last_generated_timestamp:
         try:
@@ -680,8 +677,8 @@ def simulation_status(run_id):
         except Exception:
             pass
     start_ts = run.get('start_timestamp')
-    # Active objects (all types including resources)
-    active_objects = sum(1 for obj in state.objects.values() if obj.active) if state else 0
+    # Active objects: sum of _active_by_type set sizes (O(types) not O(objects))
+    active_objects = sum(len(s) for s in state._active_by_type.values()) if state else 0
     # Pending obligations (number of distinct (target, scope) pairs)
     total_obligations = len(state._obligations_count) if state else 0
     # Cumulative deactivation and fulfillment counters
@@ -723,8 +720,8 @@ def run_simulation():
         ocdeclare_file = data.get('ocdeclareFile')
         event_log_file = data.get('eventLogFile')
         run_id         = data.get('runId')          # optional: enables live status/stop
-        max_steps = int(data.get('maxSteps', 50))
-        print(f"[simulate] maxSteps received: {max_steps}", flush=True)
+        max_steps = int(data.get('maxEvents') or data.get('maxSteps') or 10_000_000)
+        print(f"[simulate] maxEvents received: {max_steps}", flush=True)
         # Time-based limit: simulated seconds to advance (None = use steps only)
         max_sim_time_s = data.get('maxSimTimeS')
         if max_sim_time_s is not None:
@@ -884,6 +881,57 @@ def run_simulation():
             dir=str(METRICS_DIR), prefix='iteration_tmp_'
         )
         _iter_tmp_path = _iter_tmp.name
+
+        # Write model snapshot as the first record so the iteration log is self-contained
+        import json as _json2
+        _model_header = {
+            "event": "model_snapshot",
+            "ocdeclare_file": ocdeclare_file,
+            "start_activities": start_activities,
+            "constraints": [
+                {
+                    "constraint_type": getattr(c, "constraint_type", None),
+                    "source_activity": getattr(c, "source_activity", None),
+                    "target_activity": getattr(c, "target_activity", None),
+                    "scope_kind": getattr(c.scope, "kind", None) if hasattr(c, "scope") and c.scope else None,
+                    "scope_object_type": getattr(c.scope, "object_type", None) if hasattr(c, "scope") and c.scope else None,
+                    "nmin": getattr(c, "nmin", None),
+                    "nmax": getattr(c, "nmax", None),
+                }
+                for c in static_model.constraints
+            ],
+            "activities": [
+                {
+                    "name": a.name,
+                    "bindings": [
+                        {
+                            "object_type": b.object_type,
+                            "creates": getattr(b, "creates", False),
+                            "deactivates": getattr(b, "deactivates", False),
+                            "min_count": getattr(b, "min_count", 1),
+                            "max_count": getattr(b, "max_count", None),
+                        }
+                        for b in (a.bindings or [])
+                    ],
+                }
+                for a in static_model.activities
+            ],
+            "o2o_rules": [
+                {
+                    "source_type": getattr(r, "source_type", None),
+                    "target_type": getattr(r, "target_type", None),
+                    "min_links": getattr(r, "min_links", None),
+                    "max_links": getattr(r, "max_links", None),
+                    "bidirectional": getattr(r, "bidirectional", False),
+                }
+                for r in (static_model.o2o_rules or [])
+            ],
+            "resource_types": list(static_model.resource_types or []),
+            "resource_pool_sizes": dict(static_model.resource_pool_sizes or {}),
+            "no_parallel_activities": list(getattr(static_model, "no_parallel_activities", set()) or []),
+        }
+        _iter_tmp.write(_json2.dumps(_model_header) + '\n')
+        _iter_tmp.flush()
 
         def trace_func(event: str, payload: dict):
             if event == "iteration":
@@ -1112,10 +1160,7 @@ def run_simulation():
                 'audit': audit,
                 'concurrency_pairs': concurrency_pairs,
                 'resource_types': list(static_model.resource_types or []),
-                'completed_traces': sum(
-                    1 for obj in final_state.objects.values()
-                    if not obj.active and obj.object_type not in (static_model.resource_types or set())
-                ),
+                'completed_traces': getattr(final_state, 'completed_trace_count', 0),
                 'sim_time_s': (
                     (final_state.last_generated_timestamp - config.start_timestamp).total_seconds()
                     if final_state.last_generated_timestamp else None

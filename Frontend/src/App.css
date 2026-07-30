@@ -4099,3 +4099,29 @@ details[open] .formula-summary::before { content: '▼ '; }
   color: white;
   border-color: #1e293b;
 }
+
+/* ── Constraint tab filter buttons ──────────────────────────────────────── */
+.con-filter-btn {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.6rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  background: white;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.con-filter-btn:hover { background: #f1f5f9; border-color: #cbd5e1; }
+.con-filter-btn.active { background: #1e293b; color: white; border-color: #1e293b; }
+.con-filter-badge {
+  font-size: 0.68rem;
+  background: #e2e8f0;
+  color: #475569;
+  border-radius: 10px;
+  padding: 0.05rem 0.35rem;
+  font-weight: 600;
+}
+.con-filter-btn.active .con-filter-badge { background: rgba(255,255,255,0.25); color: white; }

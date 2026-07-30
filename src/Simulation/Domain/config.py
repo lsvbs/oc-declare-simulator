@@ -22,7 +22,7 @@ class SimulationConfig:
     """
     Global simulation settings that are not part of the static process model.
     """
-    max_steps: int = 100
+    max_steps: int = 10_000_000  # safety cap (event count); time is the primary stop driver
     max_sim_time_s: Optional[float] = None
     # Trace-based limit: stop when this many objects have been deactivated (completed their lifecycle)
     max_traces: Optional[int] = None

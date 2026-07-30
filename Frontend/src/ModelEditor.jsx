@@ -432,11 +432,46 @@ export default function ModelEditor({
     { id: 'flow',         label: 'Object Flow',  count: null },
   ];
 
-  const filteredConstraints = constraints.filter(c =>
-    !conFilter ||
-    c.source_activity?.toLowerCase().includes(conFilter.toLowerCase()) ||
-    c.target_activity?.toLowerCase().includes(conFilter.toLowerCase())
-  );
+  // Pre-compute special filter sets
+  const activitiesWithSelfLoop = useMemo(() => {
+    const set = new Set();
+    constraints.forEach(c => {
+      if (c.source_activity && c.target_activity && c.source_activity === c.target_activity) {
+        set.add(c.source_activity);
+      }
+    });
+    return set;
+  }, [constraints]);
+
+  const activitiesWithMultipleResponsesBefore = useMemo(() => {
+    // Activities that appear as target in 2+ response/chain_response constraints
+    const counts = {};
+    constraints.forEach(c => {
+      if (['response','chain_response','alternate_response'].includes(c.constraint_type) && c.target_activity) {
+        counts[c.target_activity] = (counts[c.target_activity] || 0) + 1;
+      }
+    });
+    return new Set(Object.keys(counts).filter(a => counts[a] >= 2));
+  }, [constraints]);
+
+  const [conSpecialFilter, setConSpecialFilter] = useState(''); // '' | 'selfloop' | 'multi_response'
+
+  const filteredConstraints = constraints.filter(c => {
+    const textMatch = !conFilter ||
+      c.source_activity?.toLowerCase().includes(conFilter.toLowerCase()) ||
+      c.target_activity?.toLowerCase().includes(conFilter.toLowerCase());
+    if (!textMatch) return false;
+    if (conSpecialFilter === 'selfloop') {
+      return c.source_activity === c.target_activity ||
+        activitiesWithSelfLoop.has(c.source_activity) ||
+        activitiesWithSelfLoop.has(c.target_activity);
+    }
+    if (conSpecialFilter === 'multi_response') {
+      return activitiesWithMultipleResponsesBefore.has(c.source_activity) ||
+        activitiesWithMultipleResponsesBefore.has(c.target_activity);
+    }
+    return true;
+  });
 
   // ── Timing helpers ────────────────────────────────────────────────────────
   const DIST_TYPES = ['lognormal', 'normal', 'exponential', 'fixed'];
@@ -645,6 +680,26 @@ export default function ModelEditor({
                       {startActivities.includes(act.name) ? '★ start' : '☆ start'}
                     </button>
                   )}
+                  {/* Allow parallel toggle — exempt resource-only activities */}
+                  {!(act.bindings||[]).every(b => (model.resource_types||[]).includes(b.object_type)) && (() => {
+                    const noParallel = (model.no_parallel_activities || []);
+                    const isNoParallel = noParallel.includes(act.name);
+                    return (
+                      <button
+                        className={`sa-toggle-label${isNoParallel ? ' active' : ''}`}
+                        onClick={e => {
+                          e.stopPropagation();
+                          const next = isNoParallel
+                            ? noParallel.filter(a => a !== act.name)
+                            : [...noParallel, act.name];
+                          onModelChange({ ...model, no_parallel_activities: next });
+                        }}
+                        title={isNoParallel ? 'Currently: only one instance at a time. Click to allow parallel.' : 'Currently: unlimited parallel. Click to restrict to one at a time.'}
+                      >
+                        {isNoParallel ? '⊘ no parallel' : '⇉ parallel'}
+                      </button>
+                    );
+                  })()}
                   {(act.bindings || []).length === 0 && (
                     <span className="binding-warning-badge" title="This activity has no object bindings and will never fire.">
                       ⚠ No bindings
@@ -1074,6 +1129,28 @@ export default function ModelEditor({
                 onChange={e => setConFilter(e.target.value)}
               />
               <span className="filter-count">{filteredConstraints.length} / {constraints.length}</span>
+            </div>
+            <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'0.5rem'}}>
+              <button
+                className={`con-filter-btn${conSpecialFilter === '' ? ' active' : ''}`}
+                onClick={() => setConSpecialFilter('')}
+              >All</button>
+              <button
+                className={`con-filter-btn${conSpecialFilter === 'selfloop' ? ' active' : ''}`}
+                onClick={() => setConSpecialFilter(conSpecialFilter === 'selfloop' ? '' : 'selfloop')}
+                title="Activities that have constraints where source and target are the same activity"
+              >
+                Self-loop constraints
+                {activitiesWithSelfLoop.size > 0 && <span className="con-filter-badge">{activitiesWithSelfLoop.size}</span>}
+              </button>
+              <button
+                className={`con-filter-btn${conSpecialFilter === 'multi_response' ? ' active' : ''}`}
+                onClick={() => setConSpecialFilter(conSpecialFilter === 'multi_response' ? '' : 'multi_response')}
+                title="Activities that are targets of 2+ response constraints"
+              >
+                Multiple responses before
+                {activitiesWithMultipleResponsesBefore.size > 0 && <span className="con-filter-badge">{activitiesWithMultipleResponsesBefore.size}</span>}
+              </button>
             </div>
 
             <div className="constraints-list">

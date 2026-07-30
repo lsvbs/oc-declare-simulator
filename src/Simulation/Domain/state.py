@@ -151,6 +151,9 @@ class SimulationState:
     total_deactivations: int = 0
     total_obligations_fulfilled: int = 0   # target activity actually fired
     total_obligations_cancelled: int = 0   # cleared because scope object deactivated
+    # Running count of deactivated non-resource objects (= completed traces)
+    # Maintained in deactivate_object — avoids O(n) scan in _should_stop
+    completed_trace_count: int = 0
     # Precedence satisfied cache: set of (source_activity, target_activity, scope_kind, object_id)
     # Once a precedence is permanently satisfied for an object it is never rechecked.
     # Only cached when nmax is None (no upper bound) — nmax constraints can become
@@ -208,6 +211,10 @@ class SimulationState:
             del self._obligations_count[k]
         self.total_deactivations += 1
         self.total_obligations_cancelled += len(keys_to_remove)
+        # Increment completed trace count for non-resource objects
+        resource_types: set = getattr(self, '_resource_types', set()) or set()
+        if obj.object_type not in resource_types:
+            self.completed_trace_count += 1
         # Clear precedence satisfied cache entries for this object
         self._prec_satisfied = {k for k in self._prec_satisfied if k[-1] != object_id}
 

@@ -4067,6 +4067,8 @@ function App() {
   const [dropZeroConfConstraints, setDropZeroConfConstraints] = useState(false);
   // Whether to set nmax to max observed for unbounded constraints
   const [setNmaxFromBounds, setSetNmaxFromBounds] = useState(false);
+  // Whether to apply nmin/nmax discovered from model check to constraints
+  const [applyNminNmaxFromModelCheck, setApplyNminNmaxFromModelCheck] = useState(false);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
   const [lifecycleError, setLifecycleError] = useState(null);
   const [resourceResult, setResourceResult] = useState(null);     // [{type, instance_count}]
@@ -4540,7 +4542,7 @@ function App() {
       // Compute max_sim_time_s — active when value is filled in (no checkbox needed)
       const unitToS = { seconds: 1, minutes: 60, hours: 3600, days: 86400, weeks: 604800 };
       // Steps: active when maxSteps has a value, else safety cap
-      const effectiveMaxSteps = config.maxSteps && parseInt(config.maxSteps) > 0
+      const effectiveMaxEvents = config.maxSteps && parseInt(config.maxSteps) > 0
         ? parseInt(config.maxSteps)
         : 10_000_000;
       const maxSimTimeS = config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && !isNaN(parseFloat(config.maxSimTimeValue))
@@ -4552,7 +4554,7 @@ function App() {
 
       const simulationData = {
         ...config,
-        maxSteps: effectiveMaxSteps,
+        maxEvents: effectiveMaxEvents,
         runId,
         eventLogFile: discoveryConfig.eventLogFile,
         maxSimTimeS,
@@ -4673,6 +4675,101 @@ function App() {
     });
   }, [discoveryConfig.startActivityProbSelected, externalTab]); // also re-sync when switching to simulation tab
 
+  // Standalone OC-Declare model check — runs the same logic as LogModelConformance
+  // Returns { constraintResults, globalConformance, globalSatisfied, totalEvents }
+  const runLogModelCheck = useCallback(async (model, eventLogFile) => {
+    if (!model || Array.isArray(model) || !eventLogFile) return null;
+    const constraints = model.constraints || [];
+    if (!constraints.length) return null;
+    try {
+      const r = await axios.get(`/api/eventlog-events?file=${encodeURIComponent(eventLogFile)}`);
+      const evts = r.data.events || [];
+      const tmap = r.data.object_types_map || {};
+      const n = evts.length;
+      const eventObjs = evts.map(e => new Set(e.object_ids || []));
+      const temporalFilter = (srcIdx, ctype) => {
+        const srcTs = evts[srcIdx].timestamp;
+        if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
+        if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
+        const result = [];
+        for (let j = 0; j < n; j++) {
+          if (['response','chain_response','succession','alternate_response',
+               'precedence','alternate_precedence'].includes(ctype)) {
+            if (evts[j].timestamp >= srcTs) result.push(j);
+          } else { result.push(j); }
+        }
+        return result;
+      };
+      const satisfies = (i, c) => {
+        if (evts[i].activity !== c.source_activity) return true;
+        const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
+        const tgt = c.target_activity;
+        const scope = c.scope || { kind: 'global' };
+        const temporal = temporalFilter(i, c.constraint_type);
+        const tgtCandidates = temporal.filter(j => evts[j].activity === tgt);
+        if (scope.kind === 'global') {
+          const cnt = tgtCandidates.length;
+          if (['not_coexistence','not_succession'].includes(c.constraint_type)) return cnt === 0;
+          return cnt >= nmin && (nmax == null || cnt <= nmax);
+        }
+        const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
+        if (scopeObjs.length === 0) return true;
+        for (const oid of scopeObjs) {
+          const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
+          const cnt = matching.length;
+          if (['not_coexistence','not_succession'].includes(c.constraint_type)) {
+            if (cnt > 0) return false;
+          } else {
+            if (cnt < nmin) return false;
+            if (nmax != null && cnt > nmax) return false;
+          }
+        }
+        return true;
+      };
+      const results = [];
+      let globalSatisfied = new Array(n).fill(true);
+      for (let idx = 0; idx < constraints.length; idx++) {
+        const c = constraints[idx];
+        const sourceEvents = evts.map((e,i) => e.activity === c.source_activity ? i : -1).filter(i => i >= 0);
+        const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+        if (sourceEvents.length === 0) {
+          results.push({ label, confidence: 1, satisfied: 0, total: 0, constraint: c,
+                         observedNmin: null, observedNmax: null });
+          continue;
+        }
+        const scope = c.scope || { kind: 'global' };
+        let satisfied = 0;
+        // Track target repetitions per (source event, scope object) to derive observed nmin/nmax
+        const repCounts = []; // all observed repetition counts across source events × scope objects
+        for (const i of sourceEvents) {
+          const temporal = temporalFilter(i, c.constraint_type);
+          const tgtCandidates = temporal.filter(j => evts[j].activity === c.target_activity);
+          if (scope.kind === 'each' && scope.object_type) {
+            const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
+            if (scopeObjs.length > 0) {
+              for (const oid of scopeObjs) {
+                repCounts.push(tgtCandidates.filter(j => eventObjs[j].has(oid)).length);
+              }
+            }
+          } else {
+            repCounts.push(tgtCandidates.length);
+          }
+          if (satisfies(i, c)) { satisfied++; } else { globalSatisfied[i] = false; }
+        }
+        const observedNmin = repCounts.length > 0 ? Math.min(...repCounts) : null;
+        const observedNmax = repCounts.length > 0 ? Math.max(...repCounts) : null;
+        const confidence = sourceEvents.length > 0 ? satisfied / sourceEvents.length : 1;
+        results.push({ label, confidence, satisfied, total: sourceEvents.length, constraint: c,
+                       observedNmin, observedNmax });
+      }
+      const globalCount = globalSatisfied.filter(Boolean).length;
+      return { constraintResults: results, globalConformance: n > 0 ? globalCount / n : null, globalSatisfied: globalCount, totalEvents: n };
+    } catch(e) {
+      console.error('Model check failed:', e);
+      return null;
+    }
+  }, []);
+
   // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)
   const applyStartProbability = useCallback(async () => {
     if (!activeProbMatrix || !discoveryResults?.likely_start_activities?.length) return;
@@ -4742,15 +4839,53 @@ function App() {
       { key: 'startProb', label: 'Start Activity + Probability', fn: applyStartProbability },
     ];
     const steps = allSteps.filter(s => discoveryChecks[s.key]);
-    // +2 for health check + model check (always run)
-    const total = steps.length + 1; // +1 for health check
+    const total = steps.length + 2; // +1 health check, +1 model check
 
     try {
       for (let i = 0; i < steps.length; i++) {
         setDiscoveryProgress({ current: i + 1, total, currentName: steps[i].label });
         await steps[i].fn();
       }
-      setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'Constraint Health Check' });
+
+      // Auto-assign no_parallel_activities for activities that involve resource objects
+      setActiveModel(prev => {
+        if (!prev || Array.isArray(prev)) return prev;
+        const resourceTypes = new Set(prev.resource_types || []);
+        if (resourceTypes.size === 0) return prev;
+        const noParallel = new Set(prev.no_parallel_activities || []);
+        (prev.activities || []).forEach(a => {
+          const hasResource = (a.bindings || []).some(b => resourceTypes.has(b.object_type));
+          if (hasResource) noParallel.add(a.name);
+        });
+        return { ...prev, no_parallel_activities: [...noParallel] };
+      });
+
+      // OC-Declare Model Check
+      setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'OC-Declare Model Check' });
+      const modelForCheck = activeModelRef.current;
+      const modelCheckResult = await runLogModelCheck(modelForCheck, discoveryConfig.eventLogFile);
+      if (modelCheckResult) {
+        setLogConfResults(modelCheckResult);
+        // Apply nmin/nmax from model check if checkbox is on
+        if (applyNminNmaxFromModelCheck) {
+          setActiveModel(prev => {
+            if (!prev || Array.isArray(prev)) return prev;
+            const updated = (prev.constraints || []).map(c => {
+              const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+              const result = modelCheckResult.constraintResults.find(r => r.label === label);
+              if (!result || result.total === 0) return c;
+              // Only fill in the missing value — never overwrite an already-set value
+              const newNmin = (c.nmin == null && result.observedNmin != null) ? result.observedNmin : c.nmin;
+              const newNmax = (c.nmax == null && result.observedNmax != null) ? result.observedNmax : c.nmax;
+              if (newNmin === c.nmin && newNmax === c.nmax) return c;
+              return { ...c, nmin: newNmin, nmax: newNmax };
+            });
+            return { ...prev, constraints: updated };
+          });
+        }
+      }
+
+      setDiscoveryProgress({ current: steps.length + 2, total, currentName: 'Constraint Health Check' });
       await runHealthCheck();
       // Snapshot discovered model as immutable base using refs (not stale closure values)
       const snapModel  = activeModelRef.current  ? JSON.parse(JSON.stringify(activeModelRef.current))  : null;
@@ -4768,6 +4903,7 @@ function App() {
       setDiscoveryProgress({ current: 0, total: 0, currentName: '' });
     }
   }, [discoveryChecks, discoveryConfig.eventLogFile, dropZeroConfConstraints, logConfResults,
+      applyNminNmaxFromModelCheck, runLogModelCheck,
       runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery,
       applyStartProbability, runHealthCheck]);
 
@@ -5934,6 +6070,19 @@ function App() {
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
                           <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>avg events/instance</div>
                         </div>
+
+                        {/* Model check options */}
+                        {config.ocdeclareFile && (
+                          <div className="landing-option-group" style={{borderTop:'1px solid #e2e8f0',paddingTop:'0.75rem',marginTop:'0.25rem'}}>
+                            <label className="landing-option-label">OC-Declare Model Check</label>
+                            <label style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.78rem',cursor:'pointer',marginTop:'0.25rem'}}>
+                              <input type="checkbox" checked={applyNminNmaxFromModelCheck}
+                                onChange={e => setApplyNminNmaxFromModelCheck(e.target.checked)} />
+                              Apply nmin/nmax from log to constraints
+                            </label>
+                            <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>Sets bounds per constraint based on how often they fire in the log</div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -6468,16 +6617,21 @@ function App() {
                         Stop conditions
                       </div>
                       <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                        {/* Max steps */}
+                        {/* Max events */}
                         <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max steps</span>
+                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max events</span>
                           <input type="text" inputMode="numeric" value={config.maxSteps ?? ''}
                             placeholder="e.g. 500"
                             onChange={e => handleConfigChange('maxSteps', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
                             disabled={isSimulating}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
                           {discoveryResults?.total_events != null && (
-                            <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>{discoveryResults.total_events.toLocaleString()} in log</span>
+                            <button
+                              style={{fontSize:'0.7rem',color:'#475569',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                              onClick={() => handleConfigChange('maxSteps', discoveryResults.total_events)}
+                              disabled={isSimulating}
+                              title="Use log event count as limit"
+                            >{discoveryResults.total_events.toLocaleString()} in log</button>
                           )}
                         </div>
                         {/* Simulated time */}
@@ -6522,7 +6676,12 @@ function App() {
                             disabled={isSimulating}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
                           {discoveryResults?.log_object_trace_count != null && (
-                            <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>{discoveryResults.log_object_trace_count.toLocaleString()} in log</span>
+                            <button
+                              style={{fontSize:'0.7rem',color:'#475569',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                              onClick={() => handleConfigChange('maxTraces', discoveryResults.log_object_trace_count)}
+                              disabled={isSimulating}
+                              title="Use log trace count as limit"
+                            >{discoveryResults.log_object_trace_count.toLocaleString()} in log</button>
                           )}
                         </div>
                         <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
@@ -6541,7 +6700,7 @@ function App() {
                     {isSimulating && (
                       <div className="loading-box" style={{padding:'1.5rem'}}>
                         <div className="spinner"></div>
-                        <p>Running… <span className="sim-step-counter">step {liveStepCount ?? 0}</span></p>
+                        <p>Running… <span className="sim-step-counter">events {liveStepCount ?? 0}</span></p>
                         {liveSimTime != null && (
                           <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
                             {'🕐 sim '}
@@ -6736,7 +6895,7 @@ function App() {
                       lowerIsBetter: false,
                     },
                     {
-                      label: 'Steps',
+                      label: 'Events Fired',
                       asis: resultsAsIs.steps_executed,
                       tobe: resultsToBe.steps_executed,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
@@ -6791,7 +6950,7 @@ function App() {
                         return (
                           <div style={{padding:'1rem'}}>
                             <div className="stat-grid" style={{marginBottom:'1rem'}}>
-                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Steps</div></div>
+                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Fired</div></div>
                               <div className="stat-card"><div className="stat-value">{r.events_count}</div><div className="stat-label">Events</div></div>
                               <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')}>
                                 <div className="stat-value">{coverage}{discoveredTypes.length>0&&<span className="stat-value-denom"> / {discoveredTypes.length}</span>}</div>
@@ -6811,7 +6970,7 @@ function App() {
                                 </table>
                               </Collapsible>
                             )}
-                            {label === 'As-Is' && r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
+                            {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
                               const simMetrics = r.metrics.activity_metrics;
                               const logCounts = discoveryResults.activity_counts || {};
                               const logRepeat = discoveryResults.activity_repeat_stats || {};
@@ -7910,7 +8069,7 @@ function App() {
 
             <div className="form-row">
               <div className="form-group">
-                <label>Max Steps</label>
+                <label>Max Events</label>
                 <input 
                   type="number" 
                   value={config.maxSteps}
@@ -7963,7 +8122,7 @@ function App() {
               <p>
                 Running simulation…{' '}
                 <span className="sim-step-counter">
-                  step {liveStepCount ?? 0} / {config.maxSteps}
+                  {config.maxSteps ? `events ${liveStepCount ?? 0} / ${config.maxSteps}` : `events ${liveStepCount ?? 0}`}
                 </span>
               </p>
               <button className="sim-stop-btn" onClick={stopSimulation}>
@@ -7991,7 +8150,7 @@ function App() {
                   <div className="stat-grid">
                     <div className="stat-card">
                       <div className="stat-value">{results.steps_executed}</div>
-                      <div className="stat-label">Steps Executed</div>
+                      <div className="stat-label">Events Fired</div>
                     </div>
                     <div className="stat-card">
                       <div className="stat-value">{totalEvents}</div>
