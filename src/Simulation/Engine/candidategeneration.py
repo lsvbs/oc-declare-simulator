@@ -111,6 +111,7 @@ def build_candidate_for_activity(
     state: SimulationState,
     resource_types: set[str] | None = None,
     force_object_id: str | None = None,
+    force_object_ids: list[str] | None = None,
 ) -> Optional[Candidate]:
     """Build a candidate for ``activity`` from the global active-object pool.
 
@@ -118,6 +119,8 @@ def build_candidate_for_activity(
     resources. ``force_object_id`` pins the first non-creating, non-resource
     binding to exactly that object, avoiding the temporary _active_by_type
     mutation used in _generate_candidates_des (#6).
+    ``force_object_ids`` pins a specific set of objects for all-mode obligations
+    where all objects must participate together in the candidate event.
     """
     participating_object_ids: list[str] = []
     object_types_to_create: list[str] = []
@@ -127,23 +130,25 @@ def build_candidate_for_activity(
         obj = state.objects.get(force_object_id)
         _forced_type = obj.object_type if obj else None
 
+    # Build a lookup from type → forced ids for all-mode
+    _forced_ids_by_type: dict[str, list[str]] = {}
+    if force_object_ids:
+        for _foid in force_object_ids:
+            _fobj = state.objects.get(_foid)
+            if _fobj:
+                _forced_ids_by_type.setdefault(_fobj.object_type, []).append(_foid)
+
     for binding in activity.bindings:
         # Determine how many objects to fetch for link-preference selection.
-        # For input (non-creating) bindings we fetch more than max_count so that
-        # link-preference can choose the best-linked object from the pool,
-        # rather than being forced to accept the first one from the set.
-        # A small pool of 8 is enough: linked objects sort to the front so the
-        # correct one will be selected even if many exist globally.
         if binding.creates:
-            fetch_limit = binding.min_count  # output: only reuse up to min_count
+            fetch_limit = binding.min_count
         elif binding.max_count is not None:
-            fetch_limit = max(binding.max_count * 4, 8)  # widen pool for link-preference
+            fetch_limit = max(binding.max_count * 4, 8)
         else:
             fetch_limit = 8
         existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
 
         # #6: if force_object_id pins this binding's type, replace the pool
-        # with just that one object — no _active_by_type mutation needed.
         if (force_object_id is not None
                 and not binding.creates
                 and binding.object_type == _forced_type
@@ -152,6 +157,18 @@ def build_candidate_for_activity(
             if obj is None or not obj.active:
                 return None
             existing_ids = [force_object_id]
+
+        # force_object_ids: for all-mode, force specific objects into this binding
+        elif (force_object_ids is not None
+              and not binding.creates
+              and binding.object_type in _forced_ids_by_type):
+            forced = _forced_ids_by_type[binding.object_type]
+            # Verify all forced objects are active
+            for _foid in forced:
+                _fobj = state.objects.get(_foid)
+                if _fobj is None or not _fobj.active:
+                    return None
+            existing_ids = forced
 
         # Apply attribute guard: filter out objects that don't satisfy the guard.
         guard = getattr(binding, 'guard', None)

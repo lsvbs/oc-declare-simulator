@@ -438,9 +438,38 @@ class Simulator:
             primary_type = primary_bindings[0].object_type
             active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
 
+            # Pre-compute cheap precedence blocks for this activity using only the
+            # primary object id — avoids building the full candidate when the primary
+            # object already fails a gate constraint.  Only checks 'each'-scoped
+            # precedence constraints where the scope type matches the primary binding.
+            prec_gates = [
+                con for con in self._prec_by_target.get(activity.name, [])
+                if con.scope.kind == 'each'
+                and con.scope.object_type == primary_type
+                and getattr(con, 'nmin', 0) > 0
+            ]
+
             for oid in active_ids:
                 if (activity.name, oid) in state._in_progress_objects:
                     continue
+
+                # Early exit: check precedence nmin for this primary object before
+                # the expensive build_candidate_for_activity call
+                if prec_gates:
+                    blocked = False
+                    prec_satisfied = getattr(state, '_prec_satisfied', None)
+                    for con in prec_gates:
+                        cache_key = (con.source_activity, activity.name, 'each', oid)
+                        if prec_satisfied is not None and cache_key in prec_satisfied:
+                            continue  # already permanently satisfied
+                        src_count = len(state._events_by_act_obj.get(
+                            (con.source_activity, oid), []))
+                        if src_count < con.nmin:
+                            blocked = True
+                            break
+                    if blocked:
+                        continue
+
                 # #6: pass force_object_id instead of mutating _active_by_type
                 candidate = build_candidate_for_activity(
                     activity, state,
@@ -513,7 +542,40 @@ class Simulator:
                     continue
                 seen_obligation_keys.add(dedup_key)
 
-                # B: O(1) pool membership check
+                # Handle all-mode frozenset obligations separately
+                is_frozenset = isinstance(scope_oid, frozenset)
+
+                if is_frozenset:
+                    # All-mode: target must fire involving all objects in the frozenset
+                    frozen_oids = scope_oid
+                    # Skip if any object in the set is inactive
+                    if any(not (state.objects.get(o) and state.objects[o].active) for o in frozen_oids):
+                        continue
+                    # Skip if already in pool or in-progress
+                    if any((target_act, o) in pool_index for o in frozen_oids):
+                        continue
+                    if any((target_act, o) in in_progress_index for o in frozen_oids):
+                        continue
+                    # Build candidate with all frozenset objects forced
+                    activity = act_by_name.get(target_act)
+                    if activity is None:
+                        continue
+                    candidate = build_candidate_for_activity(
+                        activity, state, resource_types=resource_types,
+                        force_object_ids=list(frozen_oids)
+                    )
+                    if candidate is None:
+                        continue
+                    if not is_candidate_semantically_allowed(self.static_model, candidate, state):
+                        continue
+                    key2 = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
+                           tuple(sorted(candidate.object_types_to_create)))
+                    if key2 not in seen_keys:
+                        seen_keys.add(key2)
+                        candidates.append(candidate)
+                    continue
+
+                # B: O(1) pool membership check (per-object and global obligations)
                 if scope_oid is not None:
                     if (target_act, scope_oid) in pool_index:
                         continue
@@ -526,6 +588,24 @@ class Simulator:
                 # the event-count check (record_event hasn't run yet for in-progress)
                 if scope_oid is not None and (target_act, scope_oid) in in_progress_index:
                     continue
+                # Also skip if ANY non-resource binding object for this activity is
+                # already in-progress — prevents the same full event being queued
+                # multiple times when the obligation fires on every step while the
+                # first instance is still running (e.g. Depart queued 40+ times).
+                activity_def = act_by_name.get(target_act)
+                if activity_def and scope_oid is not None:
+                    _skip = False
+                    for _b in activity_def.bindings:
+                        if _b.creates or _b.object_type in resource_types:
+                            continue
+                        for _oid in state._active_by_type.get(_b.object_type, set()):
+                            if (target_act, _oid) in in_progress_index:
+                                _skip = True
+                                break
+                        if _skip:
+                            break
+                    if _skip:
+                        continue
 
                 # Scope object must exist and be active
                 if scope_oid is not None:
@@ -533,18 +613,14 @@ class Simulator:
                     if scope_obj is None or not scope_obj.active:
                         continue
 
-                # F: cheap precedence pre-filter — skip if any precedence
-                # constraint on the target is unsatisfied for this scope object.
-                # Uses only the cached event count index (O(1) per constraint).
+                # F: cheap precedence pre-filter
                 blocked = False
                 for con in prec_by_target.get(target_act, []):
                     if scope_oid is None:
-                        # global scope — check global fire count
                         if not state._events_by_activity.get(con.source_activity):
                             blocked = True
                             break
-                    elif con.scope.kind == 'each' and con.scope.object_type:
-                        # check source count on this specific object
+                    elif con.scope.kind in ('each', 'any', 'all') and con.scope.object_type:
                         if scope_obj is not None and scope_obj.object_type == con.scope.object_type:
                             src_count = len(state._events_by_act_obj.get(
                                 (con.source_activity, scope_oid), []))
@@ -564,7 +640,6 @@ class Simulator:
                     continue
 
                 if scope_oid is not None:
-                    # #6: use force_object_id instead of mutating _active_by_type
                     candidate = build_candidate_for_activity(
                         activity, state, resource_types=resource_types, force_object_id=scope_oid
                     )
@@ -894,12 +969,20 @@ class Simulator:
 
     def _fulfill_response_obligations(self, executed_event, state: SimulationState) -> None:
         act = executed_event.activity_name
+        fired_oids = set(executed_event.object_ids)
         # Discharge unscoped obligations for this target activity
         if state._obligations_count.pop((act, None), None) is not None:
             state.total_obligations_fulfilled += 1
-        # Discharge scoped obligations for each scope object in this event
+        # Discharge per-object obligations (each/any mode)
         for oid in executed_event.object_ids:
             if state._obligations_count.pop((act, oid), None) is not None:
+                state.total_obligations_fulfilled += 1
+        # Discharge all-mode frozenset obligations: key is (act, frozenset)
+        # Fulfilled when all objects in the frozenset appear in this event
+        all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
+        for k in all_keys:
+            if k[1].issubset(fired_oids):
+                state._obligations_count.pop(k, None)
                 state.total_obligations_fulfilled += 1
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
@@ -913,12 +996,33 @@ class Simulator:
                 )
                 for scope_object_id in scope_object_ids:
                     key = (constraint.target_activity, scope_object_id)
-                    # Only create if not already pending — one outstanding obligation
-                    # per (target, scope_object) is sufficient. Re-firing the source
-                    # does not stack additional obligations.
+                    if key not in state._obligations_count:
+                        state._obligations_count[key] = 1
+            elif constraint.scope.kind == "any":
+                # Any: one obligation per scope object — at least one must fire the target
+                scope_object_ids = self._get_event_scope_object_ids(
+                    executed_event=executed_event,
+                    state=state,
+                    scope_object_type=constraint.scope.object_type,
+                )
+                for scope_object_id in scope_object_ids:
+                    key = (constraint.target_activity, scope_object_id)
+                    if key not in state._obligations_count:
+                        state._obligations_count[key] = 1
+            elif constraint.scope.kind == "all":
+                # All: single obligation keyed to the full frozenset of scope objects
+                # Target must fire involving ALL of them together in one event
+                scope_object_ids = self._get_event_scope_object_ids(
+                    executed_event=executed_event,
+                    state=state,
+                    scope_object_type=constraint.scope.object_type,
+                )
+                if scope_object_ids:
+                    key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
             else:
+                # Unscoped global obligation
                 key = (constraint.target_activity, None)
                 if key not in state._obligations_count:
                     state._obligations_count[key] = 1
@@ -1073,13 +1177,14 @@ class Simulator:
         for oid in in_prog.participating_object_ids:
             state._in_progress_objects.add((in_prog.candidate_activity_name, oid))
 
-        self._trace("des_started", {
-            "activity_name": candidate.activity_name,
-            "started_at": started_at.isoformat() if started_at else None,
-            "complete_at": complete_at.isoformat() if complete_at else None,
-            "participating_object_ids": in_prog.participating_object_ids,
-            "held_resource_ids": held_resource_ids,
-        })
+        if self.trace_func is not None:
+            self._trace("des_started", {
+                "activity_name": candidate.activity_name,
+                "started_at": started_at.isoformat() if started_at else None,
+                "complete_at": complete_at.isoformat() if complete_at else None,
+                "participating_object_ids": in_prog.participating_object_ids,
+                "held_resource_ids": held_resource_ids,
+            })
 
         return in_prog
 
@@ -1153,13 +1258,26 @@ class Simulator:
                     if _count_activity_for_object(state, source, oid) >= max(nmin, 1):
                         prec_satisfied.add(cache_key_base + (oid,))
 
-        self._trace("applied", {
-            "event_id": executed_event.event_id,
-            "activity_name": executed_event.activity_name,
-            "timestamp": executed_event.timestamp.isoformat() if executed_event.timestamp else None,
-            "object_ids": list(executed_event.object_ids),
-            "step_count": state.step_count,
-        })
+        if self.trace_func is not None:
+            self._trace("applied", {
+                "event_id": executed_event.event_id,
+                "activity_name": executed_event.activity_name,
+                "timestamp": executed_event.timestamp.isoformat() if executed_event.timestamp else None,
+                "started_at": in_prog.started_at.isoformat() if in_prog.started_at else None,
+                "duration_s": (in_prog.complete_at - in_prog.started_at).total_seconds()
+                              if in_prog.started_at and in_prog.complete_at else None,
+                "object_ids": list(executed_event.object_ids),
+                "step_count": state.step_count,
+                "concurrent": [
+                    {
+                        "activity": ip.candidate_activity_name,
+                        "objects": list(ip.participating_object_ids),
+                        "started_at": ip.started_at.isoformat() if ip.started_at else None,
+                        "complete_at": ip.complete_at.isoformat() if ip.complete_at else None,
+                    }
+                    for ip in state.in_progress
+                ],
+            })
 
     def _des_try_start_waiting(self, state: SimulationState,
                                completed_activity: str | None = None) -> None:

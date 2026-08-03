@@ -233,6 +233,46 @@ def run_discovery():
             key=lambda a: -trace_end_prob[a]
         ) if trace_end_prob else []
 
+        # Strict start activities: ≥95% of firings have NO preceding event on any
+        # participating object — used for auto-selection on the landing page
+        strict_start_activities = []
+        _ocel_src = event_log_ocel if event_log_ocel and isinstance(event_log_ocel, dict) else None
+        if _ocel_src:
+            try:
+                from collections import defaultdict as _dd2
+                _evdict = _ocel_src.get('events', {})
+                _evlist = list(_evdict.values()) if isinstance(_evdict, dict) else (_evdict or [])
+                # Build per-object sorted timestamp list
+                _obj_ts = _dd2(list)
+                for _ev in _evlist:
+                    _ts = _ev.get('timestamp') or _ev.get('time') or ''
+                    for _oid in (_ev.get('omap') or []):
+                        _obj_ts[_oid].append(_ts)
+                for _oid in _obj_ts:
+                    _obj_ts[_oid].sort()
+                # Count firings with/without a preceding event on any object
+                _act_no_prec = _dd2(int)
+                _act_total   = _dd2(int)
+                for _ev in _evlist:
+                    _ts  = _ev.get('timestamp') or _ev.get('time') or ''
+                    _act = _ev.get('activity') or _ev.get('type', '')
+                    if not _act: continue
+                    _objs = _ev.get('omap') or []
+                    _has_prec = any(
+                        any(t < _ts for t in _obj_ts.get(_oid, []))
+                        for _oid in _objs
+                    )
+                    _act_total[_act] += 1
+                    if not _has_prec:
+                        _act_no_prec[_act] += 1
+                strict_start_activities = sorted(
+                    [a for a, tot in _act_total.items()
+                     if tot > 0 and _act_no_prec[a] / tot >= 0.95],
+                    key=lambda a: -_act_no_prec[a]
+                )
+            except Exception:
+                pass  # fall back to empty — frontend will use likely_start
+
         # Find the first activity that actually appears in the log (chronologically)
         first_activity = None
         if isinstance(event_log, dict):
@@ -447,6 +487,7 @@ def run_discovery():
                 'time_distributions_discovered': len(time_distributions) > 0,
                 'first_activity': first_activity,
                 'likely_start_activities': likely_start,
+                'strict_start_activities': strict_start_activities,
                 'likely_end_activities':   likely_end,
                 'trace_end_prob':          trace_end_prob,
                 'trace_position':          trace_position,
@@ -982,10 +1023,14 @@ def run_simulation():
                 _iter_tmp.write(_json.dumps(entry) + '\n')
             elif event == "applied":
                 entry = {
-                    "event": "applied",
-                    "activity": payload.get("activity_name", "?"),
-                    "timestamp": payload.get("timestamp", None),
-                    "objects": payload.get("object_ids", []),
+                    "event":       "applied",
+                    "activity":    payload.get("activity_name", "?"),
+                    "timestamp":   payload.get("timestamp", None),
+                    "started_at":  payload.get("started_at", None),
+                    "duration_s":  payload.get("duration_s", None),
+                    "objects":     payload.get("object_ids", []),
+                    "step_count":  payload.get("step_count", None),
+                    "concurrent":  payload.get("concurrent", []),
                 }
                 import json as _json
                 _iter_tmp.write(_json.dumps(entry) + '\n')

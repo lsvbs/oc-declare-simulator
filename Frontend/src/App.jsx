@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import ReactDOM from 'react-dom';
 import axios from 'axios';
 import './App.css';
 import FlowChart from './FlowChart';
@@ -10,12 +11,12 @@ const TFC_R = 22;
 const TFC_HGAP = 80;
 const TFC_PAD  = 44;
 
-function tfc_layout(matrix, threshold, startSet, endSet, tracePosition) {
+function tfc_layout(matrix, threshold, startSet, endSet, tracePosition, forbiddenEdges) {
   // ── Edges ──────────────────────────────────────────────────────────────────
   const edges = [];
   Object.entries(matrix).forEach(([src, tgts]) => {
     Object.entries(tgts)
-      .filter(([tgt, p]) => tgt !== src && p >= threshold)
+      .filter(([tgt, p]) => tgt !== src && p >= threshold && !(forbiddenEdges && forbiddenEdges.has(`${src}→${tgt}`)))
       .sort((a, b) => b[1] - a[1])
       .slice(0, 5)
       .forEach(([tgt, p]) => edges.push({ src, tgt, p }));
@@ -218,8 +219,36 @@ function tfc_layout(matrix, threshold, startSet, endSet, tracePosition) {
   return { pos, edges, width: maxX, height: maxY };
 }
 
-function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities, tracePosition }) {
+function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities, tracePosition, constraints }) {
   const [threshold, setThreshold] = useState(0.05);
+
+  // Compute forbidden directed pairs from constraints
+  const forbiddenEdges = useMemo(() => {
+    const set = new Set();
+    (constraints || []).forEach(c => {
+      const src = c.source_activity;
+      const tgt = c.target_activity;
+      if (!src || !tgt) return;
+      // not_coexistence: neither can follow the other
+      if (c.constraint_type === 'not_coexistence') {
+        set.add(`${src}→${tgt}`);
+        set.add(`${tgt}→${src}`);
+      }
+      // not_succession: tgt cannot follow src
+      if (c.constraint_type === 'not_succession') {
+        set.add(`${src}→${tgt}`);
+      }
+      // not_precedence: tgt cannot be preceded by src (same direction)
+      if (c.constraint_type === 'not_precedence') {
+        set.add(`${src}→${tgt}`);
+      }
+      // not_chain_succession: tgt cannot immediately follow src
+      if (c.constraint_type === 'not_chain_succession') {
+        set.add(`${src}→${tgt}`);
+      }
+    });
+    return set;
+  }, [constraints]);
 
   const { startNodes, endNodes } = useMemo(() => {
     const starts = new Set((startActivities || []).slice(0, 3));
@@ -239,8 +268,8 @@ function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEnd
   }, [matrix, startActivities, likelyEndActivities, traceEndProb, threshold]);
 
   const { pos: layoutPos, edges, width: layoutW, height: layoutH } = useMemo(
-    () => tfc_layout(matrix, threshold, startNodes, endNodes, tracePosition || {}),
-    [matrix, threshold, startNodes, endNodes, tracePosition]
+    () => tfc_layout(matrix, threshold, startNodes, endNodes, tracePosition || {}, forbiddenEdges),
+    [matrix, threshold, startNodes, endNodes, tracePosition, forbiddenEdges]
   );
 
   // ── Draggable positions ───────────────────────────────────────────────────
@@ -410,6 +439,80 @@ function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEnd
 
 // ── HelpTip (shared with ModelEditor — CSS lives in ModelEditor.css which is
 //    bundled together, so the same class names work here too) ──────────────────
+// Hover popup showing all constraints connected to an activity
+function ActivityConstraintTooltip({ activityName, constraints }) {
+  const [pos, setPos] = React.useState(null);
+  const triggerRef = React.useRef(null);
+  const related = React.useMemo(() => (constraints || []).filter(c =>
+    c.source_activity === activityName || c.target_activity === activityName
+  ), [activityName, constraints]);
+
+  const show = () => {
+    if (!triggerRef.current) return;
+    const rect = triggerRef.current.getBoundingClientRect();
+    const popW = 420, popH = Math.min(40 + related.length * 28, 400);
+    const vw = window.innerWidth, vh = window.innerHeight;
+    // Prefer below, flip to above if not enough room
+    let top = rect.bottom + 6;
+    if (top + popH > vh - 8) top = rect.top - popH - 6;
+    // Prefer left-aligned with trigger, shift left if overflows right
+    let left = rect.left;
+    if (left + popW > vw - 8) left = vw - popW - 8;
+    if (left < 8) left = 8;
+    setPos({ top, left, popW });
+  };
+
+  const hide = () => setPos(null);
+
+  if (!related.length) return <span>{activityName}</span>;
+  return (
+    <>
+      <span ref={triggerRef} style={{cursor:'help',borderBottom:'1px dashed #94a3b8'}}
+        onMouseEnter={show} onMouseLeave={hide}>
+        {activityName}
+      </span>
+      {pos && ReactDOM.createPortal(
+        <div onMouseEnter={show} onMouseLeave={hide} style={{
+          position:'fixed', zIndex:9999,
+          top: pos.top, left: pos.left, width: pos.popW,
+          background:'white', border:'1px solid #e2e8f0', borderRadius:'8px',
+          boxShadow:'0 4px 20px rgba(0,0,0,0.14)', padding:'0.65rem 0.8rem',
+          pointerEvents:'auto',
+        }}>
+          <div style={{fontSize:'0.7rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.4rem'}}>
+            Constraints — {activityName} ({related.length})
+          </div>
+          <div style={{display:'flex',flexDirection:'column',gap:'0.22rem',maxHeight:'360px',overflowY:'auto'}}>
+            {related.map((c, i) => (
+              <div key={i} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.78rem',flexWrap:'wrap'}}>
+                <span className={`constraint-type-badge ${c.constraint_type}`} style={{flexShrink:0,fontSize:'0.65rem'}}>
+                  {(c.constraint_type||'').replace(/_/g,' ')}
+                </span>
+                <span style={{color: c.source_activity === activityName ? '#1e293b' : '#94a3b8', fontWeight: c.source_activity === activityName ? 600 : 400}}>
+                  {c.source_activity || '—'}
+                </span>
+                <span style={{color:'#94a3b8',fontSize:'0.7rem'}}>→</span>
+                <span style={{color: c.target_activity === activityName ? '#1e293b' : '#94a3b8', fontWeight: c.target_activity === activityName ? 600 : 400}}>
+                  {c.target_activity || '—'}
+                </span>
+                {(c.scope?.object_type || c.scope_object_type) && (
+                  <span style={{color:'#64748b',fontSize:'0.65rem'}}>[{c.scope?.object_type || c.scope_object_type}]</span>
+                )}
+                {(c.nmin != null || c.nmax != null) && (
+                  <span style={{color:'#475569',fontSize:'0.65rem',marginLeft:'auto',whiteSpace:'nowrap'}}>
+                    {c.nmin != null ? `n≥${c.nmin}` : ''}{c.nmin != null && c.nmax != null ? ' ' : ''}{c.nmax != null ? `n≤${c.nmax}` : ''}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>,
+        document.body
+      )}
+    </>
+  );
+}
+
 function HelpTip({ text }) {
   const [visible, setVisible] = React.useState(false);
   return (
@@ -1183,15 +1286,41 @@ function computeOCDeclareConformance(events, objectTypesMap, constraints) {
     }
 
     // scope.kind === 'each' — must hold for every object of scope.object_type in event i
+    // scope.kind === 'any'  — must hold for at least one object
+    // scope.kind === 'all'  — target event must involve ALL scope objects together
     const scopeObjs = [...eventObjs[i]].filter(oid => objectTypesMap[oid] === scope.object_type);
 
     if (scopeObjs.length === 0) {
-      // No scope objects in this event — constraint is vacuously satisfied
-      return true;
+      return true; // no scope objects — vacuously satisfied
     }
 
+    if (scope.kind === 'all') {
+      // All: find a target event that involves ALL scope objects simultaneously
+      const allSet = new Set(scopeObjs);
+      const isNeg = c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession';
+      const hasJointFiring = tgtCandidates.some(j => scopeObjs.every(oid => eventObjs[j].has(oid)));
+      if (isNeg) return !hasJointFiring;
+      const jointCount = tgtCandidates.filter(j => scopeObjs.every(oid => eventObjs[j].has(oid))).length;
+      return jointCount >= nmin && (nmax == null || jointCount <= nmax);
+    }
+
+    if (scope.kind === 'any') {
+      // Any: at least one scope object must satisfy
+      const isNeg = c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession';
+      for (const oid of scopeObjs) {
+        const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
+        const cnt = matching.length;
+        if (isNeg) {
+          if (cnt === 0) return true; // this object has no forbidden co-occurrence → satisfied
+        } else {
+          if (cnt >= nmin && (nmax == null || cnt <= nmax)) return true;
+        }
+      }
+      return isNeg ? false : false; // none satisfied
+    }
+
+    // each: must hold for every object
     for (const oid of scopeObjs) {
-      // Filter tgtCandidates to those involving this specific object
       const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
       const cnt = matching.length;
       if (c.constraint_type === 'not_coexistence' || c.constraint_type === 'not_succession') {
@@ -4045,6 +4174,8 @@ function App() {
   const [probMatrixToBe, setProbMatrixToBe] = useState(null);
   const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
   const [resultsToBe, setResultsToBe] = useState(null);    // Run To-Be results
+  const [objTabAsIs, setObjTabAsIs] = useState('concurrency');
+  const [objTabToBe, setObjTabToBe] = useState('concurrency');
   const [discoveryChecks, setDiscoveryChecks] = useState({
     lifecycle: true, timing: true, resources: true, o2o: true, startProb: true,
   });
@@ -4147,16 +4278,30 @@ function App() {
         setDiscoveryResults(response.data.results);
         setDiscoveryLogs(response.data.logs || []);
         setAvailableActivities(response.data.results.activities || []);
-        
-        // Only auto-set start activity if none are currently selected
+
+        // Auto-select start activities using strict criterion (≥95% of firings
+        // have no preceding event on any object). Fall back to likely_start if none qualify.
+        // Only applied if user hasn't already made a selection.
+        const strictStarts = response.data.results.strict_start_activities || [];
+        const likelyStarts = response.data.results.likely_start_activities || [];
+        const autoStarts = strictStarts.length > 0 ? strictStarts : likelyStarts;
+        if (autoStarts.length > 0) {
+          setDiscoveryConfig(prev => {
+            if (prev.startActivityProbSelected?.length > 0) return prev;
+            return { ...prev, startActivityProbSelected: autoStarts };
+          });
+        }
+
+        // Also keep config.startActivities in sync if empty
         const firstActivity = response.data.results.first_activity
+          || autoStarts[0]
           || response.data.results.activities?.[0];
         if (firstActivity) {
           setConfig(prev => prev.startActivities.length > 0
             ? prev
-            : { ...prev, startActivities: [firstActivity] });
+            : { ...prev, startActivities: autoStarts.length > 0 ? autoStarts : [firstActivity] });
         }
-        // Build unranked candidates from all activities (no pct info at this stage)
+        // Build unranked candidates from all activities
         setStartActivityCandidates(
           (response.data.results.activities || []).map(a => ({ activity: a, count: null, pct: null }))
         );
@@ -5890,6 +6035,7 @@ function App() {
                     traceEndProb={discoveryResults.trace_end_prob || {}}
                     likelyEndActivities={discoveryResults.likely_end_activities || []}
                     tracePosition={discoveryResults.trace_position || {}}
+                    constraints={activeModel?.constraints || []}
                   />
                 </Collapsible>
               )}
@@ -6472,6 +6618,7 @@ function App() {
                           traceEndProb={discoveryResults?.trace_end_prob || {}}
                           likelyEndActivities={discoveryResults?.likely_end_activities || []}
                           tracePosition={discoveryResults?.trace_position || {}}
+                          constraints={modelToBe?.constraints || []}
                         />
                         {/* Constraints — collapsible */}
                         {(modelToBe.constraints||[]).length > 0 && (
@@ -6938,7 +7085,7 @@ function App() {
                 })()}
 
                 <div className="results-compare-layout">
-                  {[{label:'As-Is', r:resultsAsIs}, {label:'To-Be', r:resultsToBe}].map(({label, r}) => (
+                  {[{label:'As-Is', r:resultsAsIs, objTab:objTabAsIs, setObjTab:setObjTabAsIs}, {label:'To-Be', r:resultsToBe, objTab:objTabToBe, setObjTab:setObjTabToBe}].map(({label, r, objTab, setObjTab}) => (
                     <div key={label} className="run-result-panel">
                       <div className="run-result-panel-header">{label}</div>
                       {!r ? (
@@ -6960,16 +7107,6 @@ function App() {
                               {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
                               {r.completed_traces!=null&&<div className="stat-card"><div className="stat-value">{r.completed_traces}</div><div className="stat-label">Traces</div></div>}
                             </div>
-                            {r.audit?.object_lifecycle_audit&&(
-                              <Collapsible title="🔬 Object Lifecycle" defaultOpen={false}>
-                                <table className="behavior-table">
-                                  <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
-                                  <tbody>{Object.entries(r.audit.object_lifecycle_audit).map(([ot,a])=>(
-                                    <tr key={ot}><td>{ot}</td><td>{a.instance_count}</td><td>{a.active_count}</td><td>{a.deactivated_count}</td><td><span className={`audit-badge audit-badge-${a.classification}`}>{a.classification}</span></td></tr>
-                                  ))}</tbody>
-                                </table>
-                              </Collapsible>
-                            )}
                             {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
                               const simMetrics = r.metrics.activity_metrics;
                               const logCounts = discoveryResults.activity_counts || {};
@@ -6988,8 +7125,8 @@ function App() {
                                   return ra !== rb ? ra - rb : a.localeCompare(b);
                                 });
                               return (
-                                <Collapsible className="logs-box sim-compare-box" title="📊 Activity Distribution vs Log" defaultOpen={false}>
-                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points.</p>
+                                <Collapsible className="logs-box sim-compare-box" title="Activity Distribution vs Log" defaultOpen={false}>
+                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points. Time share = activity's total sim time / sim span.</p>
                                   <table className="metrics-table sim-compare-table">
                                     <thead>
                                       <tr>
@@ -6999,8 +7136,8 @@ function App() {
                                         <th>Sim %</th>
                                         <th>Log %</th>
                                         <th>Diff</th>
-                                        <th>Log mean /obj</th>
-                                        <th>Sim mean /obj</th>
+                                        <th title="Activity's total service time as % of total simulated time span">Time share</th>
+                                        <th title="Mean service time per firing in simulation">Sim mean dur</th>
                                       </tr>
                                     </thead>
                                     <tbody>
@@ -7010,25 +7147,110 @@ function App() {
                                         const simPct = simTotal > 0 ? simCount / simTotal * 100 : 0;
                                         const logPct = logTotal > 0 ? logCount / logTotal * 100 : 0;
                                         const diff = simPct - logPct;
-                                        const logMeanObj = logRepeat[act]?.mean ?? null;
-                                        const simObjEvents = simActivityObjectCounts[act] ?? null;
-                                        const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                                        const meanS = simMetrics[act]?.mean_service_s ?? null;
+                                        const simSpan = r.sim_time_s ?? null;
+                                        const timeShare = (meanS != null && simCount > 0 && simSpan)
+                                          ? (meanS * simCount / simSpan * 100) : null;
+                                        const fmtDur = s => { if (s == null) return '—'; if (s < 60) return Math.round(s)+'s'; if (s < 3600) return Math.floor(s/60)+'m'; if (s < 86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                                         const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
                                         return (
                                           <tr key={act}>
-                                            <td className="metrics-act-name">{act}</td>
+                                            <td className="metrics-act-name">
+                                              <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
+                                            </td>
                                             <td>{simCount || '—'}</td>
                                             <td>{logCount || '—'}</td>
                                             <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
                                             <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
                                             <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                                            <td>{logMeanObj ?? '—'}</td>
-                                            <td>{simMeanObj ?? '—'}</td>
+                                            <td className={timeShare != null && timeShare > 50 ? 'cmp-over' : ''}>{timeShare != null ? timeShare.toFixed(1)+'%' : '—'}</td>
+                                            <td>{fmtDur(meanS)}</td>
                                           </tr>
                                         );
                                       })}
                                     </tbody>
                                   </table>
+                                </Collapsible>
+                              );
+                            })()}
+
+                            {/* Objects — tabbed: Concurrency + Object Lifecycle */}
+                            {(() => {
+                              const simMetrics = r.metrics?.activity_metrics || {};
+                              const simSpan = r.sim_time_s ?? null;
+                              const noParallel = new Set(activeModel?.no_parallel_activities || []);
+                              return (
+                                <Collapsible title="Objects" defaultOpen={false}>
+                                  <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
+                                    {['concurrency','lifecycle'].map(t => (
+                                      <button key={t}
+                                        onClick={() => setObjTab(t)}
+                                        style={{padding:'0.25rem 0.75rem',fontSize:'0.78rem',fontWeight:600,border:'none',borderRadius:'4px',cursor:'pointer',
+                                          background: objTab===t ? '#1e293b' : 'transparent',
+                                          color: objTab===t ? 'white' : '#64748b'}}>
+                                        {t === 'concurrency' ? 'Concurrency' : 'Object Lifecycle'}
+                                      </button>
+                                    ))}
+                                  </div>
+
+                                  {objTab === 'concurrency' && (
+                                    <div>
+                                      <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                                        Concurrency ratio = activity's total occupied time / total sim time. Values &gt;1.0 mean multiple instances ran simultaneously.
+                                        Self-concurrency shows whether multiple instances of the same activity ran at once.
+                                      </p>
+                                      <table className="behavior-table">
+                                        <thead>
+                                          <tr>
+                                            <th>Activity</th>
+                                            <th title="Total service time / sim span — values >1 indicate overlap">Concurrency ratio</th>
+                                            <th title="Mean duration per firing">Mean duration</th>
+                                            <th title="Whether multiple instances of this activity can run simultaneously">Self-concurrent</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {Object.entries(simMetrics)
+                                            .map(([act, m]) => {
+                                              const meanS = m.mean_service_s ?? 0;
+                                              const cnt = m.execution_count ?? 0;
+                                              const ratio = simSpan && simSpan > 0 ? (meanS * cnt / simSpan) : null;
+                                              const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                                              return { act, ratio, meanS, cnt };
+                                            })
+                                            .sort((a,b) => (b.ratio??0) - (a.ratio??0))
+                                            .map(({act, ratio, meanS, cnt}) => (
+                                              <tr key={act}>
+                                                <td>{act}</td>
+                                                <td style={{color: ratio != null && ratio > 1 ? '#16a34a' : '#475569', fontWeight: ratio != null && ratio > 1 ? 600 : 400}}>
+                                                  {ratio != null ? ratio.toFixed(2) + '×' : '—'}
+                                                  {ratio != null && ratio > 1 && <span style={{fontSize:'0.7rem',color:'#16a34a',marginLeft:'0.3rem'}}>parallel</span>}
+                                                </td>
+                                                <td style={{fontSize:'0.78rem',color:'#475569'}}>
+                                                  {(() => { const s=meanS; if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; })()}
+                                                </td>
+                                                <td>
+                                                  {noParallel.has(act)
+                                                    ? <span style={{color:'#dc2626',fontSize:'0.75rem'}}>No (restricted)</span>
+                                                    : <span style={{color:'#16a34a',fontSize:'0.75rem'}}>Yes (allowed)</span>}
+                                                </td>
+                                              </tr>
+                                            ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  )}
+
+                                  {objTab === 'lifecycle' && r.audit?.object_lifecycle_audit && (
+                                    <table className="behavior-table">
+                                      <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
+                                      <tbody>{Object.entries(r.audit.object_lifecycle_audit).map(([ot,a])=>(
+                                        <tr key={ot}><td>{ot}</td><td>{a.instance_count}</td><td>{a.active_count}</td><td>{a.deactivated_count}</td><td><span className={`audit-badge audit-badge-${a.classification}`}>{a.classification}</span></td></tr>
+                                      ))}</tbody>
+                                    </table>
+                                  )}
+                                  {objTab === 'lifecycle' && !r.audit?.object_lifecycle_audit && (
+                                    <p style={{fontSize:'0.82rem',color:'#94a3b8'}}>No object lifecycle data available.</p>
+                                  )}
                                 </Collapsible>
                               );
                             })()}
@@ -8235,8 +8457,8 @@ function App() {
                               <th title="Share of all simulated events">Sim %</th>
                               <th title="Share of all log events">Log %</th>
                               <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
-                              <th title="Average times this activity fired per object in the log (from discovery)">Log mean /obj</th>
-                              <th title="Average times this activity fired per object in the simulation">Sim mean /obj</th>
+                              <th title="Activity's total service time as % of total simulated time span">Time share</th>
+                              <th title="Mean service time per firing in simulation">Sim mean dur</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -8246,14 +8468,18 @@ function App() {
                               const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
                               const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
                               const diff = simPct - logPct;
-                              const logMeanObj = logRepeat[act]?.mean ?? null;
-                              const simObjEvents = simActivityObjectCounts[act] ?? null;
-                              const simMeanObj = simObjEvents > 0 ? (simCount / simObjEvents).toFixed(2) : null;
+                              const meanS = simMetrics[act]?.mean_service_s ?? null;
+                              const simSpan = results?.sim_time_s ?? null;
+                              const timeShare = (meanS != null && simCount > 0 && simSpan)
+                                ? (meanS * simCount / simSpan * 100) : null;
+                              const fmtDur = s => { if (s==null) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                               const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
                                 : diff > 0 ? 'cmp-over' : 'cmp-under';
                               return (
                                 <tr key={act}>
-                                  <td className="metrics-act-name">{act}</td>
+                                  <td className="metrics-act-name">
+                                    <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
+                                  </td>
                                   <td>{simCount || '—'}</td>
                                   <td>{logCount || '—'}</td>
                                   <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
@@ -8261,8 +8487,8 @@ function App() {
                                   <td className={`cmp-diff ${diffClass}`}>
                                     {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
                                   </td>
-                                  <td>{logMeanObj ?? '—'}</td>
-                                  <td>{simMeanObj ?? '—'}</td>
+                                  <td className={timeShare != null && timeShare > 50 ? 'cmp-over' : ''}>{timeShare != null ? timeShare.toFixed(1)+'%' : '—'}</td>
+                                  <td>{fmtDur(meanS)}</td>
                                 </tr>
                               );
                             })}

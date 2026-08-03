@@ -94,6 +94,16 @@ def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationStat
                 return False
         return True
 
+    if constraint.scope.kind in ("any", "all"):
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            return True
+        results = [_activity_fired_for_object(state, forbidden, oid) for oid in scope_ids]
+        if constraint.scope.kind == "any":
+            return not any(results)   # fail if any object has the forbidden activity
+        else:  # all
+            return not all(results)   # fail only if all objects have it
+
     return not _activity_fired_globally(state, forbidden)
 
 
@@ -103,10 +113,25 @@ def check_response(constraint: Any, candidate: Any, state: SimulationState, scop
     nmax = getattr(constraint, "nmax", None)
 
     if candidate.activity_name == required_target:
-        if constraint.scope.kind == "each" and nmax is not None:
+        if nmax is not None:
             scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-            for oid in scope_ids:
-                if _count_activity_for_object(state, required_target, oid) >= nmax:
+            if constraint.scope.kind == "each":
+                for oid in scope_ids:
+                    if _count_activity_for_object(state, required_target, oid) >= nmax:
+                        return False
+            elif constraint.scope.kind == "any":
+                # Block only if ALL scope objects have already reached nmax
+                if scope_ids and all(
+                    _count_activity_for_object(state, required_target, oid) >= nmax
+                    for oid in scope_ids
+                ):
+                    return False
+            elif constraint.scope.kind == "all":
+                # Block if any scope object has reached nmax
+                if any(
+                    _count_activity_for_object(state, required_target, oid) >= nmax
+                    for oid in scope_ids
+                ):
                     return False
         return True
 
@@ -151,9 +176,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
                 return False
             if nmax is not None and a_count > nmax:
                 return False
-            # nmax on a precedence also caps how many times the TARGET may fire:
-            # e.g. precedence(OEC → PUEC, nmax=1) means PUEC fires at most nmax times
-            # per nmax firings of OEC for this object.
             if nmax is not None:
                 t_count = _count_activity_for_object(state, target, oid)
                 if t_count >= nmax:
@@ -163,6 +185,28 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
                 prec_satisfied.add(cache_key_base + (oid,))
 
         return True
+
+    if constraint.scope.kind in ("any", "all"):
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            return _activity_fired_globally(state, source) if nmin > 0 else True
+        results = []
+        for oid in scope_ids:
+            a_count = _count_activity_for_object(state, source, oid)
+            ok = True
+            if nmin > 0 and a_count < nmin:
+                ok = False
+            if nmax is not None and a_count > nmax:
+                ok = False
+            if nmax is not None and ok:
+                t_count = _count_activity_for_object(state, target, oid)
+                if t_count >= nmax:
+                    ok = False
+            results.append(ok)
+        if constraint.scope.kind == "any":
+            return any(results)   # pass if at least one object satisfies
+        else:  # all
+            return all(results)   # pass only if all objects satisfy
 
     # Global fallback
     return _activity_fired_globally(state, source)
@@ -175,14 +219,15 @@ def check_not_precedence(constraint: Any, candidate: Any, state: SimulationState
     if candidate.activity_name != target:
         return True
 
-    if constraint.scope.kind == "each":
+    if constraint.scope.kind in ("each", "any", "all"):
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
         if not scope_ids:
             return True
-        for oid in scope_ids:
-            if _activity_fired_for_object(state, source, oid):
-                return False
-        return True
+        results = [_activity_fired_for_object(state, source, oid) for oid in scope_ids]
+        if constraint.scope.kind == "any":
+            return not any(results)   # fail if any object has the source
+        else:  # each or all
+            return not any(results)   # same: fail if any scope object was preceded by source
 
     return not _activity_fired_globally(state, source)
 
@@ -212,6 +257,16 @@ def check_chain_precedence(constraint: Any, candidate: Any, state: SimulationSta
                 return False
         return True
 
+    if constraint.scope.kind in ("any", "all"):
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            return True
+        results = [_last_activity_for_scope_object(state, oid) == source for oid in scope_ids]
+        if constraint.scope.kind == "any":
+            return any(results)   # pass if at least one has source as last event
+        else:  # all
+            return all(results)   # pass only if all have source as last event
+
     if not state.executed_events:
         return False
     return state.executed_events[-1].activity_name == source
@@ -224,24 +279,17 @@ def check_chain_response(constraint: Any, candidate: Any, state: SimulationState
     if constraint.scope.kind == "each":
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
 
-        # Check existing scope objects: if any are armed (last event = source),
-        # only the target activity may fire next that touches them.
         for oid in scope_ids:
             if _last_activity_for_scope_object(state, oid) == source:
                 if candidate.activity_name != target:
                     return False
 
-        # If this candidate IS the source and creates new scope objects, check whether
-        # any previously-created scope objects of this source are still armed (awaiting
-        # their target).  If so, firing source again would leave even more objects armed
-        # and the target would never catch up — block it.
         if candidate.activity_name == source and candidate.activity_name != target:
             created_scope = sum(
                 1 for t in (getattr(candidate, "object_types_to_create", []) or [])
                 if t == constraint.scope.object_type
             )
             if created_scope > 0:
-                # Count existing armed (source-last-seen) scope objects
                 armed = sum(
                     1 for oid in state._active_by_type.get(constraint.scope.object_type, ())
                     if _last_activity_for_scope_object(state, oid) == source
@@ -249,6 +297,20 @@ def check_chain_response(constraint: Any, candidate: Any, state: SimulationState
                 if armed > 0:
                     return False
 
+        return True
+
+    if constraint.scope.kind in ("any", "all"):
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        armed = [oid for oid in scope_ids if _last_activity_for_scope_object(state, oid) == source]
+        if armed:
+            if constraint.scope.kind == "any":
+                # Any: if at least one is armed and this is not the target, block
+                if candidate.activity_name != target:
+                    return False
+            else:  # all
+                # All: if all are armed and this is not the target, block
+                if len(armed) == len(scope_ids) and candidate.activity_name != target:
+                    return False
         return True
 
     if state.executed_events:

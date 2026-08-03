@@ -205,8 +205,12 @@ class SimulationState:
             active_set.discard(object_id)
 
         # Clear all pending obligations scoped to this object.
-        # Obligations are keyed as (target_activity, scope_object_id).
-        keys_to_remove = [k for k in self._obligations_count if k[1] == object_id]
+        # Handles both per-object keys (target, oid) and all-mode frozenset keys (target, frozenset({...}))
+        keys_to_remove = [
+            k for k in self._obligations_count
+            if (isinstance(k[1], str) and k[1] == object_id) or
+               (isinstance(k[1], frozenset) and object_id in k[1])
+        ]
         for k in keys_to_remove:
             del self._obligations_count[k]
         self.total_deactivations += 1

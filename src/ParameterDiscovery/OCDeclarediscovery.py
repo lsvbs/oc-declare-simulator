@@ -1597,11 +1597,30 @@ def compute_ocpa_metrics(
         pool = _stats(b["pooling_s"])
         lag  = _stats(b["lagging_s"])
 
-        # Service time: use anchor params if available, otherwise use
-        # direct measurement (time from this event to next event on same object).
-        # Fall back to sojourn-based estimate if no next-event data exists.
-        raw_direct = b["service_direct_s"]
-        raw_source = raw_direct if raw_direct else b["sojourn_s"]
+        # Service time source selection:
+        # service_direct_s = forward gap (next event on same object) — correct for
+        # non-terminal activities where the primary objects are reused.
+        # sojourn_s = backward gap (this event - latest preceding event on any object)
+        # = time since last thing happened to any of the participating objects before
+        # this activity. For terminal-like activities (e.g. Depart) where only
+        # secondary objects (e.g. TDs) have next events, the forward gap is polluted
+        # by unrelated reuse times. Sojourn is more reliable in that case because it
+        # measures the actual waiting time before this activity fires (e.g. dwell time
+        # at port = Load to Vehicle timestamp → Depart timestamp).
+        # Heuristic: use service_direct_s only if its median < sojourn median.
+        # When they agree (non-terminal activities) it doesn't matter which is used.
+        # When they disagree (terminal), sojourn gives the more meaningful value.
+        direct = b["service_direct_s"]
+        soj_vals = b["sojourn_s"]
+        if direct and soj_vals:
+            direct_median = sorted(direct)[len(direct)//2]
+            soj_median    = sorted(soj_vals)[len(soj_vals)//2]
+            raw_source = direct if direct_median <= soj_median else soj_vals
+        elif direct:
+            raw_source = direct
+        else:
+            raw_source = soj_vals
+        using_fallback = raw_source is soj_vals and not direct
         if act in anchor_map:
             anc = anchor_map[act]
             svc_mean = float(anc.get("mean_seconds", soj["mean"]))
@@ -1613,16 +1632,17 @@ def compute_ocpa_metrics(
             sorted_svc = sorted(raw_source)
             n = len(sorted_svc)
 
-            # Option 2: fit lognormal to the sub-range around the chosen percentile.
-            # Each mode defines a [lo_pct, hi_pct] window; mean and std are computed
-            # only from observations within that window so they are mutually consistent.
-            if service_time_mode == 'p25':
+            # For terminal activities using sojourn fallback, always use minimum
+            # window to strip idle-time inflation from the backward-looking sojourn.
+            effective_mode = 'minimum' if using_fallback else service_time_mode
+
+            if effective_mode == 'p25':
                 lo_idx = 0
                 hi_idx = max(0, int(math.ceil(0.50 * n)) - 1)  # [min, P50]
-            elif service_time_mode == 'p50':
+            elif effective_mode == 'p50':
                 lo_idx = max(0, int(math.ceil(0.25 * n)) - 1)  # [P25, P75]
                 hi_idx = max(0, int(math.ceil(0.75 * n)) - 1)
-            else:  # 'minimum' — [min, P25], deterministic if only one value
+            else:  # 'minimum' — [min, P25]
                 lo_idx = 0
                 hi_idx = max(0, int(math.ceil(0.25 * n)) - 1)
 

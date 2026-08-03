@@ -1183,6 +1183,18 @@ export default function ModelEditor({
                       </>
                     ) : (
                       <div className="constraint-edit-inline">
+                        <label className="constraint-edit-label">scope kind:
+                          <select
+                            className="constraint-edit-select"
+                            value={c.scope?.kind || 'each'}
+                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, kind: e.target.value } })}
+                          >
+                            <option value="each">Each (∀)</option>
+                            <option value="any">Any</option>
+                            <option value="all">All</option>
+                            <option value="global">Global</option>
+                          </select>
+                        </label>
                         <label className="constraint-edit-label">scope type:
                           <select
                             className="constraint-edit-select"
