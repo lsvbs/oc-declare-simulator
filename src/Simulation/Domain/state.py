@@ -133,6 +133,8 @@ class SimulationState:
     # activity_name -> list of service durations in seconds (one per firing):
     # the clock advance sampled by the time policy when the activity fired.
     activity_service_s: dict[str, list[float]] = field(default_factory=dict)
+    # Per (activity, object_type) service time samples — enables "time per object type per activity" metrics
+    activity_service_by_type_s: dict = field(default_factory=dict)  # (act_name, obj_type) -> [float]
     # activity_name -> list of pre-start process waiting durations (DES only)
     process_wait_s: dict[str, list[float]] = field(default_factory=dict)
 
@@ -159,6 +161,11 @@ class SimulationState:
     # Only cached when nmax is None (no upper bound) — nmax constraints can become
     # violated again if the source fires too many times, so they cannot be cached.
     _prec_satisfied: set = field(default_factory=set)
+    # Performance: track object types with zero active instances to skip constraint checks
+    _inactive_scope_types: set = field(default_factory=set)
+    # Performance: typed link index — _linked_by_type[oid][object_type] = set of linked oids of that type
+    # Makes _count_links_for_object O(1) instead of O(degree)
+    _linked_by_type: dict = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -182,6 +189,8 @@ class SimulationState:
         self.objects[object_id] = obj
         self._active_by_type.setdefault(object_type, set()).add(object_id)
         self._type_of_object[object_id] = object_type
+        # Object type now has active instances — remove from inactive set
+        self._inactive_scope_types.discard(object_type)
         return obj
 
     def deactivate_object(self, object_id: str) -> None:
@@ -203,6 +212,9 @@ class SimulationState:
         active_set = self._active_by_type.get(obj.object_type)
         if active_set:
             active_set.discard(object_id)
+            # If this was the last active object of this type, mark type as inactive
+            if not active_set:
+                self._inactive_scope_types.add(obj.object_type)
 
         # Clear all pending obligations scoped to this object.
         # Handles both per-object keys (target, oid) and all-mode frozenset keys (target, frozenset({...}))
@@ -261,6 +273,12 @@ class SimulationState:
         )
         self._links_by_object.setdefault(source_object_id, set()).add(target_object_id)
         self._links_by_object.setdefault(target_object_id, set()).add(source_object_id)
+        # Maintain typed link index for O(1) count_links_for_object
+        src_type = self._type_of_object.get(source_object_id)
+        tgt_type = self._type_of_object.get(target_object_id)
+        if src_type and tgt_type:
+            self._linked_by_type.setdefault(source_object_id, {}).setdefault(tgt_type, set()).add(target_object_id)
+            self._linked_by_type.setdefault(target_object_id, {}).setdefault(src_type, set()).add(source_object_id)
 
     def record_event(
         self,

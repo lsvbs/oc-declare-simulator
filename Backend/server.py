@@ -1200,6 +1200,7 @@ def run_simulation():
                 # or the Download Metrics button to access the full data.
                 'metrics': {
                     'activity_metrics': metrics.get('activity_metrics', {}),
+                    'activity_service_by_type': metrics.get('activity_service_by_type', {}),
                     # object_metrics omitted — too large; available via metrics file download
                 },
                 'audit': audit,

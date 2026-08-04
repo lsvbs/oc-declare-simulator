@@ -50,6 +50,10 @@ def apply_conservative_link_policy(static_model, participating_ids, created_obje
         return neighbors is not None and tgt in neighbors
 
     def _count_links(oid: str, other_type: str) -> int:
+        # O(1) via typed index if available, else O(degree) fallback
+        lbt = getattr(state, '_linked_by_type', None)
+        if lbt is not None:
+            return len(lbt.get(oid, {}).get(other_type, frozenset()))
         count = 0
         for neighbor_id in state._links_by_object.get(oid, ()):
             obj = state.objects.get(neighbor_id)
@@ -438,15 +442,19 @@ class Simulator:
             primary_type = primary_bindings[0].object_type
             active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
 
-            # Pre-compute cheap precedence blocks for this activity using only the
-            # primary object id — avoids building the full candidate when the primary
-            # object already fails a gate constraint.  Only checks 'each'-scoped
-            # precedence constraints where the scope type matches the primary binding.
-            prec_gates = [
+            # Pre-compute cheap precedence gates for this activity (nmin and nmax)
+            # using only the primary object id — avoids building the full candidate.
+            prec_gates_nmin = [
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
                 and getattr(con, 'nmin', 0) > 0
+            ]
+            prec_gates_nmax = [
+                con for con in self._prec_by_target.get(activity.name, [])
+                if con.scope.kind == 'each'
+                and con.scope.object_type == primary_type
+                and getattr(con, 'nmax', None) is not None
             ]
 
             for oid in active_ids:
@@ -455,16 +463,33 @@ class Simulator:
 
                 # Early exit: check precedence nmin for this primary object before
                 # the expensive build_candidate_for_activity call
-                if prec_gates:
+                if prec_gates_nmin:
                     blocked = False
                     prec_satisfied = getattr(state, '_prec_satisfied', None)
-                    for con in prec_gates:
+                    for con in prec_gates_nmin:
                         cache_key = (con.source_activity, activity.name, 'each', oid)
                         if prec_satisfied is not None and cache_key in prec_satisfied:
                             continue  # already permanently satisfied
                         src_count = len(state._events_by_act_obj.get(
                             (con.source_activity, oid), []))
                         if src_count < con.nmin:
+                            blocked = True
+                            break
+                    if blocked:
+                        continue
+
+                # Early exit: check precedence nmax and target count cap
+                if prec_gates_nmax:
+                    blocked = False
+                    for con in prec_gates_nmax:
+                        src_count = len(state._events_by_act_obj.get(
+                            (con.source_activity, oid), []))
+                        if src_count > con.nmax:
+                            blocked = True
+                            break
+                        t_count = len(state._events_by_act_obj.get(
+                            (activity.name, oid), []))
+                        if t_count >= con.nmax:
                             blocked = True
                             break
                     if blocked:
@@ -1229,6 +1254,19 @@ class Simulator:
             timestamp=in_prog.complete_at,
         )
         state.current_time = in_prog.complete_at
+
+        # Track service time broken down by object type — enables per-(activity, type) metrics
+        if in_prog.started_at and in_prog.complete_at:
+            svc = (in_prog.complete_at - in_prog.started_at).total_seconds()
+            if svc >= 0:
+                _seen_types: set = set()
+                for _oid in in_prog.participating_object_ids:
+                    _obj = state.objects.get(_oid)
+                    if _obj and _obj.object_type not in self._resource_types_set:
+                        _key = (in_prog.candidate_activity_name, _obj.object_type)
+                        if _key not in _seen_types:
+                            _seen_types.add(_key)
+                            state.activity_service_by_type_s.setdefault(_key, []).append(svc)
         state.last_generated_timestamp = in_prog.complete_at
 
         self._update_obligations_after_event(executed_event, state)

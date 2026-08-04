@@ -224,11 +224,23 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         )
 
     # Build per-activity constraint index for O(1) lookup in check_all_constraints
+    # Sort each activity's list cheapest-to-evaluate first so early failures
+    # short-circuit the loop before reaching expensive timeline-walking checks.
+    _CONSTRAINT_COST = {
+        'precedence': 0, 'chain_precedence': 1, 'response': 2,
+        'not_coexistence': 3, 'not_precedence': 3, 'not_succession': 3,
+        'chain_response': 4, 'chain_succession': 4,
+        'alternate_precedence': 5, 'alternate_response': 5, 'succession': 5,
+    }
     _constraints_idx: dict = {}
     for c in constraints:
         for act in (c.source_activity, c.target_activity):
             if act:
                 _constraints_idx.setdefault(act, []).append(c)
+    for act in _constraints_idx:
+        _constraints_idx[act].sort(
+            key=lambda c: _CONSTRAINT_COST.get(c.constraint_type, 9)
+        )
 
     return StaticModel(
         activities=activities,

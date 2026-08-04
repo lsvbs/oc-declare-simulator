@@ -94,6 +94,20 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
             "max_resource_wait_s":      round(max(res_wait_s), 3)             if res_wait_s else None,
         }
 
+    # ── Per-(activity, object_type) service time breakdown ───────────────────
+    # Enables "time each object type spent at each activity" in the verification matrix
+    service_by_type = getattr(state, 'activity_service_by_type_s', {})
+    activity_service_by_type: dict[str, Any] = {}
+    for (act_name, obj_type), durations in service_by_type.items():
+        if not durations:
+            continue
+        activity_service_by_type.setdefault(act_name, {})[obj_type] = {
+            "mean_s": round(statistics.mean(durations), 3),
+            "min_s":  round(min(durations), 3),
+            "max_s":  round(max(durations), 3),
+            "count":  len(durations),
+        }
+
     # ── Object metrics ────────────────────────────────────────────────────────
     obj_timeline: dict[str, list] = {}
     for ev in state.executed_events:
@@ -119,10 +133,11 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
         }
 
     return {
-        "activity_metrics": activity_metrics,
-        "object_metrics":   object_metrics,
-        "total_events":     len(state.executed_events),
-        "total_objects":    len(state.objects),
+        "activity_metrics":          activity_metrics,
+        "activity_service_by_type":  activity_service_by_type,
+        "object_metrics":            object_metrics,
+        "total_events":              len(state.executed_events),
+        "total_objects":             len(state.objects),
     }
 
 

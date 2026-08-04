@@ -3019,6 +3019,412 @@ function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities
   );
 }
 
+// ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
+function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
+  const hasBoth = !!(resultsAsIs && resultsToBe);
+  const rAsis = resultsAsIs ?? results;
+  const rTobe = resultsToBe;
+  const [verifyMode, setVerifyMode] = React.useState('frequency');
+  const [evalTab, setEvalTab] = React.useState('comparison'); // 'comparison' | 'traces' | 'matrix' | 'asis' | 'tobe'
+
+  const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+
+  // ── Compute object trace completions ──────────────────────────────────────
+  const computeTraceCompletions = (r) => {
+    if (!r) return null;
+    const audit = r.audit?.object_lifecycle_audit || {};
+    const resourceTypes = new Set(r.resource_types || []);
+    const totalByType = {}, deactByType = {};
+    Object.entries(audit).forEach(([ot, a]) => {
+      if (resourceTypes.has(ot)) return;
+      totalByType[ot] = a.instance_count || 0;
+      deactByType[ot] = a.deactivated_count || 0;
+    });
+    const totalAll = Object.values(totalByType).reduce((s,v)=>s+v,0);
+    const deactAll = Object.values(deactByType).reduce((s,v)=>s+v,0);
+    return { totalByType, deactByType, totalAll, deactAll, pct: totalAll>0?Math.round(deactAll/totalAll*100):0 };
+  };
+  const tracesAsis = computeTraceCompletions(rAsis);
+  const tracesTobe = computeTraceCompletions(rTobe);
+
+  // Log trace completion from discoveryResults
+  const logTraces = discoveryResults?.log_object_trace_count ?? null;
+
+  // ── Compute verification matrix ────────────────────────────────────────────
+  const [timeSubMode, setTimeSubMode] = React.useState('mean'); // mean | min | max
+
+  const buildMatrix = (r) => {
+    if (!r) return null;
+    const metrics = r.metrics?.activity_metrics || {};
+    const serviceByType = r.metrics?.activity_service_by_type || {}; // act -> {obj_type -> {mean_s,min_s,max_s}}
+    const resourceTypes = new Set(r.resource_types || []);
+    const audit = r.audit?.object_lifecycle_audit || {};
+    const activities = Object.keys(metrics).sort();
+    const objTypes = Object.keys(audit).filter(t => !resourceTypes.has(t));
+
+    // Build activity→participating object types from activeModel bindings
+    const actBindings = {}; // act -> Set of object types
+    const modelToUse = activeModel || modelBase;
+    if (modelToUse?.activities) {
+      modelToUse.activities.forEach(a => {
+        const types = new Set((a.bindings||[]).map(b=>b.object_type).filter(t=>!resourceTypes.has(t)));
+        actBindings[a.name] = types;
+      });
+    }
+
+    const simObjTypes = r.object_types || {};
+    return { activities, objTypes, metrics, serviceByType, audit, simObjTypes, actBindings };
+  };
+
+  const matrixAsis = buildMatrix(rAsis);
+  const matrixTobe = buildMatrix(rTobe);
+  const logActivityCounts = discoveryResults?.activity_counts || {};
+  const logObjectTypes = discoveryResults?.object_type_stats || {};
+
+  const VERIFY_MODES = [
+    { key: 'frequency',   label: 'Event Frequency' },
+    { key: 'time',        label: 'Time per Event' },
+    { key: 'cardinality', label: 'Objects per Event' },
+    { key: 'obj_time',    label: 'Time per Object Type' },
+  ];
+
+  // Tab buttons for top navigation
+  const tabs = [
+    { key: 'comparison', label: 'Comparison' },
+    { key: 'traces',     label: 'Trace Completion' },
+    { key: 'matrix',     label: 'Verification Matrix' },
+    { key: 'asis',       label: 'As-Is Evaluation' },
+    ...(rTobe ? [{ key: 'tobe', label: 'To-Be Evaluation' }] : []),
+  ];
+
+  const renderTracePanel = (tc, label, logCount) => {
+    if (!tc) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No {label} run yet.</div>;
+    return (
+      <div>
+        <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+          <div className="behavior-stat-card">
+            <div className="behavior-stat-val">{tc.deactAll.toLocaleString()}</div>
+            <div className="behavior-stat-label">Completed traces</div>
+          </div>
+          <div className="behavior-stat-card">
+            <div className="behavior-stat-val">{tc.totalAll.toLocaleString()}</div>
+            <div className="behavior-stat-label">Total objects</div>
+          </div>
+          <div className={`behavior-stat-card`} style={{background: tc.pct>=80?'#f0fdf4':tc.pct>=50?'#fffbeb':'#fff1f2'}}>
+            <div className="behavior-stat-val">{tc.pct}%</div>
+            <div className="behavior-stat-label">Completion rate</div>
+          </div>
+          {logCount != null && (
+            <div className="behavior-stat-card">
+              <div className="behavior-stat-val">{logCount.toLocaleString()}</div>
+              <div className="behavior-stat-label">Log objects</div>
+            </div>
+          )}
+        </div>
+        <table className="behavior-table">
+          <thead><tr><th>Object Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>
+            {logObjectTypes && <th>Log count</th>}
+          </tr></thead>
+          <tbody>
+            {Object.entries(tc.totalByType).map(([ot, tot]) => {
+              const deact = tc.deactByType[ot] || 0;
+              const active = tot - deact;
+              const pct = tot > 0 ? Math.round(deact/tot*100) : 0;
+              const logCnt = logObjectTypes[ot]?.count ?? null;
+              return (
+                <tr key={ot}>
+                  <td>{ot}</td>
+                  <td>{tot}</td>
+                  <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{deact}</td>
+                  <td style={{color:'#64748b'}}>{active}</td>
+                  <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'80px',overflow:'hidden'}}>
+                    <div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/>
+                  </div><span style={{fontSize:'0.72rem',color:'#64748b',marginLeft:'4px'}}>{pct}%</span></td>
+                  {logObjectTypes && <td style={{color:'#94a3b8'}}>{logCnt != null ? logCnt.toLocaleString() : '—'}</td>}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const renderVerifyMatrix = (matrix, label) => {
+    if (!matrix) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No {label} run yet.</div>;
+    const { activities, objTypes, metrics, serviceByType, audit, simObjTypes, actBindings } = matrix;
+    if (!activities.length) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No activity metrics available for {label}. Run a simulation first to populate the matrix.</div>;
+    // If no object type audit data, use all object types from actBindings
+    const cols = objTypes.length > 0 ? objTypes
+      : [...new Set(Object.values(actBindings).flatMap(s => [...s]))].sort();
+
+    // For time mode, columns are object types; service time shown per (activity, object_type)
+    const getCellVal = (act, ot) => {
+      const m = metrics[act] || {};
+      const a = audit[ot] || {};
+      const participates = !actBindings[act] || actBindings[act].size === 0 || actBindings[act].has(ot);
+
+      if (verifyMode === 'frequency') {
+        const cnt = m.execution_count || 0;
+        return cnt > 0 ? cnt : null;
+      }
+      if (verifyMode === 'time') {
+        if (!participates) return null;
+        // Use per-(activity, object_type) breakdown if available
+        const perType = serviceByType?.[act]?.[ot];
+        if (perType) {
+          const val = timeSubMode === 'min' ? perType.min_s
+                    : timeSubMode === 'max' ? perType.max_s
+                    : perType.mean_s;
+          return (val != null && val > 0) ? val : null;
+        }
+        // Fallback: activity-level metric (same for all participating types)
+        const val = timeSubMode === 'min' ? m.min_service_s
+                  : timeSubMode === 'max' ? m.max_service_s
+                  : m.mean_service_s;
+        return (val != null && val > 0) ? val : null;
+      }
+      if (verifyMode === 'cardinality') {
+        if (!participates) return null;
+        const objCount = simObjTypes[ot] || 0;
+        const fires = m.execution_count || 0;
+        if (!fires || !objCount) return null;
+        const ratio = objCount / fires;
+        return ratio > 0 ? ratio : null;
+      }
+      if (verifyMode === 'obj_time') {
+        const lt = a.event_count_stats;
+        return lt?.mean != null && lt.mean > 0 ? lt.mean : null;
+      }
+      return null;
+    };
+
+    const fmtCell = (val) => {
+      if (verifyMode === 'time') return fmtDur(val);
+      if (verifyMode === 'cardinality') return val.toFixed(1);
+      if (verifyMode === 'obj_time') return val.toFixed(1)+' ev';
+      return val?.toLocaleString() ?? '—';
+    };
+
+    const getLogVal = (act, ot) => {
+      if (verifyMode === 'frequency') {
+        const cnt = logActivityCounts[act];
+        return cnt > 0 ? cnt.toLocaleString() : null;
+      }
+      if (verifyMode === 'cardinality') {
+        const logOtCount = logObjectTypes[ot]?.count || 0;
+        const logActCount = logActivityCounts[act] || 0;
+        if (!logActCount || !logOtCount) return null;
+        const ratio = logOtCount / logActCount;
+        return ratio > 0 ? ratio.toFixed(1) : null;
+      }
+      return null;
+    };
+
+    const showLogRef = verifyMode === 'frequency' || verifyMode === 'cardinality';
+    const vertStyle = { writingMode:'vertical-rl', transform:'rotate(180deg)', whiteSpace:'nowrap',
+      fontSize:'0.7rem', padding:'0.25rem 0.1rem', maxHeight:'120px', textOverflow:'ellipsis', overflow:'hidden' };
+
+    return (
+      <div style={{overflowX:'auto'}}>
+        <table className="behavior-table" style={{fontSize:'0.75rem',borderCollapse:'collapse'}}>
+          <thead>
+            <tr style={{verticalAlign:'bottom'}}>
+              <th style={{minWidth:'130px',fontSize:'0.72rem',textAlign:'left',paddingBottom:'0.35rem'}}>Activity</th>
+              {cols.map(ot => (
+                <th key={ot} title={ot} style={{...vertStyle,fontWeight:600,color:'#475569',border:'1px solid #e2e8f0',background:'#f8fafc'}}>
+                  {ot}
+                </th>
+              ))}
+              {showLogRef && <th style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {activities.map(act => {
+              const m = metrics[act] || {};
+              return (
+                <tr key={act}>
+                  <td style={{fontWeight:600,fontSize:'0.72rem',whiteSpace:'nowrap',paddingRight:'0.5rem'}}>{act}</td>
+                  {cols.map(ot => {
+                    const val = getCellVal(act, ot);
+                    const hasVal = val != null && val !== 0;
+                    return (
+                      <td key={ot} style={{textAlign:'center',border:'1px solid #f1f5f9',
+                        background: hasVal ? (verifyMode==='time'?'#eff6ff':verifyMode==='frequency'?'#f0fdf4':'#fefce8') : 'transparent',
+                        color: hasVal ? (verifyMode==='time'?'#1d4ed8':verifyMode==='frequency'?'#166534':'#78350f') : '#cbd5e1',
+                        fontWeight: hasVal ? 600 : 400,
+                        fontSize:'0.72rem', padding:'0.2rem 0.3rem',
+                      }}>
+                        {hasVal ? fmtCell(val) : '—'}
+                      </td>
+                    );
+                  })}
+                  {showLogRef && (
+                    <td style={{color:'#94a3b8',textAlign:'center',fontSize:'0.7rem',border:'1px solid #f1f5f9'}}>
+                      {getLogVal(act, cols[0]) ?? '—'}
+                    </td>
+                  )}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      {/* Top navigation */}
+      <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'1rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
+        {tabs.map(t => (
+          <button key={t.key} onClick={() => setEvalTab(t.key)}
+            style={{padding:'0.3rem 0.75rem',fontSize:'0.78rem',fontWeight:600,border:'none',borderRadius:'4px',cursor:'pointer',
+              background: evalTab===t.key ? '#1e293b' : 'transparent',
+              color: evalTab===t.key ? 'white' : '#64748b'}}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Comparison header — always shown when both exist */}
+      {hasBoth && evalTab === 'comparison' && (() => {
+        const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
+        const pct = (a,b) => a&&b&&a!==0 ? Math.round((b-a)/Math.abs(a)*100) : null;
+        const metrics = [
+          { label:'Events Fired', a:rAsis?.steps_executed, b:rTobe?.steps_executed, fmt:v=>v?.toLocaleString(), lower:null },
+          { label:'Sim Time', a:rAsis?.sim_time_s, b:rTobe?.sim_time_s, fmt:fmtDur, lower:true },
+          { label:'Completed Traces', a:tracesAsis?.deactAll, b:tracesTobe?.deactAll, fmt:v=>v?.toLocaleString(), lower:false },
+          { label:'Trace Rate', a:tracesAsis?.pct, b:tracesTobe?.pct, fmt:v=>v!=null?v+'%':null, lower:false },
+          { label:'Avg Parallelism', a:rAsis?.avg_parallelism, b:rTobe?.avg_parallelism, fmt:v=>v?.toFixed(2), lower:false },
+          { label:'Pending Obligations', a:rAsis?.completed_traces, b:rTobe?.completed_traces, fmt:v=>v?.toLocaleString(), lower:null },
+        ];
+        return (
+          <div className="results-comparison-header" style={{marginBottom:'1rem'}}>
+            {metrics.map((m,i) => {
+              const p = pct(m.a, m.b);
+              const diff = m.a!=null&&m.b!=null ? m.b-m.a : null;
+              const color = p===null||m.lower===null ? '#64748b'
+                : (m.lower ? (diff<0?'#16a34a':'#dc2626') : (diff>0?'#16a34a':'#dc2626'));
+              return (
+                <div key={i} className="compare-metric-card">
+                  <div className="compare-metric-label">{m.label}</div>
+                  <div className="compare-metric-asis">{m.fmt(m.a) ?? '—'}</div>
+                  <div className="compare-metric-tobe" style={{color}}>
+                    {m.fmt(m.b) ?? '—'}
+                    {p!==null && <span className="compare-metric-pct"> {p>0?'+':''}{p}%</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
+
+      {/* Side-by-side comparison of previous evaluations */}
+      {evalTab === 'comparison' && (
+        <div className="results-compare-layout">
+          {[{label:'As-Is', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label,r}) => (
+            <div key={label} className="run-result-panel">
+              <div className="run-result-panel-header">{label}</div>
+              <div style={{padding:'0.5rem'}}>
+                <EvaluationTab
+                  results={r}
+                  discoveryResults={discoveryResults}
+                  activeModel={activeModel}
+                  serviceTimeMode={serviceTimeMode}
+                  simActivityObjectCounts={simActivityObjectCounts}
+                  onConformanceSaved={onConformanceSaved}
+                  eventLogFiles={eventLogFiles}
+                  handleFileUpload={handleFileUpload}
+                  inputLogConfResults={inputLogConfResults}
+                  inputEventLogFile={inputEventLogFile}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Trace completion tab */}
+      {evalTab === 'traces' && (
+        <div className="results-compare-layout">
+          <div className="run-result-panel">
+            <div className="run-result-panel-header">As-Is</div>
+            <div style={{padding:'1rem'}}>{renderTracePanel(tracesAsis, 'As-Is', logTraces)}</div>
+          </div>
+          {rTobe && (
+            <div className="run-result-panel">
+              <div className="run-result-panel-header">To-Be</div>
+              <div style={{padding:'1rem'}}>{renderTracePanel(tracesTobe, 'To-Be', logTraces)}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Verification matrix tab */}
+      {evalTab === 'matrix' && (
+        <div>
+          <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',flexWrap:'wrap',alignItems:'center'}}>
+            <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginRight:'0.25rem'}}>Mode:</span>
+            {VERIFY_MODES.map(m => (
+              <button key={m.key} onClick={() => setVerifyMode(m.key)}
+                style={{padding:'0.2rem 0.65rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
+                  border: verifyMode===m.key ? '2px solid #1e293b' : '1px solid #e2e8f0',
+                  background: verifyMode===m.key ? '#1e293b' : 'white',
+                  color: verifyMode===m.key ? 'white' : '#475569'}}>
+                {m.label}
+              </button>
+            ))}
+            {verifyMode === 'time' && (
+              <>
+                <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginLeft:'0.75rem',marginRight:'0.25rem'}}>Aggregation:</span>
+                {['mean','min','max'].map(sub => (
+                  <button key={sub} onClick={() => setTimeSubMode(sub)}
+                    style={{padding:'0.2rem 0.55rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
+                      border: timeSubMode===sub ? '2px solid #1d4ed8' : '1px solid #e2e8f0',
+                      background: timeSubMode===sub ? '#1d4ed8' : 'white',
+                      color: timeSubMode===sub ? 'white' : '#475569'}}>
+                    {sub.charAt(0).toUpperCase()+sub.slice(1)}
+                  </button>
+                ))}
+              </>
+            )}
+          </div>
+          <div className="results-compare-layout">
+            <div className="run-result-panel">
+              <div className="run-result-panel-header">As-Is</div>
+              <div style={{padding:'1rem'}}>{renderVerifyMatrix(matrixAsis, 'As-Is')}</div>
+            </div>
+            {rTobe && (
+              <div className="run-result-panel">
+                <div className="run-result-panel-header">To-Be</div>
+                <div style={{padding:'1rem'}}>{renderVerifyMatrix(matrixTobe, 'To-Be')}</div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Individual evaluation tabs */}
+      {evalTab === 'asis' && rAsis && (
+        <EvaluationTab results={rAsis} discoveryResults={discoveryResults} activeModel={activeModel}
+          serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
+          onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
+          handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
+          inputEventLogFile={inputEventLogFile} />
+      )}
+      {evalTab === 'tobe' && rTobe && (
+        <EvaluationTab results={rTobe} discoveryResults={discoveryResults} activeModel={activeModel}
+          serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
+          onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
+          handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
+          inputEventLogFile={inputEventLogFile} />
+      )}
+    </div>
+  );
+}
+
 function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
   const logDurations = activeModel?.activity_durations || {};
@@ -4174,6 +4580,7 @@ function App() {
   const [probMatrixToBe, setProbMatrixToBe] = useState(null);
   const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
   const [resultsToBe, setResultsToBe] = useState(null);    // Run To-Be results
+  const [evaluationReady, setEvaluationReady] = useState(false); // true after Run Evaluation clicked
   const [objTabAsIs, setObjTabAsIs] = useState('concurrency');
   const [objTabToBe, setObjTabToBe] = useState('concurrency');
   const [discoveryChecks, setDiscoveryChecks] = useState({
@@ -4717,6 +5124,7 @@ function App() {
       if (mode === 'asis') setResultsAsIs(response.data.results);
       else setResultsToBe(response.data.results);
       setLastCompletedMode(mode);
+      setEvaluationReady(false); // reset — user must click Run Evaluation for new results
       // Do NOT auto-navigate — show completion banner with button instead
 
       // Push a snapshot to session history for replay
@@ -5725,11 +6133,14 @@ function App() {
             { key: 'behavior',   label: 'Model Behavior' },
             { key: 'scenario',   label: 'Scenario Builder' },
             { key: 'results',    label: 'Results' },
-            { key: 'evaluation', label: 'Evaluation' },
+            { key: 'evaluation', label: 'Evaluation', disabled: !evaluationReady },
           ].map(t => (
             <button key={t.key}
               className={`main-tab-btn${externalTab === t.key ? ' active' : ''}`}
-              onClick={() => setExternalTab(t.key)}>
+              disabled={t.disabled}
+              title={t.disabled ? 'Click Run Evaluation in the Results tab first' : undefined}
+              onClick={() => !t.disabled && setExternalTab(t.key)}
+              style={t.disabled ? {opacity:0.4, cursor:'not-allowed'} : {}}>
               {t.label}
             </button>
           ))}
@@ -7084,6 +7495,36 @@ function App() {
                   );
                 })()}
 
+                {/* Run Evaluation button */}
+                {(resultsAsIs || resultsToBe) && (
+                  <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'1rem',
+                    background: evaluationReady ? '#f0fdf4' : '#f8fafc',
+                    border:`1px solid ${evaluationReady?'#86efac':'#e2e8f0'}`,
+                    borderRadius:'8px',padding:'0.75rem 1rem'}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:700,fontSize:'0.85rem',color:'#1e293b'}}>
+                        {evaluationReady ? '✓ Evaluation ready' : 'Run Evaluation to compute conformance, trace completion, and verification metrics'}
+                      </div>
+                      {evaluationReady && (
+                        <div style={{fontSize:'0.72rem',color:'#64748b',marginTop:'0.15rem'}}>
+                          Re-run after new simulations to update results
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      className="simulate-button"
+                      style={{width:'auto',padding:'0.5rem 1.25rem',fontSize:'0.85rem',
+                        background: evaluationReady ? '#475569' : '#1e293b'}}
+                      onClick={() => {
+                        setEvaluationReady(true);
+                        setExternalTab('evaluation');
+                      }}
+                    >
+                      {evaluationReady ? '↻ Re-run Evaluation' : '▶ Run Evaluation'}
+                    </button>
+                  </div>
+                )}
+
                 <div className="results-compare-layout">
                   {[{label:'As-Is', r:resultsAsIs, objTab:objTabAsIs, setObjTab:setObjTabAsIs}, {label:'To-Be', r:resultsToBe, objTab:objTabToBe, setObjTab:setObjTabToBe}].map(({label, r, objTab, setObjTab}) => (
                     <div key={label} className="run-result-panel">
@@ -7314,10 +7755,13 @@ function App() {
                     <div className="section-header"><h2>Evaluation</h2><p>Run a simulation first.</p></div>
                   </div>
                 ) : (
-                  <EvaluationTab
-                    results={resultsToBe ?? resultsAsIs ?? results}
+                  <EvaluationWrapper
+                    resultsAsIs={resultsAsIs}
+                    resultsToBe={resultsToBe}
+                    results={results}
                     discoveryResults={discoveryResults}
                     activeModel={activeModel}
+                    modelBase={modelBase}
                     serviceTimeMode={serviceTimeMode}
                     simActivityObjectCounts={simActivityObjectCounts}
                     onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs||[])).catch(()=>{})}

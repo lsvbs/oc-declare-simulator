@@ -537,7 +537,17 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
             continue
         scope_ids_cache.setdefault(runtime.object_type, []).append(oid)
 
+    # Performance: set of object types with zero active instances — constraints
+    # scoped to these types pass trivially (scope_ids would be empty → True)
+    inactive_types = getattr(state, '_inactive_scope_types', None)
+    creates_set = set(getattr(candidate, 'object_types_to_create', []) or [])
+
     for constraint in relevant:
+        # Skip constraint if its scope type is fully inactive and not being created now
+        if inactive_types is not None:
+            scope_type = getattr(constraint.scope, 'object_type', None)
+            if scope_type and scope_type in inactive_types and scope_type not in creates_set:
+                continue
         if not check_constraint(constraint, candidate, state, scope_ids_cache):
             return False
     return True
@@ -548,7 +558,11 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
 # ---------------------------------------------------------------------------
 
 def _count_links_for_object(state: SimulationState, object_id: str, other_type: str) -> int:
-    """Count links from object_id to runtime objects of `other_type` — O(degree)."""
+    """Count links from object_id to runtime objects of `other_type` — O(1) via typed index."""
+    linked_by_type = getattr(state, '_linked_by_type', None)
+    if linked_by_type is not None:
+        return len(linked_by_type.get(object_id, {}).get(other_type, _EMPTY_SET))
+    # Fallback: O(degree) scan if index not available
     count = 0
     for neighbor_id in state._links_by_object.get(object_id, ()):
         obj = state.objects.get(neighbor_id)
@@ -576,8 +590,14 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
         if t:
             participant_types[oid] = t
 
+    # Pre-filter: only check rules whose both sides appear in this candidate's types
+    all_types = set(participant_types.values()) | set(created_counts.keys())
+
     for rule in static_model.o2o_rules:
         if rule.max_links is None:
+            continue
+        # Skip rules where either type is absent from this candidate
+        if rule.source_type not in all_types or rule.target_type not in all_types:
             continue
         # Skip rules where either side is a resource type — resources are
         # shared across cases and must not accumulate permanent link caps.
