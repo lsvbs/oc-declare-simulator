@@ -886,19 +886,26 @@ def discover_lifecycle(
 
 def discover_resource_types(
     ocel_log: Dict[str, Any],
-    resource_threshold: float = 50.0
+    resource_threshold: float = 2.0
 ) -> List[str]:
     """Classify object types as reusable resources.
 
-    A type is classified as a resource if the average number of events per
-    instance exceeds ``resource_threshold`` (default 50).  Resources like
-    Forklifts and Trucks participate across many unrelated case chains and
-    should never be deactivated or restricted to per-case link neighbourhoods.
+    A type is classified as a resource if the average maximum per-activity
+    reuse count per object instance exceeds ``resource_threshold``.
+
+    "Per-activity reuse" = how many times a single object instance appears in
+    the SAME activity. A Forklift firing Weigh 200 times scores 200.
+    An applicant firing Interview Held exactly once scores 1 — not a resource.
+
+    This correctly distinguishes shared infrastructure (Forklifts, Trucks) from
+    case objects (applicants, orders) that each go through activities at most
+    a small fixed number of times.
 
     Args:
         ocel_log: OCEL 2.0 log dictionary
-        resource_threshold: Minimum average events-per-instance to qualify as
-            a resource.  Default 50.
+        resource_threshold: Minimum average max-per-activity repetitions per
+            instance. Default 2.0 — an object must repeat the same activity
+            more than twice on average to be classified as a resource.
 
     Returns:
         List of resource object type names.
@@ -909,31 +916,47 @@ def discover_resource_types(
     objects = ocel_log.get('objects', {})
     events  = ocel_log.get('events', {})
 
-    # Count events per object instance
-    event_counts: Dict[str, int] = {}
-    for event_data in events.values():
-        omap = event_data.get('omap', []) or event_data.get('relationships', [])
-        for obj_id in omap:
-            event_counts[obj_id] = event_counts.get(obj_id, 0) + 1
-
-    # Aggregate by object type
     from collections import defaultdict
-    type_event_counts: Dict[str, List[int]] = defaultdict(list)
+
+    # Count (obj_id, activity) occurrences
+    obj_act_counts: Dict = defaultdict(lambda: defaultdict(int))
+    for event_data in events.values():
+        activity = (event_data.get('activity') or event_data.get('type') or
+                    event_data.get('ocel:activity', ''))
+        omap = event_data.get('omap') or []
+        if not omap:
+            rels = event_data.get('relationships') or []
+            omap = [r.get('objectId', r) if isinstance(r, dict) else r for r in rels]
+        for obj_id in omap:
+            if activity:
+                obj_act_counts[obj_id][activity] += 1
+
+    # Build object type map
+    obj_type_map = {}
     for obj_id, obj_data in objects.items():
         ot = obj_data.get('type')
         if ot:
-            type_event_counts[ot].append(event_counts.get(obj_id, 0))
+            obj_type_map[obj_id] = ot
+
+    # For each instance, find max reuse in any single activity
+    type_max_reuse: Dict = defaultdict(list)
+    for obj_id, act_counts in obj_act_counts.items():
+        ot = obj_type_map.get(obj_id)
+        if ot:
+            type_max_reuse[ot].append(max(act_counts.values()) if act_counts else 0)
+
+    # Objects with zero events score 0
+    for obj_id, obj_data in objects.items():
+        ot = obj_data.get('type')
+        if ot and obj_id not in obj_act_counts:
+            type_max_reuse[ot].append(0)
 
     resource_types = []
-    for ot, counts in type_event_counts.items():
-        if counts:
-            avg = sum(counts) / len(counts)
-            if avg >= resource_threshold:
-                resource_types.append(ot)
+    for ot, scores in type_max_reuse.items():
+        if scores and sum(scores) / len(scores) >= resource_threshold:
+            resource_types.append(ot)
 
     return sorted(resource_types)
-
-
 def discover_start_activities(
     ocel_log: Dict[str, Any],
     min_pct: float = 1.0
@@ -1612,15 +1635,21 @@ def compute_ocpa_metrics(
         # When they disagree (terminal), sojourn gives the more meaningful value.
         direct = b["service_direct_s"]
         soj_vals = b["sojourn_s"]
-        if direct and soj_vals:
+        # Filter out zero sojourn values — these occur when the activity fires as
+        # the first event on a newly created object (no preceding event → sojourn=0).
+        # Zero sojourn is not a real measurement and should not beat a real forward gap.
+        soj_vals_nonzero = [s for s in soj_vals if s > 0]
+        if direct and soj_vals_nonzero:
             direct_median = sorted(direct)[len(direct)//2]
-            soj_median    = sorted(soj_vals)[len(soj_vals)//2]
-            raw_source = direct if direct_median <= soj_median else soj_vals
+            soj_median    = sorted(soj_vals_nonzero)[len(soj_vals_nonzero)//2]
+            raw_source = direct if direct_median <= soj_median else soj_vals_nonzero
         elif direct:
             raw_source = direct
+        elif soj_vals_nonzero:
+            raw_source = soj_vals_nonzero
         else:
-            raw_source = soj_vals
-        using_fallback = raw_source is soj_vals and not direct
+            raw_source = soj_vals  # all zeros — keep as fallback
+        using_fallback = raw_source is not direct and not raw_source
         if act in anchor_map:
             anc = anchor_map[act]
             svc_mean = float(anc.get("mean_seconds", soj["mean"]))

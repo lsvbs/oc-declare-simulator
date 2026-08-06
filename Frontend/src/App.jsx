@@ -6,6 +6,30 @@ import FlowChart from './FlowChart';
 import ModelEditor from './ModelEditor';
 import { O2ODiagram } from './ModelEditor';
 
+// ── Shared utility: sort activities by log flow order ─────────────────────────
+// Uses trace_position (avg position in log traces) first, then first-occurrence
+// in object_traces, then alphabetical. Pass discoveryResults and optionally
+// an object_traces dict from a results object.
+function makeFlowRankSorter(discoveryResults, objectTraces) {
+  const rank = {};
+  // Primary: trace_position from discovery (average position in log)
+  const tp = discoveryResults?.trace_position || {};
+  Object.entries(tp).forEach(([act, pos]) => { rank[act] = pos; });
+  // Secondary: first occurrence in sim object traces (fills gaps)
+  if (objectTraces) {
+    Object.values(objectTraces).forEach(trace => {
+      (trace || []).forEach((act, i) => {
+        if (!(act in rank)) rank[act] = i + 1000; // after log-ranked ones
+      });
+    });
+  }
+  return (a, b) => {
+    const ra = a in rank ? rank[a] : 999999;
+    const rb = b in rank ? rank[b] : 999999;
+    return ra !== rb ? ra - rb : a.localeCompare(b);
+  };
+}
+
 // ── TransitionFlowChart ───────────────────────────────────────────────────────
 const TFC_R = 22;
 const TFC_HGAP = 80;
@@ -1223,44 +1247,43 @@ function computeOCDeclareConformance(events, objectTypesMap, constraints) {
 
   const n = events.length;
 
-  // Build per-event object-type map
-  // eventObjs[i] = Set of object IDs for event i
+  // Build per-event object-set and per-activity index for O(1) lookup
   const eventObjs = events.map(e => new Set(e.object_ids || []));
 
-  // For each event, which constraints it must satisfy (source activity matches)
-  // and does it satisfy them?
+  // Index events by activity for fast filtering — avoids O(n) scan per source event
+  const byActivity = {};
+  events.forEach((e, i) => {
+    (byActivity[e.activity] = byActivity[e.activity] || []).push(i);
+  });
 
-  // Temporal filter helper — given source event index i and constraint type,
-  // return which event indices are in the correct temporal position.
-  // For precedence(A→B): A is source, B is target. "A before B" means
-  // we look for B events AFTER A (ts >= srcTs).
-  // For response(A→B): A is source, B is target. Same — B must follow A.
-  const temporalFilter = (srcIdx, ctype) => {
+  // Pre-sort check: events are assumed sorted by timestamp.
+  // For forward-looking constraints (response/precedence), use binary search
+  // to find the first event with ts >= srcTs instead of scanning all n events.
+  const sortedTs = events.map(e => e.timestamp);
+
+  const firstIndexAtOrAfter = (ts) => {
+    let lo = 0, hi = n;
+    while (lo < hi) { const mid = (lo+hi)>>1; sortedTs[mid] < ts ? lo=mid+1 : hi=mid; }
+    return lo;
+  };
+
+  // Temporal filter — returns indices of target-activity events in the correct window
+  // Uses activity index + binary search instead of full O(n) scan
+  const temporalFilter = (srcIdx, ctype, tgtActivity) => {
     const srcTs = events[srcIdx].timestamp;
-    const result = [];
-    for (let j = 0; j < n; j++) {
-      if (j === srcIdx) continue;
-      const ts = events[j].timestamp;
-      if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' ||
-          ctype === 'alternate_response' || ctype === 'precedence' || ctype === 'alternate_precedence') {
-        // Both precedence and response: target must come AFTER source
-        if (ts >= srcTs) result.push(j);
-      } else if (ctype === 'chain_precedence') {
-        // handled below as immediately-before
-        result.push(j);
-      } else {
-        result.push(j); // not_succession, not_coexistence, responded_existence — no temporal restriction
-      }
-    }
     // Chain constraints: only immediately adjacent
-    if (ctype === 'chain_response') {
-      return srcIdx + 1 < n ? [srcIdx + 1] : [];
+    if (ctype === 'chain_response')   return srcIdx + 1 < n ? [srcIdx + 1] : [];
+    if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
+
+    const tgtIndices = byActivity[tgtActivity] || [];
+    if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' ||
+        ctype === 'alternate_response' || ctype === 'precedence' || ctype === 'alternate_precedence') {
+      // Only events at or after srcTs — use binary search
+      const start = firstIndexAtOrAfter(srcTs);
+      return tgtIndices.filter(j => j >= start && j !== srcIdx);
     }
-    if (ctype === 'chain_precedence') {
-      // The event immediately before srcIdx must be the target
-      return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
-    }
-    return result;
+    // not_succession, not_coexistence, responded_existence — no temporal restriction
+    return tgtIndices.filter(j => j !== srcIdx);
   };
 
   // Per-event satisfaction: event i satisfies constraint c?
@@ -1274,8 +1297,8 @@ function computeOCDeclareConformance(events, objectTypesMap, constraints) {
     const scope = c.scope || { kind: 'global' };
 
     // Candidate events: of target activity, in correct temporal window
-    const temporal = temporalFilter(i, c.constraint_type);
-    const tgtCandidates = temporal.filter(j => events[j].activity === tgt);
+    // temporalFilter now takes tgt activity and returns only tgt events — no extra filter needed
+    const tgtCandidates = temporalFilter(i, c.constraint_type, tgt);
 
     if (scope.kind === 'global') {
       const cnt = tgtCandidates.length;
@@ -1432,7 +1455,7 @@ function PerObjectTypeBreakdown({ fitnessPerObject, objectTypesMap }) {
               <thead>
                 <tr>
                   <th>Object ID</th>
-                  <th className="audit-num">Events</th>
+                  <th className="audit-num">Events Completed</th>
                   <th className="audit-num">Enabled</th>
                   <th className="audit-num">Fitness</th>
                 </tr>
@@ -3019,8 +3042,168 @@ function SimVsDiscoveredComparison({ simMetrics, logDurations, orderedActivities
   );
 }
 
+// ── OC-Declare Coverage Measures ─────────────────────────────────────────────
+// Implements coverage metrics from Küsters & van der Aalst (BPM 2025) + Di Ciccio et al.
+function computeOCCoverage(results, model, discoveryResults) {
+  if (!results || !model) return null;
+  const constraints = model.constraints || [];
+  const activities = (model.activities || []).map(a => typeof a === 'string' ? a : a.name);
+  const objectTypes = [...new Set([
+    ...(model.object_types || []).map(t => typeof t === 'string' ? t : t.name),
+    ...(model.activities || []).flatMap(a => (a.bindings||[]).map(b=>b.object_type))
+  ])];
+
+  // Events and objects from simulation
+  const activitySequence = results.activity_sequence || [];
+  const firedActivities = new Set(activitySequence);
+  const simObjectTypes = new Set(Object.keys(results.object_types || {}));
+  const objectTraces = results.object_traces || {};  // oid → [act, act, ...]
+  const objectTypesMap = results.object_types_map || {};
+
+  // cov_act: fraction of model activities that appear in simulation output
+  const modelActSet = new Set([
+    ...constraints.map(c=>c.source_activity).filter(Boolean),
+    ...constraints.map(c=>c.target_activity).filter(Boolean),
+    ...activities
+  ]);
+  const firedModelActs = [...modelActSet].filter(a => firedActivities.has(a));
+  const cov_act = modelActSet.size > 0 ? firedModelActs.length / modelActSet.size : null;
+
+  // cov_ot: fraction of object types referenced in model that were instantiated
+  const modelOtSet = new Set(objectTypes.filter(Boolean));
+  const firedOts = [...modelOtSet].filter(ot => simObjectTypes.has(ot));
+  const cov_ot = modelOtSet.size > 0 ? firedOts.length / modelOtSet.size : null;
+
+  // cov_activation: fraction of constraints with at least one source event (non-vacuous)
+  const sourceEventCounts = {};
+  activitySequence.forEach(a => { sourceEventCounts[a] = (sourceEventCounts[a]||0)+1; });
+  const constraintsWithSource = constraints.filter(c => c.source_activity && (sourceEventCounts[c.source_activity]||0)>0);
+  const cov_activation = constraints.length > 0 ? constraintsWithSource.length / constraints.length : null;
+  const sourceCounts = constraints.map(c => sourceEventCounts[c.source_activity]||0).filter(n=>n>0);
+  const medianSrc = sourceCounts.length > 0 ? sourceCounts.sort((a,b)=>a-b)[Math.floor(sourceCounts.length/2)] : null;
+
+  // cov_inv: fraction of (constraint, obj_type) pairs where |obj^ot(e)| ≥ 2 for some source event
+  // Tests whether Each/All/Any modes are distinguishable
+  let invTotal = 0, invTestable = 0;
+  const scopeTypeCounts = {}; // act -> {ot -> [counts per event]}
+  Object.entries(objectTraces).forEach(([oid, trace]) => {
+    const ot = objectTypesMap[oid];
+    if (!ot) return;
+    trace.forEach(act => {
+      if (!scopeTypeCounts[act]) scopeTypeCounts[act] = {};
+      scopeTypeCounts[act][ot] = (scopeTypeCounts[act][ot]||0)+1;
+    });
+  });
+  constraints.forEach(c => {
+    const scopeOt = c.scope?.object_type;
+    if (!scopeOt) return;
+    invTotal++;
+    const maxPerEvent = scopeTypeCounts[c.source_activity]?.[scopeOt];
+    if (maxPerEvent != null && maxPerEvent >= 2) invTestable++;
+  });
+  const cov_inv = invTotal > 0 ? invTestable / invTotal : null;
+
+  // cov_min: fraction of constraints where some cascade count > nmin
+  // proxy: activities that fired more times than nmin would require
+  let minTotal = 0, minDistinguishable = 0;
+  constraints.forEach(c => {
+    const nmin = c.nmin ?? 1;
+    if (nmin <= 0) return;
+    minTotal++;
+    const cnt = sourceEventCounts[c.target_activity]||0;
+    if (cnt > nmin) minDistinguishable++;
+  });
+  const cov_min = minTotal > 0 ? minDistinguishable / minTotal : null;
+
+  // cov_max: fraction of finite-nmax constraints where the max was reached
+  const finiteMax = constraints.filter(c => c.nmax != null && c.nmax > 0);
+  let maxReached = 0;
+  finiteMax.forEach(c => {
+    const cnt = sourceEventCounts[c.target_activity]||0;
+    if (cnt >= c.nmax) maxReached++;
+  });
+  const cov_max = finiteMax.length > 0 ? maxReached / finiteMax.length : null;
+
+  // cov_neg: fraction of negated constraints (nmax=0) where target appeared at all in the output
+  const negConstraints = constraints.filter(c => c.nmax === 0);
+  let negNonTrivial = 0;
+  negConstraints.forEach(c => {
+    if (firedActivities.has(c.target_activity)) negNonTrivial++;
+  });
+  const cov_neg = negConstraints.length > 0 ? negNonTrivial / negConstraints.length : null;
+
+  // cov_arrow: EF/EP constraints where some event satisfies EF but not a direct-chain version
+  // Proxy: fraction of response/precedence (non-chain) constraints where target fired
+  const weakArrow = constraints.filter(c => ['response','precedence'].includes(c.constraint_type));
+  let arrowDist = 0;
+  weakArrow.forEach(c => {
+    // If target fires, there's a chance EF/EP is distinguishable from DF/DP
+    if (firedActivities.has(c.target_activity)) arrowDist++;
+  });
+  const cov_arrow = weakArrow.length > 0 ? arrowDist / weakArrow.length : null;
+
+  // cov_guard: not computable from log — mark as N/A
+  const cov_guard = null;
+
+  return {
+    cov_act:        { value: cov_act,        fired: firedModelActs.length, total: modelActSet.size },
+    cov_ot:         { value: cov_ot,         fired: firedOts.length,        total: modelOtSet.size },
+    cov_activation: { value: cov_activation, fired: constraintsWithSource.length, total: constraints.length, median: medianSrc },
+    cov_inv:        { value: cov_inv,         tested: invTestable, total: invTotal },
+    cov_min:        { value: cov_min,         dist: minDistinguishable, total: minTotal },
+    cov_max:        { value: cov_max,         reached: maxReached, total: finiteMax.length },
+    cov_neg:        { value: cov_neg,         nonTrivial: negNonTrivial, total: negConstraints.length },
+    cov_arrow:      { value: cov_arrow,       dist: arrowDist, total: weakArrow.length },
+    cov_guard:      { value: null,            note: 'Not computable from log — requires simulator instrumentation' },
+  };
+}
+
+function OCCoveragePanel({ results, model, discoveryResults }) {
+  const cov = React.useMemo(
+    () => computeOCCoverage(results, model, discoveryResults),
+    [results, model, discoveryResults]
+  );
+  if (!cov) return <div style={{color:'#94a3b8',fontSize:'0.82rem'}}>Run a simulation to compute coverage.</div>;
+
+  const fmt = v => v == null ? 'N/A' : (v*100).toFixed(1)+'%';
+  const color = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
+
+  const rows = [
+    { key:'cov_act',        label:'Activity coverage',        desc:'Fraction of model activities that appeared in sim output', detail: `${cov.cov_act.fired}/${cov.cov_act.total} activities fired` },
+    { key:'cov_ot',         label:'Object type coverage',     desc:'Fraction of model object types instantiated', detail: `${cov.cov_ot.fired}/${cov.cov_ot.total} types seen` },
+    { key:'cov_activation', label:'Constraint activation',    desc:'Fraction of constraints with ≥1 source event (non-vacuous)', detail: `${cov.cov_activation.fired}/${cov.cov_activation.total} non-vacuous, median src events: ${cov.cov_activation.median??'—'}` },
+    { key:'cov_inv',        label:'Involvement testability',  desc:'Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any', detail: `${cov.cov_inv.tested}/${cov.cov_inv.total} pairs testable` },
+    { key:'cov_min',        label:'nmin discriminability',    desc:'Fraction of constraints where cascade count > nmin — tighter bound distinguishable', detail: `${cov.cov_min.dist}/${cov.cov_min.total} constraints` },
+    { key:'cov_max',        label:'nmax reachability',        desc:'Fraction of finite-nmax constraints where the max was actually reached', detail: `${cov.cov_max.reached}/${cov.cov_max.total} constraints (finite nmax only)` },
+    { key:'cov_neg',        label:'Negative constraint test', desc:'Fraction of nmax=0 constraints where target activity appeared (non-trivial test)', detail: `${cov.cov_neg.nonTrivial}/${cov.cov_neg.total} non-trivial` },
+    { key:'cov_arrow',      label:'Arrow discriminability',   desc:'Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)', detail: `${cov.cov_arrow.dist}/${cov.cov_arrow.total} response/precedence constraints` },
+    { key:'cov_guard',      label:'Guard coverage',           desc:'Whether precedence constraints blocked candidates during generation', detail: cov.cov_guard.note },
+  ];
+
+  return (
+    <div>
+      <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.75rem'}}>
+        Based on Küsters & van der Aalst (BPM 2025) OC-Declare framework. Green ≥90%, amber ≥60%, red &lt;60%.
+      </p>
+      <table className="behavior-table" style={{fontSize:'0.78rem'}}>
+        <thead><tr><th>Measure</th><th style={{width:'70px',textAlign:'center'}}>Score</th><th>What it indicates</th><th>Detail</th></tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.key}>
+              <td style={{fontWeight:600,whiteSpace:'nowrap'}}>{r.label}</td>
+              <td style={{textAlign:'center',fontWeight:700,color:color(cov[r.key]?.value)}}>{fmt(cov[r.key]?.value)}</td>
+              <td style={{color:'#475569',fontSize:'0.72rem'}}>{r.desc}</td>
+              <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{r.detail}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 // ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
-function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
+function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount }) {
   const hasBoth = !!(resultsAsIs && resultsToBe);
   const rAsis = resultsAsIs ?? results;
   const rTobe = resultsToBe;
@@ -3056,14 +3239,13 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   const buildMatrix = (r) => {
     if (!r) return null;
     const metrics = r.metrics?.activity_metrics || {};
-    const serviceByType = r.metrics?.activity_service_by_type || {}; // act -> {obj_type -> {mean_s,min_s,max_s}}
+    const serviceByType = r.metrics?.activity_service_by_type || {};
     const resourceTypes = new Set(r.resource_types || []);
     const audit = r.audit?.object_lifecycle_audit || {};
-    const activities = Object.keys(metrics).sort();
+    const activities = Object.keys(metrics).sort(makeFlowRankSorter(discoveryResults, r.object_traces));
     const objTypes = Object.keys(audit).filter(t => !resourceTypes.has(t));
 
-    // Build activity→participating object types from activeModel bindings
-    const actBindings = {}; // act -> Set of object types
+    const actBindings = {};
     const modelToUse = activeModel || modelBase;
     if (modelToUse?.activities) {
       modelToUse.activities.forEach(a => {
@@ -3091,10 +3273,9 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   // Tab buttons for top navigation
   const tabs = [
     { key: 'comparison', label: 'Comparison' },
-    { key: 'traces',     label: 'Trace Completion' },
+    { key: 'coverage',   label: 'Coverage' },
     { key: 'matrix',     label: 'Verification Matrix' },
-    { key: 'asis',       label: 'As-Is Evaluation' },
-    ...(rTobe ? [{ key: 'tobe', label: 'To-Be Evaluation' }] : []),
+    { key: 'evaluation', label: 'Evaluation' },
   ];
 
   const renderTracePanel = (tc, label, logCount) => {
@@ -3165,8 +3346,8 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
       const participates = !actBindings[act] || actBindings[act].size === 0 || actBindings[act].has(ot);
 
       if (verifyMode === 'frequency') {
-        const cnt = m.execution_count || 0;
-        return cnt > 0 ? cnt : null;
+        const cnt = serviceByType?.[act]?.[ot]?.count ?? null;
+        return cnt != null && cnt > 0 ? cnt : null;
       }
       if (verifyMode === 'time') {
         if (!participates) return null;
@@ -3275,6 +3456,16 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
 
   return (
     <div>
+      {/* Re-run button mirrored from Results tab */}
+      {onRerunEvaluation && (
+        <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'0.75rem'}}>
+          <button className="simulate-button"
+            style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',background:'#475569'}}
+            onClick={onRerunEvaluation}>
+            ↻ Re-run Evaluation
+          </button>
+        </div>
+      )}
       {/* Top navigation */}
       <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'1rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
         {tabs.map(t => (
@@ -3292,7 +3483,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
         const pct = (a,b) => a&&b&&a!==0 ? Math.round((b-a)/Math.abs(a)*100) : null;
         const metrics = [
-          { label:'Events Fired', a:rAsis?.steps_executed, b:rTobe?.steps_executed, fmt:v=>v?.toLocaleString(), lower:null },
+          { label:'Events Completed', a:rAsis?.steps_executed, b:rTobe?.steps_executed, fmt:v=>v?.toLocaleString(), lower:null },
           { label:'Sim Time', a:rAsis?.sim_time_s, b:rTobe?.sim_time_s, fmt:fmtDur, lower:true },
           { label:'Completed Traces', a:tracesAsis?.deactAll, b:tracesTobe?.deactAll, fmt:v=>v?.toLocaleString(), lower:false },
           { label:'Trace Rate', a:tracesAsis?.pct, b:tracesTobe?.pct, fmt:v=>v!=null?v+'%':null, lower:false },
@@ -3346,22 +3537,6 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         </div>
       )}
 
-      {/* Trace completion tab */}
-      {evalTab === 'traces' && (
-        <div className="results-compare-layout">
-          <div className="run-result-panel">
-            <div className="run-result-panel-header">As-Is</div>
-            <div style={{padding:'1rem'}}>{renderTracePanel(tracesAsis, 'As-Is', logTraces)}</div>
-          </div>
-          {rTobe && (
-            <div className="run-result-panel">
-              <div className="run-result-panel-header">To-Be</div>
-              <div style={{padding:'1rem'}}>{renderTracePanel(tracesTobe, 'To-Be', logTraces)}</div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Verification matrix tab */}
       {evalTab === 'matrix' && (
         <div>
@@ -3406,20 +3581,40 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         </div>
       )}
 
-      {/* Individual evaluation tabs */}
-      {evalTab === 'asis' && rAsis && (
-        <EvaluationTab results={rAsis} discoveryResults={discoveryResults} activeModel={activeModel}
-          serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
-          onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
-          handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
-          inputEventLogFile={inputEventLogFile} />
+      {/* Coverage tab — side-by-side for As-Is and To-Be */}
+      {evalTab === 'coverage' && (
+        <div className="results-compare-layout">
+          {[{label:'As-Is', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
+            <div key={label} className="run-result-panel">
+              <div className="run-result-panel-header">{label}</div>
+              <div style={{padding:'1rem'}}>
+                <OCCoveragePanel results={r} model={activeModel || modelBase} discoveryResults={discoveryResults} />
+              </div>
+            </div>
+          ))}
+        </div>
       )}
-      {evalTab === 'tobe' && rTobe && (
-        <EvaluationTab results={rTobe} discoveryResults={discoveryResults} activeModel={activeModel}
-          serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
-          onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
-          handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
-          inputEventLogFile={inputEventLogFile} />
+
+      {/* Evaluation tab — As-Is and To-Be side by side */}
+      {evalTab === 'evaluation' && (
+        <div className="results-compare-layout">
+          {[{label:'As-Is', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
+            <div key={label} className="run-result-panel">
+              <div className="run-result-panel-header">{label}</div>
+              <div style={{padding:'0.5rem'}}>
+                {r ? (
+                  <EvaluationTab key={evalRunCount} results={r} discoveryResults={discoveryResults} activeModel={activeModel}
+                    serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
+                    onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
+                    handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
+                    inputEventLogFile={inputEventLogFile} />
+                ) : (
+                  <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'1rem'}}>No {label} run yet.</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
@@ -3638,6 +3833,13 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
               if (!m) return s;
               return s + (m.mean_service_s || 0) * (m.execution_count || 0);
             }, 0);
+            const wmapeAct = logTotal > 0 && simTotal > 0
+              ? orderedActivities.reduce((s, act) => {
+                  const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
+                  const lp = (logCounts[act]||0) / logTotal * 100;
+                  return s + Math.abs(sp - lp);
+                }, 0)
+              : null;
             return (
               <table className="metrics-table sim-compare-table">
                 <thead>
@@ -3647,7 +3849,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                     <th title="Times fired in input log">Log count</th>
                     <th title="Share of simulated events">Sim %</th>
                     <th title="Share of log events">Log %</th>
-                    <th title="Sim % − Log %">Diff</th>
+                    <th title="Sim % − Log %">Diff {wmapeAct != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmapeAct < 10 ? '#16a34a' : wmapeAct < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmapeAct.toFixed(1)}%</span>}</th>
                     <th title="Mean service time per firing">Mean svc</th>
                     <th title="Total accumulated service time (mean × count)">Total svc</th>
                     <th title="Share of total accumulated service time across all activities">Time share</th>
@@ -3781,12 +3983,82 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           )}
         </div>
 
-        {/* Sim Metrics vs Log Discovery — above service time */}
-        <SimVsDiscoveredComparison
-          simMetrics={simMetrics}
-          logDurations={logDurations}
-          orderedActivities={orderedActivities}
-        />
+        {/* WMAPE: Sim mean vs Log mean, and Log mean vs Discovered mean */}
+        {(() => {
+          const simM = simMetrics;
+          const logDurs = logDurations; // discovered from input OCEL
+          const simDurs = simDiscovered || {}; // timing discovered from output OCEL
+          const acts = orderedActivities.filter(a => simM[a] || logDurs[a]);
+          if (acts.length === 0) return null;
+
+          const fmtS = v => { if(!v) return '—'; if(v>=86400) return (v/86400).toFixed(1)+'d'; if(v>=3600) return (v/3600).toFixed(1)+'h'; if(v>=60) return Math.round(v/60)+'m'; return Math.round(v)+'s'; };
+
+          // WMAPE = Σ |sim - log| / Σ log  (weighted by log count)
+          const wmape = (pairs) => {
+            let num = 0, den = 0;
+            pairs.forEach(([sim, log, w]) => {
+              if (sim != null && log != null && log > 0) { num += Math.abs(sim-log) * (w||1); den += log * (w||1); }
+            });
+            return den > 0 ? (num/den*100) : null;
+          };
+
+          const simVsLogPairs = acts.map(a => [simM[a]?.mean_service_s, logDurs[a]?.service_mean, simM[a]?.execution_count||1]);
+          const logVsDiscPairs = acts.map(a => [logDurs[a]?.service_mean, simDurs[a]?.service_mean, simM[a]?.execution_count||1]);
+          const wmapeSimLog = wmape(simVsLogPairs);
+          const wmapeLogDisc = wmape(logVsDiscPairs);
+
+          return (
+            <Collapsible className="eval-subsection" title="Timing WMAPE — Sim vs Log vs Discovered" defaultOpen={true}>
+              {/* WMAPE summary cards */}
+              <div style={{display:'flex',gap:'1rem',marginBottom:'0.75rem',flexWrap:'wrap'}}>
+                <div className="behavior-stat-card" style={{background:wmapeSimLog!=null&&wmapeSimLog<20?'#f0fdf4':wmapeSimLog!=null&&wmapeSimLog<50?'#fffbeb':'#fff1f2'}}>
+                  <div className="behavior-stat-val">{wmapeSimLog!=null?wmapeSimLog.toFixed(1)+'%':'—'}</div>
+                  <div className="behavior-stat-label">WMAPE: Sim mean vs Log mean</div>
+                </div>
+                {simDurs && Object.keys(simDurs).length > 0 && (
+                  <div className="behavior-stat-card" style={{background:wmapeLogDisc!=null&&wmapeLogDisc<20?'#f0fdf4':wmapeLogDisc!=null&&wmapeLogDisc<50?'#fffbeb':'#fff1f2'}}>
+                    <div className="behavior-stat-val">{wmapeLogDisc!=null?wmapeLogDisc.toFixed(1)+'%':'—'}</div>
+                    <div className="behavior-stat-label">WMAPE: Log mean vs Discovered (output)</div>
+                  </div>
+                )}
+              </div>
+              <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.5rem'}}>
+                WMAPE = Σ|sim−log| / Σlog weighted by execution count. Lower = better match.
+              </p>
+
+              {/* Per-activity table */}
+              <table className="metrics-table" style={{fontSize:'0.78rem'}}>
+                <thead>
+                  <tr>
+                    <th>Activity</th>
+                    <th>Log mean</th><th>Sim mean</th><th>|Δ|%</th>
+                    {simDurs && Object.keys(simDurs).length > 0 && <><th>Discovered mean</th><th>Log vs Disc |Δ|%</th></>}
+                  </tr>
+                </thead>
+                <tbody>{acts.map(act => {
+                  const lm = logDurs[act]?.service_mean;
+                  const sm = simM[act]?.mean_service_s;
+                  const dm = simDurs[act]?.service_mean;
+                  const diffSD = lm&&sm&&lm>0 ? Math.abs(sm-lm)/lm*100 : null;
+                  const diffLD = lm&&dm&&lm>0 ? Math.abs(dm-lm)/lm*100 : null;
+                  const cls = v => v==null?'':v<10?'cmp-ok':v<50?'':' cmp-over';
+                  return (
+                    <tr key={act}>
+                      <td>{act}</td>
+                      <td>{fmtS(lm)}</td>
+                      <td>{fmtS(sm)}</td>
+                      <td className={`audit-num${cls(diffSD)}`}>{diffSD!=null?diffSD.toFixed(1)+'%':'—'}</td>
+                      {simDurs && Object.keys(simDurs).length > 0 && <>
+                        <td>{fmtS(dm)}</td>
+                        <td className={`audit-num${cls(diffLD)}`}>{diffLD!=null?diffLD.toFixed(1)+'%':'—'}</td>
+                      </>}
+                    </tr>
+                  );
+                })}</tbody>
+              </table>
+            </Collapsible>
+          );
+        })()}
 
         {/* Service time chart */}
         <Collapsible className="eval-subsection" title="Service Time per Activity" defaultOpen={false}>
@@ -4209,30 +4481,33 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
     setProgress({ done: 0, total });
 
     const eventObjs = evts.map(e => new Set(e.object_ids || []));
-    const temporalFilter = (srcIdx, ctype) => {
+    // Index events by activity for O(1) lookup instead of O(n) scan
+    const byAct = {};
+    evts.forEach((e, i) => { (byAct[e.activity] = byAct[e.activity] || []).push(i); });
+    const sortedEvtTs = evts.map(e => e.timestamp);
+    const firstAtOrAfter = (ts) => {
+      let lo = 0, hi = n;
+      while (lo < hi) { const mid=(lo+hi)>>1; sortedEvtTs[mid] < ts ? lo=mid+1 : hi=mid; }
+      return lo;
+    };
+    const temporalFilter = (srcIdx, ctype, tgtAct) => {
       const srcTs = evts[srcIdx].timestamp;
       if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
       if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
-      const result = [];
-      for (let j = 0; j < n; j++) {
-        if (j === srcIdx) continue;
-        const ts = evts[j].timestamp;
-        if (['response','chain_response','succession','alternate_response',
-             'precedence','alternate_precedence'].includes(ctype)) {
-          if (ts >= srcTs) result.push(j);
-        } else {
-          result.push(j);
-        }
+      const tgtIdxs = byAct[tgtAct] || [];
+      if (['response','chain_response','succession','alternate_response',
+           'precedence','alternate_precedence'].includes(ctype)) {
+        const start = firstAtOrAfter(srcTs);
+        return tgtIdxs.filter(j => j >= start && j !== srcIdx);
       }
-      return result;
+      return tgtIdxs.filter(j => j !== srcIdx);
     };
     const satisfies = (i, c) => {
       if (evts[i].activity !== c.source_activity) return true;
       const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
       const tgt = c.target_activity;
       const scope = c.scope || { kind: 'global' };
-      const temporal = temporalFilter(i, c.constraint_type);
-      const tgtCandidates = temporal.filter(j => evts[j].activity === tgt);
+      const tgtCandidates = temporalFilter(i, c.constraint_type, tgt);
       if (scope.kind === 'global') {
         const cnt = tgtCandidates.length;
         if (['not_coexistence','not_succession'].includes(c.constraint_type)) return cnt === 0;
@@ -4400,7 +4675,7 @@ function App() {
   const [ocdeclareDiscoveryConfig, setOcdeclareDiscoveryConfig] = useState({
     eventLogFile: '',
     lifecycleThreshold: 0.5,
-    resourceThreshold: 50,
+    resourceThreshold: 2,
     constraintTypes: {
       precedence: true,
       response: true,
@@ -4581,6 +4856,7 @@ function App() {
   const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
   const [resultsToBe, setResultsToBe] = useState(null);    // Run To-Be results
   const [evaluationReady, setEvaluationReady] = useState(false); // true after Run Evaluation clicked
+  const [evalRunCount, setEvalRunCount] = useState(0); // increments on each explicit Run Evaluation click
   const [objTabAsIs, setObjTabAsIs] = useState('concurrency');
   const [objTabToBe, setObjTabToBe] = useState('concurrency');
   const [discoveryChecks, setDiscoveryChecks] = useState({
@@ -5240,26 +5516,28 @@ function App() {
       const tmap = r.data.object_types_map || {};
       const n = evts.length;
       const eventObjs = evts.map(e => new Set(e.object_ids || []));
-      const temporalFilter = (srcIdx, ctype) => {
+      const byActIdx = {};
+      evts.forEach((e, i) => { (byActIdx[e.activity] = byActIdx[e.activity] || []).push(i); });
+      const sortedEvtsTs = evts.map(e => e.timestamp);
+      const firstGe = (ts) => { let lo=0,hi=n; while(lo<hi){const m=(lo+hi)>>1;sortedEvtsTs[m]<ts?lo=m+1:hi=m;}return lo; };
+      const temporalFilter = (srcIdx, ctype, tgtAct) => {
         const srcTs = evts[srcIdx].timestamp;
         if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
         if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
-        const result = [];
-        for (let j = 0; j < n; j++) {
-          if (['response','chain_response','succession','alternate_response',
-               'precedence','alternate_precedence'].includes(ctype)) {
-            if (evts[j].timestamp >= srcTs) result.push(j);
-          } else { result.push(j); }
+        const tgtIs = byActIdx[tgtAct] || [];
+        if (['response','chain_response','succession','alternate_response',
+             'precedence','alternate_precedence'].includes(ctype)) {
+          const start = firstGe(srcTs);
+          return tgtIs.filter(j => j >= start && j !== srcIdx);
         }
-        return result;
+        return tgtIs.filter(j => j !== srcIdx);
       };
       const satisfies = (i, c) => {
         if (evts[i].activity !== c.source_activity) return true;
         const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
         const tgt = c.target_activity;
         const scope = c.scope || { kind: 'global' };
-        const temporal = temporalFilter(i, c.constraint_type);
-        const tgtCandidates = temporal.filter(j => evts[j].activity === tgt);
+        const tgtCandidates = temporalFilter(i, c.constraint_type, tgt);
         if (scope.kind === 'global') {
           const cnt = tgtCandidates.length;
           if (['not_coexistence','not_succession'].includes(c.constraint_type)) return cnt === 0;
@@ -5295,8 +5573,8 @@ function App() {
         // Track target repetitions per (source event, scope object) to derive observed nmin/nmax
         const repCounts = []; // all observed repetition counts across source events × scope objects
         for (const i of sourceEvents) {
-          const temporal = temporalFilter(i, c.constraint_type);
-          const tgtCandidates = temporal.filter(j => evts[j].activity === c.target_activity);
+          const temporal = temporalFilter(i, c.constraint_type, c.target_activity);
+          const tgtCandidates = temporal; // already filtered to target activity
           if (scope.kind === 'each' && scope.object_type) {
             const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
             if (scopeObjs.length > 0) {
@@ -6153,17 +6431,17 @@ function App() {
           <h2 className="mode-selector-title">Choose your workflow</h2>
           <div className="mode-cards">
             <div className="mode-card" onClick={() => setWorkflowMode('internal')}>
-              <div className="mode-card-icon">🔍</div>
+              <div className="mode-card-icon">◈</div>
               <div className="mode-card-label">Internal Discovery</div>
               <div className="mode-card-desc">Load an OCEL log and discover everything — constraints, probabilities, and timing — from scratch.</div>
             </div>
             <div className="mode-card" onClick={() => setWorkflowMode('external-ocel')}>
-              <div className="mode-card-icon">📂</div>
+              <div className="mode-card-icon">◉</div>
               <div className="mode-card-label">External OC-Declare + OCEL</div>
               <div className="mode-card-desc">Bring your own OC-Declare constraint file and an OCEL log for parameter discovery.</div>
             </div>
             <div className="mode-card" onClick={() => setWorkflowMode('external-empty')}>
-              <div className="mode-card-icon">✏️</div>
+              <div className="mode-card-icon">◎</div>
               <div className="mode-card-label">Manual / No Files</div>
               <div className="mode-card-desc">Build the model entirely in the editor. Discovery features unavailable without an OCEL log.</div>
             </div>
@@ -6539,7 +6817,7 @@ function App() {
                   {/* Drop prompt */}
                   {!discoveryConfig.eventLogFile && (
                     <div className="ocel-drop-prompt">
-                      <div className="ocel-drop-icon">📂</div>
+                      
                       <div className="ocel-drop-label">Drop event log here</div>
                       <div className="ocel-drop-sub">or click to browse (.json, .xml)</div>
                     </div>
@@ -6625,7 +6903,7 @@ function App() {
                           <input type="number" min={1} value={resourceThreshold}
                             onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                          <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>avg events/instance</div>
+                          <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>max same-activity repetitions/instance</div>
                         </div>
 
                         {/* Model check options */}
@@ -6687,7 +6965,7 @@ function App() {
                       <div style={{display:'flex',alignItems:'center',justifyContent:'center',paddingTop: config.ocdeclareFile ? '1.5rem' : '0'}}>
                         {!config.ocdeclareFile && (
                           <div className="ocel-drop-prompt" style={{gap:'0.2rem'}}>
-                            <div style={{fontSize:'1.4rem'}}>📋</div>
+                            
                             <div className="ocel-drop-label" style={{fontSize:'0.9rem'}}>Drop OC-Declare file here</div>
                             <div className="ocel-drop-sub">or click to browse (.json)</div>
                           </div>
@@ -7453,7 +7731,7 @@ function App() {
                       lowerIsBetter: false,
                     },
                     {
-                      label: 'Events Fired',
+                      label: 'Events Completed',
                       asis: resultsAsIs.steps_executed,
                       tobe: resultsToBe.steps_executed,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
@@ -7465,6 +7743,13 @@ function App() {
                       tobe: resultsToBe.completed_traces,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
                       lowerIsBetter: null,
+                    },
+                    {
+                      label: 'Avg Trace Duration',
+                      asis: resultsAsIs.avg_connected_trace_duration_s,
+                      tobe: resultsToBe.avg_connected_trace_duration_s,
+                      fmt: fmtDur,
+                      lowerIsBetter: true,
                     },
                   ];
                   return (
@@ -7517,6 +7802,7 @@ function App() {
                         background: evaluationReady ? '#475569' : '#1e293b'}}
                       onClick={() => {
                         setEvaluationReady(true);
+                        setEvalRunCount(c => c + 1);
                         setExternalTab('evaluation');
                       }}
                     >
@@ -7538,8 +7824,7 @@ function App() {
                         return (
                           <div style={{padding:'1rem'}}>
                             <div className="stat-grid" style={{marginBottom:'1rem'}}>
-                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Fired</div></div>
-                              <div className="stat-card"><div className="stat-value">{r.events_count}</div><div className="stat-label">Events</div></div>
+                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Completed</div></div>
                               <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')}>
                                 <div className="stat-value">{coverage}{discoveredTypes.length>0&&<span className="stat-value-denom"> / {discoveredTypes.length}</span>}</div>
                                 <div className="stat-label">Activity Types</div>
@@ -7547,6 +7832,7 @@ function App() {
                               <div className="stat-card"><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
                               {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
                               {r.completed_traces!=null&&<div className="stat-card"><div className="stat-value">{r.completed_traces}</div><div className="stat-label">Traces</div></div>}
+                              {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
                             </div>
                             {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
                               const simMetrics = r.metrics.activity_metrics;
@@ -7554,17 +7840,15 @@ function App() {
                               const logRepeat = discoveryResults.activity_repeat_stats || {};
                               const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
                               const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                              // Sort by first appearance in object traces
-                              const flowRank = {};
-                              Object.values(r.object_traces || {}).forEach(trace =>
-                                trace.forEach((act, i) => { if (!(act in flowRank)) flowRank[act] = i; })
-                              );
                               const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                                .sort((a, b) => {
-                                  const ra = a in flowRank ? flowRank[a] : 999999;
-                                  const rb = b in flowRank ? flowRank[b] : 999999;
-                                  return ra !== rb ? ra - rb : a.localeCompare(b);
-                                });
+                                .sort(makeFlowRankSorter(discoveryResults, r.object_traces));
+                              const wmape = logTotal > 0 && simTotal > 0
+                                ? allActs.reduce((s, act) => {
+                                    const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
+                                    const lp = (logCounts[act]||0) / logTotal * 100;
+                                    return s + Math.abs(sp - lp);
+                                  }, 0)
+                                : null;
                               return (
                                 <Collapsible className="logs-box sim-compare-box" title="Activity Distribution vs Log" defaultOpen={false}>
                                   <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points. Time share = activity's total sim time / sim span.</p>
@@ -7576,7 +7860,7 @@ function App() {
                                         <th>Log count</th>
                                         <th>Sim %</th>
                                         <th>Log %</th>
-                                        <th>Diff</th>
+                                        <th>Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
                                         <th title="Activity's total service time as % of total simulated time span">Time share</th>
                                         <th title="Mean service time per firing in simulation">Sim mean dur</th>
                                       </tr>
@@ -7696,13 +7980,117 @@ function App() {
                               );
                             })()}
                             {r.metrics?.activity_metrics&&(
-                              <Collapsible title="⏱ Activity Timing" defaultOpen={false}>
+                              <Collapsible title="Activity Timing" defaultOpen={false}>
                                 <table className="behavior-table">
                                   <thead><tr><th>Activity</th><th>Count</th><th>Mean (s)</th></tr></thead>
-                                  <tbody>{Object.entries(r.metrics.activity_metrics).map(([act,m])=>(
+                                  <tbody>{Object.entries(r.metrics.activity_metrics)
+                                    .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, r.object_traces)(a,b))
+                                    .map(([act,m])=>(
                                     <tr key={act}><td>{act}</td><td>{m.execution_count}</td><td>{m.mean_service_s!=null?Math.round(m.mean_service_s):'—'}</td></tr>
                                   ))}</tbody>
                                 </table>
+                              </Collapsible>
+                            )}
+
+                            {/* Trace Completion — moved from Evaluation tab */}
+                            {r.audit?.object_lifecycle_audit && (() => {
+                              const resourceTypes = new Set(r.resource_types||[]);
+                              const audit = r.audit.object_lifecycle_audit;
+                              const logObjTypes = discoveryResults?.object_type_stats || {};
+                              const logTotal = discoveryResults?.log_object_trace_count ?? null;
+                              const nonRes = Object.entries(audit).filter(([ot])=>!resourceTypes.has(ot));
+                              const totalAll = nonRes.reduce((s,[,a])=>s+(a.instance_count||0),0);
+                              const deactAll = nonRes.reduce((s,[,a])=>s+(a.deactivated_count||0),0);
+                              const pctAll = totalAll>0?Math.round(deactAll/totalAll*100):0;
+                              return (
+                                <Collapsible title="Trace Completion" defaultOpen={false}>
+                                  <div style={{display:'flex',gap:'0.75rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+                                    <div className="behavior-stat-card"><div className="behavior-stat-val">{deactAll.toLocaleString()}</div><div className="behavior-stat-label">Completed</div></div>
+                                    <div className="behavior-stat-card"><div className="behavior-stat-val">{totalAll.toLocaleString()}</div><div className="behavior-stat-label">Total objects</div></div>
+                                    <div className="behavior-stat-card" style={{background:pctAll>=80?'#f0fdf4':pctAll>=50?'#fffbeb':'#fff1f2'}}><div className="behavior-stat-val">{pctAll}%</div><div className="behavior-stat-label">Rate</div></div>
+                                    {logTotal!=null&&<div className="behavior-stat-card"><div className="behavior-stat-val">{logTotal.toLocaleString()}</div><div className="behavior-stat-label">Log objects</div></div>}
+                                  </div>
+                                  <table className="behavior-table">
+                                    <thead><tr><th>Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>{Object.keys(logObjTypes).length>0&&<th>Log count</th>}</tr></thead>
+                                    <tbody>{nonRes.map(([ot,a])=>{
+                                      const pct=a.instance_count>0?Math.round(a.deactivated_count/a.instance_count*100):0;
+                                      return (<tr key={ot}><td>{ot}</td><td>{a.instance_count}</td>
+                                        <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{a.deactivated_count}</td>
+                                        <td>{a.instance_count-a.deactivated_count}</td>
+                                        <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'60px',overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:'4px'}}><div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/></div>{pct}%</td>
+                                        {Object.keys(logObjTypes).length>0&&<td style={{color:'#94a3b8'}}>{logObjTypes[ot]?.count!=null?logObjTypes[ot].count.toLocaleString():'—'}</td>}
+                                      </tr>);
+                                    })}</tbody>
+                                  </table>
+                                </Collapsible>
+                              );
+                            })()}
+
+                            {/* OC-Declare Coverage Measures */}
+                            <Collapsible title="OC-Declare Coverage" defaultOpen={false}>
+                              <OCCoveragePanel
+                                results={r}
+                                model={activeModel || modelBase}
+                                discoveryResults={discoveryResults}
+                              />
+                            </Collapsible>
+
+                            {/* Former Evaluation Part — immediately available after sim stop */}
+                            {r.metrics?.activity_metrics && (
+                              <Collapsible title="Former Evaluation Part" defaultOpen={false}>
+                                {/* Service & Waiting time per activity */}
+                                <Collapsible title="Service / Waiting Time per Activity" defaultOpen={false}>
+                                  <table className="behavior-table" style={{fontSize:'0.78rem'}}>
+                                    <thead><tr><th>Activity</th><th>Mean svc</th><th>Min svc</th><th>Max svc</th><th>Mean res. wait</th><th>Mean pool wait</th></tr></thead>
+                                    <tbody>{Object.entries(r.metrics.activity_metrics)
+                                      .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, r.object_traces)(a,b))
+                                      .map(([act,m])=>{
+                                        const fmtS = v => { if(!v) return '—'; if(v>=86400) return (v/86400).toFixed(1)+'d'; if(v>=3600) return (v/3600).toFixed(1)+'h'; if(v>=60) return Math.round(v/60)+'m'; return Math.round(v)+'s'; };
+                                        return (<tr key={act}>
+                                          <td>{act}</td>
+                                          <td>{fmtS(m.mean_service_s)}</td>
+                                          <td>{fmtS(m.min_service_s)}</td>
+                                          <td>{fmtS(m.max_service_s)}</td>
+                                          <td>{fmtS(m.mean_resource_wait_s)}</td>
+                                          <td>{fmtS(m.mean_wait_in_pool_s)}</td>
+                                        </tr>);
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </Collapsible>
+
+                                {/* Sim Metrics vs Log Discovery */}
+                                {activeModel?.activity_durations && (() => {
+                                  const logDurs = activeModel.activity_durations || {};
+                                  const simM = r.metrics.activity_metrics;
+                                  const fmtS = v => { if(!v) return '—'; if(v>=86400) return (v/86400).toFixed(1)+'d'; if(v>=3600) return (v/3600).toFixed(1)+'h'; if(v>=60) return Math.round(v/60)+'m'; return Math.round(v)+'s'; };
+                                  const pct = (a,b) => a&&b&&a!==0 ? ((b-a)/a*100) : null;
+                                  const fmtPct = v => v==null?'—':(v>=0?'+':'')+v.toFixed(1)+'%';
+                                  const cls = v => { if(v==null) return ''; const n=Math.abs(v); return n<10?'cmp-ok':v>0?'cmp-over':'cmp-under'; };
+                                  const acts = Object.keys(simM).sort(makeFlowRankSorter(discoveryResults, r.object_traces));
+                                  return (
+                                    <Collapsible title="Sim Metrics vs Log Discovery" defaultOpen={false}>
+                                      <table className="metrics-table" style={{fontSize:'0.78rem'}}>
+                                        <thead><tr><th>Activity</th><th>Log mean</th><th>Sim mean</th><th>Δ</th><th>Log max</th><th>Sim max</th><th>Δ</th></tr></thead>
+                                        <tbody>{acts.map(act => {
+                                          const log = logDurs[act] || {};
+                                          const sim = simM[act] || {};
+                                          const dMean = pct(log.service_mean, sim.mean_service_s);
+                                          const dMax  = pct(log.service_max,  sim.max_service_s);
+                                          return (<tr key={act}>
+                                            <td>{act}</td>
+                                            <td>{fmtS(log.service_mean)}</td>
+                                            <td>{fmtS(sim.mean_service_s)}</td>
+                                            <td className={`audit-num cmp-diff ${cls(dMean)}`}>{fmtPct(dMean)}</td>
+                                            <td>{fmtS(log.service_max)}</td>
+                                            <td>{fmtS(sim.max_service_s)}</td>
+                                            <td className={`audit-num cmp-diff ${cls(dMax)}`}>{fmtPct(dMax)}</td>
+                                          </tr>);
+                                        })}</tbody>
+                                      </table>
+                                    </Collapsible>
+                                  );
+                                })()}
                               </Collapsible>
                             )}
                             {r.output_file && (
@@ -7748,31 +8136,31 @@ function App() {
             )}{/* end results tab */}
 
             {/* ── EVALUATION TAB ── */}
-            {externalTab === 'evaluation' && (
-              <div className="ext-ocel-tab-content">
-                {!(resultsToBe||resultsAsIs||results) ? (
-                  <div className="discovery-section">
-                    <div className="section-header"><h2>Evaluation</h2><p>Run a simulation first.</p></div>
-                  </div>
-                ) : (
-                  <EvaluationWrapper
-                    resultsAsIs={resultsAsIs}
-                    resultsToBe={resultsToBe}
-                    results={results}
-                    discoveryResults={discoveryResults}
-                    activeModel={activeModel}
-                    modelBase={modelBase}
-                    serviceTimeMode={serviceTimeMode}
-                    simActivityObjectCounts={simActivityObjectCounts}
-                    onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs||[])).catch(()=>{})}
-                    eventLogFiles={eventLogFiles}
-                    handleFileUpload={handleFileUpload}
-                    inputLogConfResults={logConfResults}
-                    inputEventLogFile={discoveryConfig.eventLogFile}
-                  />
-                )}
-              </div>
-            )}{/* end evaluation tab */}
+            <div className="ext-ocel-tab-content" style={{display: externalTab === 'evaluation' ? undefined : 'none'}}>
+              {!(resultsToBe||resultsAsIs||results) ? (
+                <div className="discovery-section">
+                  <div className="section-header"><h2>Evaluation</h2><p>Run a simulation first.</p></div>
+                </div>
+              ) : (
+                <EvaluationWrapper
+                  resultsAsIs={resultsAsIs}
+                  resultsToBe={resultsToBe}
+                  results={results}
+                  discoveryResults={discoveryResults}
+                  activeModel={activeModel}
+                  modelBase={modelBase}
+                  serviceTimeMode={serviceTimeMode}
+                  simActivityObjectCounts={simActivityObjectCounts}
+                  onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs||[])).catch(()=>{})}
+                  eventLogFiles={eventLogFiles}
+                  handleFileUpload={handleFileUpload}
+                  inputLogConfResults={logConfResults}
+                  inputEventLogFile={discoveryConfig.eventLogFile}
+                  evalRunCount={evalRunCount}
+                  onRerunEvaluation={() => { setEvaluationReady(true); setEvalRunCount(c => c + 1); }}
+                />
+              )}
+            </div>{/* end evaluation tab */}
           </div>
         )}{/* end external-ocel tabs */}
 
@@ -8816,11 +9204,11 @@ function App() {
                   <div className="stat-grid">
                     <div className="stat-card">
                       <div className="stat-value">{results.steps_executed}</div>
-                      <div className="stat-label">Events Fired</div>
+                      <div className="stat-label">Events Completed</div>
                     </div>
                     <div className="stat-card">
                       <div className="stat-value">{totalEvents}</div>
-                      <div className="stat-label">Events Fired</div>
+                      <div className="stat-label">Events Completed</div>
                     </div>
                     <div className={`stat-card ${missingTypes.length > 0 ? 'stat-card-warn' : 'stat-card-ok'}`}>
                       <div className="stat-value">
@@ -8877,15 +9265,15 @@ function App() {
                     const logRepeat = discoveryResults.activity_repeat_stats || {};
                     const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
                     const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                    const actSeq = results.metrics?.activity_sequence || [];
-                    const flowRank = {};
-                    actSeq.forEach((a, i) => { if (!(a in flowRank)) flowRank[a] = i; });
                     const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                      .sort((a, b) => {
-                        const ra = a in flowRank ? flowRank[a] : 999999;
-                        const rb = b in flowRank ? flowRank[b] : 999999;
-                        return ra !== rb ? ra - rb : a.localeCompare(b);
-                      });
+                      .sort(makeFlowRankSorter(discoveryResults, results?.object_traces));
+                    const wmape = logTotal > 0 && simTotal > 0
+                      ? allActs.reduce((s, act) => {
+                          const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
+                          const lp = (logCounts[act]||0) / logTotal * 100;
+                          return s + Math.abs(sp - lp);
+                        }, 0)
+                      : null;
                     return (
                       <>
                         <p className="sim-compare-hint">
@@ -8900,7 +9288,7 @@ function App() {
                               <th title="Times fired in the input event log">Log count</th>
                               <th title="Share of all simulated events">Sim %</th>
                               <th title="Share of all log events">Log %</th>
-                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff</th>
+                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
                               <th title="Activity's total service time as % of total simulated time span">Time share</th>
                               <th title="Mean service time per firing in simulation">Sim mean dur</th>
                             </tr>
@@ -9020,7 +9408,9 @@ function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.entries(results.audit.activity_participation_audit).map(([act, a]) => (
+                      {Object.entries(results.audit.activity_participation_audit)
+                        .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, results?.object_traces)(a,b))
+                        .map(([act, a]) => (
                         <tr key={act} className={`audit-row-${a.classification}`}>
                           <td className="audit-type">{act}</td>
                           <td className="audit-num">{a.execution_count}</td>
@@ -9287,7 +9677,7 @@ function App() {
                               <thead>
                                 <tr>
                                   <th>Object</th>
-                                  <th>Events</th>
+                                  <th>Events Completed</th>
                                   <th>Lifetime</th>
                                   <th>First event</th>
                                   <th>Last event</th>
@@ -9419,7 +9809,7 @@ function App() {
                       <th>Event log</th>
                       <th>Model</th>
                       <th>Steps</th>
-                      <th>Events</th>
+                      <th>Events Completed</th>
                       <th>Objects</th>
                       <th>Seed</th>
                       <th title="Simulation wall-clock runtime">Runtime</th>

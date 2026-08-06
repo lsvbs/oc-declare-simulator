@@ -195,6 +195,37 @@ class Simulator:
             if con.constraint_type == 'response':
                 self._response_by_source.setdefault(con.source_activity, []).append(con)
 
+        # Phase 1: For each response target B, which precedence sources must fire first?
+        # _obligation_prerequisites[target_act][scope_type] = [required_source_activities]
+        self._obligation_prerequisites: dict = {}
+        for con in static_model.constraints:
+            if con.constraint_type not in ('response', 'chain_response'):
+                continue
+            tgt = con.target_activity
+            scope_type = getattr(con.scope, 'object_type', None) if con.scope else None
+            prec_gates = [
+                p.source_activity for p in static_model.constraints
+                if p.constraint_type == 'precedence'
+                and p.target_activity == tgt
+                and getattr(p.scope, 'object_type', None) == scope_type
+                and getattr(p, 'nmin', 0) > 0
+            ]
+            if prec_gates:
+                self._obligation_prerequisites.setdefault(tgt, {}).setdefault(
+                    scope_type, []).extend(prec_gates)
+
+        # Phase 2: Non-resource, non-creating object types required per activity
+        # Used to skip activities whose required types are all inactive
+        self._activity_required_types: dict = {}
+        resource_set = set(getattr(static_model, 'resource_types', []) or [])
+        for activity in static_model.activities:
+            required = {
+                b.object_type for b in activity.bindings
+                if not b.creates and b.object_type not in resource_set
+            }
+            if required:
+                self._activity_required_types[activity.name] = required
+
         # Reusable set for obligation dedup — cleared each step, avoids per-step allocation
         self._seen_obligation_keys: set = set()
         # Delta tracking for iteration log: last-seen cumulative counters
@@ -384,6 +415,11 @@ class Simulator:
             if activity.name in no_parallel and activity.name in in_progress_acts:
                 continue
 
+            # Phase 2: skip if all required object types have zero active instances
+            _req_types = self._activity_required_types.get(activity.name)
+            if _req_types and _req_types.issubset(state._inactive_scope_types):
+                continue
+
             # Find the primary non-resource input binding (first creates=False, non-resource type)
             primary_bindings = [
                 b for b in activity.bindings
@@ -559,7 +595,9 @@ class Simulator:
 
             seen_obligation_keys = self._seen_obligation_keys
             seen_obligation_keys.clear()
-            for (target_act, scope_oid), count in list(state._obligations_count.items()):
+            # Phase 1: iterate only _obligations_ready (prerequisites met) instead of all _obligations_count
+            _inject_pool = state._obligations_ready if state._obligations_ready else state._obligations_count
+            for (target_act, scope_oid), count in list(_inject_pool.items()):
                 if count <= 0:
                     continue
                 dedup_key = (target_act, scope_oid)
@@ -991,66 +1029,186 @@ class Simulator:
     def _update_obligations_after_event(self, executed_event, state: SimulationState) -> None:
         self._fulfill_response_obligations(executed_event, state)
         self._create_response_obligations(executed_event, state)
+        self._promote_obligations(executed_event, state)
+
+    def _update_eligibility(self, executed_event, state: SimulationState) -> None:
+        """Incrementally update _eligible_for_activity after an event fires.
+
+        When activity A fires on objects O1..On:
+        - Activities unlocked by precedence(A → B): add relevant objects to B's eligible set
+        - Activities blocked by not_coexistence(A, B) or not_succession(A, B): remove objects
+        - nmax cap: if target hit nmax, remove from eligible
+        Uses conservative approach — only handles 'each'-scoped constraints.
+        Falls back gracefully: _eligible_for_activity is optional; if absent, normal loop runs.
+        """
+        act = executed_event.activity_name
+        resource_types = self._resource_types_set
+        eligible = state._eligible_for_activity
+
+        for con in self.static_model.constraints_for_activity(act):
+            if con.scope.kind != 'each':
+                continue
+            scope_type = getattr(con.scope, 'object_type', None)
+            if not scope_type or scope_type in resource_types:
+                continue
+            ctype = con.constraint_type
+
+            # A fired as source of precedence(A → B): objects of scope_type in this event
+            # may now satisfy B's nmin — add them to B's eligible set
+            if ctype == 'precedence' and con.source_activity == act:
+                tgt = con.target_activity
+                nmin = getattr(con, 'nmin', 0)
+                nmax = getattr(con, 'nmax', None)
+                # Only update eligibility for activities already tracked (start activities)
+                if tgt not in eligible:
+                    continue  # don't create new sets for non-tracked activities
+                for oid in executed_event.object_ids:
+                    obj = state.objects.get(oid)
+                    if obj and obj.object_type == scope_type and obj.active:
+                        src_count = len(state._events_by_act_obj.get((act, oid), []))
+                        if src_count >= nmin:
+                            eligible[tgt].add(oid)
+                        # If nmax exceeded (source count), remove target eligibility
+                        if nmax is not None and src_count > nmax:
+                            eligible[tgt].discard(oid)
+
+            # A fired as target of precedence(X → A): A itself may now be eligible
+            # (handled by prec_satisfied cache — no action needed here)
+
+            # not_coexistence or not_succession: remove from source's eligible set
+            elif ctype in ('not_coexistence', 'not_succession'):
+                other = con.target_activity if con.source_activity == act else con.source_activity
+                if other in eligible:
+                    for oid in executed_event.object_ids:
+                        obj = state.objects.get(oid)
+                        if obj and obj.object_type == scope_type:
+                            eligible[other].discard(oid)
+
+            # response nmax: if A is the target and has now hit nmax, remove from eligible
+            elif ctype == 'response' and con.target_activity == act:
+                nmax = getattr(con, 'nmax', None)
+                if nmax is not None and act in eligible:
+                    for oid in executed_event.object_ids:
+                        obj = state.objects.get(oid)
+                        if obj and obj.object_type == scope_type:
+                            t_count = len(state._events_by_act_obj.get((act, oid), []))
+                            if t_count >= nmax:
+                                eligible[act].discard(oid)
+        self._fulfill_response_obligations(executed_event, state)
+        self._create_response_obligations(executed_event, state)
+        self._promote_obligations(executed_event, state)
+
+    def _is_obligation_ready(self, target_act: str, scope_oid: str, state: SimulationState) -> bool:
+        """Check if all precedence prerequisites for target_act have fired for scope_oid."""
+        prereqs = self._obligation_prerequisites.get(target_act)
+        if not prereqs:
+            return True
+        scope_type = state._type_of_object.get(scope_oid)
+        for req_source in prereqs.get(scope_type, []):
+            if not state._events_by_act_obj.get((req_source, scope_oid)):
+                return False
+        return True
+
+    def _promote_obligations(self, executed_event, state: SimulationState) -> None:
+        """After event fires, promote blocked obligations whose blocking prerequisite just fired."""
+        act = executed_event.activity_name
+        for scope_oid in executed_event.object_ids:
+            key = (act, scope_oid)
+            to_promote = state._obligations_blocked.pop(key, None)
+            if not to_promote:
+                continue
+            for (tgt, oblg_oid) in to_promote:
+                # Only promote if obligation still exists in the authoritative count
+                if (tgt, oblg_oid) not in state._obligations_count:
+                    continue
+                if self._is_obligation_ready(tgt, oblg_oid, state):
+                    state._obligations_ready[(tgt, oblg_oid)] = 1
+                else:
+                    # Still blocked by another prerequisite — re-register under next blocker
+                    prereqs = self._obligation_prerequisites.get(tgt, {})
+                    oblg_scope_type = state._type_of_object.get(oblg_oid)
+                    for req_source in prereqs.get(oblg_scope_type, []):
+                        if not state._events_by_act_obj.get((req_source, oblg_oid)):
+                            state._obligations_blocked.setdefault(
+                                (req_source, oblg_oid), set()).add((tgt, oblg_oid))
+                            break
 
     def _fulfill_response_obligations(self, executed_event, state: SimulationState) -> None:
         act = executed_event.activity_name
         fired_oids = set(executed_event.object_ids)
         # Discharge unscoped obligations for this target activity
         if state._obligations_count.pop((act, None), None) is not None:
+            state._obligations_ready.pop((act, None), None)
             state.total_obligations_fulfilled += 1
         # Discharge per-object obligations (each/any mode)
         for oid in executed_event.object_ids:
             if state._obligations_count.pop((act, oid), None) is not None:
+                state._obligations_ready.pop((act, oid), None)
                 state.total_obligations_fulfilled += 1
-        # Discharge all-mode frozenset obligations: key is (act, frozenset)
-        # Fulfilled when all objects in the frozenset appear in this event
+        # Discharge all-mode frozenset obligations
         all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
         for k in all_keys:
             if k[1].issubset(fired_oids):
                 state._obligations_count.pop(k, None)
+                state._obligations_ready.pop(k, None)
                 state.total_obligations_fulfilled += 1
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
-        # #8: use pre-indexed dict instead of scanning all constraints
         for constraint in self._response_by_source.get(executed_event.activity_name, []):
             if constraint.scope.kind == "each":
                 scope_object_ids = self._get_event_scope_object_ids(
-                    executed_event=executed_event,
-                    state=state,
+                    executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
                 for scope_object_id in scope_object_ids:
                     key = (constraint.target_activity, scope_object_id)
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        # Route to ready or blocked pool
+                        if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
+                            state._obligations_ready[key] = 1
+                        else:
+                            prereqs = self._obligation_prerequisites.get(constraint.target_activity, {})
+                            scope_type = state._type_of_object.get(scope_object_id)
+                            for req_source in prereqs.get(scope_type, []):
+                                if not state._events_by_act_obj.get((req_source, scope_object_id)):
+                                    state._obligations_blocked.setdefault(
+                                        (req_source, scope_object_id), set()).add(key)
+                                    break
             elif constraint.scope.kind == "any":
-                # Any: one obligation per scope object — at least one must fire the target
                 scope_object_ids = self._get_event_scope_object_ids(
-                    executed_event=executed_event,
-                    state=state,
+                    executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
                 for scope_object_id in scope_object_ids:
                     key = (constraint.target_activity, scope_object_id)
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
+                            state._obligations_ready[key] = 1
+                        else:
+                            prereqs = self._obligation_prerequisites.get(constraint.target_activity, {})
+                            scope_type = state._type_of_object.get(scope_object_id)
+                            for req_source in prereqs.get(scope_type, []):
+                                if not state._events_by_act_obj.get((req_source, scope_object_id)):
+                                    state._obligations_blocked.setdefault(
+                                        (req_source, scope_object_id), set()).add(key)
+                                    break
             elif constraint.scope.kind == "all":
-                # All: single obligation keyed to the full frozenset of scope objects
-                # Target must fire involving ALL of them together in one event
                 scope_object_ids = self._get_event_scope_object_ids(
-                    executed_event=executed_event,
-                    state=state,
+                    executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
                 if scope_object_ids:
                     key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._obligations_ready[key] = 1  # all-mode: always ready (frozenset handles sync)
             else:
-                # Unscoped global obligation
                 key = (constraint.target_activity, None)
                 if key not in state._obligations_count:
                     state._obligations_count[key] = 1
+                    state._obligations_ready[key] = 1  # unscoped: always ready
 
     def _get_event_scope_object_ids(
         self,
@@ -1151,6 +1309,18 @@ class Simulator:
             defaults = attribute_defaults.get(object_type, {})
             obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
+            # Phase 3: add newly created object to eligibility for start activities only.
+            # Non-start activities are updated via _update_eligibility when prerequisites fire.
+            for act_name in self._start_names_set:
+                elig_set = state._eligible_for_activity.get(act_name)
+                if elig_set is None:
+                    continue
+                act_def_sa = self._act_by_name.get(act_name)
+                if act_def_sa:
+                    primary_sa = next((b for b in act_def_sa.bindings
+                                       if not b.creates and b.object_type not in self._resource_types_set), None)
+                    if primary_sa and primary_sa.object_type == object_type:
+                        elig_set.add(obj.object_id)
 
         apply_conservative_link_policy(
             self.static_model,
@@ -1270,6 +1440,7 @@ class Simulator:
         state.last_generated_timestamp = in_prog.complete_at
 
         self._update_obligations_after_event(executed_event, state)
+        self._update_eligibility(executed_event, state)
 
         # Populate precedence satisfied cache on firing: for every precedence
         # with this activity as target, mark it satisfied for each participating
@@ -1330,14 +1501,14 @@ class Simulator:
             return
 
         # Build set of activities that COULD be affected by the completed activity
-        # (i.e. activities that share a constraint with it).
+        # Use _constraints_by_activity index (O(1)) instead of scanning all constraints (O(C))
         if completed_activity is not None:
             affected: set[str] | None = set()
-            for con in self.static_model.constraints:
-                if con.source_activity == completed_activity:
-                    affected.add(con.target_activity)
-                if con.target_activity == completed_activity:
+            for con in self.static_model.constraints_for_activity(completed_activity):
+                if con.source_activity:
                     affected.add(con.source_activity)
+                if con.target_activity:
+                    affected.add(con.target_activity)
             affected.add(completed_activity)
         else:
             affected = None  # unknown — re-check everything
@@ -1393,6 +1564,21 @@ class Simulator:
                 state._type_of_object[oid] = res_type
 
         start_activity_names = self._start_names_set
+
+        # Phase 3: pre-populate eligibility for start activities (no prerequisites)
+        resource_types_set = state._resource_types
+        for activity in self.static_model.activities:
+            if activity.name not in start_activity_names:
+                continue
+            primary_bindings = [
+                b for b in activity.bindings
+                if not b.creates and b.object_type not in resource_types_set
+            ]
+            if primary_bindings:
+                primary_type = primary_bindings[0].object_type
+                state._eligible_for_activity[activity.name] = set(
+                    state._active_by_type.get(primary_type, set())
+                )
 
         while True:
             # Early stop requested by the frontend (Stop button)

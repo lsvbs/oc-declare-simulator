@@ -55,6 +55,68 @@ import threading
 _active_runs: dict = {}
 
 
+def _compute_avg_connected_trace_duration(state, resource_types) -> float | None:
+    """Compute average trace duration across all completed connected-component traces.
+
+    A trace starts when the first event fires on any object in the connected
+    component and ends when the last event fires on any object in the component.
+    Only traces where the root non-resource object is deactivated are counted.
+    """
+    from collections import deque
+    resource_set = set(resource_types or [])
+
+    # Build per-object event timestamps
+    obj_timestamps = {}  # obj_id -> [timestamps]
+    for ev in state.executed_events:
+        if ev.timestamp is None:
+            continue
+        for oid in ev.object_ids:
+            obj_timestamps.setdefault(oid, []).append(ev.timestamp)
+
+    # Find deactivated non-resource objects as trace roots
+    deactivated_roots = [
+        oid for oid, obj in state.objects.items()
+        if not obj.active and obj.object_type not in resource_set
+    ]
+
+    if not deactivated_roots:
+        return None
+
+    # BFS over _links_by_object to find connected component for each root
+    # Only traverse non-resource objects to stay within the case boundary
+    visited_global: set = set()
+    durations = []
+
+    for root in deactivated_roots:
+        if root in visited_global:
+            continue  # already part of another trace's component
+        # BFS
+        component: set = set()
+        queue = deque([root])
+        while queue:
+            oid = queue.popleft()
+            if oid in component:
+                continue
+            component.add(oid)
+            for neighbor in state._links_by_object.get(oid, set()):
+                obj = state.objects.get(neighbor)
+                if obj and obj.object_type not in resource_set and neighbor not in component:
+                    queue.append(neighbor)
+        visited_global.update(component)
+
+        # Collect all event timestamps for this component
+        all_ts = []
+        for oid in component:
+            all_ts.extend(obj_timestamps.get(oid, []))
+        if len(all_ts) >= 2:
+            span = (max(all_ts) - min(all_ts)).total_seconds()
+            durations.append(span)
+
+    if not durations:
+        return None
+    return round(sum(durations) / len(durations), 1)
+
+
 def _compute_ocel_time_span(ocel_source) -> float | None:
     """Return the total time span of an OCEL log in seconds (last − first timestamp)."""
     if not ocel_source or not isinstance(ocel_source, dict):
@@ -1211,6 +1273,12 @@ def run_simulation():
                     (final_state.last_generated_timestamp - config.start_timestamp).total_seconds()
                     if final_state.last_generated_timestamp else None
                 ),
+                # Connected-component trace duration: for each completed non-resource root object,
+                # find all objects reachable via links, then measure first-to-last event timestamp.
+                # Average across all completed traces gives avg_connected_trace_duration_s.
+                'avg_connected_trace_duration_s': (lambda: _compute_avg_connected_trace_duration(
+                    final_state, static_model.resource_types or set()
+                ))(),
                 # Aggregate trace lifetime: mean of (last_event - first_event) per non-resource object
                 'avg_trace_lifetime_s': (lambda om: (
                     round(sum(v['lifetime_s'] for v in om.values() if v.get('lifetime_s') is not None) /

@@ -164,8 +164,17 @@ class SimulationState:
     # Performance: track object types with zero active instances to skip constraint checks
     _inactive_scope_types: set = field(default_factory=set)
     # Performance: typed link index — _linked_by_type[oid][object_type] = set of linked oids of that type
-    # Makes _count_links_for_object O(1) instead of O(degree)
     _linked_by_type: dict = field(default_factory=dict)
+
+    # Phase 1 — Obligation stratification
+    # Ready pool: (target_act, scope_oid) → 1 — prerequisites satisfied, inject immediately
+    _obligations_ready: dict = field(default_factory=dict)
+    # Blocked pool: (blocking_source_act, scope_oid) → set of (target_act, oblg_oid) waiting for it
+    _obligations_blocked: dict = field(default_factory=dict)
+
+    # Phase 3 — Activity-object eligibility index
+    # activity_name → set of object_ids currently eligible as primary binding
+    _eligible_for_activity: dict = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -191,6 +200,7 @@ class SimulationState:
         self._type_of_object[object_id] = object_type
         # Object type now has active instances — remove from inactive set
         self._inactive_scope_types.discard(object_type)
+        # New object initially eligible for start activities (eligibility index populated by simulator)
         return obj
 
     def deactivate_object(self, object_id: str) -> None:
@@ -217,7 +227,6 @@ class SimulationState:
                 self._inactive_scope_types.add(obj.object_type)
 
         # Clear all pending obligations scoped to this object.
-        # Handles both per-object keys (target, oid) and all-mode frozenset keys (target, frozenset({...}))
         keys_to_remove = [
             k for k in self._obligations_count
             if (isinstance(k[1], str) and k[1] == object_id) or
@@ -227,6 +236,14 @@ class SimulationState:
             del self._obligations_count[k]
         self.total_deactivations += 1
         self.total_obligations_cancelled += len(keys_to_remove)
+        # Clean up stratified obligation pools
+        for k in [k for k in self._obligations_ready if isinstance(k[1], str) and k[1] == object_id]:
+            del self._obligations_ready[k]
+        for k in [k for k in self._obligations_blocked if isinstance(k[1], str) and k[1] == object_id]:
+            self._obligations_blocked.pop(k, None)
+        # Remove from eligibility index
+        for act_eligible in self._eligible_for_activity.values():
+            act_eligible.discard(object_id)
         # Increment completed trace count for non-resource objects
         resource_types: set = getattr(self, '_resource_types', set()) or set()
         if obj.object_type not in resource_types:
