@@ -1423,7 +1423,164 @@ def get_run_events(run_id):
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
-@app.route('/api/eventlog-events', methods=['GET'])
+@app.route('/api/run-history/<run_id>/ocpq', methods=['GET'])
+def get_run_ocpq(run_id):
+    """Compute OCPQ schema measures from an output OCEL log.
+
+    For every ordered (source_activity, target_activity) pair that share at least
+    one object, compute:
+      support      - number of distinct (source_event_id, target_event_id) connections
+      coverage     - fraction of source instances reaching ≥1 target
+      selectivity  - 1 / avg targets per connected source  (high = discriminating)
+      reach        - fraction of target instances reached by ≥1 source
+      exclusivity  - 1 / avg sources per connected target  (high = exclusive)
+      throughput   - mean seconds between source and target event (event-to-event)
+      eq_class     - hash of the exact set of (src_oid, tgt_oid) connections
+    """
+    try:
+        log_path = OUTPUT_DIR / run_id
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {run_id}'}), 404
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            ocel = json.load(f)
+
+        events_raw = ocel.get('events', [])
+        if isinstance(events_raw, dict):
+            events_raw = list(events_raw.values())
+        objects_raw = ocel.get('objects', [])
+        if isinstance(objects_raw, dict):
+            objects_raw = list(objects_raw.values())
+
+        # Build object_type map
+        obj_type: dict[str, str] = {o['id']: o.get('type', '') for o in objects_raw}
+
+        # Parse events — keep only those with timestamps
+        from datetime import datetime, timezone
+        def parse_ts(s):
+            if not s: return None
+            try:
+                return datetime.fromisoformat(s.replace('Z', '+00:00'))
+            except Exception:
+                return None
+
+        events: list[dict] = []
+        for ev in events_raw:
+            ts = parse_ts(ev.get('time', ''))
+            rels = ev.get('relationships', []) or []
+            oids = [r['objectId'] for r in rels if r.get('objectId')]
+            events.append({
+                'id':       ev.get('id', ''),
+                'activity': ev.get('type', ''),
+                'ts':       ts,
+                'oids':     set(oids),
+            })
+        events.sort(key=lambda e: (e['ts'] or datetime.min.replace(tzinfo=timezone.utc)))
+
+        # Build per-object event sequence (ordered by timestamp)
+        obj_events: dict[str, list[dict]] = {}
+        for ev in events:
+            for oid in ev['oids']:
+                obj_events.setdefault(oid, []).append(ev)
+
+        # For each object, generate consecutive (source, target) event pairs
+        # A "schema" is (source_activity, target_activity)
+        from collections import defaultdict
+        import hashlib
+
+        # schema -> list of {src_ev_id, tgt_ev_id, src_oid, delta_s}
+        schema_connections: dict[tuple, list[dict]] = defaultdict(list)
+
+        for oid, evs in obj_events.items():
+            otype = obj_type.get(oid, '')
+            for i in range(len(evs) - 1):
+                src = evs[i]
+                tgt = evs[i + 1]
+                if src['activity'] == tgt['activity']:
+                    continue
+                schema = (src['activity'], tgt['activity'])
+                delta_s = None
+                if src['ts'] and tgt['ts']:
+                    delta_s = (tgt['ts'] - src['ts']).total_seconds()
+                schema_connections[schema].append({
+                    'src_ev':   src['id'],
+                    'tgt_ev':   tgt['id'],
+                    'oid':      oid,
+                    'otype':    otype,
+                    'delta_s':  delta_s,
+                })
+
+        # Count total source / target instances per activity
+        act_event_count: dict[str, int] = defaultdict(int)
+        for ev in events:
+            act_event_count[ev['activity']] += 1
+
+        results = []
+        for (src_act, tgt_act), conns in sorted(schema_connections.items()):
+            # Support: distinct (src_ev, tgt_ev) pairs
+            conn_pairs = set((c['src_ev'], c['tgt_ev']) for c in conns)
+            support = len(conn_pairs)
+
+            # Coverage: fraction of source instances that reach ≥1 target
+            connected_srcs = set(c['src_ev'] for c in conns)
+            total_src = act_event_count.get(src_act, 0)
+            coverage = round(len(connected_srcs) / total_src, 4) if total_src else 0
+
+            # Selectivity: 1 / avg targets per connected source
+            src_to_tgts: dict[str, set] = defaultdict(set)
+            for c in conns:
+                src_to_tgts[c['src_ev']].add(c['tgt_ev'])
+            avg_fan_out = sum(len(v) for v in src_to_tgts.values()) / len(src_to_tgts) if src_to_tgts else 0
+            selectivity = round(1 / avg_fan_out, 4) if avg_fan_out else None
+
+            # Reach: fraction of target instances reached
+            connected_tgts = set(c['tgt_ev'] for c in conns)
+            total_tgt = act_event_count.get(tgt_act, 0)
+            reach = round(len(connected_tgts) / total_tgt, 4) if total_tgt else 0
+
+            # Exclusivity: 1 / avg sources per connected target
+            tgt_to_srcs: dict[str, set] = defaultdict(set)
+            for c in conns:
+                tgt_to_srcs[c['tgt_ev']].add(c['src_ev'])
+            avg_fan_in = sum(len(v) for v in tgt_to_srcs.values()) / len(tgt_to_srcs) if tgt_to_srcs else 0
+            exclusivity = round(1 / avg_fan_in, 4) if avg_fan_in else None
+
+            # Throughput: mean delta_s
+            deltas = [c['delta_s'] for c in conns if c['delta_s'] is not None]
+            throughput_s = round(sum(deltas) / len(deltas), 1) if deltas else None
+
+            # Eq class: hash of the exact (src_ev, tgt_ev) connection set
+            pair_str = '|'.join(sorted(f'{s}>{t}' for s, t in conn_pairs))
+            eq_class = hashlib.md5(pair_str.encode()).hexdigest()[:8]
+
+            # Object type breakdown
+            otype_counts: dict[str, int] = defaultdict(int)
+            for c in conns:
+                otype_counts[c['otype']] += 1
+
+            results.append({
+                'source_activity':  src_act,
+                'target_activity':  tgt_act,
+                'support':          support,
+                'coverage':         coverage,
+                'selectivity':      selectivity,
+                'reach':            reach,
+                'exclusivity':      exclusivity,
+                'throughput_s':     throughput_s,
+                'eq_class':         eq_class,
+                'object_types':     dict(otype_counts),
+            })
+
+        # Sort by support desc
+        results.sort(key=lambda r: -r['support'])
+
+        return jsonify({'schemas': results, 'total': len(results)})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 def get_eventlog_events():
     """Return a lightweight event list from an input OCEL log for conformance checking."""
     try:
@@ -1830,7 +1987,297 @@ def analyze_blocking():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
-@app.route('/api/discover-timing', methods=['POST'])
+@app.route('/api/analyze-pressure', methods=['POST'])
+def analyze_pressure():
+    """Iterative constraint pressure analysis.
+
+    Runs a deeper instrumented dry-run than /api/analyze-blocking:
+    - Classifies WHY each activity is absent from the candidate pool each step
+    - Computes pressure scores weighted by firing deficit vs log expectation
+    - Returns top blocking constraints ranked by score with suggestions
+    """
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+        from src.Simulation.Engine.simulator import Simulator
+        from src.Simulation.Domain.config import SimulationConfig, StartPolicy
+        from src.Simulation.Domain.state import SimulationState
+        from collections import defaultdict
+        from datetime import datetime
+
+        data = request.json or {}
+        model_override    = data.get('modelOverride')
+        start_activities  = data.get('startActivities') or []
+        prob_matrix       = data.get('probMatrixOverride') or {}
+        dry_run_steps     = int(data.get('steps', 5000))
+        seed              = int(data.get('seed', 42))
+        activity_counts   = data.get('activityCounts') or {}     # from discoveryResults
+        ocel_time_span_s  = data.get('ocelTimeSpanS') or None    # total log time span
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not model_override:
+            return jsonify({'error': 'modelOverride required'}), 400
+
+        if isinstance(model_override, list):
+            static_model = parse_ocdeclare_list(model_override)
+        else:
+            static_model = parse_ocdeclare_dict(model_override)
+
+        resource_types = set(static_model.resource_types or [])
+
+        # ── Phase 1: Expected rates from log ────────────────────────────────────
+        log_total_events = sum(activity_counts.values()) or 1
+        log_days = (ocel_time_span_s / 86400) if ocel_time_span_s and ocel_time_span_s > 0 else None
+
+        expected_rate: dict[str, float] = {}  # firings per day from log
+        for act, cnt in activity_counts.items():
+            if log_days and log_days > 0:
+                expected_rate[act] = cnt / log_days
+            else:
+                expected_rate[act] = cnt / log_total_events * 100  # fallback: per 100 events
+
+        # Build per-activity primary binding type (first non-creating non-resource binding)
+        primary_type: dict[str, str | None] = {}
+        for a in static_model.activities:
+            for b in a.bindings:
+                if not b.creates and b.object_type not in resource_types:
+                    primary_type[a.name] = b.object_type
+                    break
+            else:
+                primary_type[a.name] = None
+
+        # Build precedence constraints per target activity for reason classification
+        prec_by_target: dict[str, list] = defaultdict(list)
+        for c in static_model.constraints:
+            if c.constraint_type in ('precedence', 'chain_precedence'):
+                prec_by_target[c.target_activity].append(c)
+
+        # ── Phase 2: Instrumented dry-run ───────────────────────────────────────
+        # block_counts[act][reason] = steps blocked for that reason
+        # reasons: 'no_objects', 'precedence', 'resource_busy', 'other'
+        block_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        # blocking_constraint[act] = constraint key that most blocked it
+        blocking_constraint: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        fired_counts: dict[str, int] = defaultdict(int)
+        total_steps_run = [0]
+        last_sim_time = [None]
+
+        original_gen = Simulator._generate_candidates_des
+
+        def _pressure_gen(self_s, state):
+            candidates = original_gen(self_s, state)
+            if not state.objects:
+                return candidates
+            pool_acts = {c.activity_name for c in candidates}
+            total_steps_run[0] += 1
+            last_sim_time[0] = state.current_time
+
+            waiting_acts = {wc.candidate_activity_name for wc in state.waiting_queue}
+
+            for act in self_s.static_model.activities:
+                if act.name in pool_acts:
+                    continue
+
+                # Resource busy — activity is in waiting queue (passed semantic checks, failed resource)
+                if act.name in waiting_acts:
+                    block_counts[act.name]['resource_busy'] += 1
+                    # Find which resource type is blocking
+                    for wc in state.waiting_queue:
+                        if wc.candidate_activity_name == act.name:
+                            blocking_constraint[act.name][f'resource:{wc.blocked_resource_type}'] += 1
+                            break
+                    continue
+
+                pt = primary_type.get(act.name)
+
+                # No objects of required type
+                if pt and not state._active_by_type.get(pt):
+                    block_counts[act.name]['no_objects'] += 1
+                    blocking_constraint[act.name]['no_objects'] += 1
+                    continue
+
+                # Precedence not met — check nmin for each precedence constraint
+                prec_blocked = False
+                for c in prec_by_target.get(act.name, []):
+                    nmin = getattr(c, 'nmin', 1) or 1
+                    if nmin <= 0:
+                        continue
+                    # Check at least one active object of the scope type is blocked by this
+                    scope_type = getattr(c.scope, 'object_type', None) if c.scope else None
+                    if scope_type:
+                        active_ids = state._active_by_type.get(scope_type, set())
+                        for oid in list(active_ids)[:8]:  # sample up to 8
+                            src_events = state._events_by_act_obj.get((c.source_activity, oid))
+                            src_count = len(src_events) if src_events else 0
+                            if src_count < nmin:
+                                prec_blocked = True
+                                ckey = f'precedence:{c.source_activity}→{act.name}'
+                                blocking_constraint[act.name][ckey] += 1
+                                break
+                    if prec_blocked:
+                        break
+
+                if prec_blocked:
+                    block_counts[act.name]['precedence'] += 1
+                    continue
+
+                # All other constraint failures or missing bindings
+                block_counts[act.name]['other'] += 1
+
+            return candidates
+
+        # Also track actual firing counts
+        original_complete = Simulator._des_complete_activity
+
+        def _tracking_complete(self_s, in_prog, state):
+            fired_counts[in_prog.candidate_activity_name] += 1
+            return original_complete(self_s, in_prog, state)
+
+        Simulator._generate_candidates_des = _pressure_gen
+        Simulator._des_complete_activity = _tracking_complete
+
+        try:
+            cfg = SimulationConfig(
+                max_steps=dry_run_steps,
+                seed=seed,
+                start_policy=StartPolicy(start_activity_names=start_activities),
+                start_timestamp=datetime(2025, 1, 1, 9, 0, 0),
+            )
+            sim = Simulator(static_model, cfg,
+                            transition_matrix=prob_matrix,
+                            start_counts={})
+            sim.run_des(state=SimulationState())
+        finally:
+            Simulator._generate_candidates_des = original_gen
+            Simulator._des_complete_activity = original_complete
+
+        # ── Phase 3: Pressure and deficit scores ────────────────────────────────
+        steps = max(total_steps_run[0], 1)
+
+        # Compute simulated time span in days
+        start_dt = datetime(2025, 1, 1, 9, 0, 0)
+        end_dt = last_sim_time[0] or start_dt
+        sim_days = max((end_dt - start_dt).total_seconds() / 86400, 1e-6)
+
+        activity_rates: dict[str, dict] = {}
+        for act in static_model.activities:
+            name = act.name
+            exp = expected_rate.get(name)
+            actual = fired_counts.get(name, 0) / sim_days if sim_days > 0 else 0
+            deficit = max(0.0, (exp - actual)) if exp is not None else 0.0
+            activity_rates[name] = {
+                'expected': round(exp, 3) if exp is not None else None,
+                'actual': round(actual, 3),
+                'deficit': round(deficit, 3),
+                'fired': fired_counts.get(name, 0),
+            }
+
+        # ── Phase 4: Score each (activity, constraint) pair ─────────────────────
+        scored: list[dict] = []
+        seen: set[str] = set()
+
+        for act_name, reason_counts in block_counts.items():
+            total_blocked = sum(reason_counts.values())
+            pressure = total_blocked / steps
+            if pressure < 0.05:
+                continue
+
+            deficit = activity_rates.get(act_name, {}).get('deficit', 0.0)
+            score = round(pressure * max(deficit, 0.1), 4)  # min weight 0.1 so low-deficit still surfaces
+
+            # Find the dominant constraint key
+            all_ckeys = blocking_constraint.get(act_name, {})
+            top_ckey = max(all_ckeys, key=all_ckeys.get) if all_ckeys else None
+
+            # Determine primary reason
+            primary_reason = max(reason_counts, key=reason_counts.get)
+
+            # Build constraint detail
+            constraint_detail = None
+            suggestion = None
+            if top_ckey and top_ckey.startswith('precedence:'):
+                parts = top_ckey[len('precedence:'):].split('→')
+                src = parts[0] if len(parts) == 2 else ''
+                c_obj = next((c for c in static_model.constraints
+                              if c.constraint_type in ('precedence', 'chain_precedence')
+                              and c.source_activity == src
+                              and c.target_activity == act_name), None)
+                nmin_val = getattr(c_obj, 'nmin', 1) if c_obj else 1
+                nmax_val = getattr(c_obj, 'nmax', None) if c_obj else None
+                constraint_detail = {
+                    'constraint_type': c_obj.constraint_type if c_obj else 'precedence',
+                    'source': src,
+                    'target': act_name,
+                    'nmin': nmin_val,
+                    'nmax': nmax_val,
+                }
+                pct = round(reason_counts.get('precedence', 0) / steps * 100)
+                if nmin_val >= 1 and pct > 60:
+                    suggestion = f'"{src}" must precede "{act_name}" in {pct}% of steps — consider setting nmin=0 to make it optional, or check that "{src}" fires early enough'
+                elif nmax_val is not None:
+                    suggestion = f'nmax={nmax_val} cap on "{src}" may be hit before "{act_name}" can fire — consider raising nmax'
+                else:
+                    suggestion = f'Ensure "{src}" fires before "{act_name}" for each object'
+            elif top_ckey and top_ckey.startswith('resource:'):
+                rt = top_ckey[len('resource:'):]
+                constraint_detail = {'constraint_type': 'resource', 'resource_type': rt}
+                pct = round(reason_counts.get('resource_busy', 0) / steps * 100)
+                suggestion = f'Resource "{rt}" is busy in {pct}% of steps — consider increasing the pool size for "{rt}"'
+            elif top_ckey == 'no_objects':
+                pt = primary_type.get(act_name)
+                constraint_detail = {'constraint_type': 'no_objects', 'missing_type': pt}
+                suggestion = f'No active objects of type "{pt}" — check that the activity creating "{pt}" fires early enough and that deactivation is not premature'
+            else:
+                constraint_detail = {'constraint_type': 'other'}
+                suggestion = 'Activity is blocked by semantic constraints — check not_coexistence, nmax caps, or exclusive_choice constraints'
+
+            key = f'{act_name}:{top_ckey}'
+            if key not in seen:
+                seen.add(key)
+                scored.append({
+                    'activity': act_name,
+                    'pressure': round(pressure, 3),
+                    'deficit': activity_rates.get(act_name, {}).get('deficit', 0.0),
+                    'score': score,
+                    'primary_reason': primary_reason,
+                    'reason_breakdown': {k: round(v / steps, 3) for k, v in reason_counts.items()},
+                    'blocking_constraint': constraint_detail,
+                    'top_constraint_key': top_ckey,
+                    'suggestion': suggestion,
+                })
+
+        # Sort by score descending, take top 10
+        scored.sort(key=lambda x: -x['score'])
+        top_blocking = scored[:10]
+
+        # ── Phase 5: Cascade detection ───────────────────────────────────────────
+        # For each high-deficit activity blocked by precedence, trace root blocker
+        # (simple one-hop: find if the blocking source also has a deficit)
+        for entry in top_blocking:
+            cd = entry.get('blocking_constraint') or {}
+            if cd.get('constraint_type') in ('precedence', 'chain_precedence'):
+                src = cd.get('source', '')
+                src_rates = activity_rates.get(src, {})
+                if src_rates.get('deficit', 0) > 0:
+                    entry['cascade_note'] = (
+                        f'Root blocker may be "{src}" (also under-firing: '
+                        f'{src_rates["actual"]:.1f}/day vs {src_rates["expected"]:.1f}/day expected)'
+                    )
+
+        return jsonify({
+            'top_blocking': top_blocking,
+            'total_steps': steps,
+            'sim_days': round(sim_days, 2),
+            'activity_rates': {k: v for k, v in activity_rates.items() if v['expected'] or v['fired']},
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 def discover_timing():
     """Compute OCPA time metrics from an OCEL log + optional anchor service times.
 

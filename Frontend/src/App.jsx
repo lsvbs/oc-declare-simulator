@@ -30,7 +30,387 @@ function makeFlowRankSorter(discoveryResults, objectTraces) {
   };
 }
 
-// ── TransitionFlowChart ───────────────────────────────────────────────────────
+// ── ConstraintFlowGraph ───────────────────────────────────────────────────────
+// Possible-routes graph derived purely from activities + constraints.
+// Edges represent "A can directly precede B" based on precedence/response/succession
+// constraints, after transitive reduction (A→C suppressed if A→B→C exists).
+function ConstraintFlowGraph({ activities, constraints, startActivities }) {
+  const [nodeOverrides, setNodeOverrides] = React.useState({});
+  const [pan, setPan] = React.useState({ x: 0, y: 0 });
+  const dragRef = React.useRef({ type: null });
+  const svgRef = React.useRef(null);
+  const PAD = 44, R = 22, HGAP = 80;
+
+  // Reset overrides when inputs change
+  React.useEffect(() => { setNodeOverrides({}); setPan({ x: 0, y: 0 }); }, [activities, constraints]);
+
+  const { nodes, edges, pos, svgW, svgH, startSet, endSet, actCreates, actDeactivates } = React.useMemo(() => {
+    const actNames = (activities || []).map(a => typeof a === 'string' ? a : a.name).filter(Boolean);
+    if (!actNames.length) return { nodes: [], edges: [], pos: {}, svgW: 0, svgH: 0, startSet: new Set(), endSet: new Set(), actCreates: {}, actDeactivates: {} };
+
+    const cons = constraints || [];
+
+    // Build per-activity binding type sets for scope validation
+    // Also track which types each activity creates / deactivates
+    const actBindingTypes = {}; // actName → Set<objectType>
+    const actCreates = {}; // actName → [objectType]
+    const actDeactivates = {}; // actName → [objectType]
+    (activities || []).forEach(a => {
+      const name = typeof a === 'string' ? a : a.name;
+      actBindingTypes[name] = new Set((a.bindings || []).map(b => b.object_type).filter(Boolean));
+      actCreates[name] = (a.bindings || []).filter(b => b.creates && b.object_type).map(b => b.object_type);
+      actDeactivates[name] = (a.bindings || []).filter(b => b.deactivates && b.object_type).map(b => b.object_type);
+    });
+
+    // Ordering constraints: precedence(A→B) and response(A→B) and succession(A→B)
+    // mean A can precede B. chain variants too.
+    const ORDERING = new Set(['precedence', 'chain_precedence', 'response', 'chain_response', 'succession', 'chain_succession', 'alternate_response', 'alternate_precedence', 'alternate_succession', 'responded_existence']);
+    const NOT_AFTER = new Set(['not_coexistence', 'not_succession', 'not_precedence', 'not_chain_succession']);
+
+    // Raw directed edges from ordering constraints: src can precede tgt
+    // Only include edge if the scope object type is actually bound by both activities.
+    // (If no scope / global scope, the edge is always valid.)
+    const rawEdges = new Set(); // "src→tgt"
+    const forbidden = new Set(); // edges explicitly disallowed
+
+    cons.forEach(c => {
+      const src = c.source_activity || c.source;
+      const tgt = c.target_activity || c.target;
+      if (!src || !tgt || src === tgt) return;
+      const scopeType = c.scope?.object_type || c.scope_object_type || null;
+      // Scope check: if constraint is scoped to an object type, both activities
+      // must have a binding for that type (otherwise the constraint is structurally
+      // inapplicable and cannot actually constrain the flow between them)
+      if (scopeType) {
+        const srcHasScope = actBindingTypes[src]?.has(scopeType);
+        const tgtHasScope = actBindingTypes[tgt]?.has(scopeType);
+        if (!srcHasScope || !tgtHasScope) return; // skip — not a reachable path via this scope
+      }
+      if (ORDERING.has(c.constraint_type)) rawEdges.add(`${src}→${tgt}`);
+      if (NOT_AFTER.has(c.constraint_type)) {
+        forbidden.add(`${src}→${tgt}`);
+        if (c.constraint_type === 'not_coexistence') forbidden.add(`${tgt}→${src}`);
+      }
+    });
+
+    // Remove forbidden edges from raw set
+    forbidden.forEach(e => rawEdges.delete(e));
+
+    // Build adjacency for reachability
+    const adj = {}; // src → Set<tgt>  (direct raw edges only)
+    const revAdj = {}; // tgt → Set<src>
+    actNames.forEach(n => { adj[n] = new Set(); revAdj[n] = new Set(); });
+    rawEdges.forEach(e => {
+      const [s, t] = e.split('→');
+      if (adj[s] && adj[t] !== undefined) { adj[s].add(t); revAdj[t].add(s); }
+    });
+
+    // Transitive closure: reachable[a] = all nodes reachable from a via 2+ hops
+    // We'll suppress direct edge A→C if C is reachable from A via an intermediate B
+    // i.e. if ∃ B s.t. A→B and B can reach C (through raw edges)
+    const reachableFrom = {};
+    actNames.forEach(start => {
+      const visited = new Set();
+      const queue = [...adj[start]];
+      while (queue.length) {
+        const n = queue.shift();
+        if (visited.has(n)) continue;
+        visited.add(n);
+        (adj[n] || new Set()).forEach(nb => queue.push(nb));
+      }
+      reachableFrom[start] = visited;
+    });
+
+    // Transitive reduction: keep A→B only if B is NOT reachable from A without using A→B directly
+    // i.e. B should not be reachable via any other neighbour of A
+    const reducedEdges = [];
+    rawEdges.forEach(e => {
+      const [s, t] = e.split('→');
+      if (!adj[s] || !adj[t]) return;
+      // Check if t is reachable from any other direct successor of s
+      const otherSuccessors = [...adj[s]].filter(n => n !== t);
+      const reachableViaOthers = otherSuccessors.some(n => n === t || reachableFrom[n]?.has(t));
+      if (!reachableViaOthers) reducedEdges.push({ src: s, tgt: t });
+    });
+
+    // Collect all nodes that appear in edges + all model activities
+    const nodeSet = new Set(actNames);
+    reducedEdges.forEach(e => { nodeSet.add(e.src); nodeSet.add(e.tgt); });
+    const nodes = [...nodeSet];
+
+    if (!nodes.length) return { nodes: [], edges: [], pos: {}, svgW: 0, svgH: 0, startSet: new Set(), endSet: new Set() };
+
+    const startSet = new Set((startActivities || []).filter(a => nodeSet.has(a)));
+    // If no explicit starts, use nodes with no incoming edges
+    if (!startSet.size) {
+      const hasPred = new Set(reducedEdges.map(e => e.tgt));
+      nodes.forEach(n => { if (!hasPred.has(n)) startSet.add(n); });
+    }
+    const hasSucc = new Set(reducedEdges.map(e => e.src));
+    const endSet = new Set(nodes.filter(n => !hasSucc.has(n)));
+
+    // Topological rank via longest-path from startSet
+    const rankOf = {};
+    nodes.forEach(n => { rankOf[n] = startSet.has(n) ? 0 : -1; });
+    nodes.forEach(n => { if (rankOf[n] < 0) rankOf[n] = 0; });
+    for (let pass = 0; pass < nodes.length * 2; pass++) {
+      let changed = false;
+      reducedEdges.forEach(({ src, tgt }) => {
+        if (rankOf[src] + 1 > rankOf[tgt]) { rankOf[tgt] = rankOf[src] + 1; changed = true; }
+      });
+      if (!changed) break;
+    }
+
+    const numRanks = Math.max(...Object.values(rankOf), 0) + 1;
+    const byRank = Array.from({ length: numRanks }, () => []);
+    nodes.forEach(n => byRank[rankOf[n]].push(n));
+
+    const maxColSize = Math.max(...byRank.map(l => l.length), 1);
+    const pitch = R * 2 + Math.max(14, Math.round(120 / Math.max(maxColSize, 1)));
+    const midY = PAD + R + Math.floor((maxColSize - 1) / 2) * pitch;
+
+    // Constraint type colour per edge + count of constraints backing each edge
+    const edgeType = {};
+    const edgeCount = {};
+    reducedEdges.forEach(({ src, tgt }) => {
+      const key = `${src}→${tgt}`;
+      const matching = cons.filter(c => {
+        const s = c.source_activity || c.source;
+        const t = c.target_activity || c.target;
+        if (s !== src || t !== tgt || !ORDERING.has(c.constraint_type)) return false;
+        const scopeType = c.scope?.object_type || c.scope_object_type || null;
+        if (scopeType) {
+          if (!actBindingTypes[src]?.has(scopeType) || !actBindingTypes[tgt]?.has(scopeType)) return false;
+        }
+        return true;
+      });
+      edgeCount[key] = matching.length;
+      edgeType[key] = matching[0]?.constraint_type || 'precedence';
+      // Collect all distinct scope types backing this edge
+      const scopes = [...new Set(matching.map(c => c.scope?.object_type || c.scope_object_type || null).filter(Boolean))];
+      edgeCount[key + '__scopes'] = scopes;
+    });
+
+    // Spine: follow highest out-degree path from first start
+    const spineSet = new Set();
+    const seeds = [...startSet].filter(n => nodes.includes(n));
+    if (!seeds.length) seeds.push(...(byRank[0] || []));
+    seeds.forEach(start => {
+      spineSet.add(start);
+      let cur = start;
+      for (let r = rankOf[start]; r < numRanks - 1; r++) {
+        const fwd = reducedEdges.filter(e => e.src === cur && rankOf[e.tgt] === r + 1);
+        if (!fwd.length) break;
+        cur = fwd[0].tgt;
+        spineSet.add(cur);
+      }
+    });
+
+    const pos = {};
+    byRank.forEach((layer, r) => {
+      const x = PAD + R + r * (R * 2 + HGAP);
+      const spineNode = layer.find(n => spineSet.has(n)) || layer[0];
+      const others = layer.filter(n => n !== spineNode);
+      const above = [], below = [];
+      others.forEach((n, i) => { if (i % 2 === 0) above.unshift(n); else below.push(n); });
+      const ordered = [...above, spineNode, ...below];
+      const spineIdx = ordered.indexOf(spineNode);
+      ordered.forEach((n, i) => { pos[n] = { x, y: midY + (i - spineIdx) * pitch, rank: r }; });
+    });
+
+    // Shift up if any y < 0 — account for creates labels above nodes (up to ~20px extra)
+    const maxCreatesAbove = Math.max(...Object.keys(pos).map(n => (actCreates[n]?.length || 0) * 11 + (actCreates[n]?.length ? 6 : 0)), 0);
+    const minY = Math.min(...Object.values(pos).map(p => p.y));
+    const dy = minY < R + PAD + maxCreatesAbove ? R + PAD + maxCreatesAbove - minY : 0;
+    if (dy > 0) Object.values(pos).forEach(p => { p.y += dy; });
+
+    const maxDeactBelow = Math.max(...Object.keys(pos).map(n => (actDeactivates[n]?.length || 0) * 11), 0);
+    const svgW = Math.max(...Object.values(pos).map(p => p.x)) + R + PAD + 10;
+    const svgH = Math.max(...Object.values(pos).map(p => p.y)) + R + PAD + maxDeactBelow + 10;
+
+    return { nodes, edges: reducedEdges.map(e => ({
+      ...e,
+      ctype: edgeType[`${e.src}→${e.tgt}`],
+      count: edgeCount[`${e.src}→${e.tgt}`] || 1,
+      scopes: edgeCount[`${e.src}→${e.tgt}__scopes`] || [],
+    })), pos, svgW, svgH, startSet, endSet, actCreates, actDeactivates };
+  }, [activities, constraints, startActivities]);
+
+  if (!nodes.length) return <div style={{color:'#94a3b8',fontSize:'0.82rem',padding:'1rem'}}>Add activities and constraints to see the constraint flow.</div>;
+
+  const ctypeColor = t => t?.startsWith('response') || t?.startsWith('chain_response') || t?.startsWith('alternate_response') ? '#7c3aed'
+    : t?.startsWith('chain') ? '#0369a1'
+    : '#475569';
+
+  function getSVGPoint(e) {
+    const svg = svgRef.current; if (!svg) return { x: e.clientX, y: e.clientY };
+    const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+    const ctm = svg.getScreenCTM(); if (!ctm) return { x: e.clientX, y: e.clientY };
+    const tp = pt.matrixTransform(ctm.inverse());
+    return { x: tp.x - pan.x, y: tp.y - pan.y };
+  }
+  function onNodeMouseDown(e, name) {
+    e.stopPropagation();
+    const { x, y } = getSVGPoint(e);
+    const cur = effPos[name];
+    dragRef.current = { type: 'node', name, startX: x, startY: y, origX: cur.x, origY: cur.y };
+  }
+  function onSVGMouseDown(e) {
+    if (dragRef.current.type) return;
+    dragRef.current = { type: 'pan', startX: e.clientX, startY: e.clientY, origPanX: pan.x, origPanY: pan.y };
+  }
+  function onMouseMove(e) {
+    const d = dragRef.current; if (!d.type) return;
+    if (d.type === 'node') {
+      const { x, y } = getSVGPoint(e);
+      setNodeOverrides(prev => ({ ...prev, [d.name]: { x: d.origX + x - d.startX, y: d.origY + y - d.startY } }));
+    } else {
+      setPan({ x: d.origPanX + e.clientX - d.startX, y: d.origPanY + e.clientY - d.startY });
+    }
+  }
+  function onMouseUp() { dragRef.current = { type: null }; }
+
+  const effPos = React.useMemo(() => {
+    const m = {};
+    Object.entries(pos).forEach(([n, p]) => { m[n] = nodeOverrides[n] ? { ...p, ...nodeOverrides[n] } : p; });
+    return m;
+  }, [pos, nodeOverrides]);
+
+  function edgePath(src, tgt, idx, total) {
+    const s = effPos[src], t = effPos[tgt]; if (!s || !t) return { d: '', lx: 0, ly: 0 };
+    const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx+dy*dy) || 1;
+    const ux = dx/dist, uy = dy/dist, px = -uy, py = ux;
+    const spread = (idx - (total-1)/2) * 7;
+    const ox = px*spread, oy = py*spread;
+    const sx = s.x + ux*R + ox, sy = s.y + uy*R + oy;
+    const ex = t.x - ux*R + ox, ey = t.y - uy*R + oy;
+    if (t.x < s.x || (t.x === s.x && (t.rank??0) <= (s.rank??0))) {
+      const bow = 55 + Math.abs(s.y-t.y)*0.35 + Math.abs(s.x-t.x)*0.25;
+      return { d: `M ${sx} ${sy} C ${sx} ${sy-bow} ${ex} ${ey-bow} ${ex} ${ey}`, lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
+    }
+    const bendMag = Math.abs(dy)*0.18 + spread*0.4;
+    const midX = (sx+ex)/2 + px*bendMag, midY = (sy+ey)/2 + py*bendMag;
+    return { d: `M ${sx} ${sy} Q ${midX} ${midY} ${ex} ${ey}`, lx: (sx+ex)/2, ly: (sy+ey)/2 - 6 };
+  }
+
+  function nodeLabel(name, cx, cy) {
+    const words = name.split(/\s+/), MAX = R*1.7;
+    if (words.join('').length * 5 <= MAX * 1.3 && name.length <= 12)
+      return <text x={cx} y={cy+3.5} textAnchor="middle" fontSize={8.5} fill="#111" style={{pointerEvents:'none',userSelect:'none'}}>{name}</text>;
+    let best=1, bestDiff=Infinity;
+    for (let i=1;i<words.length;i++) {
+      const d=Math.abs(words.slice(0,i).join(' ').length-words.slice(i).join(' ').length);
+      if(d<bestDiff){bestDiff=d;best=i;}
+    }
+    const trunc = s => s.length*5>MAX ? s.slice(0,Math.floor(MAX/5)-1)+'…' : s;
+    return (<>
+      <text x={cx} y={cy-3} textAnchor="middle" fontSize={8.5} fill="#111" style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(0,best).join(' '))}</text>
+      <text x={cx} y={cy+8} textAnchor="middle" fontSize={8.5} fill="#111" style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(best).join(' '))}</text>
+    </>);
+  }
+
+  const pairGroups = {};
+  edges.forEach(e => { const k=`${e.src}||${e.tgt}`; (pairGroups[k]=pairGroups[k]||[]).push(e); });
+
+  return (
+    <div className="tfc-wrap">
+      <div className="tfc-controls">
+        <span className="tfc-edge-count">{edges.length} constraint edges</span>
+        <button className="tfc-reset-btn" onClick={() => { setNodeOverrides({}); setPan({x:0,y:0}); }}>↺ Reset</button>
+        <span className="tfc-legend">
+          <span style={{color:'#16a34a',fontWeight:700}}>◎</span> start &nbsp;
+          <span style={{color:'#dc2626',fontWeight:700}}>◎</span> end &nbsp;
+          <span style={{color:'#475569',fontWeight:700}}>—</span> precedence &nbsp;
+          <span style={{color:'#7c3aed',fontWeight:700}}>—</span> response &nbsp;
+          <span style={{color:'#94a3b8'}}>- -</span> single constraint
+        </span>
+      </div>
+      <div className="tfc-scroll" onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
+        <svg ref={svgRef} width={svgW} height={svgH} className="tfc-svg"
+          onMouseDown={onSVGMouseDown} style={{cursor:'grab'}}>
+          <defs>
+            <marker id="cfg-arr-grey" markerWidth="7" markerHeight="7" refX="6.5" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="#475569" />
+            </marker>
+            <marker id="cfg-arr-purple" markerWidth="7" markerHeight="7" refX="6.5" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="#7c3aed" />
+            </marker>
+            <marker id="cfg-arr-blue" markerWidth="7" markerHeight="7" refX="6.5" refY="3.5" orient="auto">
+              <path d="M0,0 L7,3.5 L0,7 Z" fill="#0369a1" />
+            </marker>
+          </defs>
+          <g transform={`translate(${pan.x},${pan.y})`}>
+            {edges.map(({ src, tgt, ctype, count, scopes }) => {
+              const key = `${src}||${tgt}`;
+              const group = pairGroups[key] || [{}];
+              const idx = group.findIndex(e => e.src === src && e.tgt === tgt);
+              const { d, lx, ly } = edgePath(src, tgt, idx, group.length);
+              const col = ctypeColor(ctype);
+              const markerId = col === '#7c3aed' ? 'cfg-arr-purple' : col === '#0369a1' ? 'cfg-arr-blue' : 'cfg-arr-grey';
+              // Abbreviate each scope type: first letter of each word
+              const scopeLabels = scopes.map(s => s.split(/\s+/).map(w => w[0].toUpperCase()).join(''));
+              const lineH = 10;
+              const maxW = Math.max(...scopeLabels.map(l => l.length * 6.4 + 4), 0);
+              return (
+                <g key={`${src}->${tgt}`}>
+                  <path d={d} fill="none" stroke={col} strokeWidth={1.5}
+                    strokeDasharray={count === 1 ? '5,3' : undefined}
+                    markerEnd={`url(#${markerId})`} />
+                  {scopeLabels.length > 0 && (
+                    <g>
+                      <rect x={lx - maxW/2} y={ly - scopeLabels.length * lineH - 1}
+                        width={maxW} height={scopeLabels.length * lineH + 2} rx={2} fill="white" opacity={0.88} />
+                      {scopeLabels.map((lbl, i) => (
+                        <text key={i} x={lx} y={ly - (scopeLabels.length - 1 - i) * lineH}
+                          textAnchor="middle" fontSize={7.5} fill={col}
+                          style={{pointerEvents:'none',userSelect:'none',fontWeight:600}}>{lbl}</text>
+                      ))}
+                    </g>
+                  )}
+                </g>
+              );
+            })}
+            {nodes.map(name => {
+              const p = effPos[name]; if (!p) return null;
+              const isStart = startSet.has(name), isEnd = endSet.has(name);
+              return (
+                <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
+                  {(isStart || isEnd) && (
+                    <circle cx={p.x} cy={p.y} r={R+5} fill="none"
+                      stroke={isStart ? '#16a34a' : '#dc2626'} strokeWidth={1.5} />
+                  )}
+                  <circle cx={p.x} cy={p.y} r={R}
+                    fill={isStart ? '#f0fdf4' : isEnd ? '#fff1f2' : '#f8fafc'}
+                    stroke={isStart ? '#16a34a' : isEnd ? '#dc2626' : '#94a3b8'} strokeWidth={1.5} />
+                  {nodeLabel(name, p.x, p.y)}
+                  {/* Created object types — stacked above node */}
+                  {(actCreates[name] || []).map((ot, i, arr) => {
+                    const abbr = ot.split(/\s+/).map(w => w[0].toUpperCase()).join('');
+                    const yOff = p.y - R - 6 - (arr.length - 1 - i) * 11;
+                    return (
+                      <text key={'c'+i} x={p.x} y={yOff} textAnchor="middle" fontSize={7}
+                        fill="#16a34a" fontWeight={700} style={{pointerEvents:'none',userSelect:'none'}}>+{abbr}</text>
+                    );
+                  })}
+                  {/* Deactivated object types — stacked below node */}
+                  {(actDeactivates[name] || []).map((ot, i) => {
+                    const abbr = ot.split(/\s+/).map(w => w[0].toUpperCase()).join('');
+                    const yOff = p.y + R + 9 + i * 11;
+                    return (
+                      <text key={'d'+i} x={p.x} y={yOff} textAnchor="middle" fontSize={7}
+                        fill="#dc2626" fontWeight={700} style={{pointerEvents:'none',userSelect:'none'}}>−{abbr}</text>
+                    );
+                  })}
+                </g>
+              );
+            })}
+          </g>
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 const TFC_R = 22;
 const TFC_HGAP = 80;
 const TFC_PAD  = 44;
@@ -3202,6 +3582,129 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
   );
 }
 
+// ── OCPQPanel ─────────────────────────────────────────────────────────────────
+function OCPQPanel({ results }) {
+  const [data, setData] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState(null);
+  const [sortKey, setSortKey] = React.useState('support');
+  const [sortDir, setSortDir] = React.useState(-1); // -1 desc, 1 asc
+  const loadedFor = React.useRef(null);
+
+  React.useEffect(() => {
+    const runId = results?.output_file;
+    if (!runId || loadedFor.current === runId) return;
+    loadedFor.current = runId;
+    setLoading(true);
+    setData(null);
+    setError(null);
+    axios.get(`/api/run-history/${encodeURIComponent(runId)}/ocpq`)
+      .then(r => setData(r.data))
+      .catch(e => setError(e.response?.data?.error || e.message))
+      .finally(() => setLoading(false));
+  }, [results?.output_file]);
+
+  if (!results?.output_file) return <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'1rem'}}>No run available.</div>;
+  if (loading) return <div style={{display:'flex',alignItems:'center',gap:'0.5rem',padding:'1rem',fontSize:'0.82rem',color:'#64748b'}}><div className="spinner spinner-sm"/>Computing OCPQ measures…</div>;
+  if (error) return <div style={{color:'#dc2626',fontSize:'0.82rem',padding:'1rem'}}>{error}</div>;
+  if (!data) return null;
+
+  const schemas = [...(data.schemas || [])];
+  schemas.sort((a, b) => {
+    const av = a[sortKey] ?? -Infinity;
+    const bv = b[sortKey] ?? -Infinity;
+    return sortDir * (typeof av === 'number' && typeof bv === 'number' ? bv - av : String(bv).localeCompare(String(av)));
+  });
+
+  const fmtDur = s => {
+    if (s == null) return '—';
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm';
+    if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+    const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+    return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+  };
+  const fmtPct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const fmtSel = v => v == null ? '—' : v.toFixed(3);
+  const colColor = (key, val) => {
+    if (val == null) return '#64748b';
+    if (key === 'coverage' || key === 'reach') return val >= 0.8 ? '#16a34a' : val >= 0.5 ? '#ca8a04' : '#dc2626';
+    if (key === 'selectivity' || key === 'exclusivity') return val >= 0.8 ? '#16a34a' : val >= 0.5 ? '#ca8a04' : '#64748b';
+    return '#1e293b';
+  };
+
+  const cols = [
+    { key: 'source_activity', label: 'Source',      fmt: v => v, color: () => '#1e293b' },
+    { key: 'target_activity', label: 'Target',      fmt: v => v, color: () => '#1e293b' },
+    { key: 'support',         label: 'Support',     fmt: v => v?.toLocaleString(), color: () => '#1e293b' },
+    { key: 'coverage',        label: 'Coverage',    fmt: fmtPct, color: v => colColor('coverage', v) },
+    { key: 'selectivity',     label: 'Selectivity', fmt: fmtSel, color: v => colColor('selectivity', v) },
+    { key: 'reach',           label: 'Reach',       fmt: fmtPct, color: v => colColor('reach', v) },
+    { key: 'exclusivity',     label: 'Exclusivity', fmt: fmtSel, color: v => colColor('exclusivity', v) },
+    { key: 'throughput_s',    label: 'Throughput',  fmt: fmtDur, color: () => '#1e293b' },
+    { key: 'eq_class',        label: 'Eq',          fmt: v => v ? v.slice(0,6) : '—', color: () => '#94a3b8' },
+  ];
+
+  const thStyle = key => ({
+    padding: '0.35rem 0.5rem', fontSize: '0.72rem', fontWeight: 700, color: '#475569',
+    cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap', textAlign: key === 'source_activity' || key === 'target_activity' ? 'left' : 'center',
+    background: sortKey === key ? '#f1f5f9' : 'transparent',
+  });
+
+  const onSort = key => {
+    if (sortKey === key) setSortDir(d => -d);
+    else { setSortKey(key); setSortDir(-1); }
+  };
+
+  return (
+    <div>
+      <p style={{fontSize:'0.75rem',color:'#94a3b8',margin:'0 0 0.5rem'}}>
+        {data.total} schemas · consecutive same-object event pairs from output log
+      </p>
+      <div style={{overflowX:'auto'}}>
+        <table className="behavior-table" style={{fontSize:'0.75rem',width:'100%'}}>
+          <thead>
+            <tr>
+              {cols.map(c => (
+                <th key={c.key} style={thStyle(c.key)} onClick={() => onSort(c.key)}>
+                  {c.label}{sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}
+                </th>
+              ))}
+              <th style={{...thStyle('object_types'), cursor:'default'}}>Objects</th>
+            </tr>
+          </thead>
+          <tbody>
+            {schemas.map((s, i) => (
+              <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                {cols.map(c => (
+                  <td key={c.key} style={{
+                    padding:'0.3rem 0.5rem', color: c.color(s[c.key]),
+                    textAlign: c.key === 'source_activity' || c.key === 'target_activity' ? 'left' : 'center',
+                    fontWeight: c.key === 'eq_class' ? 400 : 500,
+                    fontFamily: c.key === 'eq_class' ? 'monospace' : undefined,
+                    fontSize: c.key === 'eq_class' ? '0.68rem' : undefined,
+                  }}>{c.fmt(s[c.key])}</td>
+                ))}
+                <td style={{padding:'0.3rem 0.5rem',fontSize:'0.68rem',color:'#64748b',textAlign:'center'}}>
+                  {Object.entries(s.object_types || {}).map(([ot, n]) =>
+                    ot.split(/\s+/).map(w => w[0].toUpperCase()).join('') + (n > 1 ? `×${n}` : '')
+                  ).join(' ')}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{marginTop:'0.5rem',fontSize:'0.7rem',color:'#94a3b8',display:'flex',gap:'1.5rem',flexWrap:'wrap'}}>
+        <span><span style={{color:'#16a34a',fontWeight:700}}>■</span> ≥80%</span>
+        <span><span style={{color:'#ca8a04',fontWeight:700}}>■</span> 50–80%</span>
+        <span><span style={{color:'#dc2626',fontWeight:700}}>■</span> &lt;50% (coverage/reach)</span>
+        <span>Selectivity/Exclusivity: 1 = one-to-one, &lt;1 = fan-out/fan-in</span>
+      </div>
+    </div>
+  );
+}
+
 // ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
 function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount }) {
   const hasBoth = !!(resultsAsIs && resultsToBe);
@@ -3275,6 +3778,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
     { key: 'comparison', label: 'Comparison' },
     { key: 'coverage',   label: 'Coverage' },
     { key: 'matrix',     label: 'Verification Matrix' },
+    { key: 'ocpq',       label: 'OCPQ' },
     { key: 'evaluation', label: 'Evaluation' },
   ];
 
@@ -3482,21 +3986,29 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
       {hasBoth && evalTab === 'comparison' && (() => {
         const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
         const pct = (a,b) => a&&b&&a!==0 ? Math.round((b-a)/Math.abs(a)*100) : null;
+        // Graduated color: magnitude of % change scaled by direction preference
+        // lower=true: decrease is good; lower=false: increase is good; lower=null: neutral grey
+        const changeColor = (p, lower) => {
+          if (p === null || lower === null) return '#64748b';
+          const goodDir = lower ? p < 0 : p > 0;
+          const mag = Math.abs(p);
+          if (goodDir) return mag > 25 ? '#16a34a' : mag > 10 ? '#65a30d' : '#64748b';
+          return mag < 10 ? '#64748b' : mag < 25 ? '#ca8a04' : mag < 50 ? '#ea580c' : '#dc2626';
+        };
         const metrics = [
-          { label:'Events Completed', a:rAsis?.steps_executed, b:rTobe?.steps_executed, fmt:v=>v?.toLocaleString(), lower:null },
-          { label:'Sim Time', a:rAsis?.sim_time_s, b:rTobe?.sim_time_s, fmt:fmtDur, lower:true },
-          { label:'Completed Traces', a:tracesAsis?.deactAll, b:tracesTobe?.deactAll, fmt:v=>v?.toLocaleString(), lower:false },
-          { label:'Trace Rate', a:tracesAsis?.pct, b:tracesTobe?.pct, fmt:v=>v!=null?v+'%':null, lower:false },
-          { label:'Avg Parallelism', a:rAsis?.avg_parallelism, b:rTobe?.avg_parallelism, fmt:v=>v?.toFixed(2), lower:false },
-          { label:'Pending Obligations', a:rAsis?.completed_traces, b:rTobe?.completed_traces, fmt:v=>v?.toLocaleString(), lower:null },
+          { label:'Events Completed',  a:rAsis?.steps_executed,          b:rTobe?.steps_executed,          fmt:v=>v?.toLocaleString(), lower:null },
+          { label:'Sim Time',          a:rAsis?.sim_time_s,               b:rTobe?.sim_time_s,               fmt:fmtDur,                 lower:true },
+          { label:'Traces Completed',  a:tracesAsis?.deactAll,            b:tracesTobe?.deactAll,            fmt:v=>v?.toLocaleString(), lower:false },
+          { label:'Trace Rate',        a:tracesAsis?.pct,                 b:tracesTobe?.pct,                 fmt:v=>v!=null?v+'%':null,  lower:false },
+          { label:'Avg Wait Time',     a:rAsis?.avg_wait_s,               b:rTobe?.avg_wait_s,               fmt:fmtDur,                 lower:true },
+          { label:'Avg Parallelism',   a:rAsis?.avg_parallelism,          b:rTobe?.avg_parallelism,          fmt:v=>v?.toFixed(2),       lower:false },
+          { label:'Pending Obligations', a:rAsis?.completed_traces,       b:rTobe?.completed_traces,         fmt:v=>v?.toLocaleString(), lower:null },
         ];
         return (
           <div className="results-comparison-header" style={{marginBottom:'1rem'}}>
             {metrics.map((m,i) => {
               const p = pct(m.a, m.b);
-              const diff = m.a!=null&&m.b!=null ? m.b-m.a : null;
-              const color = p===null||m.lower===null ? '#64748b'
-                : (m.lower ? (diff<0?'#16a34a':'#dc2626') : (diff>0?'#16a34a':'#dc2626'));
+              const color = changeColor(p, m.lower);
               return (
                 <div key={i} className="compare-metric-card">
                   <div className="compare-metric-label">{m.label}</div>
@@ -3589,6 +4101,20 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
               <div className="run-result-panel-header">{label}</div>
               <div style={{padding:'1rem'}}>
                 <OCCoveragePanel results={r} model={activeModel || modelBase} discoveryResults={discoveryResults} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* OCPQ tab — As-Is and To-Be side by side */}
+      {evalTab === 'ocpq' && (
+        <div className="results-compare-layout">
+          {[{label:'As-Is', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
+            <div key={label} className="run-result-panel">
+              <div className="run-result-panel-header">{label}</div>
+              <div style={{padding:'0.75rem'}}>
+                <OCPQPanel results={r} />
               </div>
             </div>
           ))}
@@ -3849,7 +4375,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                     <th title="Times fired in input log">Log count</th>
                     <th title="Share of simulated events">Sim %</th>
                     <th title="Share of log events">Log %</th>
-                    <th title="Sim % − Log %">Diff {wmapeAct != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmapeAct < 10 ? '#16a34a' : wmapeAct < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmapeAct.toFixed(1)}%</span>}</th>
+                    <th title="Sim % − Log %">Diff {wmapeAct != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmapeAct < 10 ? '#16a34a' : wmapeAct < 25 ? '#ca8a04' : wmapeAct < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmapeAct.toFixed(1)}%</span>}</th>
                     <th title="Mean service time per firing">Mean svc</th>
                     <th title="Total accumulated service time (mean × count)">Total svc</th>
                     <th title="Share of total accumulated service time across all activities">Time share</th>
@@ -4739,6 +5265,8 @@ function App() {
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
   const [blockingResult, setBlockingResult] = useState(null);
   const [isAnalyzingBlocking, setIsAnalyzingBlocking] = useState(false);
+  const [pressureResult, setPressureResult] = useState(null);
+  const [isRunningPressure, setIsRunningPressure] = useState(false);
   const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
   const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
   const [error, setError] = useState(null);
@@ -5476,6 +6004,31 @@ function App() {
       setIsAnalyzingBlocking(false);
     }
   }, []);
+
+  const runPressureAnalysis = React.useCallback(async () => {
+    const model = modelToBe || activeModel;
+    const startActs = config.startActivities;
+    if (!model || !startActs?.length) return;
+    setIsRunningPressure(true);
+    setPressureResult(null);
+    try {
+      const res = await axios.post('/api/analyze-pressure', {
+        modelOverride:      model,
+        probMatrixOverride: probMatrixToBe || {},
+        startActivities:    startActs,
+        activityCounts:     discoveryResults?.activity_counts || {},
+        ocelTimeSpanS:      discoveryResults?.ocel_time_span_s ?? null,
+        steps:              5000,
+        seed:               42,
+      });
+      setPressureResult(res.data);
+    } catch (e) {
+      setPressureResult({ error: e.response?.data?.error || e.message || 'Analysis failed.' });
+    } finally {
+      setIsRunningPressure(false);
+    }
+  }, [modelToBe, activeModel, config.startActivities, probMatrixToBe, discoveryResults]);
+
 
   // Auto-run blocking analysis whenever the To-Be model changes
   React.useEffect(() => {
@@ -7294,6 +7847,20 @@ function App() {
                       <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'2rem',textAlign:'center'}}>Run discoveries first to populate the model.</div>
                     )}
 
+                    {/* Constraint Flow Graph — always shown when activities/constraints exist */}
+                    {modelToBe && (modelToBe.activities?.length > 0 || modelToBe.constraints?.length > 0) && (
+                      <div style={{marginTop:'1.5rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
+                        <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
+                          Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— possible routes from activities &amp; constraints (transitive reduction)</span>
+                        </div>
+                        <ConstraintFlowGraph
+                          activities={modelToBe.activities || []}
+                          constraints={modelToBe.constraints || []}
+                          startActivities={config.startActivities || []}
+                        />
+                      </div>
+                    )}
+
                     {/* OC-DFG — auto-updates when model/matrix changes */}
                     {modelToBe && probMatrixToBe && Object.keys(probMatrixToBe).length > 0 && (
                       <div style={{marginTop:'1.5rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
@@ -7683,6 +8250,99 @@ function App() {
                           ))}
                         </div>
                       )}
+
+                      {/* ── Constraint Pressure Analysis ── */}
+                      <div style={{marginTop:'1rem',borderTop:'1px solid #e2e8f0',paddingTop:'0.75rem'}}>
+                        <div style={{display:'flex',alignItems:'center',gap:'0.75rem',marginBottom:'0.5rem'}}>
+                          <span style={{fontSize:'0.85rem',fontWeight:700,color:'#1e293b'}}>Constraint Pressure Analysis</span>
+                          <button
+                            className="run-button"
+                            style={{padding:'0.3rem 0.9rem',fontSize:'0.78rem'}}
+                            disabled={isRunningPressure}
+                            onClick={runPressureAnalysis}
+                          >
+                            {isRunningPressure ? 'Running…' : pressureResult ? '↻ Re-run Health Check' : '▶ Run Health Check'}
+                          </button>
+                          {isRunningPressure && <div className="spinner spinner-sm"></div>}
+                        </div>
+                        <p style={{fontSize:'0.75rem',color:'#94a3b8',margin:'0 0 0.5rem'}}>
+                          5000-step dry run — ranks constraints by how much they block activities relative to log-expected firing rates.
+                        </p>
+
+                        {pressureResult?.error && (
+                          <div className="error-box" style={{marginTop:'0.5rem'}}><p>{pressureResult.error}</p></div>
+                        )}
+
+                        {pressureResult && !pressureResult.error && (() => {
+                          const top = pressureResult.top_blocking || [];
+                          const fmtRate = r => r != null ? r.toFixed(1) + '/day' : '—';
+                          const reasonLabel = r => r === 'precedence' ? 'PRECEDENCE' : r === 'resource_busy' ? 'RESOURCE' : r === 'no_objects' ? 'NO OBJECTS' : 'CONSTRAINT';
+                          const reasonColor = r => r === 'precedence' ? '#b45309' : r === 'resource_busy' ? '#7c3aed' : r === 'no_objects' ? '#dc2626' : '#475569';
+                          const scoreColor = s => s >= 2 ? '#dc2626' : s >= 0.5 ? '#d97706' : '#16a34a';
+
+                          if (top.length === 0) {
+                            return <div style={{fontSize:'0.82rem',color:'#15803d',padding:'0.5rem 0'}}>✓ No significant blocking constraints found in this dry run.</div>;
+                          }
+
+                          const maxScore = Math.max(...top.map(t => t.score), 0.01);
+
+                          return (
+                            <div style={{marginTop:'0.25rem'}}>
+                              <div style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.4rem'}}>
+                                {pressureResult.total_steps} steps · {pressureResult.sim_days}d sim span · Score = pressure × firing deficit
+                              </div>
+                              {top.map((entry, i) => {
+                                const rates = pressureResult.activity_rates?.[entry.activity] || {};
+                                const cd = entry.blocking_constraint || {};
+                                const barW = Math.round((entry.score / maxScore) * 100);
+                                return (
+                                  <div key={i} style={{
+                                    background:'#f8fafc', border:'1px solid #e2e8f0',
+                                    borderRadius:'6px', padding:'0.6rem 0.75rem',
+                                    marginBottom:'0.4rem',
+                                  }}>
+                                    <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.3rem',flexWrap:'wrap'}}>
+                                      <span style={{
+                                        fontSize:'0.68rem',fontWeight:700,padding:'1px 6px',borderRadius:'3px',
+                                        background: reasonColor(entry.primary_reason)+'22',
+                                        color: reasonColor(entry.primary_reason),
+                                      }}>{reasonLabel(entry.primary_reason)}</span>
+                                      <span style={{fontWeight:700,fontSize:'0.82rem',color:'#1e293b'}}>{entry.activity}</span>
+                                      {cd.constraint_type === 'precedence' || cd.constraint_type === 'chain_precedence' ? (
+                                        <span style={{fontSize:'0.75rem',color:'#64748b'}}>← {cd.source}</span>
+                                      ) : cd.resource_type ? (
+                                        <span style={{fontSize:'0.75rem',color:'#64748b'}}>{cd.resource_type}</span>
+                                      ) : null}
+                                      <span style={{marginLeft:'auto',fontWeight:700,fontSize:'0.82rem',color:scoreColor(entry.score)}}>
+                                        score {entry.score.toFixed(2)}
+                                      </span>
+                                    </div>
+                                    {/* Score bar */}
+                                    <div style={{height:'4px',background:'#e2e8f0',borderRadius:'2px',marginBottom:'0.35rem'}}>
+                                      <div style={{height:'100%',width:`${barW}%`,background:scoreColor(entry.score),borderRadius:'2px',transition:'width 0.3s'}}/>
+                                    </div>
+                                    <div style={{fontSize:'0.72rem',color:'#64748b',display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
+                                      <span>Blocked {Math.round(entry.pressure * 100)}% of steps</span>
+                                      {rates.expected != null && <span>Expected {fmtRate(rates.expected)} · Actual {fmtRate(rates.actual)}</span>}
+                                      {rates.deficit > 0 && <span style={{color:'#dc2626'}}>Deficit {fmtRate(rates.deficit)}</span>}
+                                    </div>
+                                    {entry.suggestion && (
+                                      <div style={{fontSize:'0.75rem',color:'#1e40af',background:'#eff6ff',borderRadius:'4px',padding:'0.3rem 0.5rem',marginTop:'0.2rem'}}>
+                                        → {entry.suggestion}
+                                      </div>
+                                    )}
+                                    {entry.cascade_note && (
+                                      <div style={{fontSize:'0.72rem',color:'#7c3aed',background:'#faf5ff',borderRadius:'4px',padding:'0.25rem 0.5rem',marginTop:'0.2rem'}}>
+                                        ⚡ {entry.cascade_note}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
+                      </div>
                     </Collapsible>
 
                   </div>
@@ -7738,7 +8398,7 @@ function App() {
                       lowerIsBetter: null,
                     },
                     {
-                      label: 'Object Traces',
+                      label: 'Object Traces Completed',
                       asis: resultsAsIs.completed_traces,
                       tobe: resultsToBe.completed_traces,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
@@ -7757,10 +8417,12 @@ function App() {
                       {metrics.map(m => {
                         const p = pct(m.asis, m.tobe);
                         const diff = m.tobe != null && m.asis != null ? m.tobe - m.asis : null;
-                        const better = m.lowerIsBetter === null ? null
-                          : (m.lowerIsBetter ? diff < 0 : diff > 0);
-                        const color = diff === 0 || diff == null || m.lowerIsBetter === null ? '#64748b'
-                          : better ? '#16a34a' : '#dc2626';
+                        const mag = Math.abs(p ?? 0);
+                        const goodDir = m.lowerIsBetter === null ? null : (m.lowerIsBetter ? diff < 0 : diff > 0);
+                        const color = diff === 0 || diff == null || m.lowerIsBetter === null || p === null ? '#64748b'
+                          : goodDir
+                            ? (mag > 25 ? '#16a34a' : mag > 10 ? '#65a30d' : '#64748b')
+                            : (mag < 10 ? '#64748b' : mag < 25 ? '#ca8a04' : mag < 50 ? '#ea580c' : '#dc2626');
                         return (
                           <div key={m.label} className="compare-metric-card">
                             <div className="compare-metric-label">{m.label}</div>
@@ -7831,7 +8493,19 @@ function App() {
                               </div>
                               <div className="stat-card"><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
                               {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
-                              {r.completed_traces!=null&&<div className="stat-card"><div className="stat-value">{r.completed_traces}</div><div className="stat-label">Traces</div></div>}
+                              {r.completed_traces!=null&&(()=>{
+                                const logTraceCount = discoveryResults?.log_object_trace_count;
+                                const cardClass = logTraceCount==null ? '' : r.completed_traces >= logTraceCount ? ' stat-card-ok' : r.completed_traces >= logTraceCount * 0.75 ? ' stat-card-warn' : ' stat-card-bad';
+                                return (
+                                  <div className={'stat-card'+cardClass}>
+                                    <div className="stat-value">
+                                      {r.completed_traces.toLocaleString()}
+                                      {logTraceCount!=null && <span className="stat-value-denom"> / {logTraceCount.toLocaleString()}</span>}
+                                    </div>
+                                    <div className="stat-label">Traces Completed</div>
+                                  </div>
+                                );
+                              })()}
                               {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
                             </div>
                             {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
@@ -7860,7 +8534,7 @@ function App() {
                                         <th>Log count</th>
                                         <th>Sim %</th>
                                         <th>Log %</th>
-                                        <th>Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
+                                        <th>Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
                                         <th title="Activity's total service time as % of total simulated time span">Time share</th>
                                         <th title="Mean service time per firing in simulation">Sim mean dur</th>
                                       </tr>
@@ -9288,7 +9962,7 @@ function App() {
                               <th title="Times fired in the input event log">Log count</th>
                               <th title="Share of all simulated events">Sim %</th>
                               <th title="Share of all log events">Log %</th>
-                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#d97706' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
+                              <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
                               <th title="Activity's total service time as % of total simulated time span">Time share</th>
                               <th title="Mean service time per firing in simulation">Sim mean dur</th>
                             </tr>

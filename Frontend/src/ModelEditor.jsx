@@ -228,6 +228,65 @@ const SCOPE_KINDS      = ['each', 'global', 'any', 'all'];
 const EMPTY_CONSTRAINT = { constraint_type: 'precedence', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null };
 const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_links: null, bidirectional: true };
 
+function ObjectLifecycleSummary({ otNames, activities, resourceTypes }) {
+  const lifecycle = {};
+  otNames.forEach(t => { lifecycle[t] = { creates: [], deactivates: [] }; });
+  (activities || []).forEach(act => {
+    (act.bindings || []).forEach(b => {
+      if (!b.object_type || !lifecycle[b.object_type]) return;
+      if (b.creates) lifecycle[b.object_type].creates.push(act.name);
+      if (b.deactivates) lifecycle[b.object_type].deactivates.push(act.name);
+    });
+  });
+  return (
+    <details style={{marginTop:'1rem'}} open>
+      <summary style={{cursor:'pointer',fontSize:'0.82rem',fontWeight:600,color:'#475569',userSelect:'none',padding:'0.3rem 0'}}>
+        Object Lifecycle Summary
+      </summary>
+      <table style={{width:'100%',fontSize:'0.78rem',borderCollapse:'collapse',marginTop:'0.5rem'}}>
+        <thead>
+          <tr style={{borderBottom:'2px solid #e2e8f0'}}>
+            <th style={{textAlign:'left',padding:'0.25rem 0.4rem',color:'#475569',fontWeight:700}}>Object Type</th>
+            <th style={{textAlign:'left',padding:'0.25rem 0.4rem',color:'#16a34a',fontWeight:700}}>Created by</th>
+            <th style={{textAlign:'left',padding:'0.25rem 0.4rem',color:'#dc2626',fontWeight:700}}>Deactivated by</th>
+          </tr>
+        </thead>
+        <tbody>
+          {otNames.map(t => {
+            const lc = lifecycle[t];
+            const isRes = resourceTypes.includes(t);
+            return (
+              <tr key={t} style={{borderBottom:'1px solid #f1f5f9',background:isRes?'#f8fafc':undefined}}>
+                <td style={{padding:'0.25rem 0.4rem',fontWeight:600,color:'#1e293b'}}>
+                  {t}{isRes && <span style={{marginLeft:'0.3rem',fontSize:'0.68rem',color:'#7c3aed',fontWeight:700}}>R</span>}
+                </td>
+                <td style={{padding:'0.25rem 0.4rem',color:'#15803d'}}>
+                  {isRes
+                    ? lc.creates.length
+                      ? <span><span style={{color:'#94a3b8',fontStyle:'italic'}}>pool</span>{' / '}{lc.creates.join(', ')}</span>
+                      : <span style={{color:'#94a3b8',fontStyle:'italic'}}>pool</span>
+                    : lc.creates.length
+                      ? lc.creates.join(', ')
+                      : <span style={{color:'#f97316',fontWeight:600}}>⚠ none</span>}
+                </td>
+                <td style={{padding:'0.25rem 0.4rem',color:'#dc2626'}}>
+                  {isRes
+                    ? lc.deactivates.length
+                      ? lc.deactivates.join(', ')
+                      : <span style={{color:'#94a3b8',fontStyle:'italic'}}>never</span>
+                    : lc.deactivates.length
+                      ? lc.deactivates.join(', ')
+                      : <span style={{color:'#f97316',fontWeight:600}}>⚠ none</span>}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </details>
+  );
+}
+
 export default function ModelEditor({
   model, probMatrix, onModelChange, onProbMatrixChange,
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
@@ -1592,6 +1651,9 @@ export default function ModelEditor({
                 );
               })}
             </div>
+
+            {/* ── Object lifecycle summary — derived from activities bindings ── */}
+            {otNames.length > 0 && <ObjectLifecycleSummary otNames={otNames} activities={model.activities || []} resourceTypes={resourceTypes} />}
           </div>
         )}
 

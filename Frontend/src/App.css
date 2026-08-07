@@ -1356,6 +1356,13 @@
   color: #166534;
 }
 
+.stat-card-bad {
+  background: #fff1f2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+}
+
 .stat-value {
   font-size: clamp(0.85rem, 3vw, 1.4rem);
   font-weight: bold;

@@ -181,7 +181,13 @@
 .editor-tabs {
   display: flex;
   gap: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+  flex-shrink: 0;
 }
+.editor-tabs::-webkit-scrollbar { height: 3px; }
+.editor-tabs::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
 
 .editor-tab {
   padding: 0.45rem 1rem;
@@ -190,6 +196,8 @@
   background: none;
   cursor: pointer;
   font-size: 0.85rem;
+  white-space: nowrap;
+  flex-shrink: 0;
   color: #64748b;
   display: flex;
   align-items: center;
