@@ -147,12 +147,8 @@ class Simulator:
 
         from src.Simulation.Engine.timepolicy import DefaultTimePolicy, DistributionTimePolicy
         durations = getattr(static_model, "activity_durations", {}) or {}
-        concurrency_probs = getattr(static_model, "concurrency_probs", {}) or {}
         if durations:
-            self.time_policy = DistributionTimePolicy(
-                durations=durations,
-                concurrency_probs=concurrency_probs or None,
-            )
+            self.time_policy = DistributionTimePolicy(durations=durations)
         else:
             self.time_policy = DefaultTimePolicy()
 
@@ -404,15 +400,9 @@ class Simulator:
 
         max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
         max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
-        no_parallel: set = getattr(self.static_model, "no_parallel_activities", set()) or set()
-        # Pre-compute which no-parallel activities are currently in-progress
-        in_progress_acts: set = {ip.candidate_activity_name for ip in state.in_progress} if no_parallel else set()
 
         for activity in self.static_model.activities:
             if is_simulation_start and activity.name not in start_activity_names:
-                continue
-            # Skip if activity disallows parallelism and is already running
-            if activity.name in no_parallel and activity.name in in_progress_acts:
                 continue
 
             # Phase 2: skip if all required object types have zero active instances

@@ -509,33 +509,9 @@ def run_discovery():
                     'mean': round(sum(runs) / len(runs), 2),
                 }
 
-        # Suggested nmax per object: 95th-percentile of per-object repeat counts
-        # from the real log.  Gives the user a data-driven starting point for
-        # max_consecutive_per_object that prevents the simulation from exceeding
-        # realistic repeat counts while still allowing natural variation.
-        activity_nmax_suggestions: dict = {}
-        if ocel_source and act_obj_counts:
-            import math
-            for act, obj_counts in act_obj_counts.items():
-                counts_list = sorted(obj_counts.values())
-                n = len(counts_list)
-                if n == 0:
-                    continue
-                # 95th percentile (nearest-rank)
-                idx_p95 = max(0, math.ceil(0.95 * n) - 1)
-                p95 = counts_list[idx_p95]
-                # p50 for context
-                idx_p50 = max(0, math.ceil(0.50 * n) - 1)
-                p50 = counts_list[idx_p50]
-                activity_nmax_suggestions[act] = {
-                    'p50': int(p50),
-                    'p95': int(p95),
-                    'suggested': int(p95),  # recommended value to plug in
-                }
-        
         # Calculate transition statistics
         transition_count = sum(len(targets) for targets in prob_matrix.values())
-        
+
         # Store in cache for later simulation use
         discovery_cache[event_log_file] = {
             'prob_matrix': prob_matrix,
@@ -544,7 +520,7 @@ def run_discovery():
             'activity_counts': activity_counts,
             'activity_repeat_stats': activity_repeat_stats,
             'activity_consec_stats': activity_consec_stats,
-            'activity_nmax_suggestions': activity_nmax_suggestions,
+            # (activity_nmax_suggestions removed)
             'start_counts': start_counts,
             'event_log': event_log,
             'event_log_ocel': event_log_ocel,  # OCEL dict for lifecycle derivation
@@ -557,7 +533,7 @@ def run_discovery():
                 'activity_counts': activity_counts,
                 'activity_repeat_stats': activity_repeat_stats,
                 'activity_consec_stats': activity_consec_stats,
-                'activity_nmax_suggestions': activity_nmax_suggestions,
+                # (activity_nmax_suggestions removed)
                 'activity_count': len(activities),
                 'total_events': total_events,
                 'total_objects': total_objects,
@@ -902,13 +878,6 @@ def run_simulation():
             merged.update(existing)
             model_data = {**model_data, 'activity_durations': merged}
 
-        # Merge concurrency probabilities into model_data
-        concurrency_probs = cached.get('concurrency_probs', {})
-        if concurrency_probs and isinstance(model_data, dict):
-            existing_cp = model_data.get('concurrency_probs') or {}
-            if not existing_cp:
-                model_data = {**model_data, 'concurrency_probs': concurrency_probs}
-        
         # Route to the correct parser based on file format:
         # - list  → hand-crafted arc-list format (Format 1)
         # - dict  → discovered structured format (Format 2)
@@ -1048,7 +1017,6 @@ def run_simulation():
             ],
             "resource_types": list(static_model.resource_types or []),
             "resource_pool_sizes": dict(static_model.resource_pool_sizes or {}),
-            "no_parallel_activities": list(getattr(static_model, "no_parallel_activities", set()) or []),
         }
         _iter_tmp.write(_json2.dumps(_model_header) + '\n')
         _iter_tmp.flush()

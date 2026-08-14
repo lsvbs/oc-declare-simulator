@@ -4500,7 +4500,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   const [verifyMode, setVerifyMode] = React.useState('frequency');
   const [evalTab, setEvalTab] = React.useState('comparison'); // 'comparison' | 'traces' | 'matrix' | 'asis' | 'tobe'
 
-  const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+  const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
 
   // ── Compute object trace completions ──────────────────────────────────────
   const computeTraceCompletions = (r) => {
@@ -4772,7 +4772,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
 
       {/* Comparison header — always shown when both exist */}
       {hasBoth && evalTab === 'comparison' && (() => {
-        const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
+        const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
         const pct = (a,b) => a&&b&&a!==0 ? Math.round((b-a)/Math.abs(a)*100) : null;
         // Graduated color: magnitude of % change scaled by direction preference
         // lower=true: decrease is good; lower=false: increase is good; lower=null: neutral grey
@@ -6156,11 +6156,6 @@ function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, s
   [...toStart].forEach(a => { if (!asStart.has(a)) chip(`+start ${a}`, 'add'); });
   [...asStart].forEach(a => { if (!toStart.has(a)) chip(`−start ${a}`, 'remove'); });
 
-  // no_parallel
-  const asNP = new Set(asis.no_parallel_activities||[]), toNP = new Set(tobe.no_parallel_activities||[]);
-  [...toNP].forEach(a => { if (!asNP.has(a)) chip(`+no_parallel ${a}`, 'add'); });
-  [...asNP].forEach(a => { if (!toNP.has(a)) chip(`−no_parallel ${a}`, 'remove'); });
-
   const colors = { add:'#16a34a', remove:'#dc2626', change:'#d97706' };
   const bg = { add:'#f0fdf4', remove:'#fff1f2', change:'#fffbeb' };
   const border = { add:'#86efac', remove:'#fca5a5', change:'#fde68a' };
@@ -6195,7 +6190,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
   const bindingObjTypes = [...new Set(acts.flatMap(a => (a.bindings||[]).map(b => b.object_type).filter(Boolean)))];
   const allObjTypes = [...new Set([...allObjTypesRaw, ...bindingObjTypes])].sort();
   const resSet = new Set(model.resource_types || []);
-  const noParSet = new Set(model.no_parallel_activities || []);
   const startSet = new Set(startActivities || []);
 
   const actFilters = filters || {};
@@ -6253,10 +6247,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
     const existing = model.object_types || [];
     onUpdate({...model, object_types: existing.filter(t => (typeof t==='string'?t:t.name) !== ot)});
   };
-  const toggleNoPar = name => {
-    const cur = model.no_parallel_activities || [];
-    onUpdate({...model, no_parallel_activities: cur.includes(name) ? cur.filter(a=>a!==name) : [...cur, name]});
-  };
   const toggleStart = name => {
     const cur = startActivities || [];
     onStartActivitiesChange(cur.includes(name) ? cur.filter(a=>a!==name) : [...cur, name]);
@@ -6272,7 +6262,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           ['−','Activity deactivates (ends lifecycle of) that object when it fires'],
           ['·','Activity involves this type but neither creates nor deactivates it'],
           ['★','Start activity — simulation begins here'],
-          ['⊘','No parallel — only one instance may run at a time'],
           ['R (superscript)','Permanent object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
         ]}/>
         {editMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click cells or ▶ to expand</span>}
@@ -6292,7 +6281,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
               {editMode && <th style={{width:'18px'}}/>}
               <th style={{textAlign:'left',verticalAlign:'bottom'}}>Activity</th>
               {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',fontSize:'0.7rem'}}>★</th>}
-              {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',fontSize:'0.7rem'}}>⊘</th>}
               {visObjTypes.map(ot => (
                 <th key={ot} style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
                   <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.75rem',fontWeight:600,lineHeight:1.1}}>
@@ -6306,7 +6294,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           <tbody>
             {visActs.map(a => {
               const isExp = expandedRows.has(a.name);
-              const colSpan = 1 + (editMode?3:0) + visObjTypes.length + (editMode?1:0);
+              const colSpan = 1 + (editMode?2:0) + visObjTypes.length + (editMode?1:0);
               return (
                 <React.Fragment key={a.name}>
                   <tr style={{background: isExp ? '#f8fafc' : undefined}}>
@@ -6319,12 +6307,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                       <td style={{textAlign:'center'}}>
                         <button onClick={() => toggleStart(a.name)} title={startSet.has(a.name)?'Remove start':'Mark start'}
                           style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.9rem',color:startSet.has(a.name)?'#d97706':'#cbd5e1',padding:0}}>★</button>
-                      </td>
-                    )}
-                    {editMode && (
-                      <td style={{textAlign:'center'}}>
-                        <button onClick={() => toggleNoPar(a.name)} title={noParSet.has(a.name)?'Allow parallel':'No parallel'}
-                          style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.9rem',color:noParSet.has(a.name)?'#dc2626':'#cbd5e1',padding:0}}>⊘</button>
                       </td>
                     )}
                     {visObjTypes.map(ot => {
@@ -6683,7 +6665,7 @@ function BehaviorTimePanel({ durations, editMode, onUpdate }) {
 
   const fmtDur = s => {
     if (s == null) return '—';
-    if (s < 60) return s + 's';
+    if (s < 60) return (Math.abs(s % 1) < 0.005 ? Math.round(s) : s.toFixed(2)) + 's';
     if (s < 3600) return Math.floor(s/60) + 'm ' + Math.floor(s%60) + 's';
     if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
     return Math.floor(s/86400) + 'd';
@@ -6802,8 +6784,8 @@ function BehaviorTimePanel({ durations, editMode, onUpdate }) {
                   <span style={{borderBottom:'1px dashed #94a3b8'}}>{act}</span>
                 </td>
                 <td>{E ? <EditableCell value={d.dist_type||'lognormal'} onSave={v=>onUpdate(act,'dist_type',v)} options={['lognormal','normal','exponential','fixed']}/> : (d.dist_type||'—')}</td>
-                <td>{E ? <EditableCell value={d.mean_seconds??''} type="number" placeholder="3600" onSave={v=>onUpdate(act,'mean_seconds',v)}/> : (d.mean_seconds!=null?Math.round(d.mean_seconds):'—')}</td>
-                <td>{E ? <EditableCell value={d.std_seconds??''} type="number" placeholder="600" onSave={v=>onUpdate(act,'std_seconds',v)}/> : (d.std_seconds!=null?Math.round(d.std_seconds):'—')}</td>
+                <td>{E ? <EditableCell value={d.mean_seconds!=null?Math.round(d.mean_seconds):''} type="number" placeholder="3600" onSave={v=>onUpdate(act,'mean_seconds',v)}/> : (d.mean_seconds!=null?Math.round(d.mean_seconds):'—')}</td>
+                <td>{E ? <EditableCell value={d.std_seconds!=null?Math.round(d.std_seconds):''} type="number" placeholder="600" onSave={v=>onUpdate(act,'std_seconds',v)}/> : (d.std_seconds!=null?Math.round(d.std_seconds):'—')}</td>
                 <td style={{color:'#94a3b8'}}>{d.log_mean_seconds != null ? Math.round(d.log_mean_seconds) : '—'}</td>
                 <td style={{color:'#94a3b8'}}>{d.min_seconds != null ? Math.round(d.min_seconds) : '—'}</td>
                 <td style={{color:'#94a3b8'}}>{d.max_seconds != null ? Math.round(d.max_seconds) : '—'}</td>
@@ -7926,19 +7908,6 @@ function App() {
         await steps[i].fn();
       }
 
-      // Auto-assign no_parallel_activities for activities that involve resource objects
-      setActiveModel(prev => {
-        if (!prev || Array.isArray(prev)) return prev;
-        const resourceTypes = new Set(prev.resource_types || []);
-        if (resourceTypes.size === 0) return prev;
-        const noParallel = new Set(prev.no_parallel_activities || []);
-        (prev.activities || []).forEach(a => {
-          const hasResource = (a.bindings || []).some(b => resourceTypes.has(b.object_type));
-          if (hasResource) noParallel.add(a.name);
-        });
-        return { ...prev, no_parallel_activities: [...noParallel] };
-      });
-
       // OC-Declare Model Check
       setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'OC-Declare Model Check' });
       const modelForCheck = activeModelRef.current;
@@ -8828,56 +8797,6 @@ function App() {
                   {discoveryResults.activity_counts
                     ? (
                       <>
-                      {discoveryResults.activity_nmax_suggestions && Object.keys(discoveryResults.activity_nmax_suggestions).length > 0 && (
-                        <div className="nmax-hint-bar">
-                          <span>
-                            Suggested <code>max consec/obj</code> values from log (p95 repeats per object).
-                            {logConfResults?.constraintResults?.length > 0 && (
-                              <> Also applies observed <code>nmax</code> to constraints from model check.</>
-                            )}
-                          </span>
-                          <button
-                            className="nmax-apply-btn"
-                            title={logConfResults?.constraintResults?.length > 0
-                              ? 'Apply p95 values as max_consecutive_per_object AND apply observed nmax to constraints from the model check'
-                              : 'Apply p95 suggestions as max_consecutive_per_object in the Model Editor (run OC-Declare Model Check first to also apply nmax to constraints)'}
-                            onClick={() => {
-                              if (!activeModel || Array.isArray(activeModel)) return;
-                              const suggestions = discoveryResults.activity_nmax_suggestions;
-                              // Step 1: update max_consecutive_per_object from p95 per-activity repeat stats
-                              const cur = activeModel.max_consecutive_per_object || {};
-                              const updatedConsec = { ...cur };
-                              Object.entries(suggestions).forEach(([act, s]) => {
-                                if (s.suggested > 1) updatedConsec[act] = s.suggested;
-                              });
-                              // Step 2: apply observedNmax to constraint nmax fields from model check
-                              let updatedConstraints = activeModel.constraints || [];
-                              if (logConfResults?.constraintResults?.length > 0) {
-                                const nmaxByLabel = {};
-                                logConfResults.constraintResults.forEach(r => {
-                                  if (r.observedNmax != null) nmaxByLabel[r.label] = r.observedNmax;
-                                });
-                                updatedConstraints = updatedConstraints.map(c => {
-                                  const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
-                                  const observed = nmaxByLabel[label];
-                                  if (observed == null) return c;
-                                  // Only set if not already explicitly set, or observed > current nmax
-                                  if (c.nmax != null && c.nmax >= observed) return c;
-                                  return { ...c, nmax: observed };
-                                });
-                              }
-                              handleModelEdit({
-                                ...activeModel,
-                                max_consecutive_per_object: updatedConsec,
-                                constraints: updatedConstraints,
-                              });
-                            }}
-                          >
-                            ⬆ Apply all to Model Editor
-                            {logConfResults?.constraintResults?.length > 0 && <span style={{fontSize:'0.68rem',fontWeight:400,marginLeft:'0.35rem',opacity:0.85}}>(+ constraint nmax)</span>}
-                          </button>
-                        </div>
-                      )}
                       <table className="activity-count-table">
                         <thead>
                           <tr>
@@ -8898,9 +8817,6 @@ function App() {
                                 <th title="Most times this activity fired on a single object">Max /obj</th>
                               </>
                             )}
-                            {discoveryResults.activity_nmax_suggestions && (
-                              <th title="Suggested max_consecutive_per_object (95th percentile repeats per object in the log). Click ⬆ to apply to the Model Editor.">Sugg. max/obj (p95)</th>
-                            )}
                           </tr>
                         </thead>
                         <tbody>
@@ -8910,7 +8826,6 @@ function App() {
                             .map(activity => {
                               const cs = discoveryResults.activity_consec_stats?.[activity];
                               const rs = discoveryResults.activity_repeat_stats?.[activity];
-                              const ns = discoveryResults.activity_nmax_suggestions?.[activity];
                               const isLikelyStart = discoveryResults.likely_start_activities?.slice(0,3).includes(activity);
                               const isLikelyEnd   = discoveryResults.likely_end_activities?.includes(activity);
                               const endProb       = discoveryResults.trace_end_prob?.[activity];
@@ -8949,23 +8864,6 @@ function App() {
                                       <td className="activity-count-num">{rs ? rs.mean : '—'}</td>
                                       <td className="activity-count-num">{rs ? rs.max : '—'}</td>
                                     </>
-                                  )}
-                                  {discoveryResults.activity_nmax_suggestions && (
-                                    <td className="activity-count-num">
-                                      {ns && ns.suggested > 1 ? (
-                                        <button
-                                          className="nmax-cell-btn"
-                                          title={`p50=${ns.p50}  p95=${ns.p95} — click to set in Model Editor`}
-                                          onClick={() => {
-                                            if (!activeModel || Array.isArray(activeModel)) return;
-                                            const cur = activeModel.max_consecutive_per_object || {};
-                                            handleModelEdit({ ...activeModel, max_consecutive_per_object: { ...cur, [activity]: ns.suggested } });
-                                          }}
-                                        >
-                                          {ns.suggested}
-                                        </button>
-                                      ) : '—'}
-                                    </td>
                                   )}
                                 </tr>
                               );
@@ -9370,7 +9268,7 @@ function App() {
                     { label: 'Log Time Span',   val: (() => {
                         const s = discoveryResults?.ocel_time_span_s;
                         if (!s) return null;
-                        if (s < 60) return s + 's';
+                        if (s < 60) return (Math.abs(s % 1) < 0.005 ? Math.round(s) : s.toFixed(2)) + 's';
                         if (s < 3600) return Math.floor(s/60) + 'm';
                         if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
                         const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
@@ -10529,7 +10427,7 @@ function App() {
                                 <div className="stat-label">Activity Types</div>
                               </div>
                               <div className="stat-card"><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
-                              {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
+                              {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
                               {r.completed_traces!=null&&(()=>{
                                 const logTraceCount = discoveryResults?.log_object_trace_count;
                                 const cardClass = logTraceCount==null ? '' : r.completed_traces >= logTraceCount ? ' stat-card-ok' : r.completed_traces >= logTraceCount * 0.75 ? ' stat-card-warn' : ' stat-card-bad';
@@ -10543,7 +10441,7 @@ function App() {
                                   </div>
                                 );
                               })()}
-                              {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
+                              {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
                             </div>
                             {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
                               const simMetrics = r.metrics.activity_metrics;
@@ -10587,7 +10485,7 @@ function App() {
                                         const simSpan = r.sim_time_s ?? null;
                                         const timeShare = (meanS != null && simCount > 0 && simSpan)
                                           ? (meanS * simCount / simSpan * 100) : null;
-                                        const fmtDur = s => { if (s == null) return '—'; if (s < 60) return Math.round(s)+'s'; if (s < 3600) return Math.floor(s/60)+'m'; if (s < 86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                                        const fmtDur = s => { if (s == null) return '—'; if (s < 60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s < 3600) return Math.floor(s/60)+'m'; if (s < 86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                                         const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
                                         return (
                                           <tr key={act}>
@@ -10614,7 +10512,6 @@ function App() {
                             {(() => {
                               const simMetrics = r.metrics?.activity_metrics || {};
                               const simSpan = r.sim_time_s ?? null;
-                              const noParallel = new Set(activeModel?.no_parallel_activities || []);
                               return (
                                 <Collapsible title="Objects" defaultOpen={false}>
                                   <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
@@ -10641,7 +10538,6 @@ function App() {
                                             <th>Activity</th>
                                             <th title="Total service time / sim span — values >1 indicate overlap">Concurrency ratio</th>
                                             <th title="Mean duration per firing">Mean duration</th>
-                                            <th title="Whether multiple instances of this activity can run simultaneously">Self-concurrent</th>
                                           </tr>
                                         </thead>
                                         <tbody>
@@ -10650,7 +10546,7 @@ function App() {
                                               const meanS = m.mean_service_s ?? 0;
                                               const cnt = m.execution_count ?? 0;
                                               const ratio = simSpan && simSpan > 0 ? (meanS * cnt / simSpan) : null;
-                                              const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                                              const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                                               return { act, ratio, meanS, cnt };
                                             })
                                             .sort((a,b) => (b.ratio??0) - (a.ratio??0))
@@ -10662,12 +10558,7 @@ function App() {
                                                   {ratio != null && ratio > 1 && <span style={{fontSize:'0.7rem',color:'#16a34a',marginLeft:'0.3rem'}}>parallel</span>}
                                                 </td>
                                                 <td style={{fontSize:'0.78rem',color:'#475569'}}>
-                                                  {(() => { const s=meanS; if (!s) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; })()}
-                                                </td>
-                                                <td>
-                                                  {noParallel.has(act)
-                                                    ? <span style={{color:'#dc2626',fontSize:'0.75rem'}}>No (restricted)</span>
-                                                    : <span style={{color:'#16a34a',fontSize:'0.75rem'}}>Yes (allowed)</span>}
+                                                  {(() => { const s=meanS; if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; })()}
                                                 </td>
                                               </tr>
                                             ))}
@@ -11252,7 +11143,6 @@ function App() {
                 parameterFiles={parameterFiles}
                 onLoadParameters={handleLoadParameters}
                 onSaveParameters={handleSaveParameters}
-                nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
                 eventLogFile={discoveryConfig.eventLogFile || ''}
               />
             </div>
@@ -12015,7 +11905,7 @@ function App() {
                               const simSpan = results?.sim_time_s ?? null;
                               const timeShare = (meanS != null && simCount > 0 && simSpan)
                                 ? (meanS * simCount / simSpan * 100) : null;
-                              const fmtDur = s => { if (s==null) return '—'; if (s<60) return Math.round(s)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                              const fmtDur = s => { if (s==null) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                               const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
                                 : diff > 0 ? 'cmp-over' : 'cmp-under';
                               return (

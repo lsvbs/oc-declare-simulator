@@ -117,8 +117,6 @@ class DistributionTimePolicy:
 
     durations: Dict[str, Any]  # activity_name -> ActivityDuration
     _fallback_delta: timedelta = timedelta(hours=1)
-    concurrency_probs: Dict[str, float] = None
-    concurrency_threshold: float = 0.3
 
     def __post_init__(self):
         # #18: pre-compute lognormal log-space parameters for each activity
@@ -156,17 +154,6 @@ class DistributionTimePolicy:
         )
 
         act = getattr(candidate, "activity_name", "")
-
-        if self.concurrency_probs and state.executed_events:
-            prev_act = state.executed_events[-1].activity_name
-            if prev_act != act:
-                key = f"{prev_act}|||{act}"
-                p = self.concurrency_probs.get(key, 0.0)
-                if p >= self.concurrency_threshold:
-                    _rng = rng if rng is not None else _random.Random()
-                    roll = float(_rng.random()) if hasattr(_rng, "random") else float(_rng.uniform(0, 1))
-                    if roll < p:
-                        return base
 
         dur = self.durations.get(act)
         if dur is None:

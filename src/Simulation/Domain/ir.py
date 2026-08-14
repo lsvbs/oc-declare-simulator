@@ -142,14 +142,9 @@ class StaticModel:
     max_consecutive_per_object: dict[str, int] = field(default_factory=dict)
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
     attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Activities in this set may NOT run concurrently with themselves across
-    # different objects. Default (not in set) = unlimited parallelism.
-    # Resource activities are always exempt (they share a pool by design).
-    no_parallel_activities: set = field(default_factory=set)
-    # Concurrency probabilities: (A, B) -> float in [0, 1].
-    # p > 0 means A and B were observed firing concurrently in the log with
-    # that frequency.  Stored as a flat dict with "A|||B" keys (both orderings
-    # map to the same value) so the frozen dataclass can hold it.
+    # Concurrency probabilities: stored for future use / analytics only.
+    # NOT used by the simulation engine — DES handles concurrency naturally
+    # via object availability and service time sampling.
     concurrency_probs: dict[str, float] = field(default_factory=dict)
     # Per-activity constraint index: activity_name -> constraints where that
     # activity is source_activity or target_activity. Built once after parse.

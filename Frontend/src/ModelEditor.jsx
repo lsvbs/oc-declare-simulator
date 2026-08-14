@@ -290,7 +290,8 @@ function ObjectLifecycleSummary({ otNames, activities, resourceTypes }) {
 export default function ModelEditor({
   model, probMatrix, onModelChange, onProbMatrixChange,
   sourceFile = '', parameterFiles = [], onLoadParameters, onSaveParameters,
-  nmaxSuggestions = {}, eventLogFile = '',
+  nmaxSuggestions = {}, // kept for API compatibility but unused
+  eventLogFile = '',
   hideParameterButtons = false,
   startActivities = [],
   onStartActivitiesChange = null,
@@ -739,26 +740,7 @@ export default function ModelEditor({
                       {startActivities.includes(act.name) ? '★ start' : '☆ start'}
                     </button>
                   )}
-                  {/* Allow parallel toggle — exempt resource-only activities */}
-                  {!(act.bindings||[]).every(b => (model.resource_types||[]).includes(b.object_type)) && (() => {
-                    const noParallel = (model.no_parallel_activities || []);
-                    const isNoParallel = noParallel.includes(act.name);
-                    return (
-                      <button
-                        className={`sa-toggle-label${isNoParallel ? ' active' : ''}`}
-                        onClick={e => {
-                          e.stopPropagation();
-                          const next = isNoParallel
-                            ? noParallel.filter(a => a !== act.name)
-                            : [...noParallel, act.name];
-                          onModelChange({ ...model, no_parallel_activities: next });
-                        }}
-                        title={isNoParallel ? 'Currently: only one instance at a time. Click to allow parallel.' : 'Currently: unlimited parallel. Click to restrict to one at a time.'}
-                      >
-                        {isNoParallel ? '⊘ no parallel' : '⇉ parallel'}
-                      </button>
-                    );
-                  })()}
+                  {/* (no parallel toggle removed — parallelism controlled via permanent object pool sizes) */}
                   {(act.bindings || []).length === 0 && (
                     <span className="binding-warning-badge" title="This activity has no object bindings and will never fire.">
                       ⚠ No bindings
@@ -1687,28 +1669,28 @@ export default function ModelEditor({
                     <label className="timing-field-label">
                       Mean (s) <HelpTip text="Average service duration in seconds." />
                       <input type="number" min={0} step={1} className="timing-num"
-                        value={td.mean_seconds ?? ''}
+                        value={td.mean_seconds != null ? Math.round(td.mean_seconds) : ''}
                         placeholder="3600"
                         onChange={e => updateTiming(act, 'mean_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
                     </label>
                     <label className="timing-field-label">
                       Std (s) <HelpTip text="Standard deviation of service duration in seconds. Not used for exponential or fixed." />
                       <input type="number" min={0} step={1} className="timing-num"
-                        value={td.std_seconds ?? ''}
+                        value={td.std_seconds != null ? Math.round(td.std_seconds) : ''}
                         placeholder="600"
                         onChange={e => updateTiming(act, 'std_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
                     </label>
                     <label className="timing-field-label">
                       Min (s) <HelpTip text="Hard lower bound on sampled duration (clamp)." />
                       <input type="number" min={0} step={1} className="timing-num"
-                        value={td.min_seconds ?? ''}
+                        value={td.min_seconds != null ? Math.round(td.min_seconds) : ''}
                         placeholder="0"
                         onChange={e => updateTiming(act, 'min_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
                     </label>
                     <label className="timing-field-label">
                       Max (s) <HelpTip text="Hard upper bound on sampled duration. Leave blank for no cap." />
                       <input type="number" min={0} step={1} className="timing-num"
-                        value={td.max_seconds ?? ''}
+                        value={td.max_seconds != null ? Math.round(td.max_seconds) : ''}
                         placeholder="∞"
                         onChange={e => updateTiming(act, 'max_seconds', e.target.value === '' ? null : parseFloat(e.target.value))} />
                     </label>
