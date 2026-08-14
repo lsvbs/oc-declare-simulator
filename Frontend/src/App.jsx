@@ -34,7 +34,7 @@ function makeFlowRankSorter(discoveryResults, objectTraces) {
 // Possible-routes graph derived purely from activities + constraints.
 // Edges represent "A can directly precede B" based on precedence/response/succession
 // constraints, after transitive reduction (A→C suppressed if A→B→C exists).
-function ConstraintFlowGraph({ activities, constraints, startActivities }) {
+function ConstraintFlowGraph({ activities, constraints, startActivities, probMatrix }) {
   const [nodeOverrides, setNodeOverrides] = React.useState({});
   const [pan, setPan] = React.useState({ x: 0, y: 0 });
   const dragRef = React.useRef({ type: null });
@@ -236,6 +236,18 @@ function ConstraintFlowGraph({ activities, constraints, startActivities }) {
     })), pos, svgW, svgH, startSet, endSet, actCreates, actDeactivates };
   }, [activities, constraints, startActivities]);
 
+
+  // Compute max probability across all edges for stroke-width scaling
+  const maxProb = React.useMemo(() => {
+    if (!probMatrix) return 1;
+    let max = 0.001;
+    edges.forEach(({ src, tgt }) => {
+      const p = probMatrix[src]?.[tgt] || 0;
+      if (p > max) max = p;
+    });
+    return max;
+  }, [edges, probMatrix]);
+
   if (!nodes.length) return <div style={{color:'#94a3b8',fontSize:'0.82rem',padding:'1rem'}}>Add activities and constraints to see the constraint flow.</div>;
 
   const ctypeColor = t => t?.startsWith('response') || t?.startsWith('chain_response') || t?.startsWith('alternate_response') ? '#7c3aed'
@@ -347,13 +359,18 @@ function ConstraintFlowGraph({ activities, constraints, startActivities }) {
               const { d, lx, ly } = edgePath(src, tgt, idx, group.length);
               const col = ctypeColor(ctype);
               const markerId = col === '#7c3aed' ? 'cfg-arr-purple' : col === '#0369a1' ? 'cfg-arr-blue' : 'cfg-arr-grey';
+              // Probability-based stroke width (like OC-DFG) — 0.8 to 3.5px
+              const prob = probMatrix ? (probMatrix[src]?.[tgt] || 0) : 0;
+              const sw = probMatrix
+                ? 0.8 + (prob / maxProb) * 2.7
+                : 1.5;
               // Abbreviate each scope type: first letter of each word
               const scopeLabels = scopes.map(s => s.split(/\s+/).map(w => w[0].toUpperCase()).join(''));
               const lineH = 10;
               const maxW = Math.max(...scopeLabels.map(l => l.length * 6.4 + 4), 0);
               return (
                 <g key={`${src}->${tgt}`}>
-                  <path d={d} fill="none" stroke={col} strokeWidth={1.5}
+                  <path d={d} fill="none" stroke={col} strokeWidth={sw}
                     strokeDasharray={count === 1 ? '5,3' : undefined}
                     markerEnd={`url(#${markerId})`} />
                   {scopeLabels.length > 0 && (
@@ -3545,30 +3562,154 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
   );
   if (!cov) return <div style={{color:'#94a3b8',fontSize:'0.82rem'}}>Run a simulation to compute coverage.</div>;
 
-  const fmt = v => v == null ? 'N/A' : (v*100).toFixed(1)+'%';
+  const fmt   = v => v == null ? 'N/A' : (v*100).toFixed(1)+'%';
   const color = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
 
-  const rows = [
-    { key:'cov_act',        label:'Activity coverage',        desc:'Fraction of model activities that appeared in sim output', detail: `${cov.cov_act.fired}/${cov.cov_act.total} activities fired` },
-    { key:'cov_ot',         label:'Object type coverage',     desc:'Fraction of model object types instantiated', detail: `${cov.cov_ot.fired}/${cov.cov_ot.total} types seen` },
-    { key:'cov_activation', label:'Constraint activation',    desc:'Fraction of constraints with ≥1 source event (non-vacuous)', detail: `${cov.cov_activation.fired}/${cov.cov_activation.total} non-vacuous, median src events: ${cov.cov_activation.median??'—'}` },
-    { key:'cov_inv',        label:'Involvement testability',  desc:'Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any', detail: `${cov.cov_inv.tested}/${cov.cov_inv.total} pairs testable` },
-    { key:'cov_min',        label:'nmin discriminability',    desc:'Fraction of constraints where cascade count > nmin — tighter bound distinguishable', detail: `${cov.cov_min.dist}/${cov.cov_min.total} constraints` },
-    { key:'cov_max',        label:'nmax reachability',        desc:'Fraction of finite-nmax constraints where the max was actually reached', detail: `${cov.cov_max.reached}/${cov.cov_max.total} constraints (finite nmax only)` },
-    { key:'cov_neg',        label:'Negative constraint test', desc:'Fraction of nmax=0 constraints where target activity appeared (non-trivial test)', detail: `${cov.cov_neg.nonTrivial}/${cov.cov_neg.total} non-trivial` },
-    { key:'cov_arrow',      label:'Arrow discriminability',   desc:'Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)', detail: `${cov.cov_arrow.dist}/${cov.cov_arrow.total} response/precedence constraints` },
-    { key:'cov_guard',      label:'Guard coverage',           desc:'Whether precedence constraints blocked candidates during generation', detail: cov.cov_guard.note },
+  // ── Radar axes (6 dimensions used in the chart) ──────────────────────────
+  // cov_guard is excluded (always null). cov_min and cov_max are averaged into
+  // one "Cardinality bounds" axis so the chart fits a clean hexagon.
+  const cardVal = (() => {
+    const a = cov.cov_min.value, b = cov.cov_max.value;
+    if (a == null && b == null) return null;
+    if (a == null) return b;
+    if (b == null) return a;
+    return (a + b) / 2;
+  })();
+
+  const axes = [
+    { key: 'cov_act',        label: 'Activity\nCoverage',       value: cov.cov_act.value },
+    { key: 'cov_ot',         label: 'Object Type\nCoverage',    value: cov.cov_ot.value },
+    { key: 'cov_activation', label: 'Constraint\nActivation',   value: cov.cov_activation.value },
+    { key: 'cov_inv',        label: 'Involvement\nTestability',  value: cov.cov_inv.value },
+    { key: 'cov_card',       label: 'Cardinality\nBounds',       value: cardVal },
+    { key: 'cov_arrow',      label: 'Arrow\nDiscriminability',   value: cov.cov_arrow.value },
   ];
+
+  // ── Pure-SVG spider/radar chart (no external lib) ────────────────────────
+  const CX = 160, CY = 155, R = 110;
+  const N = axes.length;
+  const angleOf = i => (Math.PI * 2 * i) / N - Math.PI / 2;
+
+  const spoke = (i, r) => ({
+    x: CX + r * Math.cos(angleOf(i)),
+    y: CY + r * Math.sin(angleOf(i)),
+  });
+
+  const ringLevels = [0.25, 0.5, 0.75, 1.0];
+  const ringColor  = ['#f1f5f9', '#e2e8f0', '#cbd5e1', '#94a3b8'];
+
+  const dataPoints = axes.map((ax, i) => spoke(i, R * Math.max(0, ax.value ?? 0)));
+  const dataPath   = dataPoints.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
+
+  const radarColor = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
+  const overallVal = axes.filter(a => a.value != null).reduce((s, a) => s + a.value, 0) /
+                     Math.max(1, axes.filter(a => a.value != null).length);
 
   return (
     <div>
-      <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.75rem'}}>
-        Based on Küsters & van der Aalst (BPM 2025) OC-Declare framework. Green ≥90%, amber ≥60%, red &lt;60%.
+      {/* ── Citation banner ── */}
+      <div style={{fontSize:'0.68rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',
+                   borderRadius:'6px',padding:'0.4rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
+        <strong>Radar chart axes</strong> — visualization form inspired by Pourshahid &amp; Amyot,
+        <em> "A Systematic Review and Assessment of Aspect-Oriented Methods Applied to Business Process
+        Adaptation"</em>, JSoftware 2012 (pentagon scoring 0–4 per capability axis). Axes content from
+        Küsters &amp; van der Aalst, <em>"OCPQ: Object-Centric Process Querying &amp; Constraints"</em>,
+        RCIS 2025 (coverage, selectivity, reach) and the DeCo simulation log (activity/object-type
+        participation, constraint activation, involvement testability, cardinality bounds,
+        arrow discriminability). Details in the table below.
+      </div>
+
+      {/* ── Radar + legend row ── */}
+      <div style={{display:'flex',gap:'1.5rem',alignItems:'flex-start',flexWrap:'wrap',marginBottom:'1rem'}}>
+        {/* Radar SVG */}
+        <svg width={320} height={310} style={{flexShrink:0,overflow:'visible'}}>
+          {/* Ring grid */}
+          {ringLevels.map((lvl, li) => {
+            const pts = axes.map((_, i) => spoke(i, R * lvl));
+            const d = pts.map((p, i) => `${i===0?'M':'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
+            return (
+              <g key={li}>
+                <path d={d} fill="none" stroke={ringColor[li]} strokeWidth={li === 3 ? 1.5 : 1}/>
+                <text x={CX + 3} y={CY - R * lvl - 2} fontSize="8" fill="#94a3b8">{(lvl*100).toFixed(0)}%</text>
+              </g>
+            );
+          })}
+          {/* Spokes */}
+          {axes.map((_, i) => {
+            const tip = spoke(i, R);
+            return <line key={i} x1={CX} y1={CY} x2={tip.x.toFixed(1)} y2={tip.y.toFixed(1)}
+                         stroke="#e2e8f0" strokeWidth={1}/>;
+          })}
+          {/* Data polygon */}
+          <path d={dataPath} fill={`${radarColor(overallVal)}22`} stroke={radarColor(overallVal)} strokeWidth={2}/>
+          {/* Data points */}
+          {dataPoints.map((p, i) => (
+            <circle key={i} cx={p.x.toFixed(1)} cy={p.y.toFixed(1)} r={4}
+                    fill={radarColor(axes[i].value)} stroke="white" strokeWidth={1.5}>
+              <title>{axes[i].label.replace('\n',' ')}: {fmt(axes[i].value)}</title>
+            </circle>
+          ))}
+          {/* Axis labels — split on \n, offset outward */}
+          {axes.map((ax, i) => {
+            const tip  = spoke(i, R + 22);
+            const lines = ax.label.split('\n');
+            const anchor = tip.x < CX - 5 ? 'end' : tip.x > CX + 5 ? 'start' : 'middle';
+            return (
+              <text key={i} x={tip.x.toFixed(1)} y={(tip.y - (lines.length - 1) * 7).toFixed(1)}
+                    textAnchor={anchor} fontSize="9.5" fontWeight="600" fill="#475569">
+                {lines.map((l, li) => (
+                  <tspan key={li} x={tip.x.toFixed(1)} dy={li === 0 ? 0 : 13}>{l}</tspan>
+                ))}
+              </text>
+            );
+          })}
+          {/* Overall score badge */}
+          <circle cx={CX} cy={CY} r={22} fill="white" stroke={radarColor(overallVal)} strokeWidth={2}/>
+          <text x={CX} y={CY - 5} textAnchor="middle" fontSize="11" fontWeight="700"
+                fill={radarColor(overallVal)}>{(overallVal*100).toFixed(0)}%</text>
+          <text x={CX} y={CY + 9} textAnchor="middle" fontSize="8" fill="#64748b">overall</text>
+        </svg>
+
+        {/* Mini legend */}
+        <div style={{display:'flex',flexDirection:'column',gap:'0.35rem',paddingTop:'0.25rem'}}>
+          {axes.map((ax, i) => (
+            <div key={i} style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+              <div style={{width:10,height:10,borderRadius:'50%',flexShrink:0,
+                           background: radarColor(ax.value)}}/>
+              <span style={{fontSize:'0.72rem',color:'#475569',fontWeight:600,whiteSpace:'nowrap'}}>
+                {ax.label.replace('\n',' ')}
+              </span>
+              <span style={{fontSize:'0.72rem',fontWeight:700,color:radarColor(ax.value),marginLeft:'auto',paddingLeft:'0.5rem'}}>
+                {fmt(ax.value)}
+              </span>
+            </div>
+          ))}
+          <div style={{marginTop:'0.5rem',fontSize:'0.68rem',color:'#94a3b8',lineHeight:'1.5'}}>
+            <span style={{color:'#16a34a',fontWeight:700}}>●</span> ≥90% &nbsp;
+            <span style={{color:'#d97706',fontWeight:700}}>●</span> ≥60% &nbsp;
+            <span style={{color:'#dc2626',fontWeight:700}}>●</span> &lt;60%
+          </div>
+        </div>
+      </div>
+
+      {/* ── Detail table (unchanged) ── */}
+      <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.5rem'}}>
+        Full detail — Green ≥90%, amber ≥60%, red &lt;60%. Cardinality Bounds axis = avg(nmin discriminability, nmax reachability).
       </p>
       <table className="behavior-table" style={{fontSize:'0.78rem'}}>
         <thead><tr><th>Measure</th><th style={{width:'70px',textAlign:'center'}}>Score</th><th>What it indicates</th><th>Detail</th></tr></thead>
         <tbody>
-          {rows.map(r => (
+          {[
+            { key:'cov_act',        label:'Activity coverage',        desc:'Fraction of model activities that appeared in sim output', detail: `${cov.cov_act.fired}/${cov.cov_act.total} activities fired` },
+            { key:'cov_ot',         label:'Object type coverage',     desc:'Fraction of model object types instantiated', detail: `${cov.cov_ot.fired}/${cov.cov_ot.total} types seen` },
+            { key:'cov_activation', label:'Constraint activation',    desc:'Fraction of constraints with ≥1 source event (non-vacuous)', detail: `${cov.cov_activation.fired}/${cov.cov_activation.total} non-vacuous, median src events: ${cov.cov_activation.median??'—'}` },
+            { key:'cov_inv',        label:'Involvement testability',  desc:'Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any', detail: `${cov.cov_inv.tested}/${cov.cov_inv.total} pairs testable` },
+            { key:'cov_min',        label:'nmin discriminability',    desc:'Fraction of constraints where cascade count > nmin — tighter bound distinguishable', detail: `${cov.cov_min.dist}/${cov.cov_min.total} constraints` },
+            { key:'cov_max',        label:'nmax reachability',        desc:'Fraction of finite-nmax constraints where the max was actually reached', detail: `${cov.cov_max.reached}/${cov.cov_max.total} constraints (finite nmax only)` },
+            { key:'cov_neg',        label:'Negative constraint test', desc:'Fraction of nmax=0 constraints where target activity appeared (non-trivial test)', detail: `${cov.cov_neg.nonTrivial}/${cov.cov_neg.total} non-trivial` },
+            { key:'cov_arrow',      label:'Arrow discriminability',   desc:'Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)', detail: `${cov.cov_arrow.dist}/${cov.cov_arrow.total} response/precedence constraints` },
+            { key:'cov_guard',      label:'Guard coverage',           desc:'Whether precedence constraints blocked candidates during generation', detail: cov.cov_guard.note },
+          ].map(r => (
             <tr key={r.key}>
               <td style={{fontWeight:600,whiteSpace:'nowrap'}}>{r.label}</td>
               <td style={{textAlign:'center',fontWeight:700,color:color(cov[r.key]?.value)}}>{fmt(cov[r.key]?.value)}</td>
@@ -3705,6 +3846,652 @@ function OCPQPanel({ results }) {
   );
 }
 
+// ── FurtherEvaluations — E1/E2/E3/E5/E6/E4/E7 evaluation panels ─────────────
+function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFile, startActivities }) {
+  const outputFile    = results?.output_file || null;
+  const constraints   = activeModel?.constraints || [];
+  const ocdeclareFile = activeModel?._source_file || null;
+  const modelOverride = activeModel || null;
+
+  // ── E1: Post-hoc conformance check ───────────────────────────────────────
+  const [confData,    setConfData]    = React.useState(null);
+  const [confLoading, setConfLoading] = React.useState(false);
+  const [confError,   setConfError]   = React.useState(null);
+
+  const runConformanceCheck = async () => {
+    if (!outputFile) return;
+    setConfLoading(true); setConfError(null); setConfData(null);
+    try {
+      const r = await axios.post('/api/further-eval/conformance-check', {
+        outputFile, ocdeclareFile, modelOverride,
+      });
+      setConfData(r.data);
+    } catch(e) { setConfError(e.response?.data?.error || e.message); }
+    finally { setConfLoading(false); }
+  };
+
+  // ── E2: Log fidelity ──────────────────────────────────────────────────────
+  const [fidelityData,    setFidelityData]    = React.useState(null);
+  const [fidelityLoading, setFidelityLoading] = React.useState(false);
+  const [fidelityError,   setFidelityError]   = React.useState(null);
+
+  const runFidelity = async () => {
+    if (!outputFile || !eventLogFile) return;
+    setFidelityLoading(true); setFidelityError(null); setFidelityData(null);
+    try {
+      const r = await axios.post('/api/further-eval/log-fidelity', { outputFile, eventLogFile });
+      setFidelityData(r.data);
+    } catch(e) { setFidelityError(e.response?.data?.error || e.message); }
+    finally { setFidelityLoading(false); }
+  };
+
+  // ── E3: Per-constraint obligation stats (from simulation result) ──────────
+  const constraintStats = results?.constraint_obligation_stats || {};
+  const obligationsViolated = results?.obligations_violated ?? 0;
+  const obligationsFulfilled = results?.obligations_fulfilled ?? 0;
+  const obligationsCancelled = results?.obligations_cancelled ?? 0;
+
+  // ── E4/E7: OCPA/OCPQ side-by-side comparison ─────────────────────────────
+  const [ocpaData,    setOcpaData]    = React.useState(null);
+  const [ocpaLoading, setOcpaLoading] = React.useState(false);
+  const [ocpaError,   setOcpaError]   = React.useState(null);
+
+  const runOcpaComparison = async () => {
+    if (!outputFile || !eventLogFile) return;
+    setOcpaLoading(true); setOcpaError(null); setOcpaData(null);
+    try {
+      const r = await axios.post('/api/further-eval/ocpa-ocpq-comparison', { outputFile, eventLogFile });
+      setOcpaData(r.data);
+    } catch(e) { setOcpaError(e.response?.data?.error || e.message); }
+    finally { setOcpaLoading(false); }
+  };
+
+  // ── E5: Multi-seed variance ───────────────────────────────────────────────
+  const [multiSeeds,    setMultiSeeds]    = React.useState('42,99,123,456,789');
+  const [multiData,     setMultiData]     = React.useState(null);
+  const [multiLoading,  setMultiLoading]  = React.useState(false);
+  const [multiError,    setMultiError]    = React.useState(null);
+  const safeStartActivities = Array.isArray(startActivities) && startActivities.length > 0
+    ? startActivities
+    : [];
+
+  const runMultiSeed = async () => {
+    const seeds = multiSeeds.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (!seeds.length) return;
+    setMultiLoading(true); setMultiError(null); setMultiData(null);
+    try {
+      const r = await axios.post('/api/further-eval/multi-run', {
+        seeds, ocdeclareFile, modelOverride,
+        eventLogFile,
+        startActivities: safeStartActivities,
+        maxEvents: 50000,
+      });
+      setMultiData(r.data);
+    } catch(e) { setMultiError(e.response?.data?.error || e.message); }
+    finally { setMultiLoading(false); }
+  };
+
+  // ── E6: Cardinality fidelity ──────────────────────────────────────────────
+  const [cardData,    setCardData]    = React.useState(null);
+  const [cardLoading, setCardLoading] = React.useState(false);
+  const [cardError,   setCardError]   = React.useState(null);
+
+  const runCardinality = async () => {
+    if (!outputFile || !eventLogFile) return;
+    setCardLoading(true); setCardError(null); setCardData(null);
+    try {
+      const r = await axios.post('/api/further-eval/cardinality-fidelity', { outputFile, eventLogFile });
+      setCardData(r.data);
+    } catch(e) { setCardError(e.response?.data?.error || e.message); }
+    finally { setCardLoading(false); }
+  };
+
+  const fmtPct  = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const fmtNum  = v => v == null ? '—' : Number.isInteger(v) ? v.toLocaleString() : v.toFixed(3);
+  const fmtDur  = s => {
+    if (s == null) return '—';
+    if (s >= 86400) return `${(s/86400).toFixed(1)} d`;
+    if (s >= 3600)  return `${(s/3600).toFixed(1)} h`;
+    if (s >= 60)    return `${Math.round(s/60)} min`;
+    return `${Math.round(s)} s`;
+  };
+  const pctCls  = d => d == null ? '' : Math.abs(d) < 10 ? 'cmp-ok' : Math.abs(d) < 30 ? 'cmp-under' : 'cmp-over';
+
+  const noOutput = !outputFile;
+  const noLog    = !eventLogFile;
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:'1.25rem',padding:'0.25rem 0'}}>
+
+      {/* ── E3: Per-constraint obligation fulfillment (always shown from sim results) ── */}
+      <Collapsible className="eval-section" title="E3 — Per-Constraint Obligation Rates" defaultOpen={true}>
+        {!results ? (
+          <p className="empty-notice">Run a simulation first.</p>
+        ) : (
+          <div>
+            {/* Legend */}
+            <div style={{fontSize:'0.72rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.5rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
+              <strong>Fulfillment Rate</strong> = obligations fulfilled ÷ (fulfilled + violated). An obligation is created each time a response constraint's source activity fires for a scope object. It is <em>fulfilled</em> when the target activity later fires for that object, and <em>violated</em> when the object is deactivated (case closed) before the target ever fires. <em>Cancelled</em> obligations are a subset of violations — they are removed at case-close time. A rate of 0% means the model has response constraints but the response activity never fired before cases ended; this commonly means the constraint is unenforced or the simulation terminates too early.
+            </div>
+            <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+              {[
+                {label:'Fulfilled',  val:obligationsFulfilled, color:'#16a34a'},
+                {label:'Violated',   val:obligationsViolated,  color:'#dc2626'},
+                {label:'Cancelled',  val:obligationsCancelled, color:'#ca8a04'},
+              ].map(({label,val,color}) => (
+                <div key={label} className="behavior-stat-card" style={{minWidth:'100px'}}>
+                  <div className="behavior-stat-val" style={{color}}>{val.toLocaleString()}</div>
+                  <div className="behavior-stat-label">{label}</div>
+                </div>
+              ))}
+            </div>
+            {Object.keys(constraintStats).length === 0 ? (
+              (() => {
+                const hasResponseConstraints = (activeModel?.constraints || [])
+                  .some(c => c.constraint_type === 'response' || c.constraint_type === 'chain_response');
+                return (
+                  <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>
+                    {!hasResponseConstraints
+                      ? 'No response constraints in the active model — obligation tracking only applies to response/chain_response constraints.'
+                      : 'Response constraints exist but no obligations were recorded in this run. This may mean the source activities never fired, or the model was not loaded when the simulation ran (re-simulate to populate).'}
+                  </p>
+                );
+              })()
+            ) : (
+              <table className="conf-detail-table" style={{width:'100%'}}>
+                <thead>
+                  <tr>
+                    <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                    <th className="audit-num">Fulfilled</th>
+                    <th className="audit-num">Violated</th>
+                    <th className="audit-num">Cancelled</th>
+                    <th className="audit-num">Fulfillment Rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(constraintStats).sort((a,b) => {
+                    const ra = a[1].violated/(a[1].fulfilled+a[1].violated||1);
+                    const rb = b[1].violated/(b[1].fulfilled+b[1].violated||1);
+                    return rb - ra;
+                  }).map(([key, stats]) => {
+                    const total = stats.fulfilled + stats.violated;
+                    const rate  = total > 0 ? stats.fulfilled / total : null;
+                    return (
+                      <tr key={key}>
+                        <td style={{fontSize:'0.72rem',color:'#475569',fontFamily:'monospace'}}>{key}</td>
+                        <td className="audit-num" style={{color:'#16a34a'}}>{stats.fulfilled}</td>
+                        <td className="audit-num" style={{color:'#dc2626'}}>{stats.violated}</td>
+                        <td className="audit-num" style={{color:'#ca8a04'}}>{stats.cancelled}</td>
+                        <td className="audit-num">
+                          <span style={{
+                            color: rate == null ? '#94a3b8' : rate >= 0.9 ? '#16a34a' : rate >= 0.7 ? '#ca8a04' : '#dc2626',
+                            fontWeight: 600,
+                          }}>
+                            {rate == null ? '—' : fmtPct(rate)}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </Collapsible>
+
+      {/* ── E1: Post-hoc conformance check ── */}
+      <Collapsible className="eval-section" title="E1 — Post-hoc Conformance Check" defaultOpen={false}>
+        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+          Replays the generated OCEL through the OC-Declare constraint checker and reports
+          per-constraint violation rates. Catches constraints not enforced eagerly (responded_existence,
+          exactly lower-bound, exclusive-choice lower-bound).
+        </p>
+        {noOutput ? (
+          <p className="empty-notice">No simulation output — run a simulation first.</p>
+        ) : (
+          <>
+            <button className="simulate-button"
+              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
+                      background: confLoading ? '#94a3b8' : '#6366f1'}}
+              onClick={runConformanceCheck} disabled={confLoading}>
+              {confLoading ? 'Checking…' : 'Run Conformance Check'}
+            </button>
+            {confError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{confError}</p>}
+            {confData && (
+              <div>
+                <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+                  {[
+                    {label:'Overall Fitness', val: confData.overall_fitness != null ? fmtPct(confData.overall_fitness) : '—', color: confData.overall_fitness >= 0.9 ? '#16a34a' : confData.overall_fitness >= 0.7 ? '#ca8a04' : '#dc2626'},
+                    {label:'Constraints Checked', val: confData.num_constraints, color:'#1e293b'},
+                    {label:'Scope Objects Checked', val: confData.total_checked, color:'#1e293b'},
+                    {label:'Violations', val: confData.total_violated, color: confData.total_violated > 0 ? '#dc2626' : '#16a34a'},
+                  ].map(({label,val,color}) => (
+                    <div key={label} className="behavior-stat-card" style={{minWidth:'120px'}}>
+                      <div className="behavior-stat-val" style={{color}}>{typeof val === 'number' ? val.toLocaleString() : val}</div>
+                      <div className="behavior-stat-label">{label}</div>
+                    </div>
+                  ))}
+                </div>
+                <table className="conf-detail-table" style={{width:'100%'}}>
+                  <thead>
+                    <tr>
+                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                      <th className="audit-num">Scope Type</th>
+                      <th className="audit-num">Checked</th>
+                      <th className="audit-num">Violated</th>
+                      <th className="audit-num">Violation Rate</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(confData.constraint_results || []).sort((a,b) => (b.violation_rate||0)-(a.violation_rate||0)).map((r,i) => (
+                      <tr key={i}>
+                        <td style={{fontSize:'0.72rem',fontFamily:'monospace',color:'#475569'}}>{r.constraint}</td>
+                        <td className="audit-num" style={{color:'#64748b',fontSize:'0.7rem'}}>{r.scope_type || '—'}</td>
+                        <td className="audit-num">{r.checked}</td>
+                        <td className="audit-num" style={{color: r.violated > 0 ? '#dc2626' : '#16a34a'}}>{r.violated}</td>
+                        <td className="audit-num">
+                          <span style={{color: r.violation_rate == null ? '#94a3b8' : r.violation_rate === 0 ? '#16a34a' : r.violation_rate < 0.1 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
+                            {r.violation_rate == null ? '—' : fmtPct(r.violation_rate)}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </Collapsible>
+
+      {/* ── E2: Log fidelity ── */}
+      <Collapsible className="eval-section" title="E2 — Cross-Log Fidelity (Simulated vs Real)" defaultOpen={false}>
+        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+          Compares activity frequency distributions (KL divergence), object type counts, and
+          inter-event timing (Earth Mover Distance) between the real input log and simulation output.
+        </p>
+        {noOutput || noLog ? (
+          <p className="empty-notice">{noOutput ? 'No simulation output — run a simulation first.' : 'No input event log loaded.'}</p>
+        ) : (
+          <>
+            <button className="simulate-button"
+              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
+                      background: fidelityLoading ? '#94a3b8' : '#6366f1'}}
+              onClick={runFidelity} disabled={fidelityLoading}>
+              {fidelityLoading ? 'Computing…' : 'Compute Fidelity Metrics'}
+            </button>
+            {fidelityError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{fidelityError}</p>}
+            {fidelityData && (
+              <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
+                {/* Summary cards */}
+                <div style={{display:'flex',gap:'1rem',flexWrap:'wrap'}}>
+                  {[
+                    {label:'Activity KL Divergence', val: fidelityData.activity_kl_divergence?.toFixed(4), hint:'0 = identical distributions'},
+                    {label:'Object Type KL Divergence', val: fidelityData.object_type_kl_divergence?.toFixed(4), hint:'0 = identical counts'},
+                    {label:'Timing EMD (s)', val: fidelityData.timing_emd_s?.toFixed(1) ?? '—', hint:'Wasserstein-1 on inter-event gaps'},
+                    {label:'Real Events', val: fidelityData.real_event_count?.toLocaleString(), hint:''},
+                    {label:'Sim Events',  val: fidelityData.sim_event_count?.toLocaleString(),  hint:''},
+                  ].map(({label,val,hint}) => (
+                    <div key={label} className="behavior-stat-card" style={{minWidth:'130px'}}>
+                      <div className="behavior-stat-val">{val ?? '—'}</div>
+                      <div className="behavior-stat-label">{label}</div>
+                      {hint && <div style={{fontSize:'0.63rem',color:'#94a3b8',marginTop:'0.2rem'}}>{hint}</div>}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Timing summary */}
+                {fidelityData.timing_summary && (
+                  <details>
+                    <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Timing Summary</summary>
+                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginTop:'0.5rem'}}>
+                      {[
+                        {label:'Real Mean Gap', val: fmtDur(fidelityData.timing_summary.real_gap_mean_s)},
+                        {label:'Sim Mean Gap',  val: fmtDur(fidelityData.timing_summary.sim_gap_mean_s)},
+                        {label:'Real Median Gap', val: fmtDur(fidelityData.timing_summary.real_gap_median_s)},
+                        {label:'Sim Median Gap',  val: fmtDur(fidelityData.timing_summary.sim_gap_median_s)},
+                      ].map(({label,val}) => (
+                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
+                          <div className="behavior-stat-val">{val}</div>
+                          <div className="behavior-stat-label">{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                )}
+
+                {/* Activity frequency table */}
+                <details open>
+                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Activity Frequency Comparison</summary>
+                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                    <table className="conf-detail-table" style={{width:'100%'}}>
+                      <thead>
+                        <tr>
+                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
+                          <th className="audit-num">Real Count</th>
+                          <th className="audit-num">Sim Count</th>
+                          <th className="audit-num">Real Freq</th>
+                          <th className="audit-num">Sim Freq</th>
+                          <th className="audit-num">Δ Freq</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(fidelityData.activity_freq_table || []).map((row,i) => {
+                          const diff = row.sim_freq - row.real_freq;
+                          return (
+                            <tr key={i}>
+                              <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
+                              <td className="audit-num">{row.real_count.toLocaleString()}</td>
+                              <td className="audit-num">{row.sim_count.toLocaleString()}</td>
+                              <td className="audit-num">{(row.real_freq*100).toFixed(1)}%</td>
+                              <td className="audit-num">{(row.sim_freq*100).toFixed(1)}%</td>
+                              <td className={`audit-num cmp-diff ${pctCls(diff*100)}`}>
+                                {diff >= 0 ? '+' : ''}{(diff*100).toFixed(1)}pp
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+
+                {/* Object type table */}
+                <details>
+                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Object Type Count Comparison</summary>
+                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                    <table className="conf-detail-table" style={{width:'100%'}}>
+                      <thead>
+                        <tr>
+                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Object Type</th>
+                          <th className="audit-num">Real Count</th>
+                          <th className="audit-num">Sim Count</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(fidelityData.object_type_table || []).map((row,i) => (
+                          <tr key={i}>
+                            <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.object_type}</td>
+                            <td className="audit-num">{row.real_count.toLocaleString()}</td>
+                            <td className="audit-num">{row.sim_count.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </div>
+            )}
+          </>
+        )}
+      </Collapsible>
+
+      {/* ── E4/E7: OCPA timing comparison ── */}
+      <Collapsible className="eval-section" title="E4/E7 — OCPA Timing Comparison (Real vs Sim)" defaultOpen={false}>
+        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+          Side-by-side comparison of OCPA time metrics (service, waiting, sojourn, sync, flow,
+          pooling, lagging) between the real input log and simulation output.
+        </p>
+        {noOutput || noLog ? (
+          <p className="empty-notice">{noOutput ? 'No simulation output.' : 'No input event log loaded.'}</p>
+        ) : (
+          <>
+            <button className="simulate-button"
+              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
+                      background: ocpaLoading ? '#94a3b8' : '#6366f1'}}
+              onClick={runOcpaComparison} disabled={ocpaLoading}>
+              {ocpaLoading ? 'Computing…' : 'Compare OCPA Metrics'}
+            </button>
+            {ocpaError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{ocpaError}</p>}
+            {ocpaData && (
+              <div style={{overflowX:'auto'}}>
+                {/* Global WMAPE summary */}
+                {ocpaData.global_wmape != null && (
+                  <div style={{display:'flex',alignItems:'center',gap:'0.75rem',marginBottom:'0.75rem',padding:'0.5rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px'}}>
+                    <span style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Global WMAPE:</span>
+                    <span style={{fontSize:'1rem',fontWeight:700,color: ocpaData.global_wmape < 20 ? '#16a34a' : ocpaData.global_wmape < 50 ? '#ca8a04' : '#dc2626'}}>
+                      {ocpaData.global_wmape.toFixed(1)}%
+                    </span>
+                    <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>Weighted Mean Absolute Percentage Error across all activities and time metrics (lower = better fit to real log)</span>
+                  </div>
+                )}
+                {(ocpaData.comparison || []).map((row, i) => {
+                  const fields = row.fields || {};
+                  const hasData = Object.values(fields).some(f => f.real != null || f.sim != null);
+                  if (!hasData) return null;
+                  const wmape = row.wmape;
+                  const wmapeColor = wmape == null ? '#94a3b8' : wmape < 20 ? '#16a34a' : wmape < 50 ? '#ca8a04' : '#dc2626';
+                  const fieldLabels = {
+                    service_mean:'Service (mean)', service_min:'Service (min)', service_max:'Service (max)',
+                    waiting_mean:'Waiting (mean)', sojourn_mean:'Sojourn (mean)', sync_mean:'Sync (mean)',
+                    flow_mean:'Flow (mean)', pooling_mean:'Pooling (mean)', lagging_mean:'Lagging (mean)',
+                  };
+                  return (
+                    <details key={i} style={{marginBottom:'0.5rem'}}>
+                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#1e293b',padding:'0.25rem 0',display:'flex',alignItems:'center',gap:'0.6rem'}}>
+                        <span>{row.activity}</span>
+                        {wmape != null && (
+                          <span style={{fontSize:'0.7rem',fontWeight:700,color:wmapeColor,
+                            background: wmape < 20 ? '#dcfce7' : wmape < 50 ? '#fef9c3' : '#fee2e2',
+                            padding:'0.1rem 0.4rem',borderRadius:'4px',flexShrink:0}}>
+                            WMAPE {wmape.toFixed(1)}%
+                          </span>
+                        )}
+                      </summary>
+                      <table className="conf-detail-table" style={{width:'100%',marginTop:'0.35rem'}}>
+                        <thead>
+                          <tr>
+                            <th style={{textAlign:'left',fontSize:'0.7rem'}}>Metric</th>
+                            <th className="audit-num">Real Log</th>
+                            <th className="audit-num">Sim Output</th>
+                            <th className="audit-num">Δ %</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {Object.entries(fieldLabels).map(([fk, fl]) => {
+                            const fd = fields[fk];
+                            if (!fd) return null;
+                            const { real: rv, sim: sv, pct_diff: pd } = fd;
+                            if (rv == null && sv == null) return null;
+                            return (
+                              <tr key={fk}>
+                                <td style={{fontSize:'0.7rem',color:'#64748b'}}>{fl}</td>
+                                <td className="audit-num">{rv != null ? fmtDur(rv) : '—'}</td>
+                                <td className="audit-num">{sv != null ? fmtDur(sv) : '—'}</td>
+                                <td className={`audit-num cmp-diff ${pctCls(pd)}`}>
+                                  {pd != null ? `${pd > 0 ? '+' : ''}${pd.toFixed(1)}%` : '—'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </details>
+                  );
+                })}
+              </div>
+            )}
+          </>
+        )}
+      </Collapsible>
+
+      {/* ── E5: Multi-seed variance ── */}
+      <Collapsible className="eval-section" title="E5 — Multi-Seed Variance Analysis" defaultOpen={false}>
+        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+          Runs the simulation with multiple random seeds and reports mean ± std for key metrics,
+          quantifying reproducibility and sensitivity to seed choice.
+        </p>
+        <div style={{display:'flex',gap:'0.5rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+          <label style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Seeds (comma-separated):</label>
+          <input
+            value={multiSeeds}
+            onChange={e => setMultiSeeds(e.target.value)}
+            style={{padding:'0.3rem 0.5rem',fontSize:'0.8rem',border:'1px solid #e2e8f0',borderRadius:'4px',width:'220px'}}
+            placeholder="42, 99, 123, 456, 789"
+          />
+          <button className="simulate-button"
+            style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',
+                    background: multiLoading ? '#94a3b8' : '#6366f1'}}
+            onClick={runMultiSeed} disabled={multiLoading || !safeStartActivities.length}>
+            {multiLoading ? 'Running…' : 'Run Multi-Seed Analysis'}
+          </button>
+        </div>
+        {!safeStartActivities.length && (
+          <p style={{fontSize:'0.78rem',color:'#ca8a04'}}>Start activities not detected — load a discovery result first.</p>
+        )}
+        {multiError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{multiError}</p>}
+        {multiData && (
+          <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
+            {/* Summary stats */}
+            <div style={{overflowX:'auto'}}>
+              <table className="conf-detail-table" style={{width:'100%'}}>
+                <thead>
+                  <tr>
+                    <th style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
+                    <th className="audit-num">Mean</th>
+                    <th className="audit-num">Std Dev</th>
+                    <th className="audit-num">Min</th>
+                    <th className="audit-num">Max</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(multiData.summary || {}).map(([key, s]) => (
+                    <tr key={key}>
+                      <td style={{fontSize:'0.72rem',color:'#475569'}}>{key.replace(/_/g,' ')}</td>
+                      <td className="audit-num">{fmtNum(s.mean)}</td>
+                      <td className="audit-num">{fmtNum(s.std)}</td>
+                      <td className="audit-num">{fmtNum(s.min)}</td>
+                      <td className="audit-num">{fmtNum(s.max)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Per-constraint fulfillment rates across seeds */}
+            {Object.keys(multiData.constraint_summary || {}).length > 0 && (
+              <details>
+                <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Constraint Fulfillment Rate (across seeds)</summary>
+                <table className="conf-detail-table" style={{width:'100%',marginTop:'0.5rem'}}>
+                  <thead>
+                    <tr>
+                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                      <th className="audit-num">Mean Rate</th>
+                      <th className="audit-num">Std Dev</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(multiData.constraint_summary).map(([ck, s]) => (
+                      <tr key={ck}>
+                        <td style={{fontSize:'0.7rem',fontFamily:'monospace',color:'#475569'}}>{ck}</td>
+                        <td className="audit-num">
+                          <span style={{color: s.mean == null ? '#94a3b8' : s.mean >= 0.9 ? '#16a34a' : s.mean >= 0.7 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
+                            {s.mean != null ? fmtPct(s.mean) : '—'}
+                          </span>
+                        </td>
+                        <td className="audit-num">{s.std != null ? `±${fmtPct(s.std)}` : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
+            )}
+
+            {/* Per-seed breakdown */}
+            <details>
+              <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Seed Breakdown</summary>
+              <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                <table className="conf-detail-table" style={{width:'100%'}}>
+                  <thead>
+                    <tr>
+                      <th className="audit-num">Seed</th>
+                      <th className="audit-num">Events</th>
+                      <th className="audit-num">Objects</th>
+                      <th className="audit-num">Traces</th>
+                      <th className="audit-num">Obl. Fulfilled</th>
+                      <th className="audit-num">Obl. Violated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(multiData.runs || []).map(r => (
+                      <tr key={r.seed}>
+                        <td className="audit-num" style={{fontWeight:600}}>{r.seed}</td>
+                        <td className="audit-num">{r.events_count.toLocaleString()}</td>
+                        <td className="audit-num">{r.objects_count.toLocaleString()}</td>
+                        <td className="audit-num">{r.completed_traces.toLocaleString()}</td>
+                        <td className="audit-num" style={{color:'#16a34a'}}>{r.obligations_fulfilled}</td>
+                        <td className="audit-num" style={{color: r.obligations_violated > 0 ? '#dc2626' : '#16a34a'}}>{r.obligations_violated}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+        )}
+      </Collapsible>
+
+      {/* ── E6: Object cardinality fidelity ── */}
+      <Collapsible className="eval-section" title="E6 — Object Cardinality Fidelity" defaultOpen={false}>
+        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+          Compares mean objects-per-event firing between the real log and simulation output per activity.
+          Highlights where the simulator creates fewer or more objects than the real process.
+        </p>
+        {noOutput || noLog ? (
+          <p className="empty-notice">{noOutput ? 'No simulation output.' : 'No input event log loaded.'}</p>
+        ) : (
+          <>
+            <button className="simulate-button"
+              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
+                      background: cardLoading ? '#94a3b8' : '#6366f1'}}
+              onClick={runCardinality} disabled={cardLoading}>
+              {cardLoading ? 'Computing…' : 'Compute Cardinality Fidelity'}
+            </button>
+            {cardError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{cardError}</p>}
+            {cardData && (
+              <div style={{overflowX:'auto'}}>
+                <table className="conf-detail-table" style={{width:'100%'}}>
+                  <thead>
+                    <tr>
+                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
+                      <th className="audit-num">Real Mean OPE</th>
+                      <th className="audit-num">Sim Mean OPE</th>
+                      <th className="audit-num">Δ Mean</th>
+                      <th className="audit-num">Real Count</th>
+                      <th className="audit-num">Sim Count</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(cardData.table || []).map((row, i) => {
+                      const diff = row.mean_diff;
+                      const absDiff = diff != null ? Math.abs(diff) : null;
+                      return (
+                        <tr key={i}>
+                          <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
+                          <td className="audit-num">{row.real?.mean?.toFixed(2) ?? '—'}</td>
+                          <td className="audit-num">{row.sim?.mean?.toFixed(2) ?? '—'}</td>
+                          <td className={`audit-num cmp-diff ${absDiff == null ? '' : absDiff < 0.5 ? 'cmp-ok' : absDiff < 1.5 ? 'cmp-under' : 'cmp-over'}`}>
+                            {diff != null ? `${diff >= 0 ? '+' : ''}${diff.toFixed(2)}` : '—'}
+                          </td>
+                          <td className="audit-num" style={{color:'#94a3b8'}}>{row.real?.count ?? 0}</td>
+                          <td className="audit-num" style={{color:'#94a3b8'}}>{row.sim?.count ?? 0}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <p style={{fontSize:'0.68rem',color:'#94a3b8',marginTop:'0.5rem'}}>OPE = Objects Per Event firing</p>
+              </div>
+            )}
+          </>
+        )}
+      </Collapsible>
+
+    </div>
+  );
+}
+
 // ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
 function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount }) {
   const hasBoth = !!(resultsAsIs && resultsToBe);
@@ -3780,6 +4567,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
     { key: 'matrix',     label: 'Verification Matrix' },
     { key: 'ocpq',       label: 'OCPQ' },
     { key: 'evaluation', label: 'Evaluation' },
+    { key: 'further',    label: 'Further Evaluations' },
   ];
 
   const renderTracePanel = (tc, label, logCount) => {
@@ -4142,6 +4930,17 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
           ))}
         </div>
       )}
+
+      {/* Further Evaluations tab */}
+      {evalTab === 'further' && (
+        <FurtherEvaluations
+          results={rAsis}
+          activeModel={activeModel}
+          discoveryResults={discoveryResults}
+          eventLogFile={inputEventLogFile}
+          startActivities={discoveryResults?.strict_start_activities || discoveryResults?.likely_start_activities || []}
+        />
+      )}
     </div>
   );
 }
@@ -4299,7 +5098,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
   const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
   const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
 
-  const modeLabel = { minimum: 'Minimum sojourn', p25: 'P25 sojourn', p50: 'P50 (median) sojourn' };
+  const modeLabel = { minimum: 'Minimum [min–P25]', p25: 'P25 [min–P50]', p50: 'P50 IQR [P25–P75]', p75: 'P75 [P50–max]', mean: 'Full mean' };
 
   return (
     <div className="evaluation-tab">
@@ -5182,6 +5981,881 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
   );
 }
 
+// ── EditableCell — click to edit, blur/enter to save ─────────────────────────
+function EditableCell({ value, onSave, type='text', options=null, style={}, placeholder='' }) {
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState('');
+  const inputRef = React.useRef(null);
+
+  const start = () => { setDraft(value ?? ''); setEditing(true); };
+  const commit = () => {
+    setEditing(false);
+    const parsed = type === 'number' ? (draft === '' ? null : Number(draft)) : draft;
+    if (parsed !== value) onSave(parsed);
+  };
+  const keyDown = e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false); };
+  React.useEffect(() => { if (editing && inputRef.current) inputRef.current.focus(); }, [editing]);
+
+  if (!editing) return (
+    <span onClick={start} style={{cursor:'pointer',borderBottom:'1px dashed #94a3b8',minWidth:'1em',display:'inline-block',...style}}
+      title="Click to edit">
+      {value ?? <span style={{color:'#94a3b8'}}>—</span>}
+    </span>
+  );
+
+  if (options) return (
+    <select ref={inputRef} value={draft} onChange={e => setDraft(e.target.value)} onBlur={commit} onKeyDown={keyDown}
+      style={{fontSize:'inherit',padding:'1px 2px',border:'1px solid #6366f1',borderRadius:'3px',background:'white'}}>
+      {options.map(o => <option key={o} value={o}>{o}</option>)}
+    </select>
+  );
+
+  return (
+    <input ref={inputRef} type={type} value={draft} placeholder={placeholder}
+      onChange={e => setDraft(e.target.value)} onBlur={commit} onKeyDown={keyDown}
+      style={{fontSize:'inherit',padding:'1px 3px',border:'1px solid #6366f1',borderRadius:'3px',
+        width: type==='number' ? '70px' : '120px', background:'white'}} />
+  );
+}
+
+
+// ── BehaviorLegend — ? toggle button with inline popover ─────────────────────
+function BehaviorLegend({ items }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <span style={{display:'inline-block',position:'relative',verticalAlign:'middle',marginLeft:'0.4rem'}}>
+      <button onClick={() => setOpen(o => !o)}
+        style={{fontSize:'0.7rem',padding:'0 5px',border:'1px solid #cbd5e1',borderRadius:'3px',
+          background: open ? '#eff6ff' : 'white', color: open ? '#6366f1' : '#64748b',
+          cursor:'pointer',lineHeight:'16px',fontWeight:600}}>
+        ?
+      </button>
+      {open && (
+        <div style={{
+          position:'absolute',top:'calc(100% + 4px)',left:0,zIndex:200,
+          background:'white',border:'1px solid #e2e8f0',borderRadius:'8px',
+          boxShadow:'0 4px 20px rgba(0,0,0,0.12)',padding:'0.6rem 0.8rem',
+          minWidth:'260px',maxWidth:'360px',fontSize:'0.74rem',color:'#475569',
+        }}>
+          <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'0.2rem 0.6rem'}}>
+            {items.map(([term, desc]) => (
+              <React.Fragment key={term}>
+                <span style={{fontWeight:700,color:'#1e293b',whiteSpace:'nowrap'}}>{term}</span>
+                <span>{desc}</span>
+              </React.Fragment>
+            ))}
+          </div>
+          <button onClick={() => setOpen(false)}
+            style={{marginTop:'0.4rem',fontSize:'0.7rem',padding:'1px 6px',border:'1px solid #e2e8f0',
+              borderRadius:'3px',background:'#f8fafc',cursor:'pointer',color:'#64748b',float:'right'}}>
+            close
+          </button>
+        </div>
+      )}
+    </span>
+  );
+}
+
+// ── ToBeDiffPanel — shows what changed between modelAsIs and modelToBe ────────
+function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, startActivitiesAsIs, startActivitiesToBe }) {
+  if (!modelAsIs || !modelToBe) return null;
+
+  const chips = [];
+  const chip = (label, kind) => chips.push({ label, kind }); // kind: 'add'|'remove'|'change'
+
+  const asis = modelAsIs, tobe = modelToBe;
+  const asActs = asis.activities || [], toActs = tobe.activities || [];
+  const asActMap = Object.fromEntries(asActs.map(a => [a.name, a]));
+  const toActMap = Object.fromEntries(toActs.map(a => [a.name, a]));
+
+  // Activities added / removed
+  toActs.forEach(a => { if (!asActMap[a.name]) chip(`+${a.name}`, 'add'); });
+  asActs.forEach(a => { if (!toActMap[a.name]) chip(`−${a.name}`, 'remove'); });
+
+  // Bindings changed
+  toActs.forEach(a => {
+    const asA = asActMap[a.name];
+    if (!asA) return;
+    const asBindings = Object.fromEntries((asA.bindings||[]).map(b=>[b.object_type,b]));
+    const toBindings = Object.fromEntries((a.bindings||[]).map(b=>[b.object_type,b]));
+    Object.entries(toBindings).forEach(([ot,b]) => {
+      const ab = asBindings[ot];
+      if (!ab) { chip(`${a.name}: +${ot}`, 'add'); return; }
+      const diffs = [];
+      if (b.creates !== ab.creates) diffs.push(`creates ${ab.creates}→${b.creates}`);
+      if (b.deactivates !== ab.deactivates) diffs.push(`deactivates ${ab.deactivates}→${b.deactivates}`);
+      if ((b.min_count||1) !== (ab.min_count||1)) diffs.push(`min ${ab.min_count||1}→${b.min_count||1}`);
+      if ((b.max_count||null) !== (ab.max_count||null)) diffs.push(`max ${ab.max_count??'∞'}→${b.max_count??'∞'}`);
+      if (diffs.length) chip(`${a.name}/${ot}: ${diffs.join(', ')}`, 'change');
+    });
+    Object.keys(asBindings).forEach(ot => { if (!toBindings[ot]) chip(`${a.name}: −${ot}`, 'remove'); });
+  });
+
+  // Constraints
+  const conKey = c => `${c.constraint_type}|${c.source_activity||c.source}|${c.target_activity||c.target}|${c.scope?.object_type||''}`;
+  const asCons = new Set((asis.constraints||[]).map(conKey));
+  const toCons = new Set((tobe.constraints||[]).map(conKey));
+  (tobe.constraints||[]).forEach(c => { if (!asCons.has(conKey(c))) chip(`+constraint ${c.constraint_type}(${c.source_activity}→${c.target_activity})`, 'add'); });
+  (asis.constraints||[]).forEach(c => { if (!toCons.has(conKey(c))) chip(`−constraint ${c.constraint_type}(${c.source_activity}→${c.target_activity})`, 'remove'); });
+  // nmin/nmax changes on existing constraints
+  (tobe.constraints||[]).forEach(c => {
+    const asC = (asis.constraints||[]).find(x => conKey(x) === conKey(c));
+    if (!asC) return;
+    const diffs = [];
+    if ((c.nmin??1) !== (asC.nmin??1)) diffs.push(`nmin ${asC.nmin??1}→${c.nmin??1}`);
+    if ((c.nmax??null) !== (asC.nmax??null)) diffs.push(`nmax ${asC.nmax??'∞'}→${c.nmax??'∞'}`);
+    if (diffs.length) chip(`~${c.constraint_type}(${c.source_activity}→${c.target_activity}): ${diffs.join(', ')}`, 'change');
+  });
+
+  // Timing
+  const asTiming = asis.activity_durations || {}, toTiming = tobe.activity_durations || {};
+  Object.entries(toTiming).forEach(([act, d]) => {
+    const ad = asTiming[act];
+    if (!ad) { chip(`+timing ${act}`, 'add'); return; }
+    const diffs = [];
+    if ((d.dist_type||'lognormal') !== (ad.dist_type||'lognormal')) diffs.push(`dist ${ad.dist_type}→${d.dist_type}`);
+    if (Math.abs((d.mean_seconds||0) - (ad.mean_seconds||0)) > 1) diffs.push(`mean ${Math.round(ad.mean_seconds||0)}→${Math.round(d.mean_seconds||0)}s`);
+    if (Math.abs((d.std_seconds||0) - (ad.std_seconds||0)) > 1) diffs.push(`std ${Math.round(ad.std_seconds||0)}→${Math.round(d.std_seconds||0)}s`);
+    if (diffs.length) chip(`~${act}: ${diffs.join(', ')}`, 'change');
+  });
+
+  // Probabilities
+  if (probMatrixBase && probMatrixToBe) {
+    Object.entries(probMatrixToBe).forEach(([src, tgts]) => {
+      Object.entries(tgts||{}).forEach(([tgt, p]) => {
+        const bp = (probMatrixBase[src]||{})[tgt] || 0;
+        if (Math.abs(p - bp) > 0.01) chip(`~P(${src}→${tgt}) ${(bp*100).toFixed(0)}%→${(p*100).toFixed(0)}%`, 'change');
+      });
+    });
+  }
+
+  // O2O rules
+  const o2oKey = r => `${r.source_type}|${r.target_type}`;
+  const asO2O = Object.fromEntries((asis.o2o_rules||[]).map(r=>[o2oKey(r),r]));
+  const toO2O = Object.fromEntries((tobe.o2o_rules||[]).map(r=>[o2oKey(r),r]));
+  Object.entries(toO2O).forEach(([k,r]) => {
+    if (!asO2O[k]) { chip(`+O2O ${r.source_type}→${r.target_type}`, 'add'); return; }
+    const ar = asO2O[k]; const diffs = [];
+    if ((r.min_links||0) !== (ar.min_links||0)) diffs.push(`min ${ar.min_links}→${r.min_links}`);
+    if ((r.max_links??null) !== (ar.max_links??null)) diffs.push(`max ${ar.max_links??'∞'}→${r.max_links??'∞'}`);
+    if (diffs.length) chip(`~O2O ${r.source_type}→${r.target_type}: ${diffs.join(', ')}`, 'change');
+  });
+  Object.keys(asO2O).forEach(k => { if (!toO2O[k]) { const r=asO2O[k]; chip(`−O2O ${r.source_type}→${r.target_type}`, 'remove'); }});
+
+  // Resource types / pool sizes
+  const asRes = new Set(asis.resource_types||[]), toRes = new Set(tobe.resource_types||[]);
+  toRes.forEach(r => { if (!asRes.has(r)) chip(`+permanent ${r}`, 'add'); });
+  asRes.forEach(r => { if (!toRes.has(r)) chip(`−permanent ${r}`, 'remove'); });
+  (tobe.resource_types||[]).forEach(r => {
+    const asp = (asis.resource_pool_sizes||{})[r], top = (tobe.resource_pool_sizes||{})[r];
+    if (asp != null && top != null && asp !== top) chip(`~pool ${r}: ${asp}→${top}`, 'change');
+  });
+
+  // Start activities
+  const asStart = new Set(startActivitiesAsIs||[]), toStart = new Set(startActivitiesToBe||[]);
+  [...toStart].forEach(a => { if (!asStart.has(a)) chip(`+start ${a}`, 'add'); });
+  [...asStart].forEach(a => { if (!toStart.has(a)) chip(`−start ${a}`, 'remove'); });
+
+  // no_parallel
+  const asNP = new Set(asis.no_parallel_activities||[]), toNP = new Set(tobe.no_parallel_activities||[]);
+  [...toNP].forEach(a => { if (!asNP.has(a)) chip(`+no_parallel ${a}`, 'add'); });
+  [...asNP].forEach(a => { if (!toNP.has(a)) chip(`−no_parallel ${a}`, 'remove'); });
+
+  const colors = { add:'#16a34a', remove:'#dc2626', change:'#d97706' };
+  const bg = { add:'#f0fdf4', remove:'#fff1f2', change:'#fffbeb' };
+  const border = { add:'#86efac', remove:'#fca5a5', change:'#fde68a' };
+
+  return (
+    <div style={{marginBottom:'0.75rem',padding:'0.5rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'7px',fontSize:'0.74rem'}}>
+      <span style={{fontWeight:700,color:'#475569',marginRight:'0.5rem'}}>Changes vs As-Is:</span>
+      {chips.length === 0
+        ? <span style={{color:'#94a3b8'}}>No changes from As-Is model</span>
+        : <span style={{display:'inline-flex',gap:'0.3rem',flexWrap:'wrap'}}>
+            {chips.map((c,i) => (
+              <span key={i} style={{padding:'1px 7px',borderRadius:'10px',fontWeight:500,
+                color:colors[c.kind],background:bg[c.kind],border:`1px solid ${border[c.kind]}`}}>
+                {c.label}
+              </span>
+            ))}
+          </span>
+      }
+    </div>
+  );
+}
+
+// ── BehaviorActivitiesPanel ───────────────────────────────────────────────────
+function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange }) {
+  const [expandedRows, setExpandedRows] = React.useState(new Set());
+  const [newActName, setNewActName] = React.useState('');
+  const [newObjTypeName, setNewObjTypeName] = React.useState('');
+  const [newBindings, setNewBindings] = React.useState({}); // actName → {ot, creates, deact}
+
+  const acts = model.activities || [];
+  const allObjTypesRaw = (model.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+  const bindingObjTypes = [...new Set(acts.flatMap(a => (a.bindings||[]).map(b => b.object_type).filter(Boolean)))];
+  const allObjTypes = [...new Set([...allObjTypesRaw, ...bindingObjTypes])].sort();
+  const resSet = new Set(model.resource_types || []);
+  const noParSet = new Set(model.no_parallel_activities || []);
+  const startSet = new Set(startActivities || []);
+
+  const actFilters = filters || {};
+  const visObjTypes = actFilters.object_type ? allObjTypes.filter(t => t === actFilters.object_type) : allObjTypes;
+  const visActs = actFilters.activity ? acts.filter(a => a.name === actFilters.activity) : acts;
+
+  const toggle = row => setExpandedRows(prev => {
+    const n = new Set(prev); n.has(row) ? n.delete(row) : n.add(row); return n;
+  });
+
+  const updateActs = newActs => onUpdate({...model, activities: newActs});
+  const updateAct = (name, patch) => updateActs(acts.map(a => a.name === name ? {...a, ...patch} : a));
+
+  const toggleBinding = (actName, ot, field) => {
+    updateActs(acts.map(a => a.name !== actName ? a : {
+      ...a, bindings: (a.bindings||[]).map(b => b.object_type === ot ? {...b, [field]: !b[field]} : b)
+    }));
+  };
+  const updateBindingField = (actName, ot, field, val) => {
+    updateActs(acts.map(a => a.name !== actName ? a : {
+      ...a, bindings: (a.bindings||[]).map(b => b.object_type === ot ? {...b, [field]: val} : b)
+    }));
+  };
+  const deleteBinding = (actName, ot) => {
+    updateActs(acts.map(a => a.name !== actName ? a : {
+      ...a, bindings: (a.bindings||[]).filter(b => b.object_type !== ot)
+    }));
+  };
+  const addBinding = actName => {
+    const nb = newBindings[actName] || {};
+    if (!nb.ot) return;
+    updateActs(acts.map(a => a.name !== actName ? a : {
+      ...a, bindings: [...(a.bindings||[]), {object_type: nb.ot, min_count: 1, max_count: null, creates: !!nb.creates, deactivates: !!nb.deact}]
+    }));
+    setNewBindings(prev => ({...prev, [actName]: {ot: '', creates: false, deact: false}}));
+  };
+  const deleteActivity = name => {
+    updateActs(acts.filter(a => a.name !== name));
+    setExpandedRows(prev => { const n = new Set(prev); n.delete(name); return n; });
+  };
+  const addActivity = () => {
+    const name = newActName.trim();
+    if (!name || acts.some(a => a.name === name)) return;
+    updateActs([...acts, {name, bindings:[]}]);
+    setNewActName('');
+  };
+  const addObjectType = () => {
+    const name = newObjTypeName.trim();
+    if (!name || allObjTypes.includes(name)) return;
+    const existing = model.object_types || [];
+    onUpdate({...model, object_types: [...existing, {name, attributes:{}}]});
+    setNewObjTypeName('');
+  };
+  const deleteObjectType = ot => {
+    const existing = model.object_types || [];
+    onUpdate({...model, object_types: existing.filter(t => (typeof t==='string'?t:t.name) !== ot)});
+  };
+  const toggleNoPar = name => {
+    const cur = model.no_parallel_activities || [];
+    onUpdate({...model, no_parallel_activities: cur.includes(name) ? cur.filter(a=>a!==name) : [...cur, name]});
+  };
+  const toggleStart = name => {
+    const cur = startActivities || [];
+    onStartActivitiesChange(cur.includes(name) ? cur.filter(a=>a!==name) : [...cur, name]);
+  };
+
+  const inp = s => ({fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px',...(s||{})});
+
+  return (
+    <div>
+      <div className="behavior-section-title">Activities
+        <BehaviorLegend items={[
+          ['+','Activity creates a new object of that type when it fires'],
+          ['−','Activity deactivates (ends lifecycle of) that object when it fires'],
+          ['·','Activity involves this type but neither creates nor deactivates it'],
+          ['★','Start activity — simulation begins here'],
+          ['⊘','No parallel — only one instance may run at a time'],
+          ['R (superscript)','Permanent object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
+        ]}/>
+        {editMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click cells or ▶ to expand</span>}
+      </div>
+      <TableFilterBar
+        dimensions={[
+          {key:'activity', label:'Activity', options: acts.map(a=>a.name)},
+          {key:'object_type', label:'Object Type', options: allObjTypes},
+        ]}
+        filters={actFilters}
+        onFiltersChange={onFiltersChange}
+      />
+      <div style={{overflowX:'auto'}}>
+        <table className="behavior-table">
+          <thead>
+            <tr>
+              {editMode && <th style={{width:'18px'}}/>}
+              <th style={{textAlign:'left',verticalAlign:'bottom'}}>Activity</th>
+              {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',fontSize:'0.7rem'}}>★</th>}
+              {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',fontSize:'0.7rem'}}>⊘</th>}
+              {visObjTypes.map(ot => (
+                <th key={ot} style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
+                  <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.75rem',fontWeight:600,lineHeight:1.1}}>
+                    {ot}{resSet.has(ot) && <sup style={{color:'#7c3aed',fontSize:'0.65em'}}>R</sup>}
+                  </div>
+                </th>
+              ))}
+              {editMode && <th style={{width:'20px'}}/>}
+            </tr>
+          </thead>
+          <tbody>
+            {visActs.map(a => {
+              const isExp = expandedRows.has(a.name);
+              const colSpan = 1 + (editMode?3:0) + visObjTypes.length + (editMode?1:0);
+              return (
+                <React.Fragment key={a.name}>
+                  <tr style={{background: isExp ? '#f8fafc' : undefined}}>
+                    {editMode && (
+                      <td style={{textAlign:'center',cursor:'pointer',color:'#6366f1',fontWeight:700,fontSize:'0.8rem'}}
+                        onClick={() => toggle(a.name)}>{isExp ? '▼' : '▶'}</td>
+                    )}
+                    <td style={{fontWeight:600,whiteSpace:'nowrap'}}>{a.name}</td>
+                    {editMode && (
+                      <td style={{textAlign:'center'}}>
+                        <button onClick={() => toggleStart(a.name)} title={startSet.has(a.name)?'Remove start':'Mark start'}
+                          style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.9rem',color:startSet.has(a.name)?'#d97706':'#cbd5e1',padding:0}}>★</button>
+                      </td>
+                    )}
+                    {editMode && (
+                      <td style={{textAlign:'center'}}>
+                        <button onClick={() => toggleNoPar(a.name)} title={noParSet.has(a.name)?'Allow parallel':'No parallel'}
+                          style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.9rem',color:noParSet.has(a.name)?'#dc2626':'#cbd5e1',padding:0}}>⊘</button>
+                      </td>
+                    )}
+                    {visObjTypes.map(ot => {
+                      const b = (a.bindings||[]).find(b => b.object_type === ot);
+                      if (!b) return <td key={ot}/>;
+                      const creates = b.creates, deact = b.deactivates;
+                      if (creates && deact) return (
+                        <td key={ot} style={{textAlign:'center'}}>
+                          <span style={{color:'#d97706',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'creates')}>+</span>
+                          <span style={{color:'#64748b'}}>/</span>
+                          <span style={{color:'#dc2626',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'deactivates')}>−</span>
+                        </td>
+                      );
+                      if (creates) return <td key={ot} style={{textAlign:'center',color:'#16a34a',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'creates')}>+</td>;
+                      if (deact)   return <td key={ot} style={{textAlign:'center',color:'#dc2626',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'deactivates')}>−</td>;
+                      return <td key={ot} style={{textAlign:'center',color:'#94a3b8',fontSize:'0.7rem'}}>·</td>;
+                    })}
+                    {editMode && (
+                      <td style={{textAlign:'center'}}>
+                        <button onClick={()=>deleteActivity(a.name)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',padding:0}}>×</button>
+                      </td>
+                    )}
+                  </tr>
+                  {isExp && editMode && (
+                    <tr>
+                      <td colSpan={colSpan} style={{padding:'0.5rem 0.75rem',background:'#f1f5f9',borderBottom:'2px solid #e2e8f0'}}>
+                        <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.3rem'}}>Bindings for <em>{a.name}</em></div>
+                        <table style={{width:'100%',fontSize:'0.75rem',borderCollapse:'collapse',marginBottom:'0.4rem'}}>
+                          <thead><tr style={{borderBottom:'1px solid #e2e8f0'}}>
+                            <th style={{textAlign:'left',padding:'2px 4px'}}>Object Type</th>
+                            <th style={{textAlign:'center',padding:'2px 4px'}}>Creates</th>
+                            <th style={{textAlign:'center',padding:'2px 4px'}}>Deactivates</th>
+                            <th style={{textAlign:'center',padding:'2px 4px'}}>Min</th>
+                            <th style={{textAlign:'center',padding:'2px 4px'}}>Max</th>
+                            <th/>
+                          </tr></thead>
+                          <tbody>
+                            {(a.bindings||[]).map((b,bi) => (
+                              <tr key={bi} style={{borderBottom:'1px solid #f1f5f9'}}>
+                                <td style={{padding:'2px 4px',fontWeight:500}}>{b.object_type}</td>
+                                <td style={{textAlign:'center',padding:'2px 4px'}}><input type="checkbox" checked={!!b.creates} onChange={()=>toggleBinding(a.name,b.object_type,'creates')}/></td>
+                                <td style={{textAlign:'center',padding:'2px 4px'}}><input type="checkbox" checked={!!b.deactivates} onChange={()=>toggleBinding(a.name,b.object_type,'deactivates')}/></td>
+                                <td style={{textAlign:'center',padding:'2px 4px'}}><input type="number" value={b.min_count??1} min={0} style={inp({width:'40px'})} onChange={e=>updateBindingField(a.name,b.object_type,'min_count',parseInt(e.target.value)||1)}/></td>
+                                <td style={{textAlign:'center',padding:'2px 4px'}}><input type="number" value={b.max_count??''} placeholder="∞" min={0} style={inp({width:'40px'})} onChange={e=>updateBindingField(a.name,b.object_type,'max_count',e.target.value===''?null:parseInt(e.target.value))}/></td>
+                                <td><button onClick={()=>deleteBinding(a.name,b.object_type)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700}}>×</button></td>
+                              </tr>
+                            ))}
+                            <tr>
+                              <td style={{padding:'2px 4px'}}>
+                                <select value={(newBindings[a.name]||{}).ot||''} onChange={e=>setNewBindings(p=>({...p,[a.name]:{...(p[a.name]||{}),ot:e.target.value}}))} style={inp()}>
+                                  <option value="">Add type…</option>
+                                  {allObjTypes.filter(t=>!(a.bindings||[]).some(b=>b.object_type===t)).map(t=><option key={t} value={t}>{t}</option>)}
+                                </select>
+                              </td>
+                              <td style={{textAlign:'center',padding:'2px 4px'}}><input type="checkbox" checked={!!(newBindings[a.name]||{}).creates} onChange={e=>setNewBindings(p=>({...p,[a.name]:{...(p[a.name]||{}),creates:e.target.checked}}))} /></td>
+                              <td style={{textAlign:'center',padding:'2px 4px'}}><input type="checkbox" checked={!!(newBindings[a.name]||{}).deact} onChange={e=>setNewBindings(p=>({...p,[a.name]:{...(p[a.name]||{}),deact:e.target.checked}}))} /></td>
+                              <td colSpan={2}/>
+                              <td><button onClick={()=>addBinding(a.name)} style={{fontSize:'0.75rem',padding:'1px 6px',background:'#1e293b',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add</button></td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </td>
+                    </tr>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {editMode && (
+        <div style={{marginTop:'0.75rem',display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+          {/* Add activity */}
+          <div style={{display:'flex',gap:'0.4rem',alignItems:'center'}}>
+            <input value={newActName} onChange={e=>setNewActName(e.target.value)} placeholder="New activity name…"
+              style={inp({width:'180px'})} onKeyDown={e=>e.key==='Enter'&&addActivity()}/>
+            <button onClick={addActivity} style={{fontSize:'0.75rem',padding:'2px 8px',background:'#1e293b',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add Activity</button>
+          </div>
+          {/* Object types */}
+          <div style={{display:'flex',gap:'0.4rem',alignItems:'center',flexWrap:'wrap'}}>
+            <span style={{fontSize:'0.72rem',color:'#64748b',fontWeight:600}}>Object types:</span>
+            {allObjTypes.map(ot => (
+              <span key={ot} style={{fontSize:'0.72rem',background:'#f1f5f9',border:'1px solid #e2e8f0',borderRadius:'12px',padding:'1px 8px',display:'inline-flex',alignItems:'center',gap:'3px'}}>
+                {ot}
+                <button onClick={()=>deleteObjectType(ot)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:0,fontSize:'0.7rem',lineHeight:1}}>×</button>
+              </span>
+            ))}
+            <input value={newObjTypeName} onChange={e=>setNewObjTypeName(e.target.value)} placeholder="New type…"
+              style={inp({width:'100px'})} onKeyDown={e=>e.key==='Enter'&&addObjectType()}/>
+            <button onClick={addObjectType} style={{fontSize:'0.72rem',padding:'1px 6px',background:'#475569',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+</button>
+          </div>
+        </div>
+      )}
+
+      {!editMode && (
+        <div style={{marginTop:'0.5rem',fontSize:'0.72rem',color:'#64748b',display:'flex',gap:'1rem'}}>
+          <span><span style={{color:'#16a34a',fontWeight:700}}>+</span> creates</span>
+          <span><span style={{color:'#dc2626',fontWeight:700}}>−</span> deactivates</span>
+          <span><span style={{color:'#d97706',fontWeight:700}}>+/−</span> both</span>
+          <span><sup style={{color:'#7c3aed'}}>R</sup> permanent object</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const BEHAVIOR_CTYPES = ['precedence','not_precedence','response','not_coexistence','chain_precedence','chain_response',
+  'responded_existence','absence','exactly','init','exclusive_choice','succession','chain_succession',
+  'not_succession','not_chain_succession','alternate_response','alternate_precedence','alternate_succession'];
+const BEHAVIOR_SCOPE_KINDS = ['each','any','all'];
+const BEHAVIOR_EMPTY_CON = {constraint_type:'precedence',source_activity:'',target_activity:'',scope:{kind:'each',object_type:''},nmin:1,nmax:null};
+
+function AddO2ORuleForm({ otNames, onAdd }) {
+  const [src, setSrc] = React.useState('');
+  const [tgt, setTgt] = React.useState('');
+  const [min, setMin] = React.useState(0);
+  const [max, setMax] = React.useState('');
+  const [bidir, setBidir] = React.useState(true);
+  const inp = s => ({fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px',...(s||{})});
+  const add = () => {
+    if (!src || !tgt || src === tgt) return;
+    onAdd({source_type:src, target_type:tgt, min_links:min||0, max_links:max===''?null:parseInt(max), bidirectional:bidir});
+    setSrc(''); setTgt(''); setMin(0); setMax(''); setBidir(true);
+  };
+  return (
+    <div style={{marginTop:'0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.6rem 0.75rem'}}>
+      <div style={{fontWeight:600,fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem'}}>Add O2O Rule</div>
+      <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',alignItems:'center'}}>
+        <select value={src} onChange={e=>setSrc(e.target.value)} style={inp()}>
+          <option value="">From…</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
+        </select>
+        <span style={{color:'#94a3b8'}}>→</span>
+        <select value={tgt} onChange={e=>setTgt(e.target.value)} style={inp()}>
+          <option value="">To…</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
+        </select>
+        <span style={{fontSize:'0.72rem',color:'#64748b'}}>min</span>
+        <input type="number" value={min} min={0} onChange={e=>setMin(parseInt(e.target.value)||0)} style={inp({width:'45px'})}/>
+        <span style={{fontSize:'0.72rem',color:'#64748b'}}>max</span>
+        <input type="number" value={max} placeholder="∞" min={0} onChange={e=>setMax(e.target.value)} style={inp({width:'45px'})}/>
+        <label style={{fontSize:'0.75rem',display:'flex',alignItems:'center',gap:'3px'}}>
+          <input type="checkbox" checked={bidir} onChange={e=>setBidir(e.target.checked)}/> ↔ bidir
+        </label>
+        <button onClick={add} style={{padding:'2px 8px',fontSize:'0.75rem',background:'#1e293b',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add</button>
+      </div>
+    </div>
+  );
+}
+
+
+function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, onUpdate, filters={}, onFiltersChange }) {
+  const [newCon, setNewCon] = React.useState(BEHAVIOR_EMPTY_CON);
+  const isUnary = t => ['absence','exactly','init'].includes(t);
+
+  const updateCon = (i, patch) => onUpdate(constraints.map((x,j) => j===i ? {...x,...patch} : x));
+  const deleteCon = i => onUpdate(constraints.filter((_,j) => j!==i));
+  const addCon = () => {
+    if (!newCon.source_activity) return;
+    if (!isUnary(newCon.constraint_type) && !newCon.target_activity) return;
+    onUpdate([...constraints, {...newCon}]);
+    setNewCon(BEHAVIOR_EMPTY_CON);
+  };
+
+  const sel = (val, opts, onChange) => (
+    <select value={val} onChange={e=>onChange(e.target.value)}
+      style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+      {opts.map(o=><option key={o} value={o}>{o.replace(/_/g,' ')}</option>)}
+    </select>
+  );
+
+  // Apply filters
+  const visConstraints = constraints.filter(c => {
+    if (filters.activity && c.source_activity !== filters.activity && c.target_activity !== filters.activity) return false;
+    if (filters.object_type && (c.scope?.object_type || c.scope_object_type || '') !== filters.object_type) return false;
+    if (filters.constraint_type && c.constraint_type !== filters.constraint_type) return false;
+    return true;
+  });
+
+  const conTypes = [...new Set(constraints.map(c => c.constraint_type))].sort();
+  const scopeTypes = [...new Set(constraints.map(c => c.scope?.object_type || c.scope_object_type || '').filter(Boolean))].sort();
+
+  return (
+    <div>
+      <div className="behavior-section-title">Constraints
+        <BehaviorLegend items={[
+          ['Type','The declarative constraint flavour (precedence, response, not_coexistence, chain variants, etc.)'],
+          ['Source','The activity that triggers or must precede/follow'],
+          ['Target','The activity being constrained relative to Source'],
+          ['Object Type','The object type whose instances are tracked — constraint is evaluated per-instance of this type'],
+          ['Scope (each/any/all)','each = constraint holds per individual object; any = at least one object satisfies it; all = every object must satisfy it'],
+          ['n≥','Minimum number of source firings required before target may fire (nmin). Default 1.'],
+          ['n≤','Maximum allowed source firings before target must have fired (nmax). Blank = no upper bound.'],
+        ]}/>
+        {editMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click cells to edit, × to delete</span>}
+      </div>
+      {onFiltersChange && (
+        <TableFilterBar
+          dimensions={[
+            {key:'activity',        label:'Activity',         options: actNames},
+            ...(scopeTypes.length ? [{key:'object_type', label:'Object Type', options: scopeTypes}] : []),
+            ...(conTypes.length > 1 ? [{key:'constraint_type', label:'Type', options: conTypes}] : []),
+          ]}
+          filters={filters}
+          onFiltersChange={onFiltersChange}
+        />
+      )}
+      {constraints.length > 0 ? (
+        <div style={{overflowX:'auto'}}>
+          <table className="behavior-table">
+            <thead>
+              <tr>
+                {editMode && <th style={{width:'24px'}}/>}
+                <th>Type</th><th>Source</th><th>Target</th>
+                <th>Object Type</th><th>Scope</th><th>n≥</th><th>n≤</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visConstraints.map((c, i) => {
+                const origIdx = constraints.indexOf(c);
+                const scopeOt = c.scope?.object_type || c.scope_object_type || '';
+                const scopeKind = c.scope?.kind || 'each';
+                return (
+                  <tr key={origIdx}>
+                    {editMode && <td><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
+                    <td>{editMode ? sel(c.constraint_type, BEHAVIOR_CTYPES, v=>updateCon(origIdx,{constraint_type:v})) : <span className="con-type-badge">{c.constraint_type}</span>}</td>
+                    <td>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>
+                    <td>{editMode
+                      ? (isUnary(c.constraint_type) ? <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>—</span>
+                        : sel(c.target_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{target_activity:v})))
+                      : (c.target_activity||'—')}</td>
+                    <td>{editMode
+                      ? <select value={scopeOt} onChange={e=>updateCon(origIdx,{scope:{...c.scope,object_type:e.target.value}})}
+                          style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+                          <option value="">—</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
+                        </select>
+                      : <span style={{fontWeight:scopeOt?500:400,color:scopeOt?'#1e293b':'#94a3b8'}}>{scopeOt||'—'}</span>}
+                    </td>
+                    <td>{editMode ? sel(scopeKind, BEHAVIOR_SCOPE_KINDS, v=>updateCon(origIdx,{scope:{...c.scope,kind:v}})) : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{scopeKind}</span>}</td>
+                    <td>{editMode ? <EditableCell value={c.nmin??1} type="number" onSave={v=>updateCon(origIdx,{nmin:v})}/> : (c.nmin??'—')}</td>
+                    <td>{editMode ? <EditableCell value={c.nmax??''} type="number" placeholder="∞" onSave={v=>updateCon(origIdx,{nmax:v===''||v===null?null:Number(v)})}/> : (c.nmax??'—')}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : <p className="behavior-empty">No constraints in model.</p>}
+
+      {editMode && (
+        <div style={{marginTop:'0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.6rem 0.75rem'}}>
+          <div style={{fontWeight:600,fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem'}}>Add Constraint</div>
+          <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',alignItems:'center'}}>
+            {sel(newCon.constraint_type, BEHAVIOR_CTYPES, v=>setNewCon(n=>({...n,constraint_type:v})))}
+            <select value={newCon.source_activity} onChange={e=>setNewCon(n=>({...n,source_activity:e.target.value}))}
+              style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+              <option value="">Source…</option>{actNames.map(a=><option key={a} value={a}>{a}</option>)}
+            </select>
+            {!isUnary(newCon.constraint_type) && <>
+              <span style={{color:'#94a3b8',fontSize:'0.78rem'}}>→</span>
+              <select value={newCon.target_activity} onChange={e=>setNewCon(n=>({...n,target_activity:e.target.value}))}
+                style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+                <option value="">Target…</option>{actNames.map(a=><option key={a} value={a}>{a}</option>)}
+              </select>
+            </>}
+            <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>scope:</span>
+            {sel(newCon.scope.kind, BEHAVIOR_SCOPE_KINDS, v=>setNewCon(n=>({...n,scope:{...n.scope,kind:v}})))}
+            <select value={newCon.scope.object_type||''} onChange={e=>setNewCon(n=>({...n,scope:{...n.scope,object_type:e.target.value}}))}
+              style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+              <option value="">Object…</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
+            </select>
+            <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>n≥</span>
+            <input type="number" value={newCon.nmin??1} min={0} onChange={e=>setNewCon(n=>({...n,nmin:parseInt(e.target.value)||0}))}
+              style={{width:'45px',fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/>
+            <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>n≤</span>
+            <input type="number" value={newCon.nmax??''} placeholder="∞" min={0} onChange={e=>setNewCon(n=>({...n,nmax:e.target.value===''?null:parseInt(e.target.value)}))}
+              style={{width:'45px',fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/>
+            <button onClick={addCon}
+              style={{padding:'0.2rem 0.6rem',fontSize:'0.78rem',background:'#1e293b',color:'white',border:'none',borderRadius:'4px',cursor:'pointer'}}>
+              + Add
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── TableFilter — reusable filter bar for behavior tab tables ─────────────────
+// dimensions: array of { key, label, options: [string] }
+// filters: { [key]: string }  ('' = show all)
+// onFiltersChange: (newFilters) => void
+function TableFilterBar({ dimensions, filters, onFiltersChange }) {
+  if (!dimensions || dimensions.length === 0) return null;
+  const active = Object.values(filters).some(v => v !== '');
+  return (
+    <div style={{display:'flex',gap:'0.5rem',flexWrap:'wrap',alignItems:'center',
+      padding:'0.35rem 0.5rem',background:'#f8fafc',border:'1px solid #e2e8f0',
+      borderRadius:'6px',marginBottom:'0.5rem',fontSize:'0.75rem'}}>
+      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Filter:</span>
+      {dimensions.map(dim => (
+        <label key={dim.key} style={{display:'flex',alignItems:'center',gap:'0.25rem',color:'#475569'}}>
+          <span style={{flexShrink:0}}>{dim.label}</span>
+          <select value={filters[dim.key]||''} onChange={e=>onFiltersChange({...filters,[dim.key]:e.target.value})}
+            style={{fontSize:'0.74rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px',
+              background: filters[dim.key] ? '#eff6ff' : 'white',
+              borderColor: filters[dim.key] ? '#6366f1' : '#cbd5e1'}}>
+            <option value="">All</option>
+            {dim.options.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </label>
+      ))}
+      {active && (
+        <button onClick={() => onFiltersChange(Object.fromEntries(dimensions.map(d => [d.key, ''])))}
+          style={{fontSize:'0.72rem',padding:'1px 6px',border:'1px solid #e2e8f0',borderRadius:'3px',
+            background:'white',cursor:'pointer',color:'#64748b',marginLeft:'auto'}}>
+          × Clear
+        </button>
+      )}
+    </div>
+  );
+}
+
+// useTableFilter — derive filtered data from filter state
+// filterDefs: { [key]: (item, value) => bool }
+function useTableFilter(initialDimensions) {
+  const [filters, setFilters] = React.useState({});
+  const applyFilters = (items, filterDefs) => {
+    return items.filter(item =>
+      Object.entries(filters).every(([key, val]) => {
+        if (!val) return true;
+        const fn = filterDefs[key];
+        return fn ? fn(item, val) : true;
+      })
+    );
+  };
+  return { filters, setFilters, applyFilters };
+}
+
+function BehaviorTimePanel({ durations, editMode, onUpdate }) {
+  const [showLegend, setShowLegend] = React.useState(false);
+  const [hoverState, setHoverState] = React.useState(null); // {act, x, y}
+  const { filters, setFilters, applyFilters } = useTableFilter();
+
+  const actNames = Object.keys(durations);
+  const distTypes = [...new Set(Object.values(durations).map(d => d.dist_type).filter(Boolean))];
+  const filterDimensions = [
+    { key: 'activity', label: 'Activity', options: actNames },
+    ...(distTypes.length > 1 ? [{ key: 'dist_type', label: 'Distribution', options: distTypes }] : []),
+  ];
+  const entries = applyFilters(Object.entries(durations), {
+    activity: ([act]) => act,
+    dist_type: ([, d]) => d.dist_type || '',
+  });
+
+  const fmtDur = s => {
+    if (s == null) return '—';
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm ' + Math.floor(s%60) + 's';
+    if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+    return Math.floor(s/86400) + 'd';
+  };
+
+  const buildChartPath = (mean, std, w, h, distType='lognormal') => {
+    if (!mean || mean <= 0) return null;
+    const pts = 60;
+    const PAD = 4;
+    const dtype = (distType || 'lognormal').toLowerCase();
+    let xMax, ys;
+
+    if (dtype === 'fixed') {
+      // Vertical line at mean
+      const meanX = PAD + (w - PAD*2) * 0.5;
+      return { path: `M ${meanX},${h-PAD} L ${meanX},${PAD}`, meanX, modeX: meanX, isFixed: true };
+    } else if (dtype === 'exponential') {
+      xMax = mean * 5;
+      const xs = Array.from({length: pts}, (_, i) => (i / (pts-1)) * xMax);
+      ys = xs.map(x => (1/mean) * Math.exp(-x/mean));
+    } else if (dtype === 'normal') {
+      xMax = mean + std * 3.5;
+      const xMin = Math.max(0, mean - std * 3.5);
+      const xs = Array.from({length: pts}, (_, i) => xMin + (i / (pts-1)) * (xMax - xMin));
+      ys = xs.map(x => Math.exp(-((x-mean)**2)/(2*std**2))) ;
+      const range = xMax - xMin;
+      const points2 = xs.map((x, i) => {
+        const maxY2 = Math.max(...ys, 1e-10);
+        const px = PAD + ((x - xMin) / range) * (w - PAD*2);
+        const py = (h - PAD) - (ys[i] / maxY2) * (h - PAD*2);
+        return `${px.toFixed(1)},${py.toFixed(1)}`;
+      });
+      const meanX = PAD + ((mean - xMin) / range) * (w - PAD*2);
+      return { path: `M ${points2.join(' L ')}`, meanX, modeX: meanX };
+    } else {
+      // lognormal (default)
+      xMax = mean * 4;
+      const sigma = std > 0 ? Math.min(std / mean, 1.8) : 0.4;
+      const mu = Math.log(Math.max(mean, 1));
+      const xs = Array.from({length: pts}, (_, i) => (i / (pts-1)) * xMax);
+      ys = xs.map(x => {
+        if (x <= 0) return 0;
+        const lx = Math.log(x);
+        return Math.exp(-((lx-mu)**2)/(2*sigma**2)) / (x * sigma * Math.sqrt(2*Math.PI));
+      });
+      const maxY = Math.max(...ys, 1e-10);
+      const points = xs.map((x, i) => {
+        const px = PAD + (x / xMax) * (w - PAD*2);
+        const py = (h - PAD) - (ys[i] / maxY) * (h - PAD*2);
+        return `${px.toFixed(1)},${py.toFixed(1)}`;
+      });
+      const meanX = PAD + (mean / xMax) * (w - PAD*2);
+      const mode = Math.exp(mu - sigma**2);
+      const modeX = PAD + (Math.min(mode, xMax) / xMax) * (w - PAD*2);
+      return { path: `M ${points.join(' L ')}`, meanX, modeX };
+    }
+
+    const maxY = Math.max(...ys, 1e-10);
+    const xs2 = Array.from({length: pts}, (_, i) => (i / (pts-1)) * xMax);
+    const points = xs2.map((x, i) => {
+      const px = PAD + (x / xMax) * (w - PAD*2);
+      const py = (h - PAD) - (ys[i] / maxY) * (h - PAD*2);
+      return `${px.toFixed(1)},${py.toFixed(1)}`;
+    });
+    const meanX = PAD + (mean / xMax) * (w - PAD*2);
+    return { path: `M ${points.join(' L ')}`, meanX, modeX: meanX };
+  };
+
+  return (
+    <div>
+      <div style={{display:'flex',alignItems:'center',gap:'0.75rem',marginBottom:'0.5rem'}}>
+        <div className="behavior-section-title" style={{margin:0}}>Time</div>
+        <button onClick={() => setShowLegend(l => !l)}
+          style={{fontSize:'0.72rem',padding:'0.15rem 0.5rem',border:'1px solid #cbd5e1',borderRadius:'4px',background:'white',cursor:'pointer',color:'#475569'}}>
+          ? Legend
+        </button>
+        <span style={{fontSize:'0.72rem',color:'#94a3b8'}}>Hover over an activity name to see its distribution shape</span>
+      </div>
+      {showLegend && (
+        <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.6rem 0.8rem',marginBottom:'0.75rem',fontSize:'0.75rem',color:'#475569'}}>
+          <strong>Column guide:</strong>
+          <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'0.15rem 0.75rem',marginTop:'0.3rem'}}>
+            <span style={{fontWeight:600}}>Distribution</span><span>Sampling shape — lognormal (right-skewed, always positive) is the default; exponential/fixed also available</span>
+            <span style={{fontWeight:600}}>Mean (s)</span><span>Simulation parameter μ — expected service duration in seconds; this drives simulation</span>
+            <span style={{fontWeight:600}}>Std (s)</span><span>Simulation parameter σ — spread around the mean; not used for exponential or fixed</span>
+            <span style={{fontWeight:600}}>Log Mean</span><span>Mean observed in the input event log (reference only — does not affect simulation)</span>
+            <span style={{fontWeight:600}}>Log Min / Max</span><span>Min and max durations observed in the log (reference bounds)</span>
+          </div>
+        </div>
+      )}
+      {Object.keys(durations).length > 0 ? (<>
+        <TableFilterBar dimensions={filterDimensions} filters={filters} onFiltersChange={setFilters}/>
+        <table className="behavior-table">
+          <thead>
+            <tr>
+              <th>Activity</th>
+              <th>Distribution</th>
+              <th>Mean (s)</th>
+              <th>Std (s)</th>
+              <th style={{color:'#94a3b8'}}>Log Mean</th>
+              <th style={{color:'#94a3b8'}}>Log Min</th>
+              <th style={{color:'#94a3b8'}}>Log Max</th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map(([act, d]) => {
+              const E = editMode;
+              return (
+              <tr key={act} style={{background: hoverState?.act===act ? '#f1f5f9' : undefined}}>
+                <td
+                  style={{cursor:'default',position:'relative'}}
+                  onMouseEnter={e => setHoverState({act, x: e.clientX, y: e.clientY})}
+                  onMouseMove={e => setHoverState(h => h?.act===act ? {...h, x:e.clientX, y:e.clientY} : h)}
+                  onMouseLeave={() => setHoverState(null)}
+                >
+                  <span style={{borderBottom:'1px dashed #94a3b8'}}>{act}</span>
+                </td>
+                <td>{E ? <EditableCell value={d.dist_type||'lognormal'} onSave={v=>onUpdate(act,'dist_type',v)} options={['lognormal','normal','exponential','fixed']}/> : (d.dist_type||'—')}</td>
+                <td>{E ? <EditableCell value={d.mean_seconds??''} type="number" placeholder="3600" onSave={v=>onUpdate(act,'mean_seconds',v)}/> : (d.mean_seconds!=null?Math.round(d.mean_seconds):'—')}</td>
+                <td>{E ? <EditableCell value={d.std_seconds??''} type="number" placeholder="600" onSave={v=>onUpdate(act,'std_seconds',v)}/> : (d.std_seconds!=null?Math.round(d.std_seconds):'—')}</td>
+                <td style={{color:'#94a3b8'}}>{d.log_mean_seconds != null ? Math.round(d.log_mean_seconds) : '—'}</td>
+                <td style={{color:'#94a3b8'}}>{d.min_seconds != null ? Math.round(d.min_seconds) : '—'}</td>
+                <td style={{color:'#94a3b8'}}>{d.max_seconds != null ? Math.round(d.max_seconds) : '—'}</td>
+              </tr>
+              );
+            })}
+          </tbody>
+        </table>
+
+        {/* Hover popup — rendered via portal to escape table stacking context */}
+        {hoverState && (() => {
+          const d = durations[hoverState.act];
+          if (!d) return null;
+          const W = 260, H = 120;
+          const chart = buildChartPath(d.mean_seconds, d.std_seconds, W, H - 30, d.dist_type);
+          // Position: prefer right of cursor, flip left if near edge
+          const px = Math.min(hoverState.x + 12, window.innerWidth - W - 16);
+          const py = Math.min(hoverState.y - 10, window.innerHeight - H - 16);
+          return ReactDOM.createPortal(
+            <div style={{
+              position:'fixed', left:px, top:py, width:W, zIndex:9999,
+              background:'white', border:'1px solid #e2e8f0', borderRadius:'8px',
+              boxShadow:'0 4px 20px rgba(0,0,0,0.12)', padding:'0.6rem 0.8rem',
+              pointerEvents:'none',
+            }}>
+              <div style={{fontWeight:700,fontSize:'0.78rem',color:'#1e293b',marginBottom:'0.3rem',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{hoverState.act}</div>
+              {chart ? (
+                <svg width={W-16} height={H-30} style={{display:'block',marginBottom:'0.4rem'}}>
+                  <path d={chart.path} fill="none" stroke="#6366f1" strokeWidth="2"/>
+                  {/* mean line */}
+                  <line x1={chart.meanX} y1={0} x2={chart.meanX} y2={H-30} stroke="#dc2626" strokeWidth="1" strokeDasharray="3,2"/>
+                  {/* mode line */}
+                  {chart.modeX > 4 && <line x1={chart.modeX} y1={0} x2={chart.modeX} y2={H-30} stroke="#16a34a" strokeWidth="1" strokeDasharray="3,2"/>}
+                </svg>
+              ) : (
+                <div style={{height:'60px',display:'flex',alignItems:'center',justifyContent:'center',color:'#94a3b8',fontSize:'0.72rem'}}>No shape data</div>
+              )}
+              <div style={{fontSize:'0.7rem',color:'#64748b',display:'flex',gap:'1rem',flexWrap:'wrap'}}>
+                <span style={{color:'#6366f1'}}>— curve ({d.dist_type || 'lognormal'})</span>
+                <span style={{color:'#dc2626'}}>— mean {d.mean_seconds != null ? fmtDur(Math.round(d.mean_seconds)) : '—'}</span>
+                {chart?.modeX > 4 && <span style={{color:'#16a34a'}}>— mode</span>}
+                {d.std_seconds != null && <span style={{color:'#64748b'}}>σ={fmtDur(Math.round(d.std_seconds))}</span>}
+              </div>
+            </div>,
+            document.body
+          );
+        })()}
+      </>) : <p className="behavior-empty">No timing data discovered.</p>}
+    </div>
+  );
+}
+
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -5360,7 +7034,8 @@ function App() {
   const [timingAnchors,       setTimingAnchors]       = useState({});
   const [timingMode,          setTimingMode]          = useState('single');
   const [timingSingleAct,     setTimingSingleAct]     = useState('');
-  const [serviceTimeMode,     setServiceTimeMode]     = useState('minimum'); // 'minimum' | 'p25' | 'p50'
+  const [serviceTimeMode,     setServiceTimeMode]     = useState('minimum'); // 'minimum' | 'p25' | 'p50' | 'p75' | 'mean'
+  const [discoveryDistType,   setDiscoveryDistType]   = useState('lognormal'); // distribution assigned to discovered activities
   const [isDiscoveringTiming, setIsDiscoveringTiming] = useState(false);
   const [timingDiscoveryResult, setTimingDiscoveryResult] = useState(null);
   const [timingDiscoveryFile,   setTimingDiscoveryFile]   = useState(null);
@@ -5377,8 +7052,15 @@ function App() {
   // ── External OC-Declare + OCEL tab state ──────────────────────────────────
   const [externalTab, setExternalTab] = useState('parameter'); // 'parameter' | 'behavior' | 'scenario' | 'results' | 'evaluation'
   const [behaviorSection, setBehaviorSection] = useState('activities'); // left nav in Model Behavior
-  const [modelBase, setModelBase] = useState(null);        // immutable discovered model snapshot
-  const [modelToBe, setModelToBe] = useState(null);        // editable scenario model
+  const [behaviorEditMode, setBehaviorEditMode] = useState(false); // toggle full ModelEditor in behavior tab
+  const [behaviorFilters, setBehaviorFilters] = useState({}); // { sectionKey: { dimKey: value } }
+  const [scenarioBehaviorSection, setScenarioBehaviorSection] = useState('activities');
+  const [scenarioBehaviorFilters, setScenarioBehaviorFilters] = useState({});
+  const getBehaviorFilters = section => behaviorFilters[section] || {};
+  const setBehaviorSectionFilters = (section, f) => setBehaviorFilters(prev => ({...prev, [section]: f}));
+  const [modelBase, setModelBase] = useState(null);        // immutable discovered model snapshot (never edited)
+  const [modelAsIs, setModelAsIs] = useState(null);        // editable as-is model (shown in Model Behavior)
+  const [modelToBe, setModelToBe] = useState(null);        // editable to-be model (Scenario Builder)
   const [probMatrixBase, setProbMatrixBase] = useState(null);
   const [probMatrixToBe, setProbMatrixToBe] = useState(null);
   const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
@@ -5712,7 +7394,11 @@ function App() {
         anchorActivities: anchors,
         serviceTimeMode,
       });
-      const metrics = resp.data.metrics || {};
+      // Apply the chosen distribution type to all discovered activities
+      const rawMetrics = resp.data.metrics || {};
+      const metrics = Object.fromEntries(
+        Object.entries(rawMetrics).map(([act, v]) => [act, {...v, dist_type: discoveryDistType}])
+      );
       setTimingDiscoveryResult(metrics);
       setTimingDiscoveryFile(discoveryConfig.eventLogFile);
 
@@ -6038,6 +7724,15 @@ function App() {
     }, 800); // debounce 800ms
     return () => clearTimeout(t);
   }, [modelToBe, probMatrixToBe, config.startActivities, runBlockingAnalysis]);
+
+  // Mirror config.startActivities into all three model state objects whenever it changes.
+  // This ensures the iteration log model_snapshot always has the correct start_activities.
+  React.useEffect(() => {
+    const acts = config.startActivities || [];
+    setModelBase(m => m ? {...m, start_activities: acts} : m);
+    setModelAsIs(m => m ? {...m, start_activities: acts} : m);
+    setModelToBe(m => m ? {...m, start_activities: acts} : m);
+  }, [config.startActivities]);  // eslint-disable-line react-hooks/exhaustive-deps
   // never reads a stale closure value.
   const startActivityProbSelectedRef = React.useRef(discoveryConfig.startActivityProbSelected);
   React.useEffect(() => {
@@ -6248,36 +7943,45 @@ function App() {
       setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'OC-Declare Model Check' });
       const modelForCheck = activeModelRef.current;
       const modelCheckResult = await runLogModelCheck(modelForCheck, discoveryConfig.eventLogFile);
+      let modelAfterNmax = activeModelRef.current;
       if (modelCheckResult) {
         setLogConfResults(modelCheckResult);
-        // Apply nmin/nmax from model check if checkbox is on
-        if (applyNminNmaxFromModelCheck) {
-          setActiveModel(prev => {
-            if (!prev || Array.isArray(prev)) return prev;
-            const updated = (prev.constraints || []).map(c => {
-              const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
-              const result = modelCheckResult.constraintResults.find(r => r.label === label);
-              if (!result || result.total === 0) return c;
-              // Only fill in the missing value — never overwrite an already-set value
-              const newNmin = (c.nmin == null && result.observedNmin != null) ? result.observedNmin : c.nmin;
-              const newNmax = (c.nmax == null && result.observedNmax != null) ? result.observedNmax : c.nmax;
-              if (newNmin === c.nmin && newNmax === c.nmax) return c;
-              return { ...c, nmin: newNmin, nmax: newNmax };
-            });
-            return { ...prev, constraints: updated };
+        // Build observedNmax lookup regardless of checkbox — used for hints and apply
+        const nmaxByLabel = {};
+        modelCheckResult.constraintResults.forEach(r => {
+          if (r.observedNmax != null) nmaxByLabel[r.label] = r.observedNmax;
+          if (r.observedNmin != null) nmaxByLabel[`__nmin__${r.label}`] = r.observedNmin;
+        });
+        if (applyNminNmaxFromModelCheck && modelAfterNmax && !Array.isArray(modelAfterNmax)) {
+          // Apply synchronously so the snapshot below captures the updated model
+          const updatedConstraints = (modelAfterNmax.constraints || []).map(c => {
+            const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+            const result = modelCheckResult.constraintResults.find(r => r.label === label);
+            if (!result || result.total === 0) return c;
+            const newNmin = (c.nmin == null && result.observedNmin != null) ? result.observedNmin : c.nmin;
+            const newNmax = (c.nmax == null && result.observedNmax != null) ? result.observedNmax : c.nmax;
+            if (newNmin === c.nmin && newNmax === c.nmax) return c;
+            return { ...c, nmin: newNmin, nmax: newNmax };
           });
+          modelAfterNmax = { ...modelAfterNmax, constraints: updatedConstraints };
+          setActiveModel(modelAfterNmax);
         }
       }
 
       setDiscoveryProgress({ current: steps.length + 2, total, currentName: 'Constraint Health Check' });
       await runHealthCheck();
-      // Snapshot discovered model as immutable base using refs (not stale closure values)
-      const snapModel  = activeModelRef.current  ? JSON.parse(JSON.stringify(activeModelRef.current))  : null;
+      // Snapshot: use modelAfterNmax (has nmax applied if checkbox was on) rather than
+      // activeModelRef.current which may still be the pre-setState stale value.
+      const snapModel  = modelAfterNmax ? JSON.parse(JSON.stringify(modelAfterNmax)) : null;
       const snapMatrix = activeProbMatrixRef.current ? JSON.parse(JSON.stringify(activeProbMatrixRef.current)) : null;
+      // Embed start_activities into all three model snapshots so they stay in sync
+      if (snapModel) snapModel.start_activities = config.startActivities || [];
       setModelBase(snapModel);
-      setModelToBe(snapModel  ? JSON.parse(JSON.stringify(snapModel))  : null);
+      setModelAsIs(snapModel  ? {...JSON.parse(JSON.stringify(snapModel)), start_activities: config.startActivities || []}  : null);
+      setModelToBe(snapModel  ? {...JSON.parse(JSON.stringify(snapModel)), start_activities: config.startActivities || []}  : null);
       setProbMatrixBase(snapMatrix);
       setProbMatrixToBe(snapMatrix ? JSON.parse(JSON.stringify(snapMatrix)) : null);
+      setBehaviorEditMode(false);
       setExternalTab('behavior');
     } finally {
       clearInterval(discTimerRef.current);
@@ -7126,22 +8830,51 @@ function App() {
                       <>
                       {discoveryResults.activity_nmax_suggestions && Object.keys(discoveryResults.activity_nmax_suggestions).length > 0 && (
                         <div className="nmax-hint-bar">
-                          <span>Suggested <code>max consec/obj</code> values from log (p95 repeats per object).</span>
+                          <span>
+                            Suggested <code>max consec/obj</code> values from log (p95 repeats per object).
+                            {logConfResults?.constraintResults?.length > 0 && (
+                              <> Also applies observed <code>nmax</code> to constraints from model check.</>
+                            )}
+                          </span>
                           <button
                             className="nmax-apply-btn"
-                            title="Apply all p95 suggestions as max_consecutive_per_object in the Model Editor"
+                            title={logConfResults?.constraintResults?.length > 0
+                              ? 'Apply p95 values as max_consecutive_per_object AND apply observed nmax to constraints from the model check'
+                              : 'Apply p95 suggestions as max_consecutive_per_object in the Model Editor (run OC-Declare Model Check first to also apply nmax to constraints)'}
                             onClick={() => {
                               if (!activeModel || Array.isArray(activeModel)) return;
                               const suggestions = discoveryResults.activity_nmax_suggestions;
+                              // Step 1: update max_consecutive_per_object from p95 per-activity repeat stats
                               const cur = activeModel.max_consecutive_per_object || {};
-                              const updated = { ...cur };
+                              const updatedConsec = { ...cur };
                               Object.entries(suggestions).forEach(([act, s]) => {
-                                if (s.suggested > 1) updated[act] = s.suggested;
+                                if (s.suggested > 1) updatedConsec[act] = s.suggested;
                               });
-                              handleModelEdit({ ...activeModel, max_consecutive_per_object: updated });
+                              // Step 2: apply observedNmax to constraint nmax fields from model check
+                              let updatedConstraints = activeModel.constraints || [];
+                              if (logConfResults?.constraintResults?.length > 0) {
+                                const nmaxByLabel = {};
+                                logConfResults.constraintResults.forEach(r => {
+                                  if (r.observedNmax != null) nmaxByLabel[r.label] = r.observedNmax;
+                                });
+                                updatedConstraints = updatedConstraints.map(c => {
+                                  const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
+                                  const observed = nmaxByLabel[label];
+                                  if (observed == null) return c;
+                                  // Only set if not already explicitly set, or observed > current nmax
+                                  if (c.nmax != null && c.nmax >= observed) return c;
+                                  return { ...c, nmax: observed };
+                                });
+                              }
+                              handleModelEdit({
+                                ...activeModel,
+                                max_consecutive_per_object: updatedConsec,
+                                constraints: updatedConstraints,
+                              });
                             }}
                           >
                             ⬆ Apply all to Model Editor
+                            {logConfResults?.constraintResults?.length > 0 && <span style={{fontSize:'0.68rem',fontWeight:400,marginLeft:'0.35rem',opacity:0.85}}>(+ constraint nmax)</span>}
                           </button>
                         </div>
                       )}
@@ -7431,22 +9164,72 @@ function App() {
 
                       {/* Right column: Timing + Resource threshold */}
                       <div style={{display:'flex',flexDirection:'column',gap:'1rem',flex:1}}>
-                        {/* Timing mode */}
+                        {/* Timing mode + distribution type */}
                         <div className="landing-option-group">
                           <label className="landing-option-label">Timing Discovery</label>
-                          <div style={{display:'flex',flexDirection:'column',gap:'0.3rem'}}>
+                          <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
                             {[
-                              { value: 'minimum', label: 'Minimum' },
-                              { value: 'p25',     label: 'P25 (25th percentile)' },
-                              { value: 'p50',     label: 'P50 (median)' },
+                              { value: 'minimum', label: 'Minimum',    desc: 'Mean of [min…P25] — conservative, strips tail' },
+                              { value: 'p25',     label: 'P25',        desc: 'Mean of [min…P50] — slightly broader' },
+                              { value: 'p50',     label: 'P50 (IQR)',  desc: 'Mean of [P25…P75] — ignores extremes' },
+                              { value: 'p75',     label: 'P75',        desc: 'Mean of [P50…max] — upper bound' },
+                              { value: 'mean',    label: 'Full mean',  desc: 'Mean of entire distribution' },
                             ].map(opt => (
-                              <label key={opt.value} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.82rem',cursor:'pointer'}}>
+                              <label key={opt.value} style={{display:'flex',alignItems:'flex-start',gap:'0.4rem',fontSize:'0.82rem',cursor:'pointer'}}>
                                 <input type="radio" name="landingTimingMode" value={opt.value}
                                   checked={serviceTimeMode === opt.value}
-                                  onChange={() => setServiceTimeMode(opt.value)} />
-                                {opt.label}
+                                  onChange={() => setServiceTimeMode(opt.value)}
+                                  style={{marginTop:'2px'}}/>
+                                <span>
+                                  <span style={{fontWeight:600}}>{opt.label}</span>
+                                  <span style={{color:'#94a3b8',fontSize:'0.7rem',marginLeft:'0.3rem'}}>{opt.desc}</span>
+                                </span>
                               </label>
                             ))}
+                          </div>
+                          <div style={{marginTop:'0.5rem',borderTop:'1px solid #f1f5f9',paddingTop:'0.4rem'}}>
+                            <label className="landing-option-label" style={{fontSize:'0.78rem',marginBottom:'0.25rem'}}>Distribution shape</label>
+                            {(() => {
+                              const DIST_OPTS = [
+                                {value:'lognormal',   label:'Lognormal',   short:'Right-skewed, always positive',
+                                  detail:'Most realistic for service times: most events are quick, occasional long ones. Both mean and std affect the shape. Always samples ≥ 0.'},
+                                {value:'normal',      label:'Normal',       short:'Symmetric bell curve',
+                                  detail:'Symmetric around the mean — equal chance of being faster or slower. Can sample negative values if std is large relative to mean; use only when durations are tightly clustered.'},
+                                {value:'exponential', label:'Exponential',  short:'Memoryless decay, mean only',
+                                  detail:'Only the mean matters (std is ignored). Models processes where most instances are very short and a few are very long. Good for inter-arrival times.'},
+                                {value:'fixed',       label:'Fixed',        short:'Exact deterministic value',
+                                  detail:'Every firing takes exactly mean_seconds. No randomness at all. Use when you want perfectly uniform timing or as a baseline comparison.'},
+                              ];
+                              const hovered = DIST_OPTS.find(o => o.value === discoveryDistType);
+                              return (
+                                <>
+                                  <div style={{display:'flex',gap:'0.35rem',flexWrap:'wrap'}}>
+                                    {DIST_OPTS.map(opt => (
+                                      <label key={opt.value}
+                                        style={{display:'flex',alignItems:'center',gap:'0.25rem',fontSize:'0.78rem',cursor:'pointer',
+                                          background: discoveryDistType===opt.value ? '#eff6ff' : '#f8fafc',
+                                          border:`1px solid ${discoveryDistType===opt.value?'#6366f1':'#e2e8f0'}`,
+                                          borderRadius:'4px',padding:'2px 8px',transition:'all 0.1s'}}>
+                                        <input type="radio" name="discoveryDist" value={opt.value}
+                                          checked={discoveryDistType===opt.value}
+                                          onChange={()=>setDiscoveryDistType(opt.value)}
+                                          style={{display:'none'}}/>
+                                        <span style={{fontWeight: discoveryDistType===opt.value ? 600 : 400}}>{opt.label}</span>
+                                      </label>
+                                    ))}
+                                  </div>
+                                  {hovered && (
+                                    <div style={{marginTop:'0.35rem',fontSize:'0.72rem',color:'#475569',
+                                      background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'5px',
+                                      padding:'0.35rem 0.6rem',lineHeight:1.4}}>
+                                      <span style={{fontWeight:600,color:'#1e293b'}}>{hovered.label}: </span>
+                                      <span style={{color:'#64748b'}}>{hovered.short}. </span>
+                                      {hovered.detail}
+                                    </div>
+                                  )}
+                                </>
+                              );
+                            })()}
                           </div>
                         </div>
 
@@ -7601,9 +9384,9 @@ function App() {
                   ))}
                 </div>
 
-                {!modelBase ? (
+                {!modelAsIs ? (
                   <div style={{padding:'2rem',textAlign:'center',color:'#94a3b8'}}>No model loaded yet.</div>
-                ) : (
+                ) : (<>
                   <div className="behavior-body">
                     <nav className="behavior-nav">
                       {[
@@ -7612,7 +9395,7 @@ function App() {
                         ['probabilities', 'Probabilities'],
                         ['constraints',   'Constraints'],
                         ['o2o',           'O2O Rules'],
-                        ['objects',       'Objects'],
+                        ['objects',       'Object Flows'],
                       ].map(([key, label]) => (
                         <button key={key}
                           className={'behavior-nav-item' + (behaviorSection === key ? ' active' : '')}
@@ -7620,154 +9403,295 @@ function App() {
                           {label}
                         </button>
                       ))}
+                      <div style={{flex:1}}/>
+                      <button
+                        className="run-button"
+                        style={{padding:'0.3rem 0.9rem',fontSize:'0.78rem',margin:'0 0 0 auto',
+                          background: behaviorEditMode ? '#1e293b' : '#475569'}}
+                        onClick={() => setBehaviorEditMode(m => !m)}
+                      >
+                        {behaviorEditMode ? '✓ Done Editing' : '✎ Edit As-Is'}
+                      </button>
                     </nav>
+
                     <div className="behavior-content">
+                      {/* In edit mode, the same tables are shown with editable cells */}
+                      {/* EditableCell components handle click-to-edit per value */}
+                      {/* (No separate ModelEditor — editing is inline throughout) */}
 
+                      {/* ── ACTIVITIES — matrix rows=activities, cols=object types ── */}
                       {behaviorSection === 'activities' && (
-                        <div>
-                          <div className="behavior-section-title">Activities</div>
-                          {(modelBase.activities||[]).length > 0 ? (
-                            <table className="behavior-table">
-                              <thead><tr><th>Activity</th><th>Object Type</th><th>Min</th><th>Max</th><th>Creates</th><th>Deactivates</th></tr></thead>
-                              <tbody>
-                                {(modelBase.activities||[]).flatMap(a =>
-                                  (a.bindings||[]).length > 0
-                                    ? (a.bindings||[]).map((b, bi) => (
-                                        <tr key={a.name + '-' + bi}>
-                                          {bi === 0 ? <td rowSpan={(a.bindings||[]).length} style={{fontWeight:600}}>{a.name}</td> : null}
-                                          <td>{b.object_type}</td>
-                                          <td>{b.min_count ?? 1}</td>
-                                          <td>{b.max_count ?? 1}</td>
-                                          <td style={{textAlign:'center'}}>{b.creates ? '✓' : ''}</td>
-                                          <td style={{textAlign:'center'}}>{b.deactivates ? '✓' : ''}</td>
-                                        </tr>
-                                      ))
-                                    : [<tr key={a.name}><td style={{fontWeight:600}}>{a.name}</td><td colSpan={5} style={{color:'#94a3b8'}}>no bindings</td></tr>]
-                                )}
-                              </tbody>
-                            </table>
-                          ) : <p className="behavior-empty">No activities in model.</p>}
-                        </div>
+                        <BehaviorActivitiesPanel
+                          model={modelAsIs}
+                          editMode={behaviorEditMode}
+                          onUpdate={m => setModelAsIs(m)}
+                          startActivities={config.startActivities || []}
+                          onStartActivitiesChange={acts => setConfig(c => ({...c, startActivities: acts}))}
+                          filters={getBehaviorFilters('activities')}
+                          onFiltersChange={f => setBehaviorSectionFilters('activities', f)}
+                        />
                       )}
+                      })()}
 
+                      {/* ── TIME ── */}
                       {behaviorSection === 'time' && (
-                        <div>
-                          <div className="behavior-section-title">Time</div>
-                          {modelBase.activity_durations && Object.keys(modelBase.activity_durations).length > 0 ? (
-                            <table className="behavior-table">
-                              <thead><tr><th>Activity</th><th>Distribution</th><th>Mean (s)</th><th>Std (s)</th><th>Min (s)</th><th>Max (s)</th></tr></thead>
-                              <tbody>
-                                {Object.entries(modelBase.activity_durations).map(([act, d]) => (
-                                  <tr key={act}>
-                                    <td>{act}</td>
-                                    <td>{d.dist_type || '—'}</td>
-                                    <td>{d.mean_seconds != null ? Math.round(d.mean_seconds) : '—'}</td>
-                                    <td>{d.std_seconds  != null ? Math.round(d.std_seconds)  : '—'}</td>
-                                    <td>{d.min_seconds  != null ? Math.round(d.min_seconds)  : '—'}</td>
-                                    <td>{d.max_seconds  != null ? Math.round(d.max_seconds)  : '—'}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          ) : <p className="behavior-empty">No timing data discovered.</p>}
-                        </div>
+                        <BehaviorTimePanel
+                          durations={modelAsIs.activity_durations || {}}
+                          editMode={behaviorEditMode}
+                          onUpdate={(act, field, val) => setModelAsIs(m => ({
+                            ...m, activity_durations: {...(m.activity_durations||{}),
+                              [act]: {...((m.activity_durations||{})[act]||{}), [field]: val}}
+                          }))}
+                        />
                       )}
 
-                      {behaviorSection === 'probabilities' && (
+                      {/* ── PROBABILITIES — with normalization sliders ── */}
+                      {behaviorSection === 'probabilities' && (() => {
+                        const allActNames = Object.keys(probMatrixBase || {});
+                        const probFilters = getBehaviorFilters('probabilities');
+                        const filtSrc = probFilters.from_activity || '';
+                        const filtTgt = probFilters.to_activity || '';
+                        return (
                         <div>
-                          <div className="behavior-section-title">Transition Probabilities</div>
+                          <div className="behavior-section-title">Transition Probabilities
+                            <BehaviorLegend items={[
+                              ['From → To','Source and destination activity for this transition'],
+                              ['Probability','Fraction of times this transition is taken when the source fires (0–100%)'],
+                              ['Slider','Drag to adjust; other transitions in the same row scale proportionally to keep the total at 100%'],
+                              ['Note','Probabilities below 0.1% are hidden. The simulator adds a small epsilon so 0% transitions are never fully blocked.'],
+                            ]}/>
+                            {behaviorEditMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— drag slider or click value; row normalizes automatically</span>}
+                          </div>
+                          <TableFilterBar
+                            dimensions={[
+                              {key:'from_activity', label:'From', options: allActNames},
+                              {key:'to_activity',   label:'To',   options: allActNames},
+                            ]}
+                            filters={probFilters}
+                            onFiltersChange={f => setBehaviorSectionFilters('probabilities', f)}
+                          />
                           {probMatrixBase && Object.keys(probMatrixBase).length > 0 ? (
                             <table className="behavior-table">
-                              <thead><tr><th>From</th><th>To</th><th>Probability</th></tr></thead>
+                              <thead><tr><th>From</th><th>To</th><th style={{minWidth:'160px'}}>Probability</th></tr></thead>
                               <tbody>
-                                {Object.entries(probMatrixBase).flatMap(([src, targets]) =>
-                                  Object.entries(targets || {}).filter(([, p]) => p > 0.001).map(([tgt, p], i) => (
-                                    <tr key={src + '-' + tgt}>
-                                      {i === 0 ? <td rowSpan={Object.entries(targets||{}).filter(([,p2])=>p2>0.001).length} style={{fontWeight:600}}>{src}</td> : null}
-                                      <td>{tgt}</td>
-                                      <td>{(p * 100).toFixed(1)}%</td>
-                                    </tr>
-                                  ))
-                                )}
+                                {Object.entries(probMatrixBase).filter(([src]) => !filtSrc || src === filtSrc).flatMap(([src, targets]) => {
+                                  const visEntries = Object.entries(targets || {}).filter(([tgt, p]) => p > 0.001 && (!filtTgt || tgt === filtTgt));
+                                  const rowTotal = visEntries.reduce((s,[,p])=>s+p, 0);
+                                  return visEntries.map(([tgt, p], i) => {
+                                    const pct = (p * 100).toFixed(1);
+                                    const updateProb = (newPct) => {
+                                      const newVal = Math.min(1, Math.max(0, parseFloat(newPct)||0) / 100);
+                                      const row = {...(probMatrixBase[src]||{})};
+                                      const delta = newVal - (row[tgt]||0);
+                                      row[tgt] = newVal;
+                                      // Normalize others proportionally
+                                      const others = visEntries.map(([k])=>k).filter(k=>k!==tgt);
+                                      const otherSum = others.reduce((s,k)=>s+(row[k]||0),0);
+                                      if (otherSum > 1e-9) {
+                                        others.forEach(k => { row[k] = Math.max(0,(row[k]||0) - delta*(row[k]/otherSum)); });
+                                      }
+                                      setProbMatrixBase(m=>({...m,[src]:row}));
+                                    };
+                                    return (
+                                      <tr key={src+'-'+tgt}>
+                                        {i===0 ? <td rowSpan={visEntries.length} style={{fontWeight:600}}>{src}</td> : null}
+                                        <td style={{fontSize:'0.82rem'}}>{tgt}</td>
+                                        <td>
+                                          <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
+                                            <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600,color:'#1e293b'}}>
+                                              {behaviorEditMode
+                                                ? <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/>
+                                                : pct+'%'}
+                                            </span>
+                                            {behaviorEditMode && (
+                                              <input type="range" min={0} max={100} step={0.5}
+                                                value={parseFloat(pct)}
+                                                onChange={e => updateProb(e.target.value)}
+                                                style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>
+                                            )}
+                                            {!behaviorEditMode && (
+                                              <div style={{flex:1,height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden',maxWidth:'140px'}}>
+                                                <div style={{height:'100%',width:pct+'%',background:'#6366f1',borderRadius:'3px'}}/>
+                                              </div>
+                                            )}
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    );
+                                  });
+                                })}
                               </tbody>
                             </table>
                           ) : <p className="behavior-empty">No probability data.</p>}
                         </div>
-                      )}
+                        );
+                      })()}
 
+                      {/* ── CONSTRAINTS ── */}
                       {behaviorSection === 'constraints' && (
-                        <div>
-                          <div className="behavior-section-title">Constraints</div>
-                          {(modelBase.constraints||[]).length > 0 ? (
-                            <table className="behavior-table">
-                              <thead><tr><th>Type</th><th>Source</th><th>Target</th><th>Scope</th><th>n≥</th><th>n≤</th></tr></thead>
-                              <tbody>
-                                {(modelBase.constraints||[]).map((c, i) => (
-                                  <tr key={i}>
-                                    <td><span className={'con-type-badge'}>{c.constraint_type}</span></td>
-                                    <td>{c.source_activity || c.source || '—'}</td>
-                                    <td>{c.target_activity || c.target || '—'}</td>
-                                    <td>{c.scope_object_type || '—'}</td>
-                                    <td>{c.nmin ?? '—'}</td>
-                                    <td>{c.nmax ?? '—'}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          ) : <p className="behavior-empty">No constraints in model.</p>}
-                        </div>
+                        <BehaviorConstraintsPanel
+                          constraints={modelAsIs.constraints || []}
+                          actNames={(modelAsIs.activities||[]).map(a=>a.name)}
+                          otNames={(modelAsIs.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
+                          editMode={behaviorEditMode}
+                          onUpdate={cons => setModelAsIs(m => ({...m, constraints: cons}))}
+                          filters={getBehaviorFilters('constraints')}
+                          onFiltersChange={f => setBehaviorSectionFilters('constraints', f)}
+                        />
                       )}
 
-                      {behaviorSection === 'o2o' && (
-                        <div>
-                          <div className="behavior-section-title">O2O Rules</div>
-                          {(modelBase.o2o_rules||[]).length > 0 ? (
-                            <>
-                              <table className="behavior-table" style={{marginBottom:'1rem'}}>
-                                <thead><tr><th>Source Type</th><th>Target Type</th><th>Min</th><th>Max</th><th>Direction</th></tr></thead>
+                      {/* ── O2O RULES — cardinality matrix ── */}
+                      {behaviorSection === 'o2o' && (() => {
+                        const rules = modelAsIs.o2o_rules || [];
+                        const otNames = (modelAsIs.object_types||[]).map(t => typeof t==='string'?t:t.name);
+                        if (!rules.length) return <p className="behavior-empty">No O2O rules discovered.</p>;
+
+                        const cellMap = {};
+                        otNames.forEach(a => { cellMap[a] = {}; });
+                        rules.forEach(r => {
+                          const cell = {min: r.min_links ?? 0, max: r.max_links, bidir: r.bidirectional};
+                          if (!cellMap[r.source_type]) cellMap[r.source_type] = {};
+                          cellMap[r.source_type][r.target_type] = cell;
+                          if (r.bidirectional) {
+                            if (!cellMap[r.target_type]) cellMap[r.target_type] = {};
+                            cellMap[r.target_type][r.source_type] = cell;
+                          }
+                        });
+                        const fmtCell = ({min, max}) => `${min}..${max == null ? '∞' : max}`;
+                        const involved = new Set(rules.flatMap(r => [r.source_type, r.target_type]));
+                        const allCols = otNames.filter(t => involved.has(t));
+
+                        // Filter
+                        const o2oFilters = getBehaviorFilters('o2o');
+                        const cols = o2oFilters.object_type ? allCols.filter(t => t === o2oFilters.object_type) : allCols;
+
+                        return (
+                          <div>
+                            <div className="behavior-section-title">O2O Rules
+                              <BehaviorLegend items={[
+                                ['Matrix cell','Shows min..max — the allowed number of links from a row-type object to a column-type object'],
+                                ['min..max','e.g. 1..3 means each row-object must be linked to at least 1 and at most 3 column-objects'],
+                                ['∞','No upper bound — any number of links allowed'],
+                                ['↔ (purple)','Bidirectional — rule applies in both directions equally'],
+                                ['→ (black)','One-way — rule applies only from row to column, not the reverse'],
+                                ['Blank cell','No rule between these two object types in this direction'],
+                              ]}/>
+                              {behaviorEditMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click a cardinality to edit min or max</span>}
+                            </div>
+                            <TableFilterBar
+                              dimensions={[{key:'object_type', label:'Object Type', options: allCols}]}
+                              filters={o2oFilters}
+                              onFiltersChange={f => setBehaviorSectionFilters('o2o', f)}
+                            />
+                            <p style={{fontSize:'0.75rem',color:'#64748b',margin:'0 0 0.5rem'}}>
+                              Each cell shows the cardinality from the row object to the column object.
+                              <span style={{color:'#7c3aed',marginLeft:'0.5rem'}}>↔ bidirectional</span>
+                              <span style={{color:'#1e293b',marginLeft:'0.75rem'}}>→ one-way (blank = no rule in that direction)</span>
+                            </p>
+                            <div style={{overflowX:'auto',marginBottom:'1rem'}}>
+                              <table className="behavior-table">
+                                <thead>
+                                  <tr>
+                                    <th style={{background:'#f8fafc'}}>From → To</th>
+                                    {cols.map(c => <th key={c} style={{textAlign:'center'}}>{c}</th>)}
+                                  </tr>
+                                </thead>
                                 <tbody>
-                                  {(modelBase.o2o_rules||[]).map((r, i) => (
-                                    <tr key={i}>
-                                      <td>{r.source_type}</td><td>{r.target_type}</td>
-                                      <td>{r.min_links ?? '—'}</td><td>{r.max_links ?? '—'}</td>
-                                      <td>{r.bidirectional ? '↔' : '→'}</td>
+                                  {cols.map(row => (
+                                    <tr key={row}>
+                                      <td style={{fontWeight:600,background:'#f8fafc',whiteSpace:'nowrap'}}>{row}</td>
+                                      {cols.map(col => {
+                                        const cell = cellMap[row]?.[col];
+                                        if (row === col) return <td key={col} style={{background:'#f1f5f9',textAlign:'center',color:'#cbd5e1'}}>—</td>;
+                                        const updateO2O = (field, val) => setModelAsIs(m => ({
+                                          ...m, o2o_rules: (m.o2o_rules||[]).map(r => {
+                                            const matches = r.source_type===row&&r.target_type===col || (r.bidirectional&&r.source_type===col&&r.target_type===row);
+                                            return matches ? {...r, [field]: val===''?null:(parseFloat(val)||0)} : r;
+                                          })
+                                        }));
+                                        return (
+                                          <td key={col} style={{textAlign:'center',
+                                            fontWeight: cell ? 600 : 400,
+                                            color: cell ? (cell.bidir ? '#7c3aed' : '#1e293b') : '#e2e8f0'}}>
+                                            {cell ? (
+                                              behaviorEditMode ? (
+                                                <span style={{display:'inline-flex',alignItems:'center',gap:'1px',fontSize:'0.78rem'}}>
+                                                  <EditableCell value={cell.min??0} type="number" onSave={v=>updateO2O('min_links',v)} style={{fontSize:'0.78rem'}}/>
+                                                  ..
+                                                  <EditableCell value={cell.max??''} type="number" placeholder="∞" onSave={v=>updateO2O('max_links',v)} style={{fontSize:'0.78rem'}}/>
+                                                  <span style={{fontSize:'0.7em',marginLeft:'2px'}}>{cell.bidir ? '↔' : '→'}</span>
+                                                  <button onClick={()=>setModelAsIs(m=>({...m,o2o_rules:(m.o2o_rules||[]).filter(r=>!(r.source_type===row&&r.target_type===col)&&!(r.source_type===col&&r.target_type===row))}))} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 1px',fontSize:'0.7rem',lineHeight:1}}>×</button>
+                                                </span>
+                                              ) : <>{fmtCell(cell)}<span style={{fontSize:'0.7em',marginLeft:'2px'}}>{cell.bidir ? '↔' : '→'}</span></>
+                                            ) : ''}</td>
+                                        );
+                                      })}
                                     </tr>
                                   ))}
                                 </tbody>
                               </table>
-                              <O2ODiagram
-                                rules={modelBase.o2o_rules}
-                                otNames={(modelBase.object_types||[]).map(t => typeof t === 'string' ? t : t.name)}
-                              />
-                            </>
-                          ) : <p className="behavior-empty">No O2O rules discovered.</p>}
-                        </div>
-                      )}
+                            </div>
+                            <O2ODiagram rules={rules} otNames={otNames} />
+                            {behaviorEditMode && <AddO2ORuleForm otNames={otNames} onAdd={rule=>setModelAsIs(m=>({...m,o2o_rules:[...(m.o2o_rules||[]),rule]}))}/>}
+                          </div>
+                        );
+                      })()}
 
+                      {/* ── OBJECT FLOWS ── */}
                       {behaviorSection === 'objects' && (
                         <div>
-                          <div className="behavior-section-title">Objects</div>
+                          <div className="behavior-section-title">Object Flows
+                            <BehaviorLegend items={[
+                              ['Permanent Objects','Object types that are pre-populated at simulation start, limited to a fixed pool size, and never deactivated (e.g. trucks, forklifts, workers). Pool size = number of simultaneously available instances.'],
+                              ['Attributes','Default values assigned to new object instances when they are first created. Only relevant if guards or attribute_updates use these fields.'],
+                              ['Object Flow track','Shows all activities that involve each object type, left to right in process order. + = creates, ✕ = deactivates.'],
+                            ]}/>
+                          </div>
                           <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
                             <div style={{flex:1,minWidth:'180px'}}>
-                              <div className="behavior-sub-title">Resources</div>
-                              {(modelBase.resource_types||[]).length > 0 ? (
-                                <table className="behavior-table">
-                                  <thead><tr><th>Type</th><th>Pool Size</th></tr></thead>
-                                  <tbody>
-                                    {(modelBase.resource_types||[]).map(r => (
-                                      <tr key={r}><td>{r}</td><td>{(modelBase.resource_pool_sizes||{})[r] ?? 1}</td></tr>
-                                    ))}
-                                  </tbody>
-                                </table>
-                              ) : <p className="behavior-empty">No resource types.</p>}
+                              <div className="behavior-sub-title">Permanent Objects</div>
+                              {(() => {
+                                const allOts = (modelAsIs.object_types||[]).map(t=>typeof t==='string'?t:t.name);
+                                const resTypes = modelAsIs.resource_types||[];
+                                const displayTypes = behaviorEditMode ? allOts : resTypes;
+                                if (!displayTypes.length) return <p className="behavior-empty">{behaviorEditMode ? 'No object types defined.' : 'No permanent object types.'}</p>;
+                                const toggleRes = ot => setModelAsIs(m => {
+                                  const rt = m.resource_types||[];
+                                  return {...m, resource_types: rt.includes(ot) ? rt.filter(t=>t!==ot) : [...rt, ot]};
+                                });
+                                return (
+                                  <table className="behavior-table">
+                                    <thead><tr>{behaviorEditMode && <th style={{width:'20px'}}/>}<th>Type</th><th>Pool Size</th></tr></thead>
+                                    <tbody>
+                                      {displayTypes.map(r => {
+                                        const isRes = resTypes.includes(r);
+                                        return (
+                                          <tr key={r} style={{opacity: behaviorEditMode && !isRes ? 0.5 : 1}}>
+                                            {behaviorEditMode && (
+                                              <td><input type="checkbox" checked={isRes} title={isRes?'Remove permanent object status':'Mark as permanent object (fixed pool, never deactivated)'} onChange={()=>toggleRes(r)}/></td>
+                                            )}
+                                            <td>{r}</td>
+                                            <td>{isRes ? (behaviorEditMode
+                                              ? <EditableCell value={(modelAsIs.resource_pool_sizes||{})[r]??1} type="number"
+                                                  onSave={v=>setModelAsIs(m=>({...m,resource_pool_sizes:{...(m.resource_pool_sizes||{}),[r]:parseInt(v)||1}}))}/>
+                                              : ((modelAsIs.resource_pool_sizes||{})[r]??1))
+                                              : <span style={{color:'#94a3b8',fontSize:'0.7rem'}}>—</span>}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                );
+                              })()}
                             </div>
                             <div style={{flex:1,minWidth:'180px'}}>
                               <div className="behavior-sub-title">Attributes</div>
-                              {Object.keys(modelBase.attribute_defaults||{}).length > 0 ? (
+                              {Object.keys(modelAsIs.attribute_defaults||{}).length > 0 ? (
                                 <table className="behavior-table">
                                   <thead><tr><th>Object Type</th><th>Attribute</th><th>Default</th></tr></thead>
                                   <tbody>
-                                    {Object.entries(modelBase.attribute_defaults||{}).flatMap(([ot, attrs]) =>
+                                    {Object.entries(modelAsIs.attribute_defaults||{}).flatMap(([ot, attrs]) =>
                                       Object.entries(attrs||{}).map(([attr, val], i) => (
                                         <tr key={ot+'-'+attr}>
                                           {i===0?<td rowSpan={Object.keys(attrs||{}).length} style={{fontWeight:600}}>{ot}</td>:null}
@@ -7781,16 +9705,9 @@ function App() {
                             </div>
                           </div>
                           <div className="behavior-sub-title">Object Flow</div>
-                          {(modelBase.activities||[]).map(a => {
-                            const bound = (a.bindings||[]);
-                            if (!bound.length) return null;
-                            return bound.map(b => ({ act: a.name, ot: b.object_type, creates: b.creates, deactivates: b.deactivates }));
-                          }).filter(Boolean).flat().reduce((acc, row) => {
-                            (acc[row.ot] = acc[row.ot] || []).push(row);
-                            return acc;
-                          }, {}) && (() => {
+                          {(() => {
                             const byType = {};
-                            (modelBase.activities||[]).forEach(a => (a.bindings||[]).forEach(b => {
+                            (modelAsIs.activities||[]).forEach(a => (a.bindings||[]).forEach(b => {
                               (byType[b.object_type] = byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});
                             }));
                             return Object.entries(byType).map(([ot, nodes]) => (
@@ -7813,7 +9730,21 @@ function App() {
 
                     </div>
                   </div>
-                )}
+                  {/* Constraint Flow Graph — always below the tab panels, reacts to model edits */}
+                  {modelAsIs && (modelAsIs.activities?.length > 0 || modelAsIs.constraints?.length > 0) && (
+                    <div style={{marginTop:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
+                      <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
+                        Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— possible routes · arrow width = transition probability</span>
+                      </div>
+                      <ConstraintFlowGraph
+                        activities={modelAsIs.activities || []}
+                        constraints={modelAsIs.constraints || []}
+                        startActivities={config.startActivities || []}
+                        probMatrix={probMatrixBase || {}}
+                      />
+                    </div>
+                  )}
+                </>)}
               </div>
             )}{/* end behavior tab */}
 
@@ -7822,28 +9753,223 @@ function App() {
               <div className="ext-ocel-tab-content">
                 <div className="scenario-layout">
 
-                  {/* LEFT: Model Editor — bound to modelToBe */}
-                  <div className="scenario-editor-col">
+                  {/* LEFT: Inline To-Be Model Editor */}
+                  <div className="scenario-editor-col" style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
                     <div className="behavior-section-title" style={{marginBottom:'0.5rem'}}>
-                      Model Editor <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>(To-Be — editable)</span>
+                      To-Be Model <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>— always editable · click any value to change</span>
                     </div>
-                    {modelToBe ? (
-                      <ModelEditor
-                        model={modelToBe}
-                        probMatrix={probMatrixToBe || {}}
-                        onModelChange={m => { setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
-                        onProbMatrixChange={m => { setProbMatrixToBe(m); setActiveProbMatrix(m); }}
-                        sourceFile={config.ocdeclareFile}
-                        parameterFiles={parameterFiles}
-                        onLoadParameters={handleLoadParameters}
-                        onSaveParameters={handleSaveParameters}
-                        nmaxSuggestions={discoveryResults?.activity_nmax_suggestions || {}}
-                        eventLogFile={discoveryConfig.eventLogFile || ''}
-                        hideParameterButtons={true}
-                        startActivities={config.startActivities}
-                        onStartActivitiesChange={acts => setConfig(p => ({...p, startActivities: acts}))}
+                    {modelToBe ? (<>
+                      <ToBeDiffPanel
+                        modelAsIs={modelAsIs}
+                        modelToBe={modelToBe}
+                        probMatrixBase={probMatrixBase}
+                        probMatrixToBe={probMatrixToBe}
+                        startActivitiesAsIs={modelAsIs?.start_activities || []}
+                        startActivitiesToBe={config.startActivities || []}
                       />
-                    ) : (
+                      {/* Scenario nav — mirrors Model Behavior nav */}
+                      <div style={{display:'flex',gap:'0',flexWrap:'wrap',marginBottom:'0.75rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.4rem',overflowX:'auto'}}>
+                        {[
+                          ['activities','Activities'],['time','Time'],['probabilities','Probabilities'],
+                          ['constraints','Constraints'],['o2o','O2O Rules'],['objects','Object Flows'],
+                        ].map(([key,label]) => (
+                          <button key={key}
+                            className={'behavior-nav-item' + (scenarioBehaviorSection===key?' active':'')}
+                            onClick={() => setScenarioBehaviorSection(key)}
+                            style={{border:'none',borderBottom: scenarioBehaviorSection===key?'2px solid #1e293b':'2px solid transparent',
+                              background:'none',padding:'0.3rem 0.75rem',fontSize:'0.78rem',cursor:'pointer',
+                              fontWeight:scenarioBehaviorSection===key?600:400,
+                              color:scenarioBehaviorSection===key?'#1e293b':'#64748b',whiteSpace:'nowrap'}}>
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Activities */}
+                      {scenarioBehaviorSection === 'activities' && (
+                        <BehaviorActivitiesPanel
+                          model={modelToBe}
+                          editMode={true}
+                          onUpdate={m => { setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
+                          startActivities={config.startActivities || []}
+                          onStartActivitiesChange={acts => setConfig(p => ({...p, startActivities: acts}))}
+                          filters={scenarioBehaviorFilters['activities'] || {}}
+                          onFiltersChange={f => setScenarioBehaviorFilters(p => ({...p, activities: f}))}
+                        />
+                      )}
+
+                      {/* Time */}
+                      {scenarioBehaviorSection === 'time' && (
+                        <BehaviorTimePanel
+                          durations={modelToBe.activity_durations || {}}
+                          editMode={true}
+                          onUpdate={(act, field, val) => {
+                            const m = {...modelToBe, activity_durations: {...(modelToBe.activity_durations||{}),
+                              [act]: {...((modelToBe.activity_durations||{})[act]||{}), [field]: val}}};
+                            setModelToBe(m); setActiveModel(m); handleModelEdit(m);
+                          }}
+                        />
+                      )}
+
+                      {/* Probabilities */}
+                      {scenarioBehaviorSection === 'probabilities' && (() => {
+                        const allActNames = Object.keys(probMatrixToBe || {});
+                        const pf = scenarioBehaviorFilters['probabilities'] || {};
+                        const filtSrc = pf.from_activity || '', filtTgt = pf.to_activity || '';
+                        return (
+                          <div>
+                            <div className="behavior-section-title">Transition Probabilities
+                              <BehaviorLegend items={[
+                                ['From → To','Source and destination activity for this transition'],
+                                ['Probability','Fraction of times this transition is taken (0–100%)'],
+                                ['Slider','Drag to adjust; others in the row scale proportionally'],
+                              ]}/>
+                            </div>
+                            <TableFilterBar
+                              dimensions={[{key:'from_activity',label:'From',options:allActNames},{key:'to_activity',label:'To',options:allActNames}]}
+                              filters={pf} onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,probabilities:f}))}
+                            />
+                            {probMatrixToBe && Object.keys(probMatrixToBe).length > 0 ? (
+                              <table className="behavior-table">
+                                <thead><tr><th>From</th><th>To</th><th style={{minWidth:'160px'}}>Probability</th></tr></thead>
+                                <tbody>
+                                  {Object.entries(probMatrixToBe).filter(([src])=>!filtSrc||src===filtSrc).flatMap(([src,targets])=>{
+                                    const vis = Object.entries(targets||{}).filter(([tgt,p])=>p>0.001&&(!filtTgt||tgt===filtTgt));
+                                    return vis.map(([tgt,p],i) => {
+                                      const pct = (p*100).toFixed(1);
+                                      const updateProb = newPct => {
+                                        const newVal = Math.min(1,Math.max(0,parseFloat(newPct)||0)/100);
+                                        const row = {...(probMatrixToBe[src]||{})};
+                                        const delta = newVal - (row[tgt]||0);
+                                        row[tgt] = newVal;
+                                        const others = vis.map(([k])=>k).filter(k=>k!==tgt);
+                                        const otherSum = others.reduce((s,k)=>s+(row[k]||0),0);
+                                        if (otherSum>1e-9) others.forEach(k=>{row[k]=Math.max(0,(row[k]||0)-delta*(row[k]/otherSum));});
+                                        const newMatrix = {...probMatrixToBe,[src]:row};
+                                        setProbMatrixToBe(newMatrix); setActiveProbMatrix(newMatrix);
+                                      };
+                                      return (
+                                        <tr key={src+'-'+tgt}>
+                                          {i===0?<td rowSpan={vis.length} style={{fontWeight:600}}>{src}</td>:null}
+                                          <td style={{fontSize:'0.82rem'}}>{tgt}</td>
+                                          <td><div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
+                                            <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600}}>
+                                              <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/>
+                                            </span>
+                                            <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
+                                              onChange={e=>updateProb(e.target.value)}
+                                              style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>
+                                          </div></td>
+                                        </tr>
+                                      );
+                                    });
+                                  })}
+                                </tbody>
+                              </table>
+                            ) : <p className="behavior-empty">No probability data.</p>}
+                          </div>
+                        );
+                      })()}
+
+                      {/* Constraints */}
+                      {scenarioBehaviorSection === 'constraints' && (
+                        <BehaviorConstraintsPanel
+                          constraints={modelToBe.constraints || []}
+                          actNames={(modelToBe.activities||[]).map(a=>a.name)}
+                          otNames={(modelToBe.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
+                          editMode={true}
+                          onUpdate={cons => { const m={...modelToBe,constraints:cons}; setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
+                          filters={scenarioBehaviorFilters['constraints']||{}}
+                          onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,constraints:f}))}
+                        />
+                      )}
+
+                      {/* O2O Rules */}
+                      {scenarioBehaviorSection === 'o2o' && (() => {
+                        const rules = modelToBe.o2o_rules || [];
+                        const otNames = (modelToBe.object_types||[]).map(t=>typeof t==='string'?t:t.name);
+                        const cellMap = {};
+                        otNames.forEach(a=>{cellMap[a]={};});
+                        rules.forEach(r=>{
+                          const cell={min:r.min_links??0,max:r.max_links,bidir:r.bidirectional};
+                          if(!cellMap[r.source_type])cellMap[r.source_type]={};
+                          cellMap[r.source_type][r.target_type]=cell;
+                          if(r.bidirectional){if(!cellMap[r.target_type])cellMap[r.target_type]={};cellMap[r.target_type][r.source_type]=cell;}
+                        });
+                        const fmtCell=({min,max})=>`${min}..${max==null?'∞':max}`;
+                        const involved=new Set(rules.flatMap(r=>[r.source_type,r.target_type]));
+                        const oF=scenarioBehaviorFilters['o2o']||{};
+                        const allCols=otNames.filter(t=>involved.has(t));
+                        const cols=oF.object_type?allCols.filter(t=>t===oF.object_type):allCols;
+                        const updateO2O=(row,col,field,val)=>{ const m={...modelToBe,o2o_rules:(modelToBe.o2o_rules||[]).map(r=>{const matches=r.source_type===row&&r.target_type===col||(r.bidirectional&&r.source_type===col&&r.target_type===row);return matches?{...r,[field]:val===''?null:(parseFloat(val)||0)}:r;})};setModelToBe(m);setActiveModel(m);handleModelEdit(m);};
+                        if(!rules.length) return <p className="behavior-empty">No O2O rules. Add one below.</p>;
+                        return (
+                          <div>
+                            <div className="behavior-section-title">O2O Rules<BehaviorLegend items={[['Matrix cell','min..max links from row to column object'],['↔','bidirectional'],['→','one-way']]}/></div>
+                            <TableFilterBar dimensions={[{key:'object_type',label:'Object Type',options:allCols}]} filters={oF} onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,o2o:f}))}/>
+                            <p style={{fontSize:'0.75rem',color:'#64748b',margin:'0 0 0.5rem'}}><span style={{color:'#7c3aed'}}>↔ bidir</span><span style={{marginLeft:'0.75rem'}}>→ one-way</span></p>
+                            <div style={{overflowX:'auto',marginBottom:'1rem'}}>
+                              <table className="behavior-table">
+                                <thead><tr><th style={{background:'#f8fafc'}}>From → To</th>{cols.map(c=><th key={c} style={{textAlign:'center'}}>{c}</th>)}</tr></thead>
+                                <tbody>{cols.map(row=>(
+                                  <tr key={row}>
+                                    <td style={{fontWeight:600,background:'#f8fafc',whiteSpace:'nowrap'}}>{row}</td>
+                                    {cols.map(col=>{
+                                      const cell=cellMap[row]?.[col];
+                                      if(row===col)return<td key={col} style={{background:'#f1f5f9',textAlign:'center',color:'#cbd5e1'}}>—</td>;
+                                      return(<td key={col} style={{textAlign:'center',fontWeight:cell?600:400,color:cell?(cell.bidir?'#7c3aed':'#1e293b'):'#e2e8f0'}}>
+                                        {cell?(<span style={{display:'inline-flex',alignItems:'center',gap:'1px',fontSize:'0.78rem'}}>
+                                          <EditableCell value={cell.min??0} type="number" onSave={v=>updateO2O(row,col,'min_links',v)} style={{fontSize:'0.78rem'}}/>
+                                          ..<EditableCell value={cell.max??''} type="number" placeholder="∞" onSave={v=>updateO2O(row,col,'max_links',v)} style={{fontSize:'0.78rem'}}/>
+                                          <span style={{fontSize:'0.7em'}}>{cell.bidir?'↔':'→'}</span>
+                                          <button onClick={()=>{const m={...modelToBe,o2o_rules:(modelToBe.o2o_rules||[]).filter(r=>!(r.source_type===row&&r.target_type===col)&&!(r.source_type===col&&r.target_type===row))};setModelToBe(m);setActiveModel(m);handleModelEdit(m);}} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 1px',fontSize:'0.7rem',lineHeight:1}}>×</button>
+                                        </span>):''}</td>);
+                                    })}
+                                  </tr>
+                                ))}</tbody>
+                              </table>
+                            </div>
+                            <AddO2ORuleForm otNames={otNames} onAdd={rule=>{const m={...modelToBe,o2o_rules:[...(modelToBe.o2o_rules||[]),rule]};setModelToBe(m);setActiveModel(m);handleModelEdit(m);}}/>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Object Flows */}
+                      {scenarioBehaviorSection === 'objects' && (() => {
+                        const allOts=(modelToBe.object_types||[]).map(t=>typeof t==='string'?t:t.name);
+                        const resTypes=modelToBe.resource_types||[];
+                        const toggleRes=ot=>{const rt=modelToBe.resource_types||[];const m={...modelToBe,resource_types:rt.includes(ot)?rt.filter(t=>t!==ot):[...rt,ot]};setModelToBe(m);setActiveModel(m);handleModelEdit(m);};
+                        return (
+                          <div>
+                            <div className="behavior-section-title">Object Flows<BehaviorLegend items={[['Permanent Objects','Fixed pool size, never deactivated'],['Pool size','Number of simultaneous instances']]}/></div>
+                            <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
+                              <div style={{flex:1,minWidth:'180px'}}>
+                                <div className="behavior-sub-title">Permanent Objects</div>
+                                {allOts.length===0?<p className="behavior-empty">No object types.</p>:(
+                                  <table className="behavior-table">
+                                    <thead><tr><th style={{width:'20px'}}/><th>Type</th><th>Pool Size</th></tr></thead>
+                                    <tbody>{allOts.map(r=>{
+                                      const isRes=resTypes.includes(r);
+                                      return(<tr key={r} style={{opacity:!isRes?0.5:1}}>
+                                        <td><input type="checkbox" checked={isRes} onChange={()=>toggleRes(r)}/></td>
+                                        <td>{r}</td>
+                                        <td>{isRes?<EditableCell value={(modelToBe.resource_pool_sizes||{})[r]??1} type="number" onSave={v=>{const m={...modelToBe,resource_pool_sizes:{...(modelToBe.resource_pool_sizes||{}),[r]:parseInt(v)||1}};setModelToBe(m);setActiveModel(m);handleModelEdit(m);}}/>:<span style={{color:'#94a3b8',fontSize:'0.7rem'}}>—</span>}</td>
+                                      </tr>);
+                                    })}</tbody>
+                                  </table>
+                                )}
+                              </div>
+                            </div>
+                            <div className="behavior-sub-title">Object Flow</div>
+                            {(() => {
+                              const byType={};
+                              (modelToBe.activities||[]).forEach(a=>(a.bindings||[]).forEach(b=>{(byType[b.object_type]=byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});}));
+                              return Object.entries(byType).map(([ot,nodes])=>(<div key={ot} className="object-flow-type"><div className="object-flow-type-label">{ot}</div><div className="object-flow-track">{nodes.map(n=>(<div key={n.act} className="flow-node"><span className="flow-node-name">{n.act}</span>{n.creates&&<span className="flow-node-badge flow-node-creates">+</span>}{n.deactivates&&<span className="flow-node-badge flow-node-deactivates">✕</span>}</div>))}</div></div>));
+                            })()}
+                          </div>
+                        );
+                      })()}
+                    </>) : (
                       <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'2rem',textAlign:'center'}}>Run discoveries first to populate the model.</div>
                     )}
 
@@ -7857,100 +9983,11 @@ function App() {
                           activities={modelToBe.activities || []}
                           constraints={modelToBe.constraints || []}
                           startActivities={config.startActivities || []}
+                          probMatrix={probMatrixToBe || probMatrixBase || {}}
                         />
                       </div>
                     )}
 
-                    {/* OC-DFG — auto-updates when model/matrix changes */}
-                    {modelToBe && probMatrixToBe && Object.keys(probMatrixToBe).length > 0 && (
-                      <div style={{marginTop:'1.5rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
-                        <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
-                          OC-DFG <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— updates on model changes</span>
-                        </div>
-                        <TransitionFlowChart
-                          matrix={probMatrixToBe}
-                          activityCounts={discoveryResults?.activity_counts || {}}
-                          startActivities={config.startActivities}
-                          traceEndProb={discoveryResults?.trace_end_prob || {}}
-                          likelyEndActivities={discoveryResults?.likely_end_activities || []}
-                          tracePosition={discoveryResults?.trace_position || {}}
-                          constraints={modelToBe?.constraints || []}
-                        />
-                        {/* Constraints — collapsible */}
-                        {(modelToBe.constraints||[]).length > 0 && (
-                          <Collapsible
-                            title={`Constraints (${modelToBe.constraints.length})`}
-                            defaultOpen={false}
-                          >
-                            <div style={{display:'flex',flexDirection:'column',gap:'0.25rem',maxHeight:'180px',overflowY:'auto'}}>
-                              {(modelToBe.constraints||[]).map((c,i) => (
-                                <div key={i} style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.78rem',color:'#334155'}}>
-                                  <span className={`con-type-badge con-${(c.constraint_type||'').toLowerCase().replace(/_/g,'-')}`} style={{flexShrink:0}}>
-                                    {c.constraint_type}
-                                  </span>
-                                  <span>{c.source_activity||c.source||'—'}</span>
-                                  <span style={{color:'#94a3b8'}}>→</span>
-                                  <span>{c.target_activity||c.target||'—'}</span>
-                                  {c.scope_object_type && <span style={{color:'#94a3b8',fontSize:'0.7rem'}}>({c.scope_object_type})</span>}
-                                </div>
-                              ))}
-                            </div>
-                          </Collapsible>
-                        )}
-
-                        {/* Blocking analysis — auto-updates on model change */}
-                        <Collapsible
-                          title={isAnalyzingBlocking ? '🔍 Analyzing blocking constraints…' : `🔍 Blocking Constraints${blockingResult?.blocking?.length ? ` (${blockingResult.blocking.length})` : ''}`}
-                          defaultOpen={false}
-                          badge={blockingResult?.blocking?.length > 0 ? blockingResult.blocking.length : null}
-                        >
-                          {isAnalyzingBlocking && (
-                            <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',padding:'0.5rem 0'}}>
-                              <div className="spinner spinner-sm"></div> Running dry-run analysis…
-                            </div>
-                          )}
-                          {!isAnalyzingBlocking && blockingResult?.error && (
-                            <div style={{fontSize:'0.78rem',color:'#dc2626'}}>{blockingResult.error}</div>
-                          )}
-                          {!isAnalyzingBlocking && blockingResult?.blocking?.length === 0 && (
-                            <div style={{fontSize:'0.82rem',color:'#16a34a',padding:'0.4rem 0'}}>✓ No blocking constraints detected</div>
-                          )}
-                          {!isAnalyzingBlocking && blockingResult?.blocking?.length > 0 && (
-                            <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                              <div style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.25rem'}}>
-                                Based on {blockingResult.total_steps}-step dry run + static check. Pressure = fraction of steps where activity was absent from candidate pool.
-                              </div>
-                              {blockingResult.blocking.map((b, i) => (
-                                <div key={i} style={{background: b.severity==='high'?'#fff1f2':'#fffbeb', border:`1px solid ${b.severity==='high'?'#fecdd3':'#fde68a'}`, borderRadius:'6px', padding:'0.5rem 0.75rem'}}>
-                                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.25rem'}}>
-                                    <span style={{fontWeight:700,fontSize:'0.85rem',color: b.severity==='high'?'#be123c':'#92400e'}}>{b.activity}</span>
-                                    {b.pressure != null && (
-                                      <span style={{fontSize:'0.72rem',background:'#f1f5f9',borderRadius:'4px',padding:'0.1rem 0.4rem',color:'#475569'}}>
-                                        {Math.round(b.pressure*100)}% blocked
-                                      </span>
-                                    )}
-                                    <span style={{fontSize:'0.7rem',color: b.severity==='high'?'#be123c':'#92400e',marginLeft:'auto'}}>{b.severity}</span>
-                                  </div>
-                                  {b.reason?.startsWith('static:') && (
-                                    <div style={{fontSize:'0.75rem',color:'#64748b',marginBottom:'0.2rem'}}>{b.reason.replace('static: ','')}</div>
-                                  )}
-                                  {(b.related_constraints||[]).length > 0 && (
-                                    <div style={{display:'flex',flexDirection:'column',gap:'0.15rem',marginTop:'0.2rem'}}>
-                                      {b.related_constraints.map((rc,j) => (
-                                        <div key={j} style={{fontSize:'0.72rem',color:'#475569',display:'flex',gap:'0.35rem',alignItems:'center'}}>
-                                          <span className={`con-type-badge con-${(rc.constraint_type||'').toLowerCase().replace(/_/g,'-')}`} style={{fontSize:'0.65rem'}}>{rc.constraint_type}</span>
-                                          <span>{rc.source}</span><span style={{color:'#94a3b8'}}>→</span><span>{rc.target}</span>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </Collapsible>
-                      </div>
-                    )}
                   </div>
 
                   {/* RIGHT: Simulation */}

@@ -306,17 +306,20 @@ def calculate_precedence_support_confidence(
     
     for trace in traces.values():
         has_source = source in trace
-        has_target = target in trace
-        
-        if has_source:
-            traces_with_source += 1
-            
-            # Check if source precedes target
-            if has_target:
-                source_idx = trace.index(source)
-                target_idx = trace.index(target)
-                if source_idx < target_idx:
-                    traces_with_precedence += 1
+        if not has_source:
+            continue
+
+        traces_with_source += 1
+
+        # Check if ANY occurrence of source precedes ANY occurrence of target.
+        # list.index() only finds the first occurrence, which gives wrong results
+        # when either activity repeats.  We scan for the earliest source position
+        # and then check whether target appears anywhere after it.
+        if source in trace:
+            first_source_idx = next(i for i, a in enumerate(trace) if a == source)
+            # target must appear at some position strictly after first_source_idx
+            if any(a == target for a in trace[first_source_idx + 1:]):
+                traces_with_precedence += 1
     
     support = traces_with_precedence / total_traces if total_traces > 0 else 0.0
     confidence = traces_with_precedence / traces_with_source if traces_with_source > 0 else 0.0
@@ -349,15 +352,18 @@ def calculate_response_support_confidence(
     traces_with_source = 0
     
     for trace in traces.values():
-        has_source = source in trace
-        
-        if has_source:
-            traces_with_source += 1
-            
-            # Check if target appears after source
-            source_idx = trace.index(source)
-            if target in trace[source_idx + 1:]:
-                traces_with_response += 1
+        if source not in trace:
+            continue
+
+        traces_with_source += 1
+
+        # Use the earliest occurrence of source; check if target follows any of them.
+        # list.index() only finds the first — this is correct for response (we want
+        # "does target eventually follow the first source occurrence"), but we make
+        # the intent explicit for repeated-activity traces.
+        first_source_idx = next(i for i, a in enumerate(trace) if a == source)
+        if any(a == target for a in trace[first_source_idx + 1:]):
+            traces_with_response += 1
     
     support = traces_with_response / total_traces if total_traces > 0 else 0.0
     confidence = traces_with_response / traces_with_source if traces_with_source > 0 else 0.0

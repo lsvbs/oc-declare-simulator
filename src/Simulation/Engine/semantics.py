@@ -365,10 +365,40 @@ def check_exactly(constraint: Any, candidate: Any, state: SimulationState, scope
 
 
 def check_init(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
-    """Activity must be the first event. Block all others until it fires."""
+    """Activity must be the first event for each scope object.
+
+    For 'each' scope: the target must have fired for at least one scope object
+    that participates in this candidate before any other activity fires for that
+    object.  Using _activity_fired_globally is incorrect in multi-case runs
+    because one case's init vacuously satisfies all other concurrent cases.
+    """
     target = constraint.target_activity or constraint.source_activity
     if candidate.activity_name == target:
         return True
+
+    if constraint.scope.kind == "each":
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            # No scope objects yet — vacuously satisfied (nothing to enforce against)
+            return True
+        for oid in scope_ids:
+            if not _activity_fired_for_object(state, target, oid):
+                return False
+        return True
+
+    if constraint.scope.kind == "any":
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            return True
+        return any(_activity_fired_for_object(state, target, oid) for oid in scope_ids)
+
+    if constraint.scope.kind == "all":
+        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
+        if not scope_ids:
+            return True
+        return all(_activity_fired_for_object(state, target, oid) for oid in scope_ids)
+
+    # Global fallback (no scope type set)
     return _activity_fired_globally(state, target)
 
 

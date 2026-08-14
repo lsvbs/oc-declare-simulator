@@ -1136,25 +1136,42 @@ class Simulator:
     def _fulfill_response_obligations(self, executed_event, state: SimulationState) -> None:
         act = executed_event.activity_name
         fired_oids = set(executed_event.object_ids)
+
+        def _record_fulfillment(key):
+            c_key = state._obligation_to_constraint.pop(key, None)
+            if c_key is not None:
+                stats = state._constraint_obligation_stats.setdefault(
+                    c_key, {"fulfilled": 0, "cancelled": 0, "violated": 0}
+                )
+                stats["fulfilled"] += 1
+            state.total_obligations_fulfilled += 1
+
         # Discharge unscoped obligations for this target activity
         if state._obligations_count.pop((act, None), None) is not None:
             state._obligations_ready.pop((act, None), None)
-            state.total_obligations_fulfilled += 1
+            _record_fulfillment((act, None))
         # Discharge per-object obligations (each/any mode)
         for oid in executed_event.object_ids:
             if state._obligations_count.pop((act, oid), None) is not None:
                 state._obligations_ready.pop((act, oid), None)
-                state.total_obligations_fulfilled += 1
+                _record_fulfillment((act, oid))
         # Discharge all-mode frozenset obligations
         all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
         for k in all_keys:
             if k[1].issubset(fired_oids):
                 state._obligations_count.pop(k, None)
                 state._obligations_ready.pop(k, None)
-                state.total_obligations_fulfilled += 1
+                _record_fulfillment(k)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
         for constraint in self._response_by_source.get(executed_event.activity_name, []):
+            # Constraint identity tuple used for per-constraint stats (E3/S8)
+            c_key = (
+                constraint.constraint_type,
+                constraint.source_activity,
+                constraint.target_activity,
+                getattr(constraint.scope, 'kind', 'each'),
+            )
             if constraint.scope.kind == "each":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event, state=state,
@@ -1164,6 +1181,7 @@ class Simulator:
                     key = (constraint.target_activity, scope_object_id)
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._obligation_to_constraint[key] = c_key
                         # Route to ready or blocked pool
                         if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
                             state._obligations_ready[key] = 1
@@ -1184,6 +1202,7 @@ class Simulator:
                     key = (constraint.target_activity, scope_object_id)
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._obligation_to_constraint[key] = c_key
                         if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
                             state._obligations_ready[key] = 1
                         else:
@@ -1203,11 +1222,13 @@ class Simulator:
                     key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._obligation_to_constraint[key] = c_key
                         state._obligations_ready[key] = 1  # all-mode: always ready (frozenset handles sync)
             else:
                 key = (constraint.target_activity, None)
                 if key not in state._obligations_count:
                     state._obligations_count[key] = 1
+                    state._obligation_to_constraint[key] = c_key
                     state._obligations_ready[key] = 1  # unscoped: always ready
 
     def _get_event_scope_object_ids(

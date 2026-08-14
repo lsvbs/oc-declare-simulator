@@ -527,11 +527,19 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
         # Map arc_type to internal constraint_type
         constraint_type = arc_type_map.get(arc_type, arc_type or "unknown")
 
-        # Scope: use first object_type in label.each if present, else ""
+        # Scope: detect the label kind ("each", "any", "all") present in this arc.
+        # Earlier code always forced kind="each" which silently dropped "any"/"all"
+        # semantics. We now inspect each kind in priority order and use the first one
+        # that has at least one object entry.
+        scope_kind = "each"
         scope_obj_type = ""
-        if label.get("each") and len(label["each"]) > 0:
-            scope_obj_type = str(label["each"][0].get("object_type", ""))
-        scope = Scope(kind="each", object_type=scope_obj_type)
+        for _lk in ("each", "any", "all"):
+            _entries = label.get(_lk) or []
+            if _entries:
+                scope_kind = _lk
+                scope_obj_type = str(_entries[0].get("object_type", ""))
+                break
+        scope = Scope(kind=scope_kind, object_type=scope_obj_type)
 
         # OC-DECLARE tuple (ar, s, t, ...) uses `from` = s (constrained/later)
         # and `to` = t (earlier activity that must appear before s).

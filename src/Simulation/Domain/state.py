@@ -153,6 +153,14 @@ class SimulationState:
     total_deactivations: int = 0
     total_obligations_fulfilled: int = 0   # target activity actually fired
     total_obligations_cancelled: int = 0   # cleared because scope object deactivated
+    total_obligations_violated: int = 0    # cancelled obligations that were unfulfilled (= constraint violations)
+    # Per-constraint fulfillment tracking (E3 / S8).
+    # Key: (constraint_type, source_activity, target_activity, scope_kind) — matches constraint identity.
+    # Value: {"fulfilled": int, "cancelled": int, "violated": int}
+    _constraint_obligation_stats: dict = field(default_factory=dict)
+    # Maps each active obligation key → constraint identity tuple, so deactivate_object
+    # can attribute cancellations to the right constraint without a full scan.
+    _obligation_to_constraint: dict = field(default_factory=dict)
     # Running count of deactivated non-resource objects (= completed traces)
     # Maintained in deactivate_object — avoids O(n) scan in _should_stop
     completed_trace_count: int = 0
@@ -234,6 +242,16 @@ class SimulationState:
         ]
         for k in keys_to_remove:
             del self._obligations_count[k]
+            # Each cancelled unfulfilled obligation is a constraint violation (S8).
+            # Attribute it to the originating constraint via the reverse-lookup dict.
+            c_key = self._obligation_to_constraint.pop(k, None)
+            if c_key is not None:
+                stats = self._constraint_obligation_stats.setdefault(
+                    c_key, {"fulfilled": 0, "cancelled": 0, "violated": 0}
+                )
+                stats["cancelled"] += 1
+                stats["violated"] += 1
+                self.total_obligations_violated += 1
         self.total_deactivations += 1
         self.total_obligations_cancelled += len(keys_to_remove)
         # Clean up stratified obligation pools

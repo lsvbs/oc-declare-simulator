@@ -485,7 +485,7 @@ export default function ModelEditor({
     { id: 'constraints',  label: 'Constraints',  count: constraints.length },
     { id: 'o2o',          label: 'O2O Rules',    count: o2oRules.length },
     { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
-    { id: 'resources',    label: 'Resources',    count: resourceTypes.length || null },
+    { id: 'resources',    label: 'Permanent Objects', count: resourceTypes.length || null },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
     { id: 'flow',         label: 'Object Flow',  count: null },
@@ -764,35 +764,6 @@ export default function ModelEditor({
                       ⚠ No bindings
                     </span>
                   )}
-                  <label className="max-consec-label" onClick={e => e.stopPropagation()}>
-                    max consec <HelpTip text="Maximum back-to-back firings globally (regardless of which object). Leave blank for no limit." />
-                    <input
-                      className="binding-num max-consec-input"
-                      type="number" min={1}
-                      value={(model.max_consecutive || {})[act.name] ?? ''}
-                      placeholder="∞"
-                      onChange={e => updateMaxConsecutive(act.name, e.target.value)}
-                    />
-                  </label>
-                  <label className="max-consec-label" onClick={e => e.stopPropagation()}>
-                    max consec/obj <HelpTip text="Maximum back-to-back firings on the same object. The same activity may still fire on a different object. Leave blank for no limit." />
-                    <input
-                      className="binding-num max-consec-input"
-                      type="number" min={1}
-                      value={(model.max_consecutive_per_object || {})[act.name] ?? ''}
-                      placeholder="∞"
-                      onChange={e => updateMaxConsecutivePerObject(act.name, e.target.value)}
-                    />
-                    {nmaxSuggestions[act.name] && nmaxSuggestions[act.name].suggested > 1 && (
-                      <button
-                        className="nmax-suggest-btn"
-                        title={`Log suggests max ${nmaxSuggestions[act.name].suggested} (p95). Click to apply.`}
-                        onClick={e => { e.stopPropagation(); updateMaxConsecutivePerObject(act.name, nmaxSuggestions[act.name].suggested); }}
-                      >
-                        p95:{nmaxSuggestions[act.name].suggested}
-                      </button>
-                    )}
-                  </label>
                   <span className="activity-binding-count">
                     {(act.bindings || []).length} binding{(act.bindings || []).length !== 1 ? 's' : ''}
                   </span>
@@ -819,7 +790,7 @@ export default function ModelEditor({
                         <div className="binding-row">
                           <span className="binding-type-label">
                             {b.object_type}
-                            {isResource && <span className="binding-resource-badge" title="Resource type — pool size is set in the Resources tab">R</span>}
+                            {isResource && <span className="binding-resource-badge" title="Permanent object type — fixed pool, never deactivated. Pool size is set in the Permanent Objects tab.">P</span>}
                           </span>
                           <input
                             className="binding-num"
@@ -836,7 +807,7 @@ export default function ModelEditor({
                               e.target.value === '' ? null : parseInt(e.target.value) || 0)}
                           />
                           <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
-                            title={isResource ? 'Resources come from the pre-populated pool — they cannot be created by activities.' : ''}>
+                            title={isResource ? 'Permanent objects come from the pre-populated pool — they cannot be created by activities and are never deactivated.' : ''}>
                             <input type="checkbox" checked={isResource ? false : !!b.creates}
                               disabled={isResource}
                               onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
@@ -1433,32 +1404,47 @@ export default function ModelEditor({
               </div>
             )}
 
-            {o2oRules.length > 0 && (
-              <table className="o2o-preview-table">
-                <thead>
-                  <tr>
-                    <th>Source type</th>
-                    <th></th>
-                    <th>Target type</th>
-                    <th title="Minimum links between objects of these types">Min links</th>
-                    <th title="Maximum links enforced during simulation">Max links</th>
-                    <th title="Whether the link is navigable in both directions">Dir</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {o2oRules.map((r, i) => (
-                    <tr key={i}>
-                      <td className="o2o-type">{r.source_type}</td>
-                      <td className="o2o-arrow">{r.bidirectional ? '↔' : '→'}</td>
-                      <td className="o2o-type">{r.target_type}</td>
-                      <td className="o2o-num">{r.min_links ?? '—'}</td>
-                      <td className="o2o-num">{r.max_links ?? '∞'}</td>
-                      <td className="o2o-dir">{r.bidirectional ? 'bi' : 'uni'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
+            {o2oRules.length > 0 && (() => {
+              // Cardinality matrix: rows = from-type, cols = to-type
+              const cellMap = {};
+              otNames.forEach(a => { cellMap[a] = {}; });
+              o2oRules.forEach(r => {
+                const cell = { min: r.min_links ?? 0, max: r.max_links };
+                if (cellMap[r.source_type]) cellMap[r.source_type][r.target_type] = cell;
+                if (r.bidirectional && cellMap[r.target_type]) cellMap[r.target_type][r.source_type] = cell;
+              });
+              const involved = new Set(o2oRules.flatMap(r => [r.source_type, r.target_type]));
+              const cols = otNames.filter(t => involved.has(t));
+              const fmtCell = ({min, max}) => `${min}..${max == null ? '∞' : max}`;
+              return (
+                <div style={{overflowX:'auto',marginTop:'1rem'}}>
+                  <table className="o2o-preview-table">
+                    <thead>
+                      <tr>
+                        <th style={{background:'#f8fafc',textAlign:'left'}}>From \ To</th>
+                        {cols.map(c => <th key={c} style={{textAlign:'center'}}>{c}</th>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cols.map(row => (
+                        <tr key={row}>
+                          <td style={{fontWeight:600,background:'#f8fafc',whiteSpace:'nowrap'}}>{row}</td>
+                          {cols.map(col => {
+                            if (row === col) return <td key={col} style={{background:'#f1f5f9',textAlign:'center',color:'#cbd5e1'}}>—</td>;
+                            const cell = cellMap[row]?.[col];
+                            return (
+                              <td key={col} style={{textAlign:'center',fontWeight:cell?600:400,color:cell?'#1e293b':'#e2e8f0'}}>
+                                {cell ? fmtCell(cell) : ''}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -1610,7 +1596,7 @@ export default function ModelEditor({
         {activeTab === 'resources' && (
           <div>
             <p className="prob-hint">
-              Resource object types are <strong>permanently active</strong> and never deactivated — they
+              Permanent object types are <strong>permanently active</strong> and never deactivated — they
               represent shared infrastructure (employees, forklifts, trucks) reused across cases.
               Set a <strong>pool size</strong> to pre-populate N instances at simulation start, so
               activities that bind this type always find objects without a preceding <em>creates</em> step.
@@ -1632,7 +1618,7 @@ export default function ModelEditor({
                     </label>
                     {isResource && (
                       <>
-                        <span className="resource-badge">resource</span>
+                        <span className="resource-badge">permanent</span>
                         <label className="resource-pool-label">
                           pool size
                           <input
@@ -1666,6 +1652,17 @@ export default function ModelEditor({
               discovered reference values — they do not affect simulation directly.
               Run <em>Discover Time Distributions</em> (Step 2.5) to populate these from the event log.
             </p>
+            <details style={{marginBottom:'0.75rem',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.4rem 0.7rem',background:'#f8fafc'}}>
+              <summary style={{cursor:'pointer',fontSize:'0.78rem',fontWeight:600,color:'#475569',userSelect:'none'}}>? Column legend</summary>
+              <div style={{display:'grid',gridTemplateColumns:'auto 1fr',gap:'0.15rem 0.75rem',marginTop:'0.4rem',fontSize:'0.75rem',color:'#475569'}}>
+                <span style={{fontWeight:600}}>Distribution</span><span>Sampling shape used in simulation (lognormal, exponential, uniform)</span>
+                <span style={{fontWeight:600}}>Mean</span><span>Simulation parameter μ — expected service duration in seconds</span>
+                <span style={{fontWeight:600}}>Std</span><span>Simulation parameter σ — standard deviation of service duration</span>
+                <span style={{fontWeight:600}}>Log Mean</span><span>Mean observed in the input event log (reference only)</span>
+                <span style={{fontWeight:600}}>Log Std</span><span>Standard deviation observed in the log (reference only)</span>
+                <span style={{fontWeight:600}}>Log Min / Max</span><span>Minimum and maximum observed in the log (reference bounds)</span>
+              </div>
+            </details>
             {actNames.length === 0 && <p className="empty-notice">No activities defined.</p>}
             {actNames.map(act => {
               const td = timingData[act] || {};
@@ -1786,7 +1783,7 @@ export default function ModelEditor({
                   <div className="object-flow-type-header">
                     <span className="object-flow-type-name">{otype}</span>
                     {resourceTypes.includes(otype) && (
-                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Resource</span>
+                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Permanent</span>
                     )}
                     <span className="object-flow-act-count">{sortedInvolved.length} activities</span>
                   </div>

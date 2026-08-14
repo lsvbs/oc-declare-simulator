@@ -409,12 +409,32 @@ def run_discovery():
         if ocel_source:
             ocel_events = ocel_source.get('events', {})
             events_list_raw = list(ocel_events.values() if isinstance(ocel_events, dict) else ocel_events)
+
+            def _norm_act(edata):
+                """Return activity name regardless of OCEL key variant."""
+                return (edata.get('activity') or edata.get('ocel:activity') or
+                        edata.get('type') or '')
+
+            def _norm_omap(edata):
+                """Return list of object-id strings regardless of OCEL format."""
+                raw = edata.get('omap') or edata.get('ocel:omap') or edata.get('relationships') or []
+                if raw and isinstance(raw[0], dict):
+                    return [r.get('objectId') or r.get('ocel:oid', '') for r in raw if isinstance(r, dict)]
+                return [str(x) for x in raw]
+
+            def _norm_ts(edata):
+                """Return timestamp string regardless of OCEL key variant."""
+                return (edata.get('timestamp') or edata.get('ocel:timestamp') or
+                        edata.get('time') or '')
+
             act_obj_counts: dict = {}
             for edata in events_list_raw:
-                act = edata.get('activity') or edata.get('ocel:activity', '')
+                act = _norm_act(edata)
                 if not act:
                     continue
-                for oid in (edata.get('omap') or edata.get('relationships') or []):
+                for oid in _norm_omap(edata):
+                    if not oid:
+                        continue
                     act_obj_counts.setdefault(act, {}).setdefault(oid, 0)
                     act_obj_counts[act][oid] += 1
             for act, obj_counts in act_obj_counts.items():
@@ -468,12 +488,9 @@ def run_discovery():
         activity_consec_stats: dict = {}
         if ocel_source:
             sorted_acts = [
-                edata.get('activity') or edata.get('ocel:activity', '')
-                for edata in sorted(
-                    events_list_raw,
-                    key=lambda e: e.get('timestamp') or e.get('ocel:timestamp') or ''
-                )
-                if edata.get('activity') or edata.get('ocel:activity', '')
+                _norm_act(edata)
+                for edata in sorted(events_list_raw, key=_norm_ts)
+                if _norm_act(edata)
             ]
             # Scan runs
             act_runs: dict = {}  # activity -> list of run lengths
@@ -1269,6 +1286,14 @@ def run_simulation():
                 'concurrency_pairs': concurrency_pairs,
                 'resource_types': list(static_model.resource_types or []),
                 'completed_traces': getattr(final_state, 'completed_trace_count', 0),
+                'obligations_fulfilled': getattr(final_state, 'total_obligations_fulfilled', 0),
+                'obligations_cancelled': getattr(final_state, 'total_obligations_cancelled', 0),
+                'obligations_violated': getattr(final_state, 'total_obligations_violated', 0),
+                # Per-constraint obligation stats (E3/S8): fulfillment rate per response constraint
+                'constraint_obligation_stats': {
+                    f"{k[0]}|{k[1]}→{k[2]}|{k[3]}": v
+                    for k, v in (getattr(final_state, '_constraint_obligation_stats', None) or {}).items()
+                },
                 'sim_time_s': (
                     (final_state.last_generated_timestamp - config.start_timestamp).total_seconds()
                     if final_state.last_generated_timestamp else None
@@ -1581,6 +1606,7 @@ def get_run_ocpq(run_id):
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/eventlog-events', methods=['GET'])
 def get_eventlog_events():
     """Return a lightweight event list from an input OCEL log for conformance checking."""
     try:
@@ -2278,6 +2304,7 @@ def analyze_pressure():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/discover-timing', methods=['POST'])
 def discover_timing():
     """Compute OCPA time metrics from an OCEL log + optional anchor service times.
 
@@ -2640,6 +2667,673 @@ def upload_file():
 def health_check():
     """Health check endpoint."""
     return jsonify({'status': 'ok'})
+
+
+# ── Further Evaluations endpoints ────────────────────────────────────────────
+
+def _build_static_model_from_request(data):
+    """Shared helper: parse model + event-log cache from a request dict.
+
+    Returns (static_model, prob_matrix, cached) or raises ValueError.
+    """
+    from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
+    ocdeclare_file = data.get('ocdeclareFile')
+    event_log_file = data.get('eventLogFile')
+    model_override  = data.get('modelOverride')
+
+    cached = {}
+    if event_log_file and event_log_file in discovery_cache:
+        cached = discovery_cache[event_log_file]
+    prob_matrix = cached.get('prob_matrix', {})
+
+    if model_override:
+        model_data = model_override
+    elif ocdeclare_file:
+        model_path = OCDECLARE_DIR / ocdeclare_file
+        if not model_path.exists():
+            raise ValueError(f'Model file not found: {ocdeclare_file}')
+        with open(model_path, 'r') as f:
+            model_data = json.load(f)
+    else:
+        raise ValueError('Either ocdeclareFile or modelOverride is required')
+
+    time_distributions = cached.get('time_distributions', {})
+    if time_distributions and isinstance(model_data, dict):
+        existing = model_data.get('activity_durations') or {}
+        merged = {act: m for act, m in time_distributions.items() if act not in existing}
+        merged.update(existing)
+        model_data = {**model_data, 'activity_durations': merged}
+    concurrency_probs = cached.get('concurrency_probs', {})
+    if concurrency_probs and isinstance(model_data, dict):
+        if not model_data.get('concurrency_probs'):
+            model_data = {**model_data, 'concurrency_probs': concurrency_probs}
+
+    if isinstance(model_data, list):
+        static_model = parse_ocdeclare_list(model_data)
+        lifecycle_info = derive_provisional_lifecycle_from_list(model_data)
+        static_model = apply_lifecycle_from_provisional_info(static_model, lifecycle_info)
+    else:
+        static_model = parse_ocdeclare_dict(model_data)
+
+    return static_model, prob_matrix, cached
+
+
+def _run_single_seed(static_model, prob_matrix, start_activities, seed,
+                     max_steps, max_traces, max_sim_time_s):
+    """Run a single simulation and return the final state."""
+    start_policy = StartPolicy(start_activity_names=start_activities, max_case_starts=None)
+    config = SimulationConfig(
+        max_steps=max_steps,
+        max_sim_time_s=max_sim_time_s,
+        max_traces=max_traces,
+        seed=seed,
+        start_policy=start_policy,
+        anchor_object_types=[ot.name for ot in static_model.object_types],
+    )
+
+    def _sel(candidates, state, static_model, config=None, rng=None, **kwargs):
+        return select_candidate(candidates=candidates, state=state,
+                                static_model=static_model, config=config,
+                                rng=rng, transition_matrix=prob_matrix)
+
+    sim = Simulator(static_model=static_model, config=config, select_func=_sel,
+                    transition_matrix=prob_matrix)
+    return sim.run()
+
+
+@app.route('/api/further-eval/conformance-check', methods=['POST'])
+def further_eval_conformance_check():
+    """E1 — Post-hoc conformance check of a generated OCEL against OC-Declare constraints.
+
+    Body: { outputFile: str, ocdeclareFile: str | modelOverride: dict }
+    Returns per-constraint violation summary based on the events in the output log.
+    """
+    try:
+        data = request.json or {}
+        output_file = data.get('outputFile')
+        if not output_file:
+            return jsonify({'error': 'outputFile is required'}), 400
+
+        log_path = OUTPUT_DIR / output_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {output_file}'}), 404
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            ocel = json.load(f)
+
+        static_model, _, _ = _build_static_model_from_request(data)
+
+        # Build per-object event sequences from the OCEL
+        events_raw = ocel.get('events', [])
+        if isinstance(events_raw, dict):
+            events_raw = list(events_raw.values())
+        events_raw.sort(key=lambda e: e.get('time', ''))
+
+        # Build obj_id -> [activity_name in order]
+        obj_traces = {}
+        obj_type_map = {}
+        for ev in events_raw:
+            act = ev.get('type', ev.get('activity', ''))
+            rels = ev.get('relationships', []) or []
+            for r in rels:
+                oid = r.get('objectId', '')
+                otype = r.get('qualifier', r.get('objectType', ''))
+                if oid:
+                    obj_traces.setdefault(oid, []).append(act)
+                    if otype:
+                        obj_type_map[oid] = otype
+
+        # Also check objects dict for type info
+        objects_raw = ocel.get('objects', {})
+        if isinstance(objects_raw, list):
+            for o in objects_raw:
+                oid = o.get('id', o.get('ocel:id', ''))
+                otype = o.get('type', o.get('ocel:type', ''))
+                if oid and otype:
+                    obj_type_map[oid] = otype
+
+        constraint_results = []
+        for c in static_model.constraints:
+            src = c.source_activity
+            tgt = c.target_activity
+            ctype = c.constraint_type
+            scope_type = getattr(c.scope, 'object_type', '') or ''
+            scope_kind = getattr(c.scope, 'kind', 'each')
+            nmin = getattr(c, 'nmin', 0) or 0
+            nmax = getattr(c, 'nmax', None)
+
+            # Filter to scope objects
+            if scope_type:
+                scope_objs = [oid for oid, ot in obj_type_map.items() if ot == scope_type]
+            else:
+                scope_objs = list(obj_traces.keys())
+
+            if not scope_objs:
+                constraint_results.append({
+                    'constraint': f'{ctype}({src} → {tgt})',
+                    'constraint_type': ctype,
+                    'source': src, 'target': tgt,
+                    'scope_kind': scope_kind, 'scope_type': scope_type,
+                    'checked': 0, 'violated': 0, 'violation_rate': None,
+                    'note': 'no scope objects in log',
+                })
+                continue
+
+            violated = 0
+            checked = 0
+            for oid in scope_objs:
+                trace = obj_traces.get(oid, [])
+                has_src = src in trace
+                has_tgt = tgt in trace
+
+                if ctype in ('response', 'succession'):
+                    if has_src:
+                        checked += 1
+                        first_src = next((i for i, a in enumerate(trace) if a == src), None)
+                        if first_src is not None and not any(a == tgt for a in trace[first_src + 1:]):
+                            violated += 1
+                elif ctype == 'responded_existence':
+                    if has_src:
+                        checked += 1
+                        if not has_tgt:
+                            violated += 1
+                elif ctype == 'precedence':
+                    if has_tgt:
+                        checked += 1
+                        first_tgt = next((i for i, a in enumerate(trace) if a == tgt), None)
+                        if first_tgt is not None and not any(a == src for a in trace[:first_tgt]):
+                            violated += 1
+                elif ctype == 'not_coexistence':
+                    checked += 1
+                    if has_src and has_tgt:
+                        violated += 1
+                elif ctype == 'coexistence':
+                    if has_src or has_tgt:
+                        checked += 1
+                        if not (has_src and has_tgt):
+                            violated += 1
+                elif ctype == 'exclusive_choice':
+                    checked += 1
+                    if has_src and has_tgt:
+                        violated += 1
+                    elif not has_src and not has_tgt:
+                        violated += 1
+                elif ctype in ('existence', 'init', 'last'):
+                    checked += 1
+                    if not has_src:
+                        violated += 1
+                elif ctype == 'absence':
+                    checked += 1
+                    cnt = trace.count(src)
+                    cap = nmax if nmax is not None else 0
+                    if cnt > cap:
+                        violated += 1
+                elif ctype == 'exactly':
+                    checked += 1
+                    cnt = trace.count(src)
+                    if cnt != nmin:
+                        violated += 1
+                else:
+                    # Generic: count-based check where applicable
+                    if has_src:
+                        checked += 1
+
+            rate = round(violated / checked, 4) if checked > 0 else None
+            constraint_results.append({
+                'constraint': f'{ctype}({src} → {tgt})',
+                'constraint_type': ctype,
+                'source': src, 'target': tgt,
+                'scope_kind': scope_kind, 'scope_type': scope_type,
+                'checked': checked, 'violated': violated,
+                'violation_rate': rate,
+            })
+
+        total_checked = sum(r['checked'] for r in constraint_results)
+        total_violated = sum(r['violated'] for r in constraint_results)
+        overall_fitness = round(1.0 - total_violated / total_checked, 4) if total_checked > 0 else None
+
+        return jsonify({
+            'constraint_results': constraint_results,
+            'overall_fitness': overall_fitness,
+            'total_checked': total_checked,
+            'total_violated': total_violated,
+            'num_constraints': len(constraint_results),
+            'num_objects': len(obj_traces),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/further-eval/log-fidelity', methods=['POST'])
+def further_eval_log_fidelity():
+    """E2 — Cross-log fidelity: simulated vs real OCEL.
+
+    Body: { outputFile: str, eventLogFile: str }
+    Returns per-activity KL divergence, object count distributions, timing EMD.
+    """
+    try:
+        import math
+        data = request.json or {}
+        output_file = data.get('outputFile')
+        event_log_file = data.get('eventLogFile')
+        if not output_file:
+            return jsonify({'error': 'outputFile is required'}), 400
+        if not event_log_file:
+            return jsonify({'error': 'eventLogFile (real log) is required'}), 400
+
+        log_path = OUTPUT_DIR / output_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {output_file}'}), 404
+        real_path = EVENTLOG_DIR / event_log_file
+        if not real_path.exists():
+            return jsonify({'error': f'Event log not found: {event_log_file}'}), 404
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            sim_ocel = json.load(f)
+        with open(real_path, 'r', encoding='utf-8') as f:
+            real_ocel = json.load(f)
+
+        def _extract_activities(ocel):
+            evs = ocel.get('events', [])
+            if isinstance(evs, dict):
+                evs = list(evs.values())
+            return [e.get('type', e.get('activity', '')) for e in evs]
+
+        def _extract_obj_counts_per_type(ocel):
+            objs = ocel.get('objects', {})
+            if isinstance(objs, dict):
+                obj_list = list(objs.values())
+            else:
+                obj_list = objs or []
+            counts = {}
+            for o in obj_list:
+                ot = o.get('type', o.get('ocel:type', ''))
+                counts[ot] = counts.get(ot, 0) + 1
+            return counts
+
+        def _extract_inter_event_gaps_s(ocel):
+            evs = ocel.get('events', [])
+            if isinstance(evs, dict):
+                evs = list(evs.values())
+            evs = sorted(evs, key=lambda e: e.get('time', ''))
+            from datetime import datetime
+            gaps = []
+            prev_ts = None
+            for e in evs:
+                ts_str = e.get('time', '')
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00').replace('+00:00', ''))
+                except Exception:
+                    continue
+                if prev_ts is not None:
+                    delta = (ts - prev_ts).total_seconds()
+                    if delta >= 0:
+                        gaps.append(delta)
+                prev_ts = ts
+            return gaps
+
+        def _kl_divergence(p_counts, q_counts):
+            """KL(P||Q) where P=real, Q=simulated. Uses add-1 smoothing."""
+            all_keys = set(p_counts) | set(q_counts)
+            p_total = sum(p_counts.values()) + len(all_keys)
+            q_total = sum(q_counts.values()) + len(all_keys)
+            kl = 0.0
+            for k in all_keys:
+                p = (p_counts.get(k, 0) + 1) / p_total
+                q = (q_counts.get(k, 0) + 1) / q_total
+                kl += p * math.log(p / q)
+            return round(kl, 6)
+
+        def _emd_1d(a_vals, b_vals):
+            """1-D earth mover's distance (Wasserstein-1) between two sample lists."""
+            if not a_vals or not b_vals:
+                return None
+            a_sorted = sorted(a_vals)
+            b_sorted = sorted(b_vals)
+            # Merge and compute CDF difference area
+            all_vals = sorted(set(a_sorted + b_sorted))
+            def cdf(vals, x):
+                return sum(1 for v in vals if v <= x) / len(vals)
+            emd = 0.0
+            for i in range(len(all_vals) - 1):
+                diff = abs(cdf(a_sorted, all_vals[i]) - cdf(b_sorted, all_vals[i]))
+                emd += diff * (all_vals[i + 1] - all_vals[i])
+            return round(emd, 4)
+
+        real_acts = _extract_activities(real_ocel)
+        sim_acts  = _extract_activities(sim_ocel)
+
+        real_act_counts = {}
+        for a in real_acts:
+            real_act_counts[a] = real_act_counts.get(a, 0) + 1
+        sim_act_counts = {}
+        for a in sim_acts:
+            sim_act_counts[a] = sim_act_counts.get(a, 0) + 1
+
+        activity_kl = _kl_divergence(real_act_counts, sim_act_counts)
+
+        real_obj_counts = _extract_obj_counts_per_type(real_ocel)
+        sim_obj_counts  = _extract_obj_counts_per_type(sim_ocel)
+        object_type_kl  = _kl_divergence(real_obj_counts, sim_obj_counts)
+
+        real_gaps = _extract_inter_event_gaps_s(real_ocel)
+        sim_gaps  = _extract_inter_event_gaps_s(sim_ocel)
+        timing_emd = _emd_1d(real_gaps, sim_gaps)
+
+        # Per-activity frequency comparison table
+        all_acts = sorted(set(list(real_act_counts.keys()) + list(sim_act_counts.keys())))
+        real_total = max(len(real_acts), 1)
+        sim_total  = max(len(sim_acts), 1)
+        activity_freq_table = [
+            {
+                'activity': a,
+                'real_count': real_act_counts.get(a, 0),
+                'sim_count':  sim_act_counts.get(a, 0),
+                'real_freq':  round(real_act_counts.get(a, 0) / real_total, 4),
+                'sim_freq':   round(sim_act_counts.get(a, 0) / sim_total, 4),
+            }
+            for a in all_acts
+        ]
+
+        all_types = sorted(set(list(real_obj_counts.keys()) + list(sim_obj_counts.keys())))
+        object_type_table = [
+            {
+                'object_type': t,
+                'real_count': real_obj_counts.get(t, 0),
+                'sim_count':  sim_obj_counts.get(t, 0),
+            }
+            for t in all_types
+        ]
+
+        timing_summary = {
+            'real_gap_mean_s':   round(sum(real_gaps) / len(real_gaps), 1) if real_gaps else None,
+            'sim_gap_mean_s':    round(sum(sim_gaps)  / len(sim_gaps),  1) if sim_gaps  else None,
+            'real_gap_median_s': round(sorted(real_gaps)[len(real_gaps)//2], 1) if real_gaps else None,
+            'sim_gap_median_s':  round(sorted(sim_gaps)[len(sim_gaps)//2],   1) if sim_gaps  else None,
+            'emd_s':             timing_emd,
+        }
+
+        return jsonify({
+            'activity_kl_divergence':  activity_kl,
+            'object_type_kl_divergence': object_type_kl,
+            'timing_emd_s': timing_emd,
+            'activity_freq_table': activity_freq_table,
+            'object_type_table':   object_type_table,
+            'timing_summary':      timing_summary,
+            'real_event_count': len(real_acts),
+            'sim_event_count':  len(sim_acts),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/further-eval/multi-run', methods=['POST'])
+def further_eval_multi_run():
+    """E5 — Multi-seed variance analysis.
+
+    Body: {
+      seeds: [int, ...],           # list of seeds to run (max 20)
+      ocdeclareFile | modelOverride,
+      eventLogFile,
+      startActivities: [str],
+      maxEvents: int,
+      maxTraces: int,
+    }
+    Returns mean ± std for event count, object count, completed traces,
+    obligations fulfilled/cancelled/violated, and per-constraint fulfillment rates.
+    """
+    try:
+        import math
+        data = request.json or {}
+        seeds = data.get('seeds') or [42, 99, 123, 456, 789]
+        seeds = [int(s) for s in seeds[:20]]  # cap at 20
+        start_activities = data.get('startActivities') or []
+        if not start_activities:
+            return jsonify({'error': 'startActivities is required'}), 400
+        max_steps  = int(data.get('maxEvents') or data.get('maxSteps') or 100_000)
+        max_traces = data.get('maxTraces')
+        if max_traces is not None:
+            max_traces = int(max_traces)
+        max_sim_time_s = data.get('maxSimTimeS')
+        if max_sim_time_s is not None:
+            max_sim_time_s = float(max_sim_time_s)
+
+        static_model, prob_matrix, _ = _build_static_model_from_request(data)
+
+        run_results = []
+        for seed in seeds:
+            st = _run_single_seed(
+                static_model, prob_matrix, start_activities,
+                seed, max_steps, max_traces, max_sim_time_s,
+            )
+            c_stats = {
+                f"{k[0]}|{k[1]}→{k[2]}|{k[3]}": dict(v)
+                for k, v in (getattr(st, '_constraint_obligation_stats', None) or {}).items()
+            }
+            run_results.append({
+                'seed':                  seed,
+                'events_count':          len(st.executed_events),
+                'objects_count':         len(st.objects),
+                'completed_traces':      getattr(st, 'completed_trace_count', 0),
+                'obligations_fulfilled': getattr(st, 'total_obligations_fulfilled', 0),
+                'obligations_cancelled': getattr(st, 'total_obligations_cancelled', 0),
+                'obligations_violated':  getattr(st, 'total_obligations_violated', 0),
+                'constraint_stats':      c_stats,
+            })
+
+        def _stats(values):
+            n = len(values)
+            if n == 0:
+                return {'mean': None, 'std': None, 'min': None, 'max': None}
+            mean = sum(values) / n
+            std  = math.sqrt(sum((v - mean) ** 2 for v in values) / n) if n > 1 else 0.0
+            return {'mean': round(mean, 2), 'std': round(std, 2),
+                    'min': min(values), 'max': max(values)}
+
+        summary = {
+            'events_count':          _stats([r['events_count']          for r in run_results]),
+            'objects_count':         _stats([r['objects_count']         for r in run_results]),
+            'completed_traces':      _stats([r['completed_traces']      for r in run_results]),
+            'obligations_fulfilled': _stats([r['obligations_fulfilled'] for r in run_results]),
+            'obligations_violated':  _stats([r['obligations_violated']  for r in run_results]),
+        }
+
+        # Per-constraint fulfillment rate across seeds
+        all_c_keys = set()
+        for r in run_results:
+            all_c_keys.update(r['constraint_stats'].keys())
+        constraint_summary = {}
+        for ck in sorted(all_c_keys):
+            rates = []
+            for r in run_results:
+                cs = r['constraint_stats'].get(ck, {})
+                f = cs.get('fulfilled', 0)
+                v = cs.get('violated', 0)
+                total = f + v
+                if total > 0:
+                    rates.append(f / total)
+            constraint_summary[ck] = _stats(rates) if rates else {'mean': None, 'std': None}
+
+        return jsonify({
+            'seeds':              seeds,
+            'runs':               run_results,
+            'summary':            summary,
+            'constraint_summary': constraint_summary,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/further-eval/cardinality-fidelity', methods=['POST'])
+def further_eval_cardinality_fidelity():
+    """E6 — Object cardinality fidelity: objects-per-event in real vs simulated log.
+
+    Body: { outputFile: str, eventLogFile: str }
+    Returns per-activity mean/std objects-per-event for real vs sim log.
+    """
+    try:
+        data = request.json or {}
+        output_file   = data.get('outputFile')
+        event_log_file = data.get('eventLogFile')
+        if not output_file:
+            return jsonify({'error': 'outputFile is required'}), 400
+        if not event_log_file:
+            return jsonify({'error': 'eventLogFile (real log) is required'}), 400
+
+        log_path  = OUTPUT_DIR / output_file
+        real_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {output_file}'}), 404
+        if not real_path.exists():
+            return jsonify({'error': f'Event log not found: {event_log_file}'}), 404
+
+        with open(log_path,  'r', encoding='utf-8') as f:
+            sim_ocel  = json.load(f)
+        with open(real_path, 'r', encoding='utf-8') as f:
+            real_ocel = json.load(f)
+
+        def _objects_per_event(ocel):
+            evs = ocel.get('events', [])
+            if isinstance(evs, dict):
+                evs = list(evs.values())
+            per_act = {}
+            for e in evs:
+                act  = e.get('type', e.get('activity', ''))
+                rels = e.get('relationships', []) or e.get('omap', []) or []
+                cnt  = len(rels)
+                per_act.setdefault(act, []).append(cnt)
+            return per_act
+
+        import math
+        def _summarise(vals):
+            if not vals:
+                return {'mean': None, 'std': None, 'min': None, 'max': None, 'count': 0}
+            n = len(vals)
+            mean = sum(vals) / n
+            std  = math.sqrt(sum((v - mean) ** 2 for v in vals) / n) if n > 1 else 0.0
+            return {'mean': round(mean, 3), 'std': round(std, 3),
+                    'min': min(vals), 'max': max(vals), 'count': n}
+
+        real_ope = _objects_per_event(real_ocel)
+        sim_ope  = _objects_per_event(sim_ocel)
+
+        all_acts = sorted(set(list(real_ope.keys()) + list(sim_ope.keys())))
+        table = []
+        for act in all_acts:
+            real_s = _summarise(real_ope.get(act, []))
+            sim_s  = _summarise(sim_ope.get(act, []))
+            mean_diff = (
+                round(sim_s['mean'] - real_s['mean'], 3)
+                if real_s['mean'] is not None and sim_s['mean'] is not None else None
+            )
+            table.append({
+                'activity': act,
+                'real': real_s,
+                'sim':  sim_s,
+                'mean_diff': mean_diff,
+            })
+
+        return jsonify({'table': table})
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/further-eval/ocpa-ocpq-comparison', methods=['POST'])
+def further_eval_ocpa_ocpq_comparison():
+    """E4/E7 — Side-by-side OCPA timing + OCPQ schema comparison: real vs sim log.
+
+    Body: { outputFile: str, eventLogFile: str, serviceTimeMode?: str }
+    Calls existing discover-timing-output and discover-timing logic, then pairs results.
+    """
+    try:
+        from src.ParameterDiscovery.OCDeclarediscovery import compute_ocpa_metrics, load_ocel2
+        data = request.json or {}
+        output_file    = data.get('outputFile')
+        event_log_file = data.get('eventLogFile')
+        service_mode   = data.get('serviceTimeMode', 'sojourn')
+        if not output_file:
+            return jsonify({'error': 'outputFile is required'}), 400
+        if not event_log_file:
+            return jsonify({'error': 'eventLogFile (real log) is required'}), 400
+
+        log_path  = OUTPUT_DIR / output_file
+        real_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {output_file}'}), 404
+        if not real_path.exists():
+            return jsonify({'error': f'Event log not found: {event_log_file}'}), 404
+
+        sim_ocel  = load_ocel2(str(log_path))
+        real_ocel = load_ocel2(str(real_path))
+
+        sim_metrics  = compute_ocpa_metrics(sim_ocel,  service_time_mode=service_mode) or {}
+        real_metrics = compute_ocpa_metrics(real_ocel, service_time_mode=service_mode) or {}
+
+        all_acts = sorted(set(list(sim_metrics.keys()) + list(real_metrics.keys())))
+
+        TIME_FIELDS = ['service_mean', 'service_min', 'service_max',
+                       'waiting_mean', 'sojourn_mean', 'sync_mean',
+                       'flow_mean', 'pooling_mean', 'lagging_mean']
+
+        def _pct_diff(real_v, sim_v):
+            if real_v is None or sim_v is None or real_v == 0:
+                return None
+            return round((sim_v - real_v) / abs(real_v) * 100, 1)
+
+        comparison = []
+        for act in all_acts:
+            rm = real_metrics.get(act, {})
+            sm = sim_metrics.get(act, {})
+            fields = {}
+            for f in TIME_FIELDS:
+                rv = rm.get(f)
+                sv = sm.get(f)
+                fields[f] = {
+                    'real': rv, 'sim': sv,
+                    'pct_diff': _pct_diff(rv, sv),
+                }
+            # Per-activity WMAPE: weighted mean absolute percentage error over
+            # all TIME_FIELDS that have both a real and sim value.
+            # Weight = real value (larger metrics dominate the aggregate).
+            wmape_num = 0.0
+            wmape_den = 0.0
+            for f in TIME_FIELDS:
+                rv = rm.get(f)
+                sv = sm.get(f)
+                if rv is not None and sv is not None and rv > 0:
+                    wmape_num += abs(sv - rv)
+                    wmape_den += rv
+            act_wmape = round(wmape_num / wmape_den * 100, 1) if wmape_den > 0 else None
+            comparison.append({'activity': act, 'fields': fields, 'wmape': act_wmape})
+
+        # Global WMAPE across all activities and fields
+        global_num = sum(
+            abs((row['fields'][f]['sim'] or 0) - (row['fields'][f]['real'] or 0))
+            for row in comparison for f in TIME_FIELDS
+            if row['fields'][f]['real'] and row['fields'][f]['sim'] and row['fields'][f]['real'] > 0
+        )
+        global_den = sum(
+            row['fields'][f]['real']
+            for row in comparison for f in TIME_FIELDS
+            if row['fields'][f]['real'] and row['fields'][f]['sim'] and row['fields'][f]['real'] > 0
+        )
+        global_wmape = round(global_num / global_den * 100, 1) if global_den > 0 else None
+
+        return jsonify({
+            'comparison': comparison,
+            'real_metrics': real_metrics,
+            'sim_metrics':  sim_metrics,
+            'global_wmape': global_wmape,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
 if __name__ == '__main__':
