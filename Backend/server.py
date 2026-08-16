@@ -477,6 +477,7 @@ def run_discovery():
                 for ot, max_reuse_list in _type_max_reuse.items():
                     if ot in object_type_stats and max_reuse_list:
                         object_type_stats[ot]['max_reuse'] = max(max_reuse_list)
+                        object_type_stats[ot]['min_reuse'] = min(max_reuse_list)
                         object_type_stats[ot]['mean_max_reuse'] = round(
                             sum(max_reuse_list) / len(max_reuse_list), 2
                         )

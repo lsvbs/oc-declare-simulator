@@ -6178,6 +6178,77 @@ function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, s
   );
 }
 
+// ── BehaviorProbabilitiesPanel ────────────────────────────────────────────────
+function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}, onFiltersChange }) {
+  const allActNames = Object.keys(probMatrix || {});
+  const filtSrc = filters.from_activity || '';
+  const filtTgt = filters.to_activity || '';
+
+  return (
+    <div>
+      <div className="behavior-section-title">Transition Probabilities
+        <BehaviorLegend items={[
+          ['From → To','Source and destination activity for this transition'],
+          ['Probability','Fraction of times this transition is taken when the source fires (0–100%)'],
+          ['Slider','Drag to adjust; other transitions in the same row scale proportionally to keep the total at 100%'],
+          ['Note','Probabilities below 0.1% are hidden. The simulator adds a small epsilon so 0% transitions are never fully blocked.'],
+        ]}/>
+        {editMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— drag slider or click value; row normalizes automatically</span>}
+      </div>
+      <TableFilterBar
+        dimensions={[
+          {key:'from_activity', label:'From', options: allActNames},
+          {key:'to_activity',   label:'To',   options: allActNames},
+        ]}
+        filters={filters}
+        onFiltersChange={onFiltersChange}
+      />
+      {probMatrix && Object.keys(probMatrix).length > 0 ? (
+        <table className="behavior-table">
+          <thead><tr><th>From</th><th>To</th><th style={{minWidth:'160px'}}>Probability</th></tr></thead>
+          <tbody>
+            {Object.entries(probMatrix).filter(([src]) => !filtSrc || src === filtSrc).flatMap(([src, targets]) => {
+              const visEntries = Object.entries(targets || {}).filter(([tgt, p]) => p > 0.001 && (!filtTgt || tgt === filtTgt));
+              return visEntries.map(([tgt, p], i) => {
+                const pct = (p * 100).toFixed(1);
+                const updateProb = (newPct) => {
+                  const newVal = Math.min(1, Math.max(0, parseFloat(newPct)||0) / 100);
+                  const row = {...(probMatrix[src]||{})};
+                  const delta = newVal - (row[tgt]||0);
+                  row[tgt] = newVal;
+                  const others = visEntries.map(([k])=>k).filter(k=>k!==tgt);
+                  const otherSum = others.reduce((s,k)=>s+(row[k]||0),0);
+                  if (otherSum > 1e-9) others.forEach(k => { row[k] = Math.max(0,(row[k]||0) - delta*(row[k]/otherSum)); });
+                  onUpdate(src, row);
+                };
+                return (
+                  <tr key={src+'-'+tgt}>
+                    {i===0 ? <td rowSpan={visEntries.length} style={{fontWeight:600}}>{src}</td> : null}
+                    <td style={{fontSize:'0.82rem'}}>{tgt}</td>
+                    <td>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
+                        <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600,color:'#1e293b'}}>
+                          {editMode ? <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/> : pct+'%'}
+                        </span>
+                        {editMode && <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
+                          onChange={e=>updateProb(e.target.value)}
+                          style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>}
+                        {!editMode && <div style={{flex:1,height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden',maxWidth:'140px'}}>
+                          <div style={{height:'100%',width:pct+'%',background:'#6366f1',borderRadius:'3px'}}/>
+                        </div>}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              });
+            })}
+          </tbody>
+        </table>
+      ) : <p className="behavior-empty">No probability data.</p>}
+    </div>
+  );
+}
+
 // ── BehaviorActivitiesPanel ───────────────────────────────────────────────────
 function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange }) {
   const [expandedRows, setExpandedRows] = React.useState(new Set());
@@ -6458,7 +6529,7 @@ function AddO2ORuleForm({ otNames, onAdd }) {
 }
 
 
-function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, onUpdate, filters={}, onFiltersChange }) {
+function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, onUpdate, filters={}, onFiltersChange, activities=[], onUpdateActivities=null }) {
   const [newCon, setNewCon] = React.useState(BEHAVIOR_EMPTY_CON);
   const isUnary = t => ['absence','exactly','init'].includes(t);
 
@@ -6468,6 +6539,22 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
     if (!newCon.source_activity) return;
     if (!isUnary(newCon.constraint_type) && !newCon.target_activity) return;
     onUpdate([...constraints, {...newCon}]);
+
+    // Auto-add missing object binding if scope type is set
+    const scopeOt = newCon.scope?.object_type;
+    if (scopeOt && onUpdateActivities && activities.length > 0) {
+      const involvedActs = [newCon.source_activity, ...(!isUnary(newCon.constraint_type) ? [newCon.target_activity] : [])].filter(Boolean);
+      let changed = false;
+      const newActs = activities.map(a => {
+        if (!involvedActs.includes(a.name)) return a;
+        const hasBinding = (a.bindings||[]).some(b => b.object_type === scopeOt);
+        if (hasBinding) return a;
+        changed = true;
+        return {...a, bindings: [...(a.bindings||[]), {object_type: scopeOt, min_count: 1, max_count: null, creates: false, deactivates: false}]};
+      });
+      if (changed) onUpdateActivities(newActs);
+    }
+
     setNewCon(BEHAVIOR_EMPTY_CON);
   };
 
@@ -6478,13 +6565,14 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
     </select>
   );
 
-  // Apply filters
-  const visConstraints = constraints.filter(c => {
-    if (filters.activity && c.source_activity !== filters.activity && c.target_activity !== filters.activity) return false;
-    if (filters.object_type && (c.scope?.object_type || c.scope_object_type || '') !== filters.object_type) return false;
-    if (filters.constraint_type && c.constraint_type !== filters.constraint_type) return false;
-    return true;
-  });
+  // Apply filters — keep original indices so delete/update work correctly
+  const visConstraints = constraints.reduce((acc, c, i) => {
+    if (filters.activity && c.source_activity !== filters.activity && c.target_activity !== filters.activity) return acc;
+    if (filters.object_type && (c.scope?.object_type || c.scope_object_type || '') !== filters.object_type) return acc;
+    if (filters.constraint_type && c.constraint_type !== filters.constraint_type) return acc;
+    acc.push({c, origIdx: i});
+    return acc;
+  }, []);
 
   const conTypes = [...new Set(constraints.map(c => c.constraint_type))].sort();
   const scopeTypes = [...new Set(constraints.map(c => c.scope?.object_type || c.scope_object_type || '').filter(Boolean))].sort();
@@ -6525,8 +6613,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
               </tr>
             </thead>
             <tbody>
-              {visConstraints.map((c, i) => {
-                const origIdx = constraints.indexOf(c);
+              {visConstraints.map(({c, origIdx}) => {
                 const scopeOt = c.scope?.object_type || c.scope_object_type || '';
                 const scopeKind = c.scope?.kind || 'each';
                 return (
@@ -6896,6 +6983,7 @@ function App() {
     maxTraces: '',
     seed: 42,
     startActivities: [],
+    startActivitiesLocked: false, // true once user explicitly toggles ★
   });
   const [isSimulating, setIsSimulating] = useState(false);
   const [liveStepCount, setLiveStepCount] = useState(null);
@@ -7172,7 +7260,7 @@ function App() {
           || autoStarts[0]
           || response.data.results.activities?.[0];
         if (firstActivity) {
-          setConfig(prev => prev.startActivities.length > 0
+          setConfig(prev => prev.startActivitiesLocked || prev.startActivities.length > 0
             ? prev
             : { ...prev, startActivities: autoStarts.length > 0 ? autoStarts : [firstActivity] });
         }
@@ -7289,7 +7377,7 @@ function App() {
         const topStart = ranked[0]?.activity || modelActivities[0];
         if (modelActivities.length > 0) {
           setAvailableActivities(modelActivities);
-          setConfig(prev => prev.startActivities.length > 0
+          setConfig(prev => prev.startActivitiesLocked || prev.startActivities.length > 0
             ? prev
             : { ...prev, startActivities: topStart ? [topStart] : [] });
         }
@@ -7320,7 +7408,7 @@ function App() {
             if (startActivityCandidates.length === 0) {
               const firstActivity = discResponse.data.results.first_activity || discActivities[0];
               if (firstActivity) {
-                setConfig(prev => prev.startActivities.length > 0
+                setConfig(prev => prev.startActivitiesLocked || prev.startActivities.length > 0
                   ? prev
                   : { ...prev, startActivities: [firstActivity] });
               }
@@ -9133,7 +9221,79 @@ function App() {
 
                         {/* Resource threshold */}
                         <div className="landing-option-group">
-                          <label className="landing-option-label">Resource Threshold</label>
+                          <label className="landing-option-label" style={{display:'flex',alignItems:'center',gap:'0.35rem'}}>
+                            Resource Threshold
+                            {/* ? popup with repeat stats */}
+                            {discoveryResults?.object_type_stats && (() => {
+                              const ots = discoveryResults.object_type_stats;
+                              const types = Object.keys(ots).filter(t => ots[t]?.max_reuse != null).sort();
+                              // Suggested threshold: lowest max_reuse across all object types
+                              // (the object type that repeats the least at its maximum)
+                              const minMax = types.reduce((best, t) => {
+                                const m = ots[t]?.max_reuse;
+                                return (m != null && m < best) ? m : best;
+                              }, Infinity);
+                              const suggested = minMax === Infinity ? null : minMax;
+                              return (
+                                <span style={{position:'relative',display:'inline-block'}}>
+                                  <span
+                                    style={{display:'inline-flex',alignItems:'center',justifyContent:'center',
+                                      width:'15px',height:'15px',borderRadius:'50%',fontSize:'0.68rem',
+                                      background:'#e2e8f0',color:'#475569',cursor:'help',fontWeight:700,
+                                      lineHeight:1,userSelect:'none'}}
+                                    onMouseEnter={e=>{const t=e.currentTarget.nextSibling;if(t)t.style.display='block';}}
+                                    onMouseLeave={e=>{const t=e.currentTarget.nextSibling;if(t)t.style.display='none';}}
+                                  >?</span>
+                                  <div style={{display:'none',position:'absolute',top:'calc(100% + 4px)',left:'-8px',
+                                    zIndex:300,background:'white',border:'1px solid #e2e8f0',borderRadius:'8px',
+                                    boxShadow:'0 4px 20px rgba(0,0,0,0.12)',padding:'0.6rem 0.8rem',
+                                    minWidth:'280px',maxWidth:'360px',fontSize:'0.74rem',color:'#475569'}}>
+                                    <div style={{fontWeight:700,color:'#1e293b',marginBottom:'0.3rem',fontSize:'0.78rem'}}>
+                                      Resource Threshold
+                                    </div>
+                                    <p style={{margin:'0 0 0.4rem',lineHeight:1.4}}>
+                                      Object types whose instances are reused ≥ threshold times are treated as <strong>permanent objects</strong> (pre-populated pool, never deactivated). Min/obj = least reused instance; Max/obj = most reused instance.
+                                    </p>
+                                    {suggested != null && (
+                                      <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:'5px',
+                                        padding:'0.3rem 0.5rem',marginBottom:'0.4rem',fontSize:'0.73rem',color:'#1d4ed8'}}>
+                                        Suggested: <strong>{suggested}</strong> — lowest max reuse across all object types
+                                        <button onClick={()=>setResourceThreshold(suggested)}
+                                          style={{marginLeft:'0.5rem',fontSize:'0.7rem',padding:'1px 6px',
+                                            background:'#1d4ed8',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>
+                                          Apply
+                                        </button>
+                                      </div>
+                                    )}
+                                    <div style={{fontWeight:600,color:'#475569',fontSize:'0.72rem',marginBottom:'0.25rem',
+                                      borderBottom:'1px solid #f1f5f9',paddingBottom:'0.2rem',
+                                      display:'grid',gridTemplateColumns:'1fr auto auto',gap:'0 0.75rem'}}>
+                                      <span>Object Type</span><span>Min/obj</span><span>Max/obj</span>
+                                    </div>
+                                    <div style={{maxHeight:'160px',overflowY:'auto'}}>
+                                      {types.map(t => {
+                                        const r = ots[t];
+                                        const isHighlighted = r?.max_reuse != null && r.max_reuse >= resourceThreshold;
+                                        return (
+                                          <div key={t} style={{display:'grid',gridTemplateColumns:'1fr auto auto',
+                                            gap:'0 0.75rem',padding:'1px 0',
+                                            color: isHighlighted ? '#16a34a' : '#475569',
+                                            fontWeight: isHighlighted ? 600 : 400}}>
+                                            <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{t}</span>
+                                            <span style={{textAlign:'right'}}>{r?.min_reuse ?? '—'}</span>
+                                            <span style={{textAlign:'right'}}>{r?.max_reuse ?? '—'}</span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                    <div style={{fontSize:'0.68rem',color:'#94a3b8',marginTop:'0.3rem'}}>
+                                      Green = max/obj ≥ current threshold ({resourceThreshold})
+                                    </div>
+                                  </div>
+                                </span>
+                              );
+                            })()}
+                          </label>
                           <input type="number" min={1} value={resourceThreshold}
                             onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
@@ -9324,7 +9484,7 @@ function App() {
                           editMode={behaviorEditMode}
                           onUpdate={m => setModelAsIs(m)}
                           startActivities={config.startActivities || []}
-                          onStartActivitiesChange={acts => setConfig(c => ({...c, startActivities: acts}))}
+                          onStartActivitiesChange={acts => setConfig(c => ({...c, startActivities: acts, startActivitiesLocked: true}))}
                           filters={getBehaviorFilters('activities')}
                           onFiltersChange={f => setBehaviorSectionFilters('activities', f)}
                         />
@@ -9344,86 +9504,15 @@ function App() {
                       )}
 
                       {/* ── PROBABILITIES — with normalization sliders ── */}
-                      {behaviorSection === 'probabilities' && (() => {
-                        const allActNames = Object.keys(probMatrixBase || {});
-                        const probFilters = getBehaviorFilters('probabilities');
-                        const filtSrc = probFilters.from_activity || '';
-                        const filtTgt = probFilters.to_activity || '';
-                        return (
-                        <div>
-                          <div className="behavior-section-title">Transition Probabilities
-                            <BehaviorLegend items={[
-                              ['From → To','Source and destination activity for this transition'],
-                              ['Probability','Fraction of times this transition is taken when the source fires (0–100%)'],
-                              ['Slider','Drag to adjust; other transitions in the same row scale proportionally to keep the total at 100%'],
-                              ['Note','Probabilities below 0.1% are hidden. The simulator adds a small epsilon so 0% transitions are never fully blocked.'],
-                            ]}/>
-                            {behaviorEditMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— drag slider or click value; row normalizes automatically</span>}
-                          </div>
-                          <TableFilterBar
-                            dimensions={[
-                              {key:'from_activity', label:'From', options: allActNames},
-                              {key:'to_activity',   label:'To',   options: allActNames},
-                            ]}
-                            filters={probFilters}
-                            onFiltersChange={f => setBehaviorSectionFilters('probabilities', f)}
-                          />
-                          {probMatrixBase && Object.keys(probMatrixBase).length > 0 ? (
-                            <table className="behavior-table">
-                              <thead><tr><th>From</th><th>To</th><th style={{minWidth:'160px'}}>Probability</th></tr></thead>
-                              <tbody>
-                                {Object.entries(probMatrixBase).filter(([src]) => !filtSrc || src === filtSrc).flatMap(([src, targets]) => {
-                                  const visEntries = Object.entries(targets || {}).filter(([tgt, p]) => p > 0.001 && (!filtTgt || tgt === filtTgt));
-                                  const rowTotal = visEntries.reduce((s,[,p])=>s+p, 0);
-                                  return visEntries.map(([tgt, p], i) => {
-                                    const pct = (p * 100).toFixed(1);
-                                    const updateProb = (newPct) => {
-                                      const newVal = Math.min(1, Math.max(0, parseFloat(newPct)||0) / 100);
-                                      const row = {...(probMatrixBase[src]||{})};
-                                      const delta = newVal - (row[tgt]||0);
-                                      row[tgt] = newVal;
-                                      // Normalize others proportionally
-                                      const others = visEntries.map(([k])=>k).filter(k=>k!==tgt);
-                                      const otherSum = others.reduce((s,k)=>s+(row[k]||0),0);
-                                      if (otherSum > 1e-9) {
-                                        others.forEach(k => { row[k] = Math.max(0,(row[k]||0) - delta*(row[k]/otherSum)); });
-                                      }
-                                      setProbMatrixBase(m=>({...m,[src]:row}));
-                                    };
-                                    return (
-                                      <tr key={src+'-'+tgt}>
-                                        {i===0 ? <td rowSpan={visEntries.length} style={{fontWeight:600}}>{src}</td> : null}
-                                        <td style={{fontSize:'0.82rem'}}>{tgt}</td>
-                                        <td>
-                                          <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
-                                            <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600,color:'#1e293b'}}>
-                                              {behaviorEditMode
-                                                ? <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/>
-                                                : pct+'%'}
-                                            </span>
-                                            {behaviorEditMode && (
-                                              <input type="range" min={0} max={100} step={0.5}
-                                                value={parseFloat(pct)}
-                                                onChange={e => updateProb(e.target.value)}
-                                                style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>
-                                            )}
-                                            {!behaviorEditMode && (
-                                              <div style={{flex:1,height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden',maxWidth:'140px'}}>
-                                                <div style={{height:'100%',width:pct+'%',background:'#6366f1',borderRadius:'3px'}}/>
-                                              </div>
-                                            )}
-                                          </div>
-                                        </td>
-                                      </tr>
-                                    );
-                                  });
-                                })}
-                              </tbody>
-                            </table>
-                          ) : <p className="behavior-empty">No probability data.</p>}
-                        </div>
-                        );
-                      })()}
+                      {behaviorSection === 'probabilities' && (
+                        <BehaviorProbabilitiesPanel
+                          probMatrix={probMatrixBase}
+                          editMode={behaviorEditMode}
+                          onUpdate={(src, row) => setProbMatrixBase(m => ({...m, [src]: row}))}
+                          filters={getBehaviorFilters('probabilities')}
+                          onFiltersChange={f => setBehaviorSectionFilters('probabilities', f)}
+                        />
+                      )}
 
                       {/* ── CONSTRAINTS ── */}
                       {behaviorSection === 'constraints' && (
@@ -9433,6 +9522,8 @@ function App() {
                           otNames={(modelAsIs.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
                           editMode={behaviorEditMode}
                           onUpdate={cons => setModelAsIs(m => ({...m, constraints: cons}))}
+                          activities={modelAsIs.activities || []}
+                          onUpdateActivities={acts => setModelAsIs(m => ({...m, activities: acts}))}
                           filters={getBehaviorFilters('constraints')}
                           onFiltersChange={f => setBehaviorSectionFilters('constraints', f)}
                         />
@@ -9777,6 +9868,8 @@ function App() {
                           otNames={(modelToBe.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
                           editMode={true}
                           onUpdate={cons => { const m={...modelToBe,constraints:cons}; setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
+                          activities={modelToBe.activities || []}
+                          onUpdateActivities={acts => { const m={...modelToBe,activities:acts}; setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
                           filters={scenarioBehaviorFilters['constraints']||{}}
                           onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,constraints:f}))}
                         />
