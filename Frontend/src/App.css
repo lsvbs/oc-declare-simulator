@@ -3067,7 +3067,7 @@
   background: #f1f5f9;
   border-top: 1px solid #e2e8f0;
   border-bottom: 2px solid #cbd5e1;
-  padding: 0 1.5rem;
+  padding: 0;
   gap: 0;
   position: sticky;
   top: var(--topbar-h, 48px);
@@ -4043,9 +4043,10 @@ details[open] .formula-summary::before { content: '▼ '; }
 
 /* ── Results Comparison Header ───────────────────────────────────────────── */
 .results-comparison-header {
-  display: flex;
-  gap: 1rem;
-  flex-wrap: wrap;
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: auto auto auto;
+  column-gap: 1rem;
   background: white;
   border: 1px solid #e2e8f0;
   border-radius: 10px;
@@ -4053,10 +4054,9 @@ details[open] .formula-summary::before { content: '▼ '; }
   margin-bottom: 1rem;
 }
 .compare-metric-card {
-  flex: 1;
-  min-width: 120px;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 3;
   gap: 0.15rem;
   padding-right: 1rem;
   border-right: 1px solid #f1f5f9;
