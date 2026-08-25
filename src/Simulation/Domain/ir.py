@@ -45,6 +45,12 @@ class ObjectBinding:
 class Activity:
     name: str
     bindings: list[ObjectBinding] = field(default_factory=list)
+    # Phase 3: event-level attribute captures evaluated at activity completion.
+    # Each entry is one of:
+    #   {"name": "channel",      "source": "static", "value": "web"}
+    #   {"name": "order_status", "source": "object",
+    #    "object_type": "order", "attribute": "status"}
+    event_attributes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,11 @@ class Constraint:
     scope: Scope
     nmin: int = 0
     nmax: int | None = None
+    # Phase 2: OC-Declare object-filter guard.
+    # {"attribute": "priority", "op": "==", "value": "high"}
+    # Scope objects NOT satisfying the guard are exempt from this constraint
+    # (they are simply skipped — not blocked). Same op set as ObjectBinding.guard.
+    guard: dict | None = None
 
 
 @dataclass(frozen=True)

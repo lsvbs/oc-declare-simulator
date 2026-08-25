@@ -276,7 +276,7 @@ const SCOPE_KINDS      = ['each', 'any', 'all'];
 // nmin defaults to 1 so a manually added precedence constraint actually enforces
 // "source before target" during simulation. nmin is only meaningful for
 // precedence; the other constraint checks ignore it, so the default is harmless.
-const EMPTY_CONSTRAINT = { constraint_type: '', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null };
+const EMPTY_CONSTRAINT = { constraint_type: '', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null, guard: null };
 const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_links: null, bidirectional: true };
 
 function ObjectLifecycleSummary({ otNames, activities, resourceTypes }) {
@@ -354,6 +354,7 @@ export default function ModelEditor({
   const [expandedActs,   setExpandedActs]   = useState(new Set());
   const [expandedGuards, setExpandedGuards] = useState(new Set()); // `${ai}-${bi}`
   const [expandedEffects,setExpandedEffects]= useState(new Set()); // `${ai}-${bi}`
+  const [expandedEventCaps,setExpandedEventCaps]= useState(new Set()); // ai
   const [selectedParamFile, setSelectedParamFile] = useState('');
   const [expandedProbs,  setExpandedProbs]  = useState(new Set());
   const [conFilter,      setConFilter]      = useState('');
@@ -388,6 +389,11 @@ export default function ModelEditor({
       ...a,
       bindings: (a.bindings || []).map((b, bidx) => bidx !== bi ? b : { ...b, [field]: value }),
     });
+    onModelChange({ ...model, activities: newActs });
+  };
+
+  const updateActivityEventCaps = (actName, caps) => {
+    const newActs = activities.map(a => a.name !== actName ? a : { ...a, event_attributes: caps });
     onModelChange({ ...model, activities: newActs });
   };
 
@@ -753,7 +759,7 @@ export default function ModelEditor({
           <div className="activities-list">
             {/* ── Toolbar: global constraint toggle + parameter buttons ── */}
             <div className="activities-toolbar">
-              <label className="act-con-summary-toggle" title="Show/hide constraint summary for each activity">
+              <label className="act-con-summary-toggle" title="Show/hide constraint summary for all activities">
                 <input
                   type="checkbox"
                   checked={showConSummary.size === activities.length && activities.length > 0}
@@ -763,7 +769,7 @@ export default function ModelEditor({
                     else setShowConSummary(new Set());
                   }}
                 />
-                Show constraints
+                Show all constraint summaries
               </label>
               <div className="activities-toolbar-right">
                 {!hideParameterButtons && (
@@ -834,6 +840,29 @@ export default function ModelEditor({
                   <span className="activity-binding-count">
                     {(act.bindings || []).length} binding{(act.bindings || []).length !== 1 ? 's' : ''}
                   </span>
+                  <button
+                    className={`binding-guard-btn${(act.event_attributes?.length) ? ' active' : ''}`}
+                    title="Event captures: attribute values recorded into the event log when this activity fires"
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (!expandedActs.has(act.name)) toggleAct(act.name);
+                      setExpandedEventCaps(prev => {
+                        const n = new Set(prev); n.has(act.name) ? n.delete(act.name) : n.add(act.name); return n;
+                      });
+                    }}>
+                    {(act.event_attributes?.length) ? '[event caps ✓]' : '[event caps]'}
+                  </button>
+                  <button
+                    className={`binding-guard-btn${showConSummary.has(act.name) ? ' active' : ''}`}
+                    title="Show constraint summary for this activity"
+                    onClick={e => {
+                      e.stopPropagation();
+                      setShowConSummary(prev => {
+                        const n = new Set(prev); n.has(act.name) ? n.delete(act.name) : n.add(act.name); return n;
+                      });
+                    }}>
+                    {showConSummary.has(act.name) ? '[constraints ✓]' : '[constraints]'}
+                  </button>
                 </div>
                 {expandedActs.has(act.name) && (
                   <div className="activity-bindings">
@@ -957,7 +986,12 @@ export default function ModelEditor({
                                   className="guard-op-select"
                                   value={upd.op || 'set'}
                                   onChange={e => {
-                                    const updated = (b.attribute_updates || []).map((u, i) => i === ui ? { ...u, op: e.target.value } : u);
+                                    const newOp = e.target.value;
+                                    const updated = (b.attribute_updates || []).map((u, i) => {
+                                      if (i !== ui) return u;
+                                      const { value: _v, by: _b, ...rest } = u;
+                                      return newOp === 'set' ? { ...rest, op: newOp, value: '' } : { ...rest, op: newOp, by: '' };
+                                    });
                                     updateBinding(ai, bi, 'attribute_updates', updated);
                                   }}>
                                   <option value="set">set</option>
@@ -1009,6 +1043,84 @@ export default function ModelEditor({
                         + Add binding
                       </button>
                     </div>
+
+                    {/* ── Event captures section ── */}
+                    {expandedEventCaps.has(act.name) && (
+                      <div className="binding-effects-section" style={{marginTop:'0.5rem'}}>
+                        <span className="binding-guard-label" style={{marginBottom:'0.25rem',display:'block'}}>Event captures:</span>
+                        {(act.event_attributes || []).map((cap, ci) => (
+                          <div key={ci} className="binding-effects-row" style={{alignItems:'center',flexWrap:'wrap',gap:'0.35rem'}}>
+                            <input
+                              className="guard-attr-input"
+                              placeholder="attr name"
+                              value={cap.name || ''}
+                              onChange={e => {
+                                const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, name: e.target.value } : c);
+                                updateActivityEventCaps(act.name, caps);
+                              }}
+                            />
+                            <select
+                              className="guard-op-select"
+                              value={cap.source || 'static'}
+                              onChange={e => {
+                                const src = e.target.value;
+                                const base = { name: cap.name || '', source: src };
+                                const updated = src === 'static'
+                                  ? { ...base, value: '' }
+                                  : { ...base, object_type: '', attribute: '' };
+                                const caps = (act.event_attributes || []).map((c, i) => i === ci ? updated : c);
+                                updateActivityEventCaps(act.name, caps);
+                              }}>
+                              <option value="static">static</option>
+                              <option value="object">object</option>
+                            </select>
+                            {(cap.source || 'static') === 'static' ? (
+                              <input
+                                className="guard-value-input"
+                                placeholder="value"
+                                value={cap.value ?? ''}
+                                onChange={e => {
+                                  const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, value: e.target.value } : c);
+                                  updateActivityEventCaps(act.name, caps);
+                                }}
+                              />
+                            ) : (
+                              <>
+                                <select
+                                  className="guard-op-select"
+                                  value={cap.object_type || ''}
+                                  onChange={e => {
+                                    const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, object_type: e.target.value } : c);
+                                    updateActivityEventCaps(act.name, caps);
+                                  }}>
+                                  <option value="">type…</option>
+                                  {otNames.map(t => <option key={t} value={t}>{t}</option>)}
+                                </select>
+                                <input
+                                  className="guard-attr-input"
+                                  placeholder="attribute"
+                                  value={cap.attribute || ''}
+                                  onChange={e => {
+                                    const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, attribute: e.target.value } : c);
+                                    updateActivityEventCaps(act.name, caps);
+                                  }}
+                                />
+                              </>
+                            )}
+                            <button className="row-delete-btn" title="Remove capture"
+                              onClick={() => {
+                                const caps = (act.event_attributes || []).filter((_, i) => i !== ci);
+                                updateActivityEventCaps(act.name, caps);
+                              }}>✕</button>
+                          </div>
+                        ))}
+                        <button className="add-binding-btn" style={{marginTop:'0.25rem'}}
+                          onClick={() => {
+                            const caps = [...(act.event_attributes || []), { name: '', source: 'static', value: '' }];
+                            updateActivityEventCaps(act.name, caps);
+                          }}>+ Add capture</button>
+                      </div>
+                    )}
                   </div>
                 )}
                 {/* ── Constraint summary popup ── */}
@@ -1268,8 +1380,12 @@ export default function ModelEditor({
               {sortedConstraints.map((c, idx) => {
                 const realIdx = constraints.indexOf(c);
                 const isEditing = editingConIdx === realIdx;
+                const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                  : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                  : undefined;
                 return (
-                  <div key={idx} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}>
+                  <div key={idx} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}
+                    style={rowBg ? {background:rowBg} : undefined}>
                     <span
                       className={`constraint-type-badge ${c.constraint_type}`}
                       title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g, ' ')}
@@ -1328,6 +1444,23 @@ export default function ModelEditor({
                             onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
                           />
                         </label>
+                        <label className="constraint-edit-label">
+                          <HelpTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint. Same attribute/op/value format as binding guards.">guard:</HelpTip>
+                          {c.guard ? (
+                            <span style={{display:'flex',gap:'0.25rem',alignItems:'center'}}>
+                              <input className="constraint-edit-num" style={{width:'5rem'}} placeholder="attribute"
+                                value={c.guard.attribute||''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, attribute: e.target.value} })} />
+                              <select className="constraint-edit-select" style={{width:'3.5rem'}} value={c.guard.op||'=='} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, op: e.target.value} })}>
+                                {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
+                              </select>
+                              <input className="constraint-edit-num" style={{width:'4rem'}} placeholder="value"
+                                value={c.guard.value??''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, value: e.target.value} })} />
+                              <button className="row-delete-btn" title="Remove guard" onClick={() => updateConstraint(realIdx, { guard: null })}>✕</button>
+                            </span>
+                          ) : (
+                            <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
+                          )}
+                        </label>
                         <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
                       </div>
                     )}
@@ -1337,6 +1470,7 @@ export default function ModelEditor({
               })}
             </div>
 
+            <div className="add-form-header">+ Add Constraint</div>
             <div className="add-form">
               <select value={newCon.constraint_type}
                 onChange={e => setNewCon(p => ({
@@ -1420,6 +1554,21 @@ export default function ModelEditor({
                     onChange={e => setNewCon(p => ({ ...p, nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) }))}
                   />
                 </span>
+              )}
+              {newCon.guard ? (
+                <span style={{display:'flex',gap:'0.25rem',alignItems:'center',flexWrap:'wrap'}}>
+                  <span style={{fontSize:'0.72rem',color:'#64748b'}}>guard: if</span>
+                  <input className="card-input" style={{width:'5rem'}} placeholder="attribute"
+                    value={newCon.guard.attribute||''} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, attribute: e.target.value} }))} />
+                  <select className="constraint-edit-select" style={{width:'3.5rem'}} value={newCon.guard.op||'=='} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, op: e.target.value} }))}>
+                    {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                  <input className="card-input" style={{width:'4rem'}} placeholder="value"
+                    value={newCon.guard.value??''} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, value: e.target.value} }))} />
+                  <button className="row-delete-btn" title="Remove guard" onClick={() => setNewCon(p => ({ ...p, guard: null }))}>✕</button>
+                </span>
+              ) : (
+                <button className="con-filter-btn" onClick={() => setNewCon(p => ({ ...p, guard: {attribute:'', op:'==', value:''} }))}>+ guard</button>
               )}
               <button className="add-form-btn" onClick={addConstraint}>+ Add</button>
             </div>
@@ -1618,6 +1767,19 @@ export default function ModelEditor({
               const attrDefs = (typeof ot === 'object' ? ot.attributes : null) || [];
               const schema = (model.attribute_schema || {})[otName] || {};
 
+              // Also show attrs discovered only in attribute_schema (no explicit type def)
+              const defNames = new Set(attrDefs.map(a => a.name));
+              const mergedAttrDefs = [
+                ...attrDefs,
+                ...Object.keys(schema)
+                  .filter(n => !defNames.has(n))
+                  .map(n => {
+                    const v = schema[n];
+                    const type = typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? 'float' : 'string';
+                    return { name: n, type, _discovered: true };
+                  }),
+              ];
+
               const updateDefault = (attrName, value) => {
                 const newSchema = {
                   ...(model.attribute_schema || {}),
@@ -1658,13 +1820,13 @@ export default function ModelEditor({
               return (
                 <div key={otName} className="timing-row">
                   <div className="timing-act-name">{otName}</div>
-                  {attrDefs.length === 0 && (
+                  {mergedAttrDefs.length === 0 && (
                     <span className="timing-no-data">no attributes defined</span>
                   )}
-                  {attrDefs.map(ad => (
+                  {mergedAttrDefs.map(ad => (
                     <div key={ad.name} className="attr-row">
                       <span className="attr-name">{ad.name}</span>
-                      <span className="attr-type">({ad.type})</span>
+                      <span className="attr-type" title={ad._discovered ? 'type inferred from discovered values' : undefined}>({ad.type}{ad._discovered ? ', discovered' : ''})</span>
                       <input
                         className="attr-default-input"
                         title={`Default value for ${ad.name}`}

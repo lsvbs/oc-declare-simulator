@@ -233,7 +233,7 @@
 /* ── Body ─────────────────────────────────────────────────────────────────── */
 .editor-body {
   padding: 1rem 1.5rem 1.25rem;
-  max-height: 440px;
+  max-height: min(60vh, 600px);
   overflow-y: auto;
 }
 
@@ -381,7 +381,7 @@
 
 .binding-header-row {
   display: grid;
-  grid-template-columns: 150px 55px 100px 80px 85px 28px;
+  grid-template-columns: 150px 55px 100px 80px 85px 68px 72px 28px;
   gap: 0.5rem;
   font-size: 0.72rem;
   font-weight: 600;
@@ -395,7 +395,7 @@
 
 .binding-row {
   display: grid;
-  grid-template-columns: 150px 55px 100px 80px 85px 28px;
+  grid-template-columns: 150px 55px 100px 80px 85px 68px 72px 28px;
   align-items: center;
   gap: 0.5rem;
   margin-bottom: 0.35rem;
@@ -674,7 +674,7 @@
   padding: 0.45rem 0.75rem;
   background: #f8fafc;
   border-radius: 6px;
-  border: 1px solid #f1f5f9;
+  border: 1px solid #d1d5db;
   font-size: 0.82rem;
   flex-wrap: wrap;
 }
@@ -731,9 +731,33 @@
   white-space: nowrap;
 }
 
-.constraint-type-badge.precedence     { background: #dbeafe; color: #1d4ed8; }
-.constraint-type-badge.response       { background: #dcfce7; color: #15803d; }
-.constraint-type-badge.not_coexistence{ background: #fef2f2; color: #dc2626; }
+/* ── Ordering group (blue) ── */
+.constraint-type-badge.precedence          { background: #dbeafe; color: #1d4ed8; }
+.constraint-type-badge.chain_precedence    { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; }
+.constraint-type-badge.alternate_precedence{ background: #e0e7ff; color: #3730a3; }
+
+/* ── Response / obligation group (green) ── */
+.constraint-type-badge.response            { background: #dcfce7; color: #15803d; }
+.constraint-type-badge.chain_response      { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; }
+.constraint-type-badge.alternate_response  { background: #d1fae5; color: #065f46; }
+.constraint-type-badge.responded_existence { background: #cffafe; color: #0e7490; }
+
+/* ── Succession / combined group (teal / sky) ── */
+.constraint-type-badge.succession          { background: #e0f2fe; color: #0369a1; }
+.constraint-type-badge.chain_succession    { background: #f0f9ff; color: #0369a1; border: 1px solid #bae6fd; }
+.constraint-type-badge.alternate_succession{ background: #ccfbf1; color: #0f766e; }
+
+/* ── Prohibition / exclusion group (red / pink) ── */
+.constraint-type-badge.not_coexistence     { background: #fef2f2; color: #dc2626; }
+.constraint-type-badge.not_precedence      { background: #fff1f2; color: #e11d48; }
+.constraint-type-badge.not_succession      { background: #ffe4e6; color: #be123c; }
+.constraint-type-badge.not_chain_succession{ background: #fce7f3; color: #9d174d; }
+.constraint-type-badge.exclusive_choice    { background: #fdf4ff; color: #a21caf; }
+
+/* ── Existence / count group (amber / orange) ── */
+.constraint-type-badge.absence             { background: #fef3c7; color: #92400e; }
+.constraint-type-badge.exactly             { background: #ffedd5; color: #c2410c; }
+.constraint-type-badge.init                { background: #fef9c3; color: #713f12; }
 
 .constraint-src, .constraint-tgt { font-weight: 500; color: #1e293b; }
 .constraint-arrow { color: #94a3b8; }
@@ -776,6 +800,19 @@
 .o2o-cardinality { color: #64748b; font-size: 0.78rem; }
 
 /* ── Add Form (shared by Constraints + O2O) ───────────────────────────────── */
+.add-form-header {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #4f46e5;
+  letter-spacing: 0.03em;
+  padding: 0.5rem 0.1rem 0.3rem;
+  margin-top: 0.75rem;
+  border-top: 2px solid #e0e7ff;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 .add-form {
   display: flex;
   flex-wrap: wrap;

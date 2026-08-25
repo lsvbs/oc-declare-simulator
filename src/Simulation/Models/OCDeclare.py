@@ -166,8 +166,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                     attribute_updates=tuple(b.get("attribute_updates") or ()),
                 )
             )
-        activities.append(Activity(name=name, bindings=bindings))
-
+        activities.append(Activity(
+            name=name,
+            bindings=bindings,
+            event_attributes=tuple(a.get("event_attributes") or ()),
+        ))
     # Constraints
     constraints = []
     for c in data.get("constraints", []) or []:
@@ -207,6 +210,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                 scope=Scope(kind=str(scope_kind), object_type=str(scope_object_type) if scope_object_type is not None else ""),
                 nmin=nmin,
                 nmax=nmax,
+                guard=c.get("guard") or None,
             )
         )
 
@@ -570,6 +574,8 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
     for n in sorted(activity_names):
         per_act = activity_bindings.get(n, {})
         bindings = list(per_act.values())
+        # Arc-list format cannot express event_attributes or constraint guards;
+        # those fields default to empty/None on the constructed dataclasses.
         activities.append(Activity(name=n, bindings=bindings))
     object_types_list = [ObjectType(name=n) for n in sorted(object_types)]
 

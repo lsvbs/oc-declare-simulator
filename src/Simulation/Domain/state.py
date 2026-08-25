@@ -13,6 +13,9 @@ class RuntimeObject:
     # DES occupancy: set while this resource is held by an in-progress activity
     busy_until: Optional[datetime] = None
     busy_by: Optional[str] = None   # activity_name holding this resource
+    # Phase 4: full attribute change history for OCEL 2.0 timestamped export
+    # Each entry: (timestamp: Optional[datetime], attr_name: str, new_value: Any)
+    attribute_history: list = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +56,8 @@ class ExecutedEvent:
     activity_name: str
     timestamp: Optional[datetime]
     object_ids: list[str] = field(default_factory=list)
+    # Phase 3: event-level attributes captured at activity completion
+    attributes: dict[str, Any] = field(default_factory=dict)
 
     @property
     def participating_object_ids(self) -> list[str]:
@@ -173,6 +178,10 @@ class SimulationState:
     _inactive_scope_types: set = field(default_factory=set)
     # Performance: typed link index — _linked_by_type[oid][object_type] = set of linked oids of that type
     _linked_by_type: dict = field(default_factory=dict)
+
+    # Phase 1b: guard coverage counters — incremented by candidategeneration
+    guard_checks_total: int = 0
+    guard_checks_passed: int = 0
 
     # Phase 1 — Obligation stratification
     # Ready pool: (target_act, scope_oid) → 1 — prerequisites satisfied, inject immediately
@@ -320,12 +329,14 @@ class SimulationState:
         activity_name: str,
         participating_object_ids: list[str],
         timestamp: Optional[datetime] = None,
+        attributes: Optional[dict] = None,
     ) -> ExecutedEvent:
         event = ExecutedEvent(
             event_id=self.new_event_id(),
             activity_name=activity_name,
             timestamp=timestamp,
             object_ids=participating_object_ids,
+            attributes=dict(attributes) if attributes else {},
         )
         self.executed_events.append(event)
         self.step_count += 1

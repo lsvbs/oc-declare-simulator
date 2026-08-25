@@ -1300,7 +1300,9 @@ def discover_ocdeclare_model(
     start_activities_ranked = discover_start_activities(ocel_log)
 
     # Collect attribute schema and default values from the log.
-    # attribute_schema: { object_type: { attr_name: most_common_value } }
+    # attribute_schema: { object_type: { attr_name: initial_value } }
+    # Phase 4d: when attribute entries carry timestamps, use the earliest-observed
+    # value per attribute (object's initial state) instead of most-common.
     # object_type_attr_defs: { object_type: [ {name, type} ] }
     attribute_schema: Dict[str, Any] = {}
     object_type_attr_defs: Dict[str, list] = {}
@@ -1320,6 +1322,7 @@ def discover_ocdeclare_model(
             for a in attr_defs if isinstance(a, dict) and a.get("name")
         ]
 
+    # Buckets: (object_type, attr_name) -> list of (timestamp_str_or_None, value)
     attr_value_buckets: Dict[str, Dict[str, list]] = {}
     obj_iter = raw_objects.values() if isinstance(raw_objects, dict) else (raw_objects if isinstance(raw_objects, list) else [])
     for obj_entry in obj_iter:
@@ -1333,21 +1336,51 @@ def discover_ocdeclare_model(
                     continue
                 name = a.get("name")
                 value = a.get("value")
+                ts = a.get("time")  # may be None for unversioned entries
                 if name is not None and value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((ts, value))
         elif isinstance(attrs, dict):
             for name, value in attrs.items():
                 if value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((None, value))
 
     for ot, attr_map in attr_value_buckets.items():
         defaults = {}
-        for attr_name, values in attr_map.items():
-            counter = Counter(str(v) for v in values)
-            most_common_str, _ = counter.most_common(1)[0]
-            original = next((v for v in values if str(v) == most_common_str), most_common_str)
-            defaults[attr_name] = original
+        for attr_name, ts_value_pairs in attr_map.items():
+            # Use earliest timestamped value when available; fall back to most-common
+            timestamped = [(ts, v) for ts, v in ts_value_pairs if ts is not None]
+            if timestamped:
+                timestamped.sort(key=lambda x: x[0])
+                defaults[attr_name] = timestamped[0][1]
+            else:
+                values = [v for _, v in ts_value_pairs]
+                counter = Counter(str(v) for v in values)
+                most_common_str, _ = counter.most_common(1)[0]
+                defaults[attr_name] = next((v for v in values if str(v) == most_common_str), most_common_str)
         attribute_schema[ot] = defaults
+
+    # Phase 3e: discover event-level attribute names per activity type
+    # Collect attribute names observed on events in the log — user still decides
+    # capture source; this pre-populates the known attribute names.
+    event_attr_names: Dict[str, list] = {}  # activity_name -> [attr_name, ...]
+    raw_events = ocel_log.get("events", []) or []
+    ev_iter = raw_events.values() if isinstance(raw_events, dict) else raw_events
+    for ev_entry in ev_iter:
+        if not isinstance(ev_entry, dict):
+            continue
+        act_name = ev_entry.get("type") or ev_entry.get("activity") or ""
+        ev_attrs = ev_entry.get("attributes", []) or []
+        seen = event_attr_names.setdefault(act_name, [])
+        if isinstance(ev_attrs, list):
+            for ea in ev_attrs:
+                if isinstance(ea, dict):
+                    n = ea.get("name")
+                    if n and n not in seen:
+                        seen.append(n)
+        elif isinstance(ev_attrs, dict):
+            for n in ev_attrs:
+                if n not in seen:
+                    seen.append(n)
 
     # Build object_types list: strings for backward compat, but enrich with attr defs
     object_types_with_attrs = []
@@ -1371,10 +1404,15 @@ def discover_ocdeclare_model(
                     'deactivates': binding_info['deactivates']
                 })
 
-        activity_structures.append({
+        act_entry: Dict[str, Any] = {
             'name': activity,
-            'bindings': bindings_list
-        })
+            'bindings': bindings_list,
+        }
+        # Phase 3e: attach discovered event attribute names so the UI can
+        # pre-populate the event_attributes capture list
+        if activity in event_attr_names and event_attr_names[activity]:
+            act_entry['discovered_event_attr_names'] = event_attr_names[activity]
+        activity_structures.append(act_entry)
 
     # Build discovered model
     discovered_model = {
@@ -1384,6 +1422,7 @@ def discover_ocdeclare_model(
         'o2o_rules': o2o_rules,
         'resource_types': resource_types,
         'attribute_schema': attribute_schema,
+        'event_attribute_names': event_attr_names,  # Phase 3e
     }
     
     # Save to file if requested

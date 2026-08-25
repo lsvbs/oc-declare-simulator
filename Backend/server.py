@@ -1258,6 +1258,8 @@ def run_simulation():
                 'obligations_fulfilled': getattr(final_state, 'total_obligations_fulfilled', 0),
                 'obligations_cancelled': getattr(final_state, 'total_obligations_cancelled', 0),
                 'obligations_violated': getattr(final_state, 'total_obligations_violated', 0),
+                'guard_checks_total': getattr(final_state, 'guard_checks_total', 0),
+                'guard_checks_passed': getattr(final_state, 'guard_checks_passed', 0),
                 # Per-constraint obligation stats (E3/S8): fulfillment rate per response constraint
                 'constraint_obligation_stats': {
                     f"{k[0]}|{k[1]}→{k[2]}|{k[3]}": v
@@ -1817,6 +1819,93 @@ def constraint_health():
         except Exception:
             pass  # annotation is best-effort — never break the health check
 
+        return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/pinpoint-blocking', methods=['POST'])
+def pinpoint_blocking():
+    """Iteratively identify which constraints are blocking activities by removing
+    the top blocker each round and re-running the simulation."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from constraint_health_report import pinpoint_blocking_constraints
+
+        data = request.json or {}
+        model_override   = data.get('modelOverride')
+        ocdeclare_file   = data.get('ocdeclareFile')
+        start_activities = data.get('startActivities') or (
+            [data['startActivity']] if data.get('startActivity') else []
+        )
+        steps     = int(data.get('steps', 200))
+        max_rounds = int(data.get('maxRounds', 12))
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not model_override and not ocdeclare_file:
+            return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
+
+        if model_override:
+            model_dict = model_override
+        else:
+            model_path = OCDECLARE_DIR / ocdeclare_file
+            if not model_path.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(model_path) as f:
+                model_dict = json.load(f)
+
+        result = pinpoint_blocking_constraints(
+            model_dict=model_dict,
+            start_activities=start_activities,
+            steps=steps,
+            max_rounds=max_rounds,
+        )
+        return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/dry-run-stats', methods=['POST'])
+def dry_run_stats_endpoint():
+    """Run a 500-step dry simulation and return pool/blocking statistics."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from constraint_health_report import dry_run_stats
+
+        data = request.json or {}
+        model_override   = data.get('modelOverride')
+        ocdeclare_file   = data.get('ocdeclareFile')
+        start_activities = data.get('startActivities') or (
+            [data['startActivity']] if data.get('startActivity') else []
+        )
+        steps = int(data.get('steps', 500))
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not model_override and not ocdeclare_file:
+            return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
+
+        if model_override:
+            model_dict = model_override
+        else:
+            model_path = OCDECLARE_DIR / ocdeclare_file
+            if not model_path.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(model_path) as f:
+                model_dict = json.load(f)
+
+        result = dry_run_stats(
+            model_dict=model_dict,
+            start_activities=start_activities,
+            steps=steps,
+        )
         return jsonify({'success': True, **result})
 
     except Exception as e:

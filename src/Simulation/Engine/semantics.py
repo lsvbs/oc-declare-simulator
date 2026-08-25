@@ -5,6 +5,7 @@ from typing import Any, Optional
 from src.Simulation.Domain.ir import StaticModel
 from src.Simulation.Domain.state import SimulationState
 from src.Simulation.Domain.ir import O2ORule
+from src.Simulation.Engine.attrutils import apply_guard_filter
 _EMPTY_SET: frozenset = frozenset()  # #14: reusable empty set to avoid alloc in O2O checks
 
 
@@ -578,6 +579,23 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
             scope_type = getattr(constraint.scope, 'object_type', None)
             if scope_type and scope_type in inactive_types and scope_type not in creates_set:
                 continue
+
+        # Phase 2: apply constraint-level object-filter guard.
+        # Scope objects not satisfying the guard are exempt — filter them out
+        # before passing to the checker. If no objects remain, skip (trivially passes).
+        c_guard = getattr(constraint, 'guard', None)
+        if c_guard:
+            scope_type = getattr(constraint.scope, 'object_type', None)
+            if scope_type:
+                original_ids = scope_ids_cache.get(scope_type, [])
+                guarded_ids = apply_guard_filter(original_ids, c_guard, state)
+                if not guarded_ids:
+                    continue  # no objects subject to this constraint — passes trivially
+                local_cache = {**scope_ids_cache, scope_type: guarded_ids}
+                if not check_constraint(constraint, candidate, state, local_cache):
+                    return False
+                continue
+
         if not check_constraint(constraint, candidate, state, scope_ids_cache):
             return False
     return True

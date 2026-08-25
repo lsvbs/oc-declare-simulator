@@ -167,7 +167,11 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
     nodes.forEach(n => byRank[rankOf[n]].push(n));
 
     const maxColSize = Math.max(...byRank.map(l => l.length), 1);
-    const pitch = R * 2 + Math.max(14, Math.round(120 / Math.max(maxColSize, 1)));
+    // Vertical pitch between nodes in the same column — includes space for creates/deactivates labels
+    const maxCreatesAny = Math.max(...nodes.map(n => actCreates[n]?.length || 0), 0);
+    const maxDeactsAny  = Math.max(...nodes.map(n => actDeactivates[n]?.length || 0), 0);
+    const labelExtra = (maxCreatesAny > 0 ? maxCreatesAny * 11 + 6 : 0) + (maxDeactsAny > 0 ? maxDeactsAny * 11 + 9 : 0);
+    const pitch = R * 2 + labelExtra + Math.max(14, Math.round(120 / Math.max(maxColSize, 1)));
     const midY = PAD + R + Math.floor((maxColSize - 1) / 2) * pitch;
 
     // Constraint type colour per edge + count of constraints backing each edge
@@ -219,7 +223,7 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       ordered.forEach((n, i) => { pos[n] = { x, y: midY + (i - spineIdx) * pitch, rank: r }; });
     });
 
-    // Shift up if any y < 0 — account for creates labels above nodes (up to ~20px extra)
+    // Shift up if any y < 0 — account for creates labels above nodes
     const maxCreatesAbove = Math.max(...Object.keys(pos).map(n => (actCreates[n]?.length || 0) * 11 + (actCreates[n]?.length ? 6 : 0)), 0);
     const minY = Math.min(...Object.values(pos).map(p => p.y));
     const dy = minY < R + PAD + maxCreatesAbove ? R + PAD + maxCreatesAbove - minY : 0;
@@ -293,15 +297,19 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
     const s = effPos[src], t = effPos[tgt]; if (!s || !t) return { d: '', lx: 0, ly: 0 };
     const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx+dy*dy) || 1;
     const ux = dx/dist, uy = dy/dist, px = -uy, py = ux;
-    const spread = (idx - (total-1)/2) * 7;
+    const spread = (idx - (total-1)/2) * 14;
     const ox = px*spread, oy = py*spread;
     const sx = s.x + ux*R + ox, sy = s.y + uy*R + oy;
     const ex = t.x - ux*R + ox, ey = t.y - uy*R + oy;
-    if (t.x < s.x || (t.x === s.x && (t.rank??0) <= (s.rank??0))) {
+    let h = 0; for (let i = 0; i < (src+tgt).length; i++) h = (h * 31 + (src+tgt).charCodeAt(i)) & 0xffff;
+    const pairBow = (h % 13) - 6;
+    if (t.x < s.x || (t.x === s.x && (t.rank ?? 0) <= (s.rank ?? 0))) {
       const bow = 55 + Math.abs(s.y-t.y)*0.35 + Math.abs(s.x-t.x)*0.25;
-      return { d: `M ${sx} ${sy} C ${sx} ${sy-bow} ${ex} ${ey-bow} ${ex} ${ey}`, lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
+      const dir = idx % 2 === 0 ? -1 : 1;
+      return { d: `M ${sx} ${sy} C ${sx} ${sy+dir*bow} ${ex} ${ey+dir*bow} ${ex} ${ey}`,
+               lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
     }
-    const bendMag = Math.abs(dy)*0.18 + spread*0.4;
+    const bendMag = Math.abs(dy)*0.18 + spread*0.4 + pairBow;
     const midX = (sx+ex)/2 + px*bendMag, midY = (sy+ey)/2 + py*bendMag;
     return { d: `M ${sx} ${sy} Q ${midX} ${midY} ${ex} ${ey}`, lx: (sx+ex)/2, ly: (sy+ey)/2 - 6 };
   }
@@ -397,6 +405,8 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
               const isStart = startSet.has(name), isEnd = endSet.has(name);
               return (
                 <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
+                  {/* Opaque background mask — gaps any edge path that passes through this node */}
+                  <circle cx={p.x} cy={p.y} r={isStart || isEnd ? R+7 : R+4} fill="#fafbff" />
                   {(isStart || isEnd) && (
                     <circle cx={p.x} cy={p.y} r={R+5} fill="none"
                       stroke={isStart ? '#16a34a' : '#dc2626'} strokeWidth={1.5} />
@@ -774,16 +784,19 @@ function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEnd
     const s = pos[src], t = pos[tgt]; if (!s || !t) return { d: '', lx: 0, ly: 0 };
     const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx+dy*dy) || 1;
     const ux = dx/dist, uy = dy/dist, px = -uy, py = ux;
-    const spread = (idx - (total-1)/2) * 7;
+    const spread = (idx - (total-1)/2) * 14;
     const ox = px*spread, oy = py*spread;
     const sx = s.x + ux*TFC_R + ox, sy = s.y + uy*TFC_R + oy;
     const ex = t.x - ux*TFC_R + ox, ey = t.y - uy*TFC_R + oy;
+    let h = 0; for (let i = 0; i < (src+tgt).length; i++) h = (h * 31 + (src+tgt).charCodeAt(i)) & 0xffff;
+    const pairBow = (h % 13) - 6;
     if (t.x < s.x || (t.x === s.x && (t.rank??0) <= (s.rank??0))) {
       const bow = 55 + Math.abs(s.y-t.y)*0.35 + Math.abs(s.x-t.x)*0.25;
-      return { d: `M ${sx} ${sy} C ${sx} ${sy-bow} ${ex} ${ey-bow} ${ex} ${ey}`,
+      const dir = idx % 2 === 0 ? -1 : 1;
+      return { d: `M ${sx} ${sy} C ${sx} ${sy+dir*bow} ${ex} ${ey+dir*bow} ${ex} ${ey}`,
                lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
     }
-    const bendMag = Math.abs(dy)*0.18 + spread*0.4;
+    const bendMag = Math.abs(dy)*0.18 + spread*0.4 + pairBow;
     const midX = (sx+ex)/2 + px*bendMag, midY = (sy+ey)/2 + py*bendMag;
     const t1 = 0.4;
     return { d: `M ${sx} ${sy} Q ${midX} ${midY} ${ex} ${ey}`,
@@ -860,6 +873,8 @@ function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEnd
               const ep = traceEndProb?.[name] || 0;
               return (
                 <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
+                  {/* Opaque background mask — gaps any edge path passing through this node */}
+                  <circle cx={x} cy={y} r={isStart || isEnd ? TFC_R+7 : TFC_R+4} fill="#fafbff" />
                   {(isStart || isEnd) && (
                     <circle cx={x} cy={y} r={TFC_R+5} fill="none"
                       stroke={isStart ? '#16a34a' : '#dc2626'} strokeWidth={1.5} />
@@ -1099,7 +1114,7 @@ function ObjectTracer({ links = [], typesMap = {}, objectMetrics = {}, resourceT
           {isResource && <span className="tracer-resource-badge" title="Resource object — excluded from chain timing">resource</span>}
           {!isResource && lifetime != null && (
             <span className="tracer-obj-lifetime" title="Service time: first to last event on this object">
-              ⚙ {_fmtChainTime(lifetime)}
+              {_fmtChainTime(lifetime)}
             </span>
           )}
           {kids.length > 0 && <span className="tracer-fanout">→ {kids.length}</span>}
@@ -1137,12 +1152,12 @@ function ObjectTracer({ links = [], typesMap = {}, objectMetrics = {}, resourceT
                   <span className="tracer-chain-timing">
                     {ct.elapsedS != null && (
                       <span className="tracer-timing-chip tracer-timing-elapsed" title="Total elapsed time: from first object entering to last object's final event">
-                        ⏱ {_fmtChainTime(ct.elapsedS)} elapsed
+                        {_fmtChainTime(ct.elapsedS)} elapsed
                       </span>
                     )}
                     {ct.totalServiceS != null && (
                       <span className="tracer-timing-chip tracer-timing-service" title="Total service time: sum of individual object lifetimes across the chain">
-                        ⚙ {_fmtChainTime(ct.totalServiceS)} service
+                        {_fmtChainTime(ct.totalServiceS)} service
                       </span>
                     )}
                   </span>
@@ -1344,7 +1359,7 @@ function TimingDiscoveryPanel({
         disabled={isDiscovering || !canDiscover}
         style={{ marginTop: '1rem' }}
       >
-        {isDiscovering ? 'Discovering…' : '⏱ Discover Time Distributions'}
+        {isDiscovering ? 'Discovering…' : 'Discover Time Distributions'}
       </button>
       )}
 
@@ -1464,11 +1479,11 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
           </span>
         )}
         <span className={`topbar-file-pill ${ocelFile ? 'loaded' : ''}`}>
-          📄 {ocelFile || 'No OCEL loaded'}
+          {ocelFile || 'No OCEL loaded'}
         </span>
         {workflowMode !== 'external-empty' && (
           <span className={`topbar-file-pill ${ocdeclFile ? 'loaded' : ''}`}>
-            📋 {ocdeclFile || 'No OC-Declare loaded'}
+            {ocdeclFile || 'No OC-Declare loaded'}
           </span>
         )}
       </div>
@@ -2212,41 +2227,38 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
 
   const pct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
   const cls = v => v == null ? '' : v >= 0.8 ? 'conf-good' : v >= 0.5 ? 'conf-mid' : 'conf-bad';
-  const MetricRow = ({ label, value, explanation, formula }) => (
-    <div className="conf-metric-row">
-      <div className="conf-metric-main">
-        <span className="conf-metric-label">{label}</span>
-        <span className={`conf-metric-value ${value != null ? (value >= 0.8 ? 'conf-good' : value >= 0.5 ? 'conf-mid' : 'conf-bad') : ''}`}>
+
+  const RichTip = ({ tip, children }) => {
+    const [pos, setPos] = React.useState(null);
+    return (
+      <span style={{cursor:'help'}}
+        onMouseEnter={e => setPos({x:e.clientX,y:e.clientY})}
+        onMouseMove={e => setPos({x:e.clientX,y:e.clientY})}
+        onMouseLeave={() => setPos(null)}>
+        {children}
+        {pos && ReactDOM.createPortal(
+          <div style={{position:'fixed',left:Math.min(pos.x+12,window.innerWidth-310),
+            top:Math.max(pos.y-10,4),background:'#1e293b',color:'white',fontSize:'0.72rem',
+            padding:'0.5rem 0.65rem',borderRadius:'6px',maxWidth:'300px',
+            zIndex:9999,lineHeight:1.5,pointerEvents:'none',boxShadow:'0 2px 12px rgba(0,0,0,0.3)'}}>
+            {tip}
+          </div>,
+          document.body
+        )}
+      </span>
+    );
+  };
+
+  const MetricLine = ({ label, value, tip }) => (
+    <div style={{display:'flex',alignItems:'center',gap:'0.5rem',padding:'0.32rem 0.1rem',borderBottom:'1px solid #f1f5f9'}}>
+      <RichTip tip={tip}>
+        <span style={{fontSize:'0.83rem',fontWeight:600,color:'#1e293b',flex:1}}>{label}</span>
+      </RichTip>
+      <RichTip tip={tip}>
+        <span className={cls(value)} style={{fontSize:'0.97rem',fontWeight:700,minWidth:'52px',textAlign:'right'}}>
           {pct(value)}
         </span>
-      </div>
-      <p className="conf-metric-explanation">{explanation}</p>
-      {formula && (
-        <details className="formula-details">
-          <summary className="formula-summary">Formula</summary>
-          <div className="formula-body">{formula}</div>
-        </details>
-      )}
-    </div>
-  );
-  // Split row: label | input log score | sim score
-  const MetricRowSplit = ({ label, logValue, simValue, explanation }) => (
-    <div className="conf-metric-row">
-      <div className="conf-metric-main" style={{gap:'0'}}>
-        <span className="conf-metric-label" style={{flex:1}}>{label}</span>
-        <div style={{display:'flex',gap:'0.75rem',alignItems:'center'}}>
-          <div style={{textAlign:'center',minWidth:'60px'}}>
-            <div style={{fontSize:'0.6rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.04em'}}>Input log</div>
-            <span className={`conf-metric-value ${cls(logValue)}`} style={{fontSize:'1rem'}}>{pct(logValue)}</span>
-          </div>
-          <div style={{fontSize:'0.8rem',color:'#cbd5e1'}}>→</div>
-          <div style={{textAlign:'center',minWidth:'60px'}}>
-            <div style={{fontSize:'0.6rem',color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.04em'}}>Simulation</div>
-            <span className={`conf-metric-value ${cls(simValue)}`} style={{fontSize:'1rem'}}>{pct(simValue)}</span>
-          </div>
-        </div>
-      </div>
-      <p className="conf-metric-explanation">{explanation}</p>
+      </RichTip>
     </div>
   );
 
@@ -2255,126 +2267,47 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
     <div className="conf-col">
       <div className="conf-col-header">{label}</div>
 
-      {/* OC-Declare Confidence */}
-      <Collapsible
-        className="eval-subsection"
-        title={
-          <span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-            OC-Declare Confidence
-            {ocdC?.globalConformance != null && (
-              <span className={cls(ocdC.globalConformance)} style={{fontSize:'0.9rem',fontWeight:700}}>
-                {(ocdC.globalConformance*100).toFixed(1)}%
-              </span>
-            )}
-          </span>
-        }
-        defaultOpen={true}
-      >
-        {!ocdC && !hasLog && <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>Loading…</p>}
-        {ocdC && (
-          <>
-            <MetricRow label="Confidence" value={ocdC.globalConformance}
-              explanation={`${ocdC.globalSatisfied} of ${ocdC.totalEvents} events satisfy all constraints.`}
-              formula={<>
-                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
-                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Confidence =</span>
-                  <span className="formula-frac">
-                    <span className="formula-num">events satisfying all constraints</span>
-                    <span className="formula-den">total events</span>
-                  </span>
-                </div>
-                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
-                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Per constraint =</span>
-                  <span className="formula-frac">
-                    <span className="formula-num">satisfied source events</span>
-                    <span className="formula-den">total source events</span>
-                  </span>
-                </div>
-                <div style={{fontSize:'0.68rem',color:'#64748b',marginTop:'0.25rem'}}>Def 8: for each scope object o in event e, count target events after e involving o — must be in [nmin, nmax]</div>
-              </>} />
-            {ocdC.constraintResults.length > 0 && (
-              <Collapsible className="conf-detail-collapsible" title="Per-constraint" defaultOpen={false}>
-                <table className="conf-detail-table">
-                  <thead><tr><th>Constraint</th><th className="audit-num">Confidence</th></tr></thead>
-                  <tbody>
-                    {ocdC.constraintResults.slice().sort((a,b)=>a.confidence-b.confidence).map(r => (
-                      <tr key={r.label} className={r.confidence < 0.5 ? 'audit-row-accumulating':''}>
-                        <td style={{fontFamily:'monospace',fontSize:'0.72rem'}}>{r.label}</td>
-                        <td className="audit-num"><span className={cls(r.confidence)}>{(r.confidence*100).toFixed(1)}%</span></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </Collapsible>
-            )}
-          </>
-        )}
-      </Collapsible>
-
-      {/* Fitness */}
-      <Collapsible
-        className="eval-subsection"
-        title={<span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-          Fitness
-          {fitC?.fitness != null && <span className={cls(fitC.fitness)} style={{fontSize:'0.9rem',fontWeight:700}}>{(fitC.fitness*100).toFixed(1)}%</span>}
-          {fitC?.constraintFitness != null && <span style={{fontSize:'0.75rem',color:'#64748b'}}>Con: <span className={cls(fitC.constraintFitness)} style={{fontWeight:600}}>{(fitC.constraintFitness*100).toFixed(1)}%</span></span>}
-        </span>}
-        defaultOpen={false}
-      >
-        {fitC
-          ? <>
-              <MetricRow label="Object-Replay Fitness" value={fitC.fitness}
-                explanation={`${fitC.fitnessEnabled ?? '—'} of ${fitC.fitnessTotal ?? '—'} events were enabled across all objects.`}
-                formula={<>
-                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
-                    <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Fitness =</span>
-                    <span className="formula-frac">
-                      <span className="formula-num">enabled events</span>
-                      <span className="formula-den">total events</span>
-                    </span>
-                  </div>
-                  <div style={{fontSize:'0.68rem',color:'#64748b'}}>Enabled = all precedence constraints on this activity were satisfied on this object at this point (source_count ≥ nmin)</div>
-                </>} />
-              <MetricRow label="Declarative Constraint Fitness" value={fitC.constraintFitness}
-                explanation={`${fitC.constraintSatisfied ?? '—'} of ${fitC.constraintTotal ?? '—'} constraint-trace pairs satisfied.`}
-                formula={<>
-                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
-                    <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Con. Fitness =</span>
-                    <span className="formula-frac">
-                      <span className="formula-num">satisfied (constraint, object) pairs</span>
-                      <span className="formula-den">evaluated (constraint, object) pairs</span>
-                    </span>
-                  </div>
-                  <div style={{fontSize:'0.68rem',color:'#64748b'}}>Evaluated at end of each object trace: response → target followed source? precedence → source preceded target? not_coexistence → only one occurred?</div>
-                </>} />
-            </>
-          : <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No object traces available.</p>}
-      </Collapsible>
-
-      {/* Precision */}
-      <Collapsible
-        className="eval-subsection"
-        title={<span style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-          Precision
-          {fitC?.precision != null && <span className={cls(fitC.precision)} style={{fontSize:'0.9rem',fontWeight:700}}>{(fitC.precision*100).toFixed(1)}%</span>}
-        </span>}
-        defaultOpen={false}
-      >
-        {fitC
-          ? <MetricRow label="Declarative Precision" value={fitC.precision}
-              explanation={`${fitC.precisionAllowed ?? '—'} of ${fitC.precisionTotal ?? '—'} transitions were in the allowed set.`}
-              formula={<>
-                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.3rem'}}>
-                  <span style={{fontSize:'0.75rem',color:'#4338ca',fontWeight:600}}>Precision =</span>
-                  <span className="formula-frac">
-                    <span className="formula-num">transitions where next activity ∈ allowed set</span>
-                    <span className="formula-den">total observed transitions</span>
-                  </span>
-                </div>
-                <div style={{fontSize:'0.68rem',color:'#64748b'}}>Allowed set = activities not blocked by any active precedence / not_coexistence / not_succession constraint given current trace state</div>
-              </>} />
-          : <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No object traces available.</p>}
-      </Collapsible>
+      {!ocdC && !hasLog && <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>Loading…</p>}
+      {ocdC && (
+        <MetricLine label="OC-Declare Confidence" value={ocdC.globalConformance}
+          tip={<>
+            <div>{ocdC.globalSatisfied} of {ocdC.totalEvents} events satisfy all constraints.</div>
+            <div style={{marginTop:'0.35rem',color:'#a5b4fc',fontWeight:600}}>Formula</div>
+            <div style={{color:'#cbd5e1'}}>events satisfying all constraints ÷ total events</div>
+            <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Per constraint: satisfied source events ÷ total source events (Def 8)</div>
+          </>}
+        />
+      )}
+      {fitC ? (
+        <>
+          <MetricLine label="Fitness" value={fitC.fitness}
+            tip={<>
+              <div>{fitC.fitnessEnabled ?? '—'} of {fitC.fitnessTotal ?? '—'} events were enabled across all objects.</div>
+              <div style={{marginTop:'0.35rem',color:'#a5b4fc',fontWeight:600}}>Formula</div>
+              <div style={{color:'#cbd5e1'}}>enabled events ÷ total events</div>
+              <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Enabled = all precedence constraints satisfied at this point (source_count ≥ nmin)</div>
+            </>}
+          />
+          <MetricLine label="Con. Fitness" value={fitC.constraintFitness}
+            tip={<>
+              <div>{fitC.constraintSatisfied ?? '—'} of {fitC.constraintTotal ?? '—'} constraint-trace pairs satisfied.</div>
+              <div style={{marginTop:'0.35rem',color:'#a5b4fc',fontWeight:600}}>Formula</div>
+              <div style={{color:'#cbd5e1'}}>satisfied (constraint, object) pairs ÷ evaluated pairs</div>
+              <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Evaluated at end of each object trace: response → target followed? precedence → source preceded? not_coexistence → only one occurred?</div>
+            </>}
+          />
+          <MetricLine label="Precision" value={fitC.precision}
+            tip={<>
+              <div>{fitC.precisionAllowed ?? '—'} of {fitC.precisionTotal ?? '—'} transitions were in the allowed set.</div>
+              <div style={{marginTop:'0.35rem',color:'#a5b4fc',fontWeight:600}}>Formula</div>
+              <div style={{color:'#cbd5e1'}}>transitions where next activity ∈ allowed set ÷ total observed transitions</div>
+              <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Allowed set = activities not blocked by any active precedence / not_coexistence / not_succession constraint</div>
+            </>}
+          />
+        </>
+      ) : (
+        <p style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>No object traces available.</p>
+      )}
     </div>
   );
 
@@ -2497,7 +2430,7 @@ function LogInspection({ eventLogFiles, handleFileUpload }) {
                 <option value="">Select event log…</option>
                 {(eventLogFiles || []).map(f => <option key={f} value={f}>{f}</option>)}
               </select>
-              <button className="browse-btn" onClick={() => fileInputRef.current?.click()} title="Browse and upload">📁</button>
+              <button className="browse-btn" onClick={() => fileInputRef.current?.click()} title="Browse and upload">…</button>
               <input ref={fileInputRef} type="file" accept=".json,.xml" style={{display:'none'}}
                 onChange={e => { if (e.target.files[0]) handleUpload(e.target.files[0]); e.target.value=''; }} />
             </div>
@@ -2528,13 +2461,13 @@ function LogInspection({ eventLogFiles, handleFileUpload }) {
             <table className="metrics-table" style={{fontSize:'0.72rem',minWidth:`${180 + acts.length*70}px`}}>
               <thead>
                 <tr>
-                  <th style={{minWidth:'120px',position:'sticky',left:0,background:'white',zIndex:1}}>
+                  <th title="Object instance ID — click to sort alphabetically" style={{minWidth:'120px',position:'sticky',left:0,background:'white',zIndex:1}}>
                     <button style={{background:'none',border:'none',cursor:'pointer',fontWeight:600,color:'#475569',fontSize:'0.72rem'}}
                       onClick={() => setSortBy('id')}>
                       Object {sortBy==='id' ? '▼' : ''}
                     </button>
                   </th>
-                  <th style={{minWidth:'80px',color:'#94a3b8'}}>Type</th>
+                  <th title="Object type as defined in the model" style={{minWidth:'80px',color:'#94a3b8'}}>Type</th>
                   {acts.map(act => (
                     <th key={act} style={{minWidth:'65px',cursor:'pointer',whiteSpace:'nowrap',
                       background: sortBy===act ? '#eef2ff' : undefined}}
@@ -2836,7 +2769,7 @@ function ConstraintAnalysis({ activeModel, results }) {
             ? <p style={{fontSize:'0.8rem',color:'#166534',fontWeight:600}}>✓ All constraint source activities fired at least once — no vacuous conformance detected.</p>
             : (
               <table className="conf-detail-table">
-                <thead><tr><th>Constraint</th><th>Reason</th></tr></thead>
+                <thead><tr><th title="The declarative constraint (type, source, target)">Constraint</th><th title="Why this constraint is considered vacuous — e.g. source activity never fired">Reason</th></tr></thead>
                 <tbody>
                   {vacuityIssues.map((v, i) => (
                     <tr key={i} className="audit-row-accumulating">
@@ -3041,12 +2974,12 @@ function TraceHealth({ results }) {
           <table className="conf-detail-table" style={{marginBottom:'0.75rem'}}>
             <thead>
               <tr>
-                <th>Activity</th>
-                <th className="audit-num">Pool steps</th>
-                <th className="audit-num">Fired</th>
-                <th className="audit-num">Fire rate</th>
-                <th className="audit-num">Avg prob</th>
-                <th>Diagnosis</th>
+                <th title="Activity name">Activity</th>
+                <th className="audit-num" title="Number of simulation steps this activity spent in the candidate pool (eligible to fire)">Pool steps</th>
+                <th className="audit-num" title="Number of times this activity actually fired during the simulation">Fired</th>
+                <th className="audit-num" title="Fraction of pool steps where the activity was actually chosen to fire (Fired ÷ Pool steps)">Fire rate</th>
+                <th className="audit-num" title="Average routing probability assigned to this activity when it was in the pool">Avg prob</th>
+                <th title="Bottleneck diagnosis based on fire rate and probability">Diagnosis</th>
               </tr>
             </thead>
             <tbody>
@@ -3092,6 +3025,71 @@ function TraceHealth({ results }) {
         </div>
       )}
     </Collapsible>
+  );
+}
+
+// ── ActivityTimeMatrix — activity × object-type timing matrix ─────────────────
+function ActivityTimeMatrix({ activityMetrics, activeModel, discoveryResults, objectTraces }) {
+  const [mode, setMode] = React.useState('mean');
+  const allOts = (activeModel?.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+  const acts = Object.keys(activityMetrics).sort(makeFlowRankSorter(discoveryResults, objectTraces));
+  const actOts = {};
+  (activeModel?.activities || []).forEach(a => {
+    actOts[a.name] = new Set((a.bindings || []).map(b => b.object_type));
+  });
+  const fmt = s => { if (s==null) return '—'; if (s<60) return (Math.abs(s%1)<0.005?Math.round(s):s.toFixed(1))+'s'; if (s<3600) return Math.floor(s/60)+'m '+Math.floor(s%60)+'s'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+  const getVal = m => mode==='mean' ? m.mean_service_s : mode==='min' ? m.min_service_s : m.max_service_s;
+  if (!allOts.length || !acts.length) return null;
+  return (
+    <div style={{marginTop:'1rem'}}>
+      <div style={{display:'flex',gap:'0.4rem',alignItems:'center',marginBottom:'0.5rem'}}>
+        <span style={{fontSize:'0.75rem',fontWeight:600,color:'#475569'}}>Time per Activity × Object Type</span>
+        {['mean','min','max'].map(m => (
+          <button key={m} onClick={() => setMode(m)}
+            style={{fontSize:'0.72rem',padding:'2px 10px',borderRadius:'20px',
+              border: '1.5px solid ' + (mode===m ? '#1e293b' : '#e2e8f0'),
+              background: mode===m ? '#1e293b' : 'white',
+              color: mode===m ? 'white' : '#64748b',
+              cursor:'pointer', fontWeight: mode===m ? 600 : 400}}>
+            {m}
+          </button>
+        ))}
+      </div>
+      <div style={{overflowX:'auto',border:'1.5px solid #1e293b',borderRadius:'6px'}}>
+        <table className="behavior-table" style={{fontSize:'0.75rem'}}>
+          <thead>
+            <tr>
+              <th style={{textAlign:'left'}}>Activity</th>
+              {allOts.map(ot => (
+                <th key={ot} style={{textAlign:'center',verticalAlign:'bottom',height:'80px',padding:'0 6px',whiteSpace:'nowrap'}}>
+                  <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.72rem',fontWeight:600,lineHeight:1.1}}>{ot}</div>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {acts.map(act => {
+              const m = activityMetrics[act];
+              const val = fmt(getVal(m));
+              const bound = actOts[act] || new Set();
+              return (
+                <tr key={act}>
+                  <td style={{fontWeight:500,whiteSpace:'nowrap'}}>{act}</td>
+                  {allOts.map(ot => (
+                    <td key={ot} style={{textAlign:'center',
+                      background: bound.has(ot) ? '#f0fdf4' : undefined,
+                      color: bound.has(ot) ? '#15803d' : '#cbd5e1',
+                      fontWeight: bound.has(ot) ? 600 : 400}}>
+                      {bound.has(ot) ? val : '—'}
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -3565,8 +3563,10 @@ function computeOCCoverage(results, model, discoveryResults) {
   });
   const cov_arrow = weakArrow.length > 0 ? arrowDist / weakArrow.length : null;
 
-  // cov_guard: not computable from log — mark as N/A
-  const cov_guard = null;
+  // cov_guard: fraction of guard evaluations that passed (from simulation instrumentation)
+  const guardTotal  = results?.guard_checks_total  ?? 0;
+  const guardPassed = results?.guard_checks_passed ?? 0;
+  const cov_guard = guardTotal > 0 ? guardPassed / guardTotal : null;
 
   return {
     cov_act:        { value: cov_act,        fired: firedModelActs.length, total: modelActSet.size },
@@ -3577,7 +3577,7 @@ function computeOCCoverage(results, model, discoveryResults) {
     cov_max:        { value: cov_max,         reached: maxReached, total: finiteMax.length },
     cov_neg:        { value: cov_neg,         nonTrivial: negNonTrivial, total: negConstraints.length },
     cov_arrow:      { value: cov_arrow,       dist: arrowDist, total: weakArrow.length },
-    cov_guard:      { value: null,            note: 'Not computable from log — requires simulator instrumentation' },
+    cov_guard:      { value: cov_guard,       total: guardTotal, passed: guardPassed },
   };
 }
 
@@ -3591,24 +3591,25 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
   const fmt   = v => v == null ? 'N/A' : (v*100).toFixed(1)+'%';
   const color = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
 
-  // ── Radar axes (6 dimensions used in the chart) ──────────────────────────
-  // cov_guard is excluded (always null). cov_min and cov_max are averaged into
-  // one "Cardinality bounds" axis so the chart fits a clean hexagon.
+  // ── Radar axes (5 dimensions — Jalali C.E/C.A/C.I/C.C/C.R) ─────────────────
+  // cov_guard excluded: it measures attribute selectivity, not log-derived coverage.
+  // C.E = mean(cov_act, cov_ot)   — element coverage
+  // C.C = mean(cov_min, cov_max, cov_neg) — count/cardinality coverage
+  const ceVal = (() => {
+    const vals = [cov.cov_act.value, cov.cov_ot.value].filter(v => v != null);
+    return vals.length > 0 ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+  })();
   const cardVal = (() => {
-    const a = cov.cov_min.value, b = cov.cov_max.value;
-    if (a == null && b == null) return null;
-    if (a == null) return b;
-    if (b == null) return a;
-    return (a + b) / 2;
+    const vals = [cov.cov_min.value, cov.cov_max.value, cov.cov_neg.value].filter(v => v != null);
+    return vals.length > 0 ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
   })();
 
   const axes = [
-    { key: 'cov_act',        label: 'Activity\nCoverage',       value: cov.cov_act.value },
-    { key: 'cov_ot',         label: 'Object Type\nCoverage',    value: cov.cov_ot.value },
-    { key: 'cov_activation', label: 'Constraint\nActivation',   value: cov.cov_activation.value },
-    { key: 'cov_inv',        label: 'Involvement\nTestability',  value: cov.cov_inv.value },
-    { key: 'cov_card',       label: 'Cardinality\nBounds',       value: cardVal },
-    { key: 'cov_arrow',      label: 'Arrow\nDiscriminability',   value: cov.cov_arrow.value },
+    { key: 'C.E', label: 'Element\nCoverage',    value: ceVal },
+    { key: 'C.A', label: 'Activation\nCoverage', value: cov.cov_activation.value },
+    { key: 'C.I', label: 'Involvement\nCoverage',value: cov.cov_inv.value },
+    { key: 'C.C', label: 'Count\nCoverage',       value: cardVal },
+    { key: 'C.R', label: 'Arrow\nCoverage',       value: cov.cov_arrow.value },
   ];
 
   // ── Pure-SVG spider/radar chart (no external lib) ────────────────────────
@@ -3633,7 +3634,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
 
   return (
     <div>
-      {/* ── Citation banner ── */}
+      {/* ── Citation banner — commented out for now ──
       <div style={{fontSize:'0.68rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',
                    borderRadius:'6px',padding:'0.4rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
         <strong>Radar chart axes</strong> — visualization form inspired by Pourshahid &amp; Amyot,
@@ -3644,6 +3645,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
         participation, constraint activation, involvement testability, cardinality bounds,
         arrow discriminability). Details in the table below.
       </div>
+      ── end citation ── */}
 
       {/* ── Radar + legend row ── */}
       <div style={{display:'flex',gap:'1.5rem',alignItems:'flex-start',flexWrap:'wrap',marginBottom:'1rem'}}>
@@ -3718,31 +3720,107 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
         </div>
       </div>
 
-      {/* ── Detail table (unchanged) ── */}
+      {/* ── Detail table ── */}
       <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.5rem'}}>
-        Full detail — Green ≥90%, amber ≥60%, red &lt;60%. Cardinality Bounds axis = avg(nmin discriminability, nmax reachability).
+        Full detail — Green ≥90%, amber ≥60%, red &lt;60%.
+        Axis scores: C.E = mean(act, ot) · C.C = mean(nmin, nmax, neg).
       </p>
       <table className="behavior-table" style={{fontSize:'0.78rem'}}>
-        <thead><tr><th>Measure</th><th style={{width:'70px',textAlign:'center'}}>Score</th><th>What it indicates</th><th>Detail</th></tr></thead>
+        <thead><tr>
+          <th title="Jalali axis this measure contributes to" style={{width:'52px'}}>Axis</th>
+          <th title="Name of the coverage or quality measure">Measure</th>
+          <th title="Computed score for this measure (0–1 or %)" style={{width:'70px',textAlign:'center'}}>Score</th>
+          <th title="What a high or low score means for simulation quality">What it indicates</th>
+          <th title="Raw counts or values behind the score">Detail</th>
+        </tr></thead>
         <tbody>
-          {[
-            { key:'cov_act',        label:'Activity coverage',        desc:'Fraction of model activities that appeared in sim output', detail: `${cov.cov_act.fired}/${cov.cov_act.total} activities fired` },
-            { key:'cov_ot',         label:'Object type coverage',     desc:'Fraction of model object types instantiated', detail: `${cov.cov_ot.fired}/${cov.cov_ot.total} types seen` },
-            { key:'cov_activation', label:'Constraint activation',    desc:'Fraction of constraints with ≥1 source event (non-vacuous)', detail: `${cov.cov_activation.fired}/${cov.cov_activation.total} non-vacuous, median src events: ${cov.cov_activation.median??'—'}` },
-            { key:'cov_inv',        label:'Involvement testability',  desc:'Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any', detail: `${cov.cov_inv.tested}/${cov.cov_inv.total} pairs testable` },
-            { key:'cov_min',        label:'nmin discriminability',    desc:'Fraction of constraints where cascade count > nmin — tighter bound distinguishable', detail: `${cov.cov_min.dist}/${cov.cov_min.total} constraints` },
-            { key:'cov_max',        label:'nmax reachability',        desc:'Fraction of finite-nmax constraints where the max was actually reached', detail: `${cov.cov_max.reached}/${cov.cov_max.total} constraints (finite nmax only)` },
-            { key:'cov_neg',        label:'Negative constraint test', desc:'Fraction of nmax=0 constraints where target activity appeared (non-trivial test)', detail: `${cov.cov_neg.nonTrivial}/${cov.cov_neg.total} non-trivial` },
-            { key:'cov_arrow',      label:'Arrow discriminability',   desc:'Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)', detail: `${cov.cov_arrow.dist}/${cov.cov_arrow.total} response/precedence constraints` },
-            { key:'cov_guard',      label:'Guard coverage',           desc:'Whether precedence constraints blocked candidates during generation', detail: cov.cov_guard.note },
-          ].map(r => (
-            <tr key={r.key}>
-              <td style={{fontWeight:600,whiteSpace:'nowrap'}}>{r.label}</td>
-              <td style={{textAlign:'center',fontWeight:700,color:color(cov[r.key]?.value)}}>{fmt(cov[r.key]?.value)}</td>
-              <td style={{color:'#475569',fontSize:'0.72rem'}}>{r.desc}</td>
-              <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{r.detail}</td>
-            </tr>
-          ))}
+          {/* C.E — Element Coverage */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            C.E — Element Coverage &nbsp;<span style={{fontWeight:400,color:'#94a3b8'}}>axis score: {fmt(ceVal)}</span>
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.E</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Activity coverage</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_act.value)}}>{fmt(cov.cov_act.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of model activities that appeared in sim output</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_act.fired}/{cov.cov_act.total} activities fired</td>
+          </tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.E</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Object type coverage</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_ot.value)}}>{fmt(cov.cov_ot.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of model object types instantiated</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_ot.fired}/{cov.cov_ot.total} types seen</td>
+          </tr>
+          {/* C.A — Activation Coverage */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            C.A — Activation Coverage &nbsp;<span style={{fontWeight:400,color:'#94a3b8'}}>axis score: {fmt(cov.cov_activation.value)}</span>
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.A</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Constraint activation</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_activation.value)}}>{fmt(cov.cov_activation.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of constraints with ≥1 source event (non-vacuous)</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_activation.fired}/{cov.cov_activation.total} non-vacuous, median src events: {cov.cov_activation.median??'—'}</td>
+          </tr>
+          {/* C.I — Involvement Coverage */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            C.I — Involvement Coverage &nbsp;<span style={{fontWeight:400,color:'#94a3b8'}}>axis score: {fmt(cov.cov_inv.value)}</span>
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.I</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Involvement testability</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_inv.value)}}>{fmt(cov.cov_inv.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_inv.tested}/{cov.cov_inv.total} pairs testable</td>
+          </tr>
+          {/* C.C — Count Coverage */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            C.C — Count Coverage &nbsp;<span style={{fontWeight:400,color:'#94a3b8'}}>axis score: {fmt(cardVal)}</span>
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>nmin discriminability</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_min.value)}}>{fmt(cov.cov_min.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of constraints where cascade count &gt; nmin — tighter bound distinguishable</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_min.dist}/{cov.cov_min.total} constraints</td>
+          </tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>nmax reachability</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_max.value)}}>{fmt(cov.cov_max.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of finite-nmax constraints where the max was actually reached</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_max.reached}/{cov.cov_max.total} constraints (finite nmax only)</td>
+          </tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Negative constraint test</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_neg.value)}}>{fmt(cov.cov_neg.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of nmax=0 constraints where target activity appeared (non-trivial test)</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_neg.nonTrivial}/{cov.cov_neg.total} non-trivial</td>
+          </tr>
+          {/* C.R — Arrow Coverage */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            C.R — Arrow Coverage &nbsp;<span style={{fontWeight:400,color:'#94a3b8'}}>axis score: {fmt(cov.cov_arrow.value)}</span>
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.R</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Arrow discriminability</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_arrow.value)}}>{fmt(cov.cov_arrow.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_arrow.dist}/{cov.cov_arrow.total} response/precedence constraints</td>
+          </tr>
+          {/* Guard — not on radar */}
+          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
+            Not on radar — requires generator instrumentation
+          </td></tr>
+          <tr>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>—</td>
+            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Guard coverage</td>
+            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_guard.value)}}>{fmt(cov.cov_guard.value)}</td>
+            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of binding/constraint guard evaluations where objects passed the attribute predicate (from simulation)</td>
+            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_guard.total > 0 ? `${cov.cov_guard.passed}/${cov.cov_guard.total} evaluations passed` : 'No guards defined in model'}</td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -3776,12 +3854,27 @@ function OCPQPanel({ results }) {
   if (error) return <div style={{color:'#dc2626',fontSize:'0.82rem',padding:'1rem'}}>{error}</div>;
   if (!data) return null;
 
-  const schemas = [...(data.schemas || [])];
+  const allSchemas = data.schemas || [];
+  const schemas = [...allSchemas];
   schemas.sort((a, b) => {
     const av = a[sortKey] ?? -Infinity;
     const bv = b[sortKey] ?? -Infinity;
     return sortDir * (typeof av === 'number' && typeof bv === 'number' ? bv - av : String(bv).localeCompare(String(av)));
   });
+
+  const _mean = (arr, key) => {
+    const vals = arr.map(r => r[key]).filter(v => v != null);
+    return vals.length > 0 ? vals.reduce((s, v) => s + v, 0) / vals.length : null;
+  };
+  const totals = {
+    support:     allSchemas.reduce((s, r) => s + (r.support ?? 0), 0),
+    coverage:    _mean(allSchemas, 'coverage'),
+    selectivity: _mean(allSchemas, 'selectivity'),
+    reach:       _mean(allSchemas, 'reach'),
+    exclusivity: _mean(allSchemas, 'exclusivity'),
+    throughput_s:_mean(allSchemas, 'throughput_s'),
+    eq_class:    new Set(allSchemas.map(r => r.eq_class).filter(Boolean)).size,
+  };
 
   const fmtDur = s => {
     if (s == null) return '—';
@@ -3801,15 +3894,15 @@ function OCPQPanel({ results }) {
   };
 
   const cols = [
-    { key: 'source_activity', label: 'Source',      fmt: v => v, color: () => '#1e293b' },
-    { key: 'target_activity', label: 'Target',      fmt: v => v, color: () => '#1e293b' },
-    { key: 'support',         label: 'Support',     fmt: v => v?.toLocaleString(), color: () => '#1e293b' },
-    { key: 'coverage',        label: 'Coverage',    fmt: fmtPct, color: v => colColor('coverage', v) },
-    { key: 'selectivity',     label: 'Selectivity', fmt: fmtSel, color: v => colColor('selectivity', v) },
-    { key: 'reach',           label: 'Reach',       fmt: fmtPct, color: v => colColor('reach', v) },
-    { key: 'exclusivity',     label: 'Exclusivity', fmt: fmtSel, color: v => colColor('exclusivity', v) },
-    { key: 'throughput_s',    label: 'Throughput',  fmt: fmtDur, color: () => '#1e293b' },
-    { key: 'eq_class',        label: 'Eq',          fmt: v => v ? v.slice(0,6) : '—', color: () => '#94a3b8' },
+    { key: 'source_activity', label: 'Source',      tip: 'Source activity — the activity that precedes the target on the same object',           fmt: v => v, color: () => '#1e293b' },
+    { key: 'target_activity', label: 'Target',      tip: 'Target activity — the activity that follows the source on the same object',            fmt: v => v, color: () => '#1e293b' },
+    { key: 'support',         label: 'Support',     tip: 'Number of consecutive same-object (source → target) event pairs observed',             fmt: v => v?.toLocaleString(), color: () => '#1e293b' },
+    { key: 'coverage',        label: 'Coverage',    tip: 'Fraction of source-activity firings that were followed by this target (support ÷ total source firings)',    fmt: fmtPct, color: v => colColor('coverage', v) },
+    { key: 'selectivity',     label: 'Selectivity', tip: 'How discriminating this path is — 1 = each source leads to exactly one target, <1 = fan-out (support ÷ total target firings)', fmt: fmtSel, color: v => colColor('selectivity', v) },
+    { key: 'reach',           label: 'Reach',       tip: 'Fraction of target-activity firings reached from this source (connected targets ÷ total target firings)',   fmt: fmtPct, color: v => colColor('reach', v) },
+    { key: 'exclusivity',     label: 'Exclusivity', tip: 'How exclusively this source leads to the target — 1 = one-to-one, <1 = fan-in from multiple sources (1 ÷ avg sources per target)', fmt: fmtSel, color: v => colColor('exclusivity', v) },
+    { key: 'throughput_s',    label: 'Throughput',  tip: 'Mean elapsed time from source event to target event on the same object',               fmt: fmtDur, color: () => '#1e293b' },
+    { key: 'eq_class',        label: 'Eq',          tip: 'Equivalence class hash — rows with the same hash share the exact same set of object connections',          fmt: v => v ? v.slice(0,6) : '—', color: () => '#94a3b8' },
   ];
 
   const thStyle = key => ({
@@ -3833,11 +3926,11 @@ function OCPQPanel({ results }) {
           <thead>
             <tr>
               {cols.map(c => (
-                <th key={c.key} style={thStyle(c.key)} onClick={() => onSort(c.key)}>
+                <th key={c.key} title={c.tip} style={thStyle(c.key)} onClick={() => onSort(c.key)}>
                   {c.label}{sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}
                 </th>
               ))}
-              <th style={{...thStyle('object_types'), cursor:'default'}}>Objects</th>
+              <th title="Object types involved in this transition and how many per event" style={{...thStyle('object_types'), cursor:'default'}}>Objects</th>
             </tr>
           </thead>
           <tbody>
@@ -3860,6 +3953,20 @@ function OCPQPanel({ results }) {
               </tr>
             ))}
           </tbody>
+          <tfoot>
+            <tr style={{borderTop:'2px solid #cbd5e1',background:'#f8fafc'}}>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'left'}}>Overall</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#64748b',textAlign:'left'}}>{allSchemas.length} paths</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'center'}}>{totals.support.toLocaleString()}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('coverage', totals.coverage),textAlign:'center'}}>{fmtPct(totals.coverage)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('selectivity', totals.selectivity),textAlign:'center'}}>{fmtSel(totals.selectivity)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('reach', totals.reach),textAlign:'center'}}>{fmtPct(totals.reach)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('exclusivity', totals.exclusivity),textAlign:'center'}}>{fmtSel(totals.exclusivity)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'center'}}>{fmtDur(totals.throughput_s)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#94a3b8',textAlign:'center',fontFamily:'monospace'}}>{totals.eq_class} unique</td>
+              <td/>
+            </tr>
+          </tfoot>
         </table>
       </div>
       <div style={{marginTop:'0.5rem',fontSize:'0.7rem',color:'#94a3b8',display:'flex',gap:'1.5rem',flexWrap:'wrap'}}>
@@ -3867,6 +3974,24 @@ function OCPQPanel({ results }) {
         <span><span style={{color:'#ca8a04',fontWeight:700}}>■</span> 50–80%</span>
         <span><span style={{color:'#dc2626',fontWeight:700}}>■</span> &lt;50% (coverage/reach)</span>
         <span>Selectivity/Exclusivity: 1 = one-to-one, &lt;1 = fan-out/fan-in</span>
+      </div>
+      <div style={{marginTop:'0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.6rem 0.85rem'}}>
+        <div style={{fontSize:'0.7rem',fontWeight:700,color:'#475569',marginBottom:'0.4rem',textTransform:'uppercase',letterSpacing:'0.05em'}}>Formulas</div>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))',gap:'0.3rem 1.5rem'}}>
+          {[
+            ['Support',     'count of consecutive same-object (source → target) pairs'],
+            ['Coverage',    'support ÷ total source-activity firings'],
+            ['Selectivity', 'support ÷ total target-activity firings'],
+            ['Reach',       'distinct objects on this path ÷ all objects of relevant type'],
+            ['Exclusivity', 'support ÷ all outgoing consecutive pairs from source'],
+            ['Throughput',  'mean elapsed time from source event to target event (same object)'],
+          ].map(([name, formula]) => (
+            <div key={name} style={{display:'flex',gap:'0.35rem',alignItems:'baseline'}}>
+              <span style={{fontSize:'0.72rem',fontWeight:700,color:'#334155',minWidth:'82px',flexShrink:0}}>{name}</span>
+              <span style={{fontSize:'0.7rem',color:'#64748b'}}>{formula}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -3917,22 +4042,7 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
   const obligationsFulfilled = results?.obligations_fulfilled ?? 0;
   const obligationsCancelled = results?.obligations_cancelled ?? 0;
 
-  // ── E4/E7: OCPA/OCPQ side-by-side comparison ─────────────────────────────
-  const [ocpaData,    setOcpaData]    = React.useState(null);
-  const [ocpaLoading, setOcpaLoading] = React.useState(false);
-  const [ocpaError,   setOcpaError]   = React.useState(null);
-
-  const runOcpaComparison = async () => {
-    if (!outputFile || !eventLogFile) return;
-    setOcpaLoading(true); setOcpaError(null); setOcpaData(null);
-    try {
-      const r = await axios.post('/api/further-eval/ocpa-ocpq-comparison', { outputFile, eventLogFile });
-      setOcpaData(r.data);
-    } catch(e) { setOcpaError(e.response?.data?.error || e.message); }
-    finally { setOcpaLoading(false); }
-  };
-
-  // ── E5: Multi-seed variance ───────────────────────────────────────────────
+  // ── Multi-seed variance ───────────────────────────────────────────────────
   const [multiSeeds,    setMultiSeeds]    = React.useState('42,99,123,456,789');
   const [multiData,     setMultiData]     = React.useState(null);
   const [multiLoading,  setMultiLoading]  = React.useState(false);
@@ -3989,8 +4099,8 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
   return (
     <div style={{display:'flex',flexDirection:'column',gap:'1.25rem',padding:'0.25rem 0'}}>
 
-      {/* ── E3: Per-constraint obligation fulfillment (always shown from sim results) ── */}
-      <Collapsible className="eval-section" title="E3 — Per-Constraint Obligation Rates" defaultOpen={true}>
+      {/* ── Per-constraint obligation fulfillment (always shown from sim results) ── */}
+      <Collapsible className="eval-section" title="Per-Constraint Obligation Rates" defaultOpen={true}>
         {!results ? (
           <p className="empty-notice">Run a simulation first.</p>
         ) : (
@@ -4027,11 +4137,11 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
               <table className="conf-detail-table" style={{width:'100%'}}>
                 <thead>
                   <tr>
-                    <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                    <th className="audit-num">Fulfilled</th>
-                    <th className="audit-num">Violated</th>
-                    <th className="audit-num">Cancelled</th>
-                    <th className="audit-num">Fulfillment Rate</th>
+                    <th title="The declarative constraint (type, source → target)" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                    <th className="audit-num" title="Number of times an obligation was created and later met (target fired before case closed)">Fulfilled</th>
+                    <th className="audit-num" title="Number of obligations that were not met — target never fired before case closed">Violated</th>
+                    <th className="audit-num" title="Obligations removed at case-close without being fulfilled or recorded as violated">Cancelled</th>
+                    <th className="audit-num" title="Fulfilled ÷ (Fulfilled + Violated) — fraction of obligations that were met">Fulfillment Rate</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -4066,8 +4176,8 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
         )}
       </Collapsible>
 
-      {/* ── E1: Post-hoc conformance check ── */}
-      <Collapsible className="eval-section" title="E1 — Post-hoc Conformance Check" defaultOpen={false}>
+      {/* ── Post-hoc conformance check ── */}
+      <Collapsible className="eval-section" title="Post-hoc Conformance Check" defaultOpen={false}>
         <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
           Replays the generated OCEL through the OC-Declare constraint checker and reports
           per-constraint violation rates. Catches constraints not enforced eagerly (responded_existence,
@@ -4102,11 +4212,11 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
                 <table className="conf-detail-table" style={{width:'100%'}}>
                   <thead>
                     <tr>
-                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                      <th className="audit-num">Scope Type</th>
-                      <th className="audit-num">Checked</th>
-                      <th className="audit-num">Violated</th>
-                      <th className="audit-num">Violation Rate</th>
+                      <th title="The declarative constraint checked" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                      <th className="audit-num" title="Object type scope for which this constraint is evaluated">Scope Type</th>
+                      <th className="audit-num" title="Total number of constraint instances evaluated across all objects">Checked</th>
+                      <th className="audit-num" title="Number of instances where the constraint was not satisfied">Violated</th>
+                      <th className="audit-num" title="Violated ÷ Checked — fraction of instances that violated the constraint">Violation Rate</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4131,8 +4241,8 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
         )}
       </Collapsible>
 
-      {/* ── E2: Log fidelity ── */}
-      <Collapsible className="eval-section" title="E2 — Cross-Log Fidelity (Simulated vs Real)" defaultOpen={false}>
+      {/* ── Log fidelity ── */}
+      <Collapsible className="eval-section" title="Cross-Log Fidelity (Simulated vs Real)" defaultOpen={false}>
         <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
           Compares activity frequency distributions (KL divergence), object type counts, and
           inter-event timing (Earth Mover Distance) between the real input log and simulation output.
@@ -4194,12 +4304,12 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
                     <table className="conf-detail-table" style={{width:'100%'}}>
                       <thead>
                         <tr>
-                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
-                          <th className="audit-num">Real Count</th>
-                          <th className="audit-num">Sim Count</th>
-                          <th className="audit-num">Real Freq</th>
-                          <th className="audit-num">Sim Freq</th>
-                          <th className="audit-num">Δ Freq</th>
+                          <th title="Activity name" style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
+                          <th className="audit-num" title="Total event count for this activity in the real input log">Real Count</th>
+                          <th className="audit-num" title="Total event count for this activity in the simulation output">Sim Count</th>
+                          <th className="audit-num" title="Fraction of all events this activity accounts for in the real log">Real Freq</th>
+                          <th className="audit-num" title="Fraction of all events this activity accounts for in the simulation">Sim Freq</th>
+                          <th className="audit-num" title="Sim Freq − Real Freq in percentage points (positive = over-represented in simulation)">Δ Freq</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -4253,97 +4363,8 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
         )}
       </Collapsible>
 
-      {/* ── E4/E7: OCPA timing comparison ── */}
-      <Collapsible className="eval-section" title="E4/E7 — OCPA Timing Comparison (Real vs Sim)" defaultOpen={false}>
-        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-          Side-by-side comparison of OCPA time metrics (service, waiting, sojourn, sync, flow,
-          pooling, lagging) between the real input log and simulation output.
-        </p>
-        {noOutput || noLog ? (
-          <p className="empty-notice">{noOutput ? 'No simulation output.' : 'No input event log loaded.'}</p>
-        ) : (
-          <>
-            <button className="simulate-button"
-              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
-                      background: ocpaLoading ? '#94a3b8' : '#6366f1'}}
-              onClick={runOcpaComparison} disabled={ocpaLoading}>
-              {ocpaLoading ? 'Computing…' : 'Compare OCPA Metrics'}
-            </button>
-            {ocpaError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{ocpaError}</p>}
-            {ocpaData && (
-              <div style={{overflowX:'auto'}}>
-                {/* Global WMAPE summary */}
-                {ocpaData.global_wmape != null && (
-                  <div style={{display:'flex',alignItems:'center',gap:'0.75rem',marginBottom:'0.75rem',padding:'0.5rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px'}}>
-                    <span style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Global WMAPE:</span>
-                    <span style={{fontSize:'1rem',fontWeight:700,color: ocpaData.global_wmape < 20 ? '#16a34a' : ocpaData.global_wmape < 50 ? '#ca8a04' : '#dc2626'}}>
-                      {ocpaData.global_wmape.toFixed(1)}%
-                    </span>
-                    <span style={{fontSize:'0.7rem',color:'#94a3b8'}}>Weighted Mean Absolute Percentage Error across all activities and time metrics (lower = better fit to real log)</span>
-                  </div>
-                )}
-                {(ocpaData.comparison || []).map((row, i) => {
-                  const fields = row.fields || {};
-                  const hasData = Object.values(fields).some(f => f.real != null || f.sim != null);
-                  if (!hasData) return null;
-                  const wmape = row.wmape;
-                  const wmapeColor = wmape == null ? '#94a3b8' : wmape < 20 ? '#16a34a' : wmape < 50 ? '#ca8a04' : '#dc2626';
-                  const fieldLabels = {
-                    service_mean:'Service (mean)', service_min:'Service (min)', service_max:'Service (max)',
-                    waiting_mean:'Waiting (mean)', sojourn_mean:'Sojourn (mean)', sync_mean:'Sync (mean)',
-                    flow_mean:'Flow (mean)', pooling_mean:'Pooling (mean)', lagging_mean:'Lagging (mean)',
-                  };
-                  return (
-                    <details key={i} style={{marginBottom:'0.5rem'}}>
-                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#1e293b',padding:'0.25rem 0',display:'flex',alignItems:'center',gap:'0.6rem'}}>
-                        <span>{row.activity}</span>
-                        {wmape != null && (
-                          <span style={{fontSize:'0.7rem',fontWeight:700,color:wmapeColor,
-                            background: wmape < 20 ? '#dcfce7' : wmape < 50 ? '#fef9c3' : '#fee2e2',
-                            padding:'0.1rem 0.4rem',borderRadius:'4px',flexShrink:0}}>
-                            WMAPE {wmape.toFixed(1)}%
-                          </span>
-                        )}
-                      </summary>
-                      <table className="conf-detail-table" style={{width:'100%',marginTop:'0.35rem'}}>
-                        <thead>
-                          <tr>
-                            <th style={{textAlign:'left',fontSize:'0.7rem'}}>Metric</th>
-                            <th className="audit-num">Real Log</th>
-                            <th className="audit-num">Sim Output</th>
-                            <th className="audit-num">Δ %</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {Object.entries(fieldLabels).map(([fk, fl]) => {
-                            const fd = fields[fk];
-                            if (!fd) return null;
-                            const { real: rv, sim: sv, pct_diff: pd } = fd;
-                            if (rv == null && sv == null) return null;
-                            return (
-                              <tr key={fk}>
-                                <td style={{fontSize:'0.7rem',color:'#64748b'}}>{fl}</td>
-                                <td className="audit-num">{rv != null ? fmtDur(rv) : '—'}</td>
-                                <td className="audit-num">{sv != null ? fmtDur(sv) : '—'}</td>
-                                <td className={`audit-num cmp-diff ${pctCls(pd)}`}>
-                                  {pd != null ? `${pd > 0 ? '+' : ''}${pd.toFixed(1)}%` : '—'}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </details>
-                  );
-                })}
-              </div>
-            )}
-          </>
-        )}
-      </Collapsible>
-
-      {/* ── E5: Multi-seed variance ── */}
-      <Collapsible className="eval-section" title="E5 — Multi-Seed Variance Analysis" defaultOpen={false}>
+      {/* ── Multi-seed variance ── */}
+      <Collapsible className="eval-section" title="Multi-Seed Variance Analysis" defaultOpen={false}>
         <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
           Runs the simulation with multiple random seeds and reports mean ± std for key metrics,
           quantifying reproducibility and sensitivity to seed choice.
@@ -4374,11 +4395,11 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
               <table className="conf-detail-table" style={{width:'100%'}}>
                 <thead>
                   <tr>
-                    <th style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
-                    <th className="audit-num">Mean</th>
-                    <th className="audit-num">Std Dev</th>
-                    <th className="audit-num">Min</th>
-                    <th className="audit-num">Max</th>
+                    <th title="Simulation metric name" style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
+                    <th className="audit-num" title="Mean value across all seeds">Mean</th>
+                    <th className="audit-num" title="Standard deviation across seeds — lower = more stable">Std Dev</th>
+                    <th className="audit-num" title="Lowest value observed across all seeds">Min</th>
+                    <th className="audit-num" title="Highest value observed across all seeds">Max</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -4402,9 +4423,9 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
                 <table className="conf-detail-table" style={{width:'100%',marginTop:'0.5rem'}}>
                   <thead>
                     <tr>
-                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                      <th className="audit-num">Mean Rate</th>
-                      <th className="audit-num">Std Dev</th>
+                      <th title="Declarative constraint identifier" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                      <th className="audit-num" title="Mean fulfillment rate across all seeds (Fulfilled ÷ (Fulfilled + Violated))">Mean Rate</th>
+                      <th className="audit-num" title="Standard deviation of fulfillment rate across seeds — lower = more consistent">Std Dev</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4431,12 +4452,12 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
                 <table className="conf-detail-table" style={{width:'100%'}}>
                   <thead>
                     <tr>
-                      <th className="audit-num">Seed</th>
-                      <th className="audit-num">Events</th>
-                      <th className="audit-num">Objects</th>
-                      <th className="audit-num">Traces</th>
-                      <th className="audit-num">Obl. Fulfilled</th>
-                      <th className="audit-num">Obl. Violated</th>
+                      <th className="audit-num" title="Random seed used for this simulation run">Seed</th>
+                      <th className="audit-num" title="Total number of events fired in this run">Events</th>
+                      <th className="audit-num" title="Total number of objects instantiated in this run">Objects</th>
+                      <th className="audit-num" title="Number of object traces that completed (lifecycle ended)">Traces</th>
+                      <th className="audit-num" title="Number of response-constraint obligations that were fulfilled">Obl. Fulfilled</th>
+                      <th className="audit-num" title="Number of response-constraint obligations that were violated (case closed before target fired)">Obl. Violated</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4458,8 +4479,8 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
         )}
       </Collapsible>
 
-      {/* ── E6: Object cardinality fidelity ── */}
-      <Collapsible className="eval-section" title="E6 — Object Cardinality Fidelity" defaultOpen={false}>
+      {/* ── Object cardinality fidelity ── */}
+      <Collapsible className="eval-section" title="Object Cardinality Fidelity" defaultOpen={false}>
         <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
           Compares mean objects-per-event firing between the real log and simulation output per activity.
           Highlights where the simulator creates fewer or more objects than the real process.
@@ -4480,12 +4501,12 @@ function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFi
                 <table className="conf-detail-table" style={{width:'100%'}}>
                   <thead>
                     <tr>
-                      <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
-                      <th className="audit-num">Real Mean OPE</th>
-                      <th className="audit-num">Sim Mean OPE</th>
-                      <th className="audit-num">Δ Mean</th>
-                      <th className="audit-num">Real Count</th>
-                      <th className="audit-num">Sim Count</th>
+                      <th title="Activity name" style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
+                      <th className="audit-num" title="Mean objects-per-event (OPE) in the real input log — average number of objects involved per firing">Real Mean OPE</th>
+                      <th className="audit-num" title="Mean objects-per-event (OPE) in the simulation output">Sim Mean OPE</th>
+                      <th className="audit-num" title="Absolute difference between real and simulated mean OPE">Δ Mean</th>
+                      <th className="audit-num" title="Number of events for this activity in the real log">Real Count</th>
+                      <th className="audit-num" title="Number of events for this activity in the simulation output">Sim Count</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4592,7 +4613,6 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
     { key: 'coverage',   label: 'Coverage' },
     { key: 'matrix',     label: 'Verification Matrix' },
     { key: 'ocpq',       label: 'OCPQ' },
-    { key: 'evaluation', label: 'Evaluation' },
     { key: 'further',    label: 'Further Evaluations' },
   ];
 
@@ -4621,8 +4641,13 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
           )}
         </div>
         <table className="behavior-table">
-          <thead><tr><th>Object Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>
-            {logObjectTypes && <th>Log count</th>}
+          <thead><tr>
+            <th title="Object type name as defined in the model">Object Type</th>
+            <th title="Total number of objects of this type instantiated in the simulation">Total</th>
+            <th title="Objects whose lifecycle ended (deactivated) — fully completed traces">Completed</th>
+            <th title="Objects still active (not yet deactivated) at the end of the simulation">Active</th>
+            <th title="Fraction of objects that completed their lifecycle (Completed ÷ Total)">Rate</th>
+            {logObjectTypes && <th title="Number of objects of this type in the input event log">Log count</th>}
           </tr></thead>
           <tbody>
             {Object.entries(tc.totalByType).map(([ot, tot]) => {
@@ -4729,13 +4754,13 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         <table className="behavior-table" style={{fontSize:'0.75rem',borderCollapse:'collapse'}}>
           <thead>
             <tr style={{verticalAlign:'bottom'}}>
-              <th style={{minWidth:'130px',fontSize:'0.72rem',textAlign:'left',paddingBottom:'0.35rem'}}>Activity</th>
+              <th title="Activity name" style={{minWidth:'130px',fontSize:'0.72rem',textAlign:'left',paddingBottom:'0.35rem'}}>Activity</th>
               {cols.map(ot => (
                 <th key={ot} title={ot} style={{...vertStyle,fontWeight:600,color:'#475569',border:'1px solid #e2e8f0',background:'#f8fafc'}}>
                   {ot}
                 </th>
               ))}
-              {showLogRef && <th style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
+              {showLogRef && <th title="Reference value from the input event log (read-only)" style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
             </tr>
           </thead>
           <tbody>
@@ -4935,28 +4960,6 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         </div>
       )}
 
-      {/* Evaluation tab — As-Is and To-Be side by side */}
-      {evalTab === 'evaluation' && (
-        <div className="results-compare-layout">
-          {[{label:'As-Is / Base Model', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
-            <div key={label} className="run-result-panel">
-              <div className="run-result-panel-header">{label}</div>
-              <div style={{padding:'0.5rem'}}>
-                {r ? (
-                  <EvaluationTab key={evalRunCount} results={r} discoveryResults={discoveryResults} activeModel={activeModel}
-                    serviceTimeMode={serviceTimeMode} simActivityObjectCounts={simActivityObjectCounts}
-                    onConformanceSaved={onConformanceSaved} eventLogFiles={eventLogFiles}
-                    handleFileUpload={handleFileUpload} inputLogConfResults={inputLogConfResults}
-                    inputEventLogFile={inputEventLogFile} />
-                ) : (
-                  <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'1rem'}}>No {label} run yet.</div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
       {/* Further Evaluations tab */}
       {evalTab === 'further' && (
         <FurtherEvaluations
@@ -5150,7 +5153,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
             <span style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:'0.75rem'}}>
               {evalElapsed != null && (
                 <span className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                  ⏱ {Math.floor(evalElapsed/60).toString().padStart(2,'0')}:{(evalElapsed%60).toString().padStart(2,'0')}
+                  {Math.floor(evalElapsed/60).toString().padStart(2,'0')}:{(evalElapsed%60).toString().padStart(2,'0')}
                 </span>
               )}
               <span className="eval-progress-count">{doneCount} / {EVAL_STEPS.length}</span>
@@ -5159,7 +5162,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           <div className="eval-progress-steps">
             {EVAL_STEPS.map(s => (
               <span key={s.key} className={`eval-step-chip ${stepsDone[s.key] ? 'eval-step-done' : stepsLoading[s.key] ? 'eval-step-loading' : 'eval-step-pending'}`}>
-                {stepsDone[s.key] ? '✓ ' : stepsLoading[s.key] ? '⏳ ' : '○ '}{s.label}
+                {stepsDone[s.key] ? '✓ ' : stepsLoading[s.key] ? '' : '○ '}{s.label}
               </span>
             ))}
           </div>
@@ -5192,6 +5195,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                 }, 0)
               : null;
             return (
+              <div style={{overflowX:'auto'}}>
               <table className="metrics-table sim-compare-table">
                 <thead>
                   <tr>
@@ -5201,8 +5205,6 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                     <th title="Share of simulated events">Sim %</th>
                     <th title="Share of log events">Log %</th>
                     <th title="Sim % − Log %">Diff {wmapeAct != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmapeAct < 10 ? '#16a34a' : wmapeAct < 25 ? '#ca8a04' : wmapeAct < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmapeAct.toFixed(1)}%</span>}</th>
-                    <th title="Mean service time per firing">Mean svc</th>
-                    <th title="Total accumulated service time (mean × count)">Total svc</th>
                     <th title="Share of total accumulated service time across all activities">Time share</th>
                   </tr>
                 </thead>
@@ -5226,8 +5228,6 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                         <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
                         <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
                         <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                        <td>{fmtS(meanSvc)}</td>
-                        <td>{fmtS(totalSvc)}</td>
                         <td>
                           {timeShare != null ? (
                             <span style={{display:'inline-flex',alignItems:'center',gap:'0.3rem'}}>
@@ -5247,36 +5247,9 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                   })}
                 </tbody>
               </table>
+              </div>
             );
           })()}
-
-          {/* Log /obj and Sim /obj — collapsible */}
-          <Collapsible className="conf-detail-collapsible" title="Firings per object" defaultOpen={false}>
-            <table className="conf-detail-table">
-              <thead>
-                <tr>
-                  <th>Activity</th>
-                  <th className="audit-num" title="Mean firings per object in log">Log /obj</th>
-                  <th className="audit-num" title="Mean firings per object in simulation">Sim /obj</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orderedActivities.map(act => {
-                  const simCount = simMetrics[act]?.execution_count ?? 0;
-                  const logMeanObj = logRepeat[act]?.mean ?? null;
-                  const simObjEvts = simActivityObjectCounts?.[act] ?? null;
-                  const simMeanObj = simObjEvts > 0 ? (simCount / simObjEvts).toFixed(2) : null;
-                  return (
-                    <tr key={act}>
-                      <td style={{fontSize:'0.78rem'}}>{act}</td>
-                      <td className="audit-num">{logMeanObj ?? '—'}</td>
-                      <td className="audit-num">{simMeanObj ?? '—'}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </Collapsible>
 
           {/* ── Confidence Score (Conformance) — inline summary + collapsible detail ── */}
           <div style={{marginTop:'0.75rem'}}>
@@ -5381,9 +5354,14 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
               <table className="metrics-table" style={{fontSize:'0.78rem'}}>
                 <thead>
                   <tr>
-                    <th>Activity</th>
-                    <th>Log mean</th><th>Sim mean</th><th>|Δ|%</th>
-                    {simDurs && Object.keys(simDurs).length > 0 && <><th>Discovered mean</th><th>Log vs Disc |Δ|%</th></>}
+                    <th title="Activity name">Activity</th>
+                    <th title="Mean service duration from the input event log">Log mean</th>
+                    <th title="Mean service duration from the simulation output">Sim mean</th>
+                    <th title="Absolute percentage difference between log mean and sim mean: |Sim − Log| ÷ Log × 100%">|Δ|%</th>
+                    {simDurs && Object.keys(simDurs).length > 0 && <>
+                      <th title="Mean service duration discovered from the simulation output OCEL (post-hoc measurement)">Discovered mean</th>
+                      <th title="Absolute percentage difference between log mean and discovered mean">Log vs Disc |Δ|%</th>
+                    </>}
                   </tr>
                 </thead>
                 <tbody>{acts.map(act => {
@@ -5416,7 +5394,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
             Both sides use the <strong>{modeLabel[serviceTimeMode] || serviceTimeMode}</strong> discovery method.
             Left: input OCEL log (from Parameter tab discovery). Right: simulated output log (discovered now).
-            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
             {simDiscoverError && <span style={{marginLeft:'0.5rem',color:'#b91c1c'}}>⚠ {simDiscoverError}</span>}
           </p>
           <ActivityBarChart
@@ -5432,7 +5410,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
         <Collapsible className="eval-subsection" title="Waiting Time per Activity" defaultOpen={false}>
           <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
             Waiting time = sojourn − service, using the same discovery method as service time.
-            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
           </p>
           <ActivityBarChart
             logDurations={logDurations}
@@ -5467,6 +5445,16 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
             const acts = orderedActivities.filter(a => logDurations[a] || simDiscovered?.[a]);
             if (acts.length === 0) return <p className="empty-notice">No timing data available yet.{simDiscovering && ' Discovering…'}</p>;
 
+            // WMAPE on service_mean (weighted by execution count)
+            let wmapeNum = 0, wmapeDen = 0;
+            acts.forEach(act => {
+              const lv = logDurations[act]?.service_mean;
+              const sv = simDiscovered?.[act]?.service_mean;
+              const w = simMetrics[act]?.execution_count || 1;
+              if (lv != null && sv != null && lv > 0) { wmapeNum += Math.abs(sv - lv) * w; wmapeDen += lv * w; }
+            });
+            const wmapeDisc = wmapeDen > 0 ? wmapeNum / wmapeDen * 100 : null;
+
             // Overall relative deviation: mean of |Δ%| across all (act, field) pairs
             let deviations = [];
             acts.forEach(act => {
@@ -5486,11 +5474,20 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
               <div>
                 <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
                   Input OCEL log vs simulated output log, both using <strong>{({minimum:'Minimum sojourn',p25:'P25 sojourn',p50:'P50 (median) sojourn'})[serviceTimeMode] || serviceTimeMode}</strong>.
-                  {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>⏳ Discovering output log…</span>}
+                  {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
                 </p>
 
                 {/* Overall deviation summary */}
                 <div className="timing-compare-overall">
+                  {wmapeDisc != null && (
+                    <span style={{marginRight:'1.5rem',display:'inline-flex',alignItems:'center',gap:'0.4rem'}}>
+                      <span className="timing-compare-overall-label">WMAPE (service mean)</span>
+                      <span className={`timing-compare-overall-val ${wmapeDisc < 20 ? 'cmp-ok' : wmapeDisc < 50 ? '' : 'cmp-over'}`}
+                        title="Weighted Mean Absolute Percentage Error on service_mean, weighted by execution count">
+                        {wmapeDisc.toFixed(1)}%
+                      </span>
+                    </span>
+                  )}
                   <span className="timing-compare-overall-label">Overall mean relative deviation</span>
                   <span className={`timing-compare-overall-val ${pctCls(overallMeanDev)}`}>{fmtPct(overallMeanDev)}</span>
                   <span className="timing-compare-overall-label" style={{marginLeft:'1.5rem'}}>Mean absolute deviation</span>
@@ -5524,11 +5521,11 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                         <table className="timing-compare-detail-table">
                           <thead>
                             <tr>
-                              <th>Metric</th>
-                              <th className="audit-num">Input Log</th>
-                              <th className="audit-num">Sim Output</th>
-                              <th className="audit-num">Δ absolute</th>
-                              <th className="audit-num">Δ %</th>
+                              <th title="Timing metric (service time, sojourn time, waiting time, etc.)">Metric</th>
+                              <th className="audit-num" title="Value measured from the input event log">Input Log</th>
+                              <th className="audit-num" title="Value measured from the simulation output">Sim Output</th>
+                              <th className="audit-num" title="Sim − Log (same unit as the metric)">Δ absolute</th>
+                              <th className="audit-num" title="(Sim − Log) ÷ Log × 100% — relative difference">Δ %</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -5559,12 +5556,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           })()}
         </Collapsible>
 
-        {/* Activity Timeline moved inside Time Comparison */}
-        <ActivityGanttChart
-          results={results}
-          orderedActivities={orderedActivities}
-          simMetrics={simMetrics}
-        />
+        {/* Activity Timeline — removed from evaluation; see Time collapsible in Results tab */}
       </Collapsible>
 
       {/* ── Trace Health ── */}
@@ -6106,7 +6098,7 @@ function ColTip({ text, children }) {
       {pos && ReactDOM.createPortal(
         <div style={{position:'fixed',left:Math.min(pos.x+12,window.innerWidth-256),
           top:Math.max(pos.y-10,4),background:'#1e293b',color:'white',fontSize:'0.72rem',
-          padding:'0.35rem 0.5rem',borderRadius:'5px',whiteSpace:'normal',maxWidth:'240px',
+          padding:'0.35rem 0.5rem',borderRadius:'5px',whiteSpace:'pre-line',maxWidth:'240px',
           zIndex:9999,lineHeight:1.4,pointerEvents:'none',boxShadow:'0 2px 8px rgba(0,0,0,0.25)'}}>
           {text}
         </div>,
@@ -6150,6 +6142,63 @@ function BehaviorLegend({ items }) {
         </div>
       )}
     </span>
+  );
+}
+
+// ── ModelInfoPopup — ℹ guide button for Base Model / Scenario Builder tabs ────
+function ModelInfoPopup({ ocdeclareFile, eventLogFile, isScenario }) {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const h = e => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [open]);
+  return (
+    <div ref={ref} style={{position:'relative',display:'inline-block',marginBottom:'0.6rem'}}>
+      <button onClick={() => setOpen(o => !o)}
+        style={{display:'inline-flex',alignItems:'center',gap:'0.3rem',fontSize:'0.75rem',
+          padding:'3px 11px',border:'1px solid #bfdbfe',borderRadius:'20px',
+          background:open?'#dbeafe':'#eff6ff',color:open?'#1d4ed8':'#3b82f6',
+          cursor:'pointer',fontWeight:600}}>
+        ℹ Model Guide
+      </button>
+      {open && (
+        <div style={{position:'absolute',top:'calc(100% + 6px)',left:0,zIndex:300,
+          background:'white',border:'1px solid #e2e8f0',borderRadius:'8px',
+          boxShadow:'0 4px 24px rgba(0,0,0,0.13)',padding:'0.75rem 1rem',
+          width:'370px',fontSize:'0.78rem',color:'#475569',lineHeight:1.6}}>
+          <div style={{fontWeight:700,color:'#1e293b',marginBottom:'0.4rem',fontSize:'0.82rem'}}>Model Guide</div>
+          <p style={{margin:'0 0 0.5rem'}}>
+            The model is loaded from previously discovered constraints from{' '}
+            <strong style={{color:'#1e293b'}}>{ocdeclareFile || '—'}</strong>{' '}
+            based on <strong style={{color:'#1e293b'}}>{eventLogFile || '—'}</strong>.
+          </p>
+          <ul style={{margin:'0',paddingLeft:'1.1rem'}}>
+            <li>To edit, click on the respective field.</li>
+            <li>To add constraints, configure in the <strong>Constraints</strong> section.</li>
+            <li>To add activities, configure in the <strong>Activities</strong> section.</li>
+            <li>To add objects, configure in the <strong>Object Flows</strong> section.</li>
+            <li>To remove constraints, activities or objects, click the removal button in their section.</li>
+          </ul>
+          {isScenario && (
+            <p style={{margin:'0.5rem 0 0',paddingTop:'0.5rem',borderTop:'1px solid #f1f5f9'}}>
+              To run, first configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
+              <strong>▶ Run As-Is / Base Model</strong> for the Base Model or{' '}
+              <strong>Run To-Be</strong> for the Alternative scenario.
+            </p>
+          )}
+          <div style={{textAlign:'right',marginTop:'0.5rem'}}>
+            <button onClick={() => setOpen(false)}
+              style={{fontSize:'0.7rem',padding:'1px 8px',border:'1px solid #e2e8f0',
+                borderRadius:'3px',background:'#f8fafc',cursor:'pointer',color:'#64748b'}}>
+              close
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -6356,12 +6405,13 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
 }
 
 // ── BehaviorActivitiesPanel ───────────────────────────────────────────────────
-function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange }) {
+function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange, foldable }) {
   const [expandedRows, setExpandedRows] = React.useState(new Set());
   const [newActName, setNewActName] = React.useState('');
   const [newObjTypeName, setNewObjTypeName] = React.useState('');
   const [newBindings, setNewBindings] = React.useState({}); // actName → {ot, creates, deact}
   const [sortAct, cycleAct, setSortAct] = useSortState();
+  const [folded, setFolded] = React.useState(true);
 
   const acts = model.activities || [];
   const allObjTypesRaw = (model.object_types || []).map(t => typeof t === 'string' ? t : t.name);
@@ -6373,7 +6423,8 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
   const actFilters = filters || {};
   const visObjTypes = actFilters.object_type ? allObjTypes.filter(t => t === actFilters.object_type) : allObjTypes;
   const filteredActs = actFilters.activity ? acts.filter(a => a.name === actFilters.activity) : acts;
-  const visActs = sortedBy(filteredActs, sortAct, (a) => a.name);
+  const foldFiltered = foldable && folded ? filteredActs.filter(a => startSet.has(a.name)) : filteredActs;
+  const visActs = sortedBy(foldFiltered, sortAct, (a) => a.name);
 
   const toggle = row => setExpandedRows(prev => {
     const n = new Set(prev); n.has(row) ? n.delete(row) : n.add(row); return n;
@@ -6455,7 +6506,12 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           ['★','Start activity — simulation begins here'],
           ['R (superscript)','Permanent object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
         ]}/>
-        {editMode && <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click cells or ▶ to expand</span>}
+        {editMode && <HelpTip text="Click any cell to toggle creates / deactivates. Click ▶ to expand a row and edit detailed bindings." />}
+        {foldable && (
+          <button onClick={() => setFolded(f => !f)} style={{marginLeft:'auto',fontSize:'0.72rem',color:'#64748b',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.1rem 0.5rem',cursor:'pointer'}}>
+            {folded ? '▶ show all' : '▼ show selected'}
+          </button>
+        )}
       </div>
       <div style={{display:'flex',gap:'0.4rem',alignItems:'stretch',marginBottom:'0.5rem'}}>
         <SortSelect s={sortAct} set={setSortAct} columns={[{col:'name',label:'Activity name'}]}/>
@@ -6469,7 +6525,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           style={{marginBottom:0,flex:1}}
         />
       </div>
-      <div style={{overflowX:'auto'}}>
+      <div style={{overflowX:'auto',border:'1.5px solid #1e293b',borderRadius:'6px'}}>
         <table className="behavior-table">
           <thead>
             <tr>
@@ -6477,8 +6533,8 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
               <th style={{textAlign:'left',verticalAlign:'bottom'}}>
                 <div style={{display:'flex',flexDirection:'column',gap:'1px'}}>
                   <span style={{fontSize:'0.62rem',color:'#16a34a',fontWeight:700,lineHeight:1}}>+ creates</span>
-                  <ColTip text="Activity name. Expand a row (▶) to view and edit its object type bindings.">Activity</ColTip>
                   <span style={{fontSize:'0.62rem',color:'#dc2626',fontWeight:700,lineHeight:1}}>− deactivates</span>
+                  <ColTip text="Activity name. Expand a row (▶) to view and edit its object type bindings.">Activity</ColTip>
                 </div>
               </th>
               {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
@@ -6492,7 +6548,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                   lc.creates.length    ? `Created: ${lc.creates.join(', ')}`     : null,
                   lc.deactivates.length ? `Deactivated: ${lc.deactivates.join(', ')}` : null,
                 ].filter(Boolean);
-                const tipText = tipLines.length ? tipLines.join('\n') : `No creates or deactivates for "${ot}"`;
+                const tipText = (tipLines.length ? tipLines.join('\n') : `No creates or deactivates for "${ot}"`) + '\n\nAdd/remove object types in the Object Flows tab.';
                 return (
                   <th key={ot} style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
                     <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.75rem',fontWeight:600,lineHeight:1.1}}>
@@ -6599,18 +6655,8 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
               style={inp({width:'180px'})} onKeyDown={e=>e.key==='Enter'&&addActivity()}/>
             <button onClick={addActivity} style={{fontSize:'0.75rem',padding:'2px 8px',background:'#1e293b',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add Activity</button>
           </div>
-          {/* Object types */}
-          <div style={{display:'flex',gap:'0.4rem',alignItems:'center',flexWrap:'wrap'}}>
-            <span style={{fontSize:'0.72rem',color:'#64748b',fontWeight:600}}>Object types:</span>
-            {allObjTypes.map(ot => (
-              <span key={ot} style={{fontSize:'0.72rem',background:'#f1f5f9',border:'1px solid #e2e8f0',borderRadius:'12px',padding:'1px 8px',display:'inline-flex',alignItems:'center',gap:'3px'}}>
-                {ot}
-                <button onClick={()=>deleteObjectType(ot)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:0,fontSize:'0.7rem',lineHeight:1}}>×</button>
-              </span>
-            ))}
-            <input value={newObjTypeName} onChange={e=>setNewObjTypeName(e.target.value)} placeholder="New type…"
-              style={inp({width:'100px'})} onKeyDown={e=>e.key==='Enter'&&addObjectType()}/>
-            <button onClick={addObjectType} style={{fontSize:'0.72rem',padding:'1px 6px',background:'#475569',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+</button>
+          <div style={{fontSize:'0.7rem',color:'#64748b',fontStyle:'italic'}}>
+            To add or remove object types, use the <strong>Object Flows</strong> tab.
           </div>
         </div>
       )}
@@ -6637,7 +6683,43 @@ const BEHAVIOR_SCOPE_KIND_OPTS = [
   {value:'any',  label:'any — at least one object'},
   {value:'all',  label:'all — every object'},
 ];
-const BEHAVIOR_EMPTY_CON = {constraint_type:'',source_activity:'',target_activity:'',scope:{kind:'each',object_type:''},nmin:1,nmax:null};
+const BEHAVIOR_EMPTY_CON = {constraint_type:'',source_activity:'',target_activity:'',scope:{kind:'each',object_type:''},nmin:1,nmax:null,guard:null};
+
+function AddObjectTypeForm({ model, onUpdate }) {
+  const [newName, setNewName] = React.useState('');
+  const allOts = (model?.object_types || []).map(t => typeof t === 'string' ? t : t.name);
+  const add = () => {
+    const n = newName.trim();
+    if (!n || allOts.includes(n)) return;
+    onUpdate({ ...model, object_types: [...(model.object_types || []), n] });
+    setNewName('');
+  };
+  const del = ot => {
+    const activities = (model.activities || []).map(a => ({
+      ...a, bindings: (a.bindings || []).filter(b => b.object_type !== ot)
+    }));
+    onUpdate({ ...model, object_types: (model.object_types || []).filter(t => (typeof t === 'string' ? t : t.name) !== ot), activities });
+  };
+  return (
+    <div style={{marginTop:'0.75rem',padding:'0.5rem 0',borderTop:'1px solid #e2e8f0'}}>
+      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',marginBottom:'0.4rem'}}>Add / Remove Object Types</div>
+      <div style={{display:'flex',gap:'0.4rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.4rem'}}>
+        {allOts.map(ot => (
+          <span key={ot} style={{fontSize:'0.72rem',background:'#f1f5f9',border:'1px solid #e2e8f0',borderRadius:'12px',padding:'1px 8px',display:'inline-flex',alignItems:'center',gap:'3px'}}>
+            {ot}
+            <button onClick={() => del(ot)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:0,fontSize:'0.7rem',lineHeight:1}}>×</button>
+          </span>
+        ))}
+      </div>
+      <div style={{display:'flex',gap:'0.4rem',alignItems:'center'}}>
+        <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="New type…"
+          style={{fontSize:'0.75rem',padding:'2px 6px',border:'1px solid #cbd5e1',borderRadius:'3px',width:'120px'}}
+          onKeyDown={e => e.key === 'Enter' && add()}/>
+        <button onClick={add} style={{fontSize:'0.72rem',padding:'2px 8px',background:'#475569',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add</button>
+      </div>
+    </div>
+  );
+}
 
 function AddO2ORuleForm({ otNames, onAdd }) {
   const [src, setSrc] = React.useState('');
@@ -6832,8 +6914,8 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
         </div>
       )}
       {constraints.length > 0 ? (
-        <div style={{overflowX:'auto'}}>
-          <table className="behavior-table">
+        <div style={{overflowX:'auto',border:'1.5px solid #1e293b',borderRadius:'6px'}}>
+          <table className="behavior-table con-table">
             <thead>
               <tr>
                 {editMode && <th style={{width:'24px'}}/>}
@@ -6844,14 +6926,18 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                 <th><ColTip text="each = holds per individual object; any = at least one object satisfies it; all = every object must satisfy it.">Scope</ColTip></th>
                 <th><ColTip text="Minimum Source firings required before Target may fire (nmin). Default 1.">n≥</ColTip></th>
                 <th><ColTip text="Maximum Source firings before Target must have fired (nmax). Blank = no upper bound.">n≤</ColTip></th>
+                <th><ColTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint.">Guard</ColTip></th>
               </tr>
             </thead>
             <tbody>
               {sortedConstraints.map(({c, origIdx}) => {
                 const scopeOt = c.scope?.object_type || c.scope_object_type || '';
                 const scopeKind = c.scope?.kind || 'each';
+                const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                  : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                  : undefined;
                 return (
-                  <tr key={origIdx}>
+                  <tr key={origIdx} style={rowBg ? {background:rowBg} : undefined}>
                     {editMode && <td><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
                     <td>{editMode ? sel(c.constraint_type, BEHAVIOR_CTYPES, v=>updateCon(origIdx,{constraint_type:v})) : <span className="con-type-badge">{c.constraint_type}</span>}</td>
                     <td>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>
@@ -6872,6 +6958,31 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                       </select> : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{scopeKind}</span>}</td>
                     <td>{editMode ? <EditableCell value={c.nmin??1} type="number" onSave={v=>updateCon(origIdx,{nmin:v})}/> : (c.nmin??'—')}</td>
                     <td>{editMode ? <EditableCell value={c.nmax??''} type="number" placeholder="∞" onSave={v=>updateCon(origIdx,{nmax:v===''||v===null?null:Number(v)})}/> : (c.nmax??'—')}</td>
+                    <td style={{minWidth:'10rem'}}>
+                      {editMode ? (
+                        c.guard ? (
+                          <span style={{display:'flex',gap:'0.2rem',alignItems:'center',flexWrap:'wrap'}}>
+                            <input style={{width:'4.5rem',fontSize:'0.72rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}} placeholder="attr"
+                              value={c.guard.attribute||''} onChange={e=>updateCon(origIdx,{guard:{...c.guard,attribute:e.target.value}})}/>
+                            <select style={{fontSize:'0.72rem',padding:'1px 2px',border:'1px solid #cbd5e1',borderRadius:'3px'}} value={c.guard.op||'=='} onChange={e=>updateCon(origIdx,{guard:{...c.guard,op:e.target.value}})}>
+                              {['==','!=','>','<','>=','<='].map(o=><option key={o} value={o}>{o}</option>)}
+                            </select>
+                            <input style={{width:'3.5rem',fontSize:'0.72rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}} placeholder="val"
+                              value={c.guard.value??''} onChange={e=>updateCon(origIdx,{guard:{...c.guard,value:e.target.value}})}/>
+                            <button onClick={()=>updateCon(origIdx,{guard:null})} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 2px'}}>×</button>
+                          </span>
+                        ) : (
+                          <button onClick={()=>updateCon(origIdx,{guard:{attribute:'',op:'==',value:''}})}
+                            style={{fontSize:'0.72rem',padding:'1px 6px',border:'1px solid #cbd5e1',borderRadius:'3px',background:'#f8fafc',cursor:'pointer',color:'#475569'}}>
+                            + guard
+                          </button>
+                        )
+                      ) : (
+                        c.guard
+                          ? <span style={{fontSize:'0.72rem',color:'#6366f1',fontFamily:'monospace'}}>{c.guard.attribute} {c.guard.op} {c.guard.value}</span>
+                          : <span style={{color:'#94a3b8',fontSize:'0.72rem'}}>—</span>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -6917,6 +7028,24 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
               <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>n≤</span>
               <input type="number" value={newCon.nmax??''} placeholder="∞" min={0} onChange={e=>setNewCon(n=>({...n,nmax:e.target.value===''?null:parseInt(e.target.value)}))}
                 style={{width:'45px',fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/>
+              {newCon.guard ? (
+                <span style={{display:'flex',gap:'0.2rem',alignItems:'center',flexWrap:'wrap'}}>
+                  <span style={{fontSize:'0.72rem',color:'#64748b'}}>guard: if</span>
+                  <input style={{width:'4.5rem',fontSize:'0.72rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}} placeholder="attr"
+                    value={newCon.guard.attribute||''} onChange={e=>setNewCon(n=>({...n,guard:{...n.guard,attribute:e.target.value}}))}/>
+                  <select style={{fontSize:'0.72rem',padding:'1px 2px',border:'1px solid #cbd5e1',borderRadius:'3px'}} value={newCon.guard.op||'=='} onChange={e=>setNewCon(n=>({...n,guard:{...n.guard,op:e.target.value}}))}>
+                    {['==','!=','>','<','>=','<='].map(o=><option key={o} value={o}>{o}</option>)}
+                  </select>
+                  <input style={{width:'3.5rem',fontSize:'0.72rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}} placeholder="val"
+                    value={newCon.guard.value??''} onChange={e=>setNewCon(n=>({...n,guard:{...n.guard,value:e.target.value}}))}/>
+                  <button onClick={()=>setNewCon(n=>({...n,guard:null}))} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 2px'}}>×</button>
+                </span>
+              ) : (
+                <button onClick={()=>setNewCon(n=>({...n,guard:{attribute:'',op:'==',value:''}}))}
+                  style={{fontSize:'0.72rem',padding:'1px 6px',border:'1px solid #cbd5e1',borderRadius:'3px',background:'#f8fafc',cursor:'pointer',color:'#475569'}}>
+                  + guard
+                </button>
+              )}
               <button onClick={addCon}
                 style={{padding:'0.2rem 0.6rem',fontSize:'0.78rem',background:'#1e293b',color:'white',border:'none',borderRadius:'4px',cursor:'pointer'}}>
                 + Add
@@ -7277,6 +7406,10 @@ function App() {
   const [isAnalyzingBlocking, setIsAnalyzingBlocking] = useState(false);
   const [pressureResult, setPressureResult] = useState(null);
   const [isRunningPressure, setIsRunningPressure] = useState(false);
+  const [pinpointResult, setPinpointResult] = useState(null);
+  const [isPinpointing, setIsPinpointing] = useState(false);
+  const [dryRunResult, setDryRunResult] = useState(null);
+  const [isDryRunning, setIsDryRunning] = useState(false);
   const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
   const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
   const [error, setError] = useState(null);
@@ -7391,6 +7524,7 @@ function App() {
 
   const [behaviorFilters, setBehaviorFilters] = useState({}); // { sectionKey: { dimKey: value } }
   const [scenarioBehaviorSection, setScenarioBehaviorSection] = useState('activities');
+  const [saPickerFolded, setSaPickerFolded] = useState(true);
   const [scenarioBehaviorFilters, setScenarioBehaviorFilters] = useState({});
   const getBehaviorFilters = section => behaviorFilters[section] || {};
   const setBehaviorSectionFilters = (section, f) => setBehaviorFilters(prev => ({...prev, [section]: f}));
@@ -8005,6 +8139,43 @@ function App() {
       setHealthResult({ error: err.response?.data?.error || 'Health check failed.' });
     } finally {
       setIsCheckingHealth(false);
+    }
+  };
+
+  const runPinpointBlocking = async () => {
+    setIsPinpointing(true);
+    setPinpointResult(null);
+    try {
+      const payload = {
+        ...config,
+        ...(activeModel ? { modelOverride: activeModel } : {}),
+        steps: 200,
+        maxRounds: 12,
+      };
+      const res = await axios.post('/api/pinpoint-blocking', payload);
+      setPinpointResult(res.data);
+    } catch (err) {
+      setPinpointResult({ error: err.response?.data?.error || 'Pinpoint analysis failed.' });
+    } finally {
+      setIsPinpointing(false);
+    }
+  };
+
+  const runDryRunStats = async () => {
+    setIsDryRunning(true);
+    setDryRunResult(null);
+    try {
+      const payload = {
+        ...config,
+        ...(activeModel ? { modelOverride: activeModel } : {}),
+        steps: 500,
+      };
+      const res = await axios.post('/api/dry-run-stats', payload);
+      setDryRunResult(res.data);
+    } catch (err) {
+      setDryRunResult({ error: err.response?.data?.error || 'Dry run failed.' });
+    } finally {
+      setIsDryRunning(false);
     }
   };
 
@@ -8983,6 +9154,32 @@ function App() {
         <p>Object-centric declarative process simulation</p>
       </header>
 
+      {/* ── Model info banner — between header and tab bar ── */}
+      {workflowMode === 'external-ocel' && (externalTab === 'behavior' || externalTab === 'scenario') && (
+        <div style={{margin:'0.5rem 1.5rem 0',background:'#eff6ff',border:'1px solid #bfdbfe',
+          borderRadius:'8px',padding:'0.6rem 1rem',fontSize:'0.78rem',color:'#475569',lineHeight:1.6}}>
+          <p style={{margin:'0 0 0.3rem'}}>
+            The model is loaded from previously discovered constraints from{' '}
+            <strong style={{color:'#1e293b'}}>{config.ocdeclareFile || '—'}</strong>{' '}
+            based on <strong style={{color:'#1e293b'}}>{discoveryConfig.eventLogFile || '—'}</strong>.
+            {' '}To edit, click on the respective field.
+          </p>
+          <p style={{margin:'0'}}>
+            To add constraints, configure in the <strong>Constraints</strong> section.{' '}
+            To add activities, configure in the <strong>Activities</strong> section.{' '}
+            To add objects, configure in the <strong>Object Flows</strong> section.{' '}
+            To remove constraints, activities or objects, click the removal button in their section.
+          </p>
+          {externalTab === 'scenario' && (
+            <p style={{margin:'0.35rem 0 0',paddingTop:'0.35rem',borderTop:'1px solid #bfdbfe'}}>
+              To run, first configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
+              <strong>▶ Run As-Is / Base Model</strong> for the Base Model or{' '}
+              <strong>Run To-Be</strong> for the Alternative scenario.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* ── Main tab bar — only shown after landing page is complete ── */}
       {workflowMode === 'external-ocel' && externalTab !== 'parameter' && (
         <div className="main-tab-bar">
@@ -9714,11 +9911,11 @@ function App() {
                     <nav className="behavior-nav">
                       {[
                         ['activities',    'Activities'],
-                        ['time',          'Time'],
-                        ['probabilities', 'Probabilities'],
+                        ['objects',       'Object Flows'],
                         ['constraints',   'Constraints'],
                         ['o2o',           'Object-to-Object Relationships'],
-                        ['objects',       'Object Flows'],
+                        ['time',          'Time'],
+                        ['probabilities', 'Probabilities'],
                       ].map(([key, label]) => (
                         <button key={key}
                           className={'behavior-nav-item' + (behaviorSection === key ? ' active' : '')}
@@ -9902,6 +10099,7 @@ function App() {
                                   return {...m, resource_types: rt.includes(ot) ? rt.filter(t=>t!==ot) : [...rt, ot]};
                                 });
                                 return (
+                                  <div style={{border:'1.5px solid #1e293b',borderRadius:'6px',overflow:'hidden'}}>
                                   <table className="behavior-table">
                                     <thead><tr><th style={{width:'20px'}}/><th>Type</th><th>Pool Size</th></tr></thead>
                                     <tbody>
@@ -9920,16 +10118,17 @@ function App() {
                                       })}
                                     </tbody>
                                   </table>
+                                  </div>
                                 );
                               })()}
                             </div>
                             <div style={{flex:1,minWidth:'180px'}}>
                               <div className="behavior-sub-title">Attributes</div>
-                              {Object.keys(modelAsIs.attribute_defaults||{}).length > 0 ? (
+                              {Object.keys(modelAsIs.attribute_schema||{}).length > 0 ? (
                                 <table className="behavior-table">
                                   <thead><tr><th>Object Type</th><th>Attribute</th><th>Default</th></tr></thead>
                                   <tbody>
-                                    {Object.entries(modelAsIs.attribute_defaults||{}).flatMap(([ot, attrs]) =>
+                                    {Object.entries(modelAsIs.attribute_schema||{}).flatMap(([ot, attrs]) =>
                                       Object.entries(attrs||{}).map(([attr, val], i) => (
                                         <tr key={ot+'-'+attr}>
                                           {i===0?<td rowSpan={Object.keys(attrs||{}).length} style={{fontWeight:600}}>{ot}</td>:null}
@@ -9942,6 +10141,7 @@ function App() {
                               ) : <p className="behavior-empty">No attributes defined.</p>}
                             </div>
                           </div>
+                          <AddObjectTypeForm model={modelAsIs} onUpdate={m => setModelAsIs(m)} />
                           <div className="behavior-sub-title">Object Flow</div>
                           {(() => {
                             const byType = {};
@@ -9965,7 +10165,7 @@ function App() {
                                     <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',paddingTop:'0.55rem',whiteSpace:'nowrap',flexShrink:0}}>Object flow:</span>
                                     <div className="object-flow-track">
                                       {sorted.map(n => (
-                                        <div key={n.act} className="flow-node">
+                                        <div key={n.act} className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}>
                                           <span className="flow-node-name">{n.act}</span>
                                           {n.creates && <span className="flow-node-badge flow-node-creates">+</span>}
                                           {n.deactivates && <span className="flow-node-badge flow-node-deactivates">✕</span>}
@@ -10011,31 +10211,25 @@ function App() {
                       To-Be Model <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>— always editable · click any value to change</span>
                     </div>
                     {modelToBe ? (<>
-                      <ToBeDiffPanel
-                        modelAsIs={modelAsIs}
-                        modelToBe={modelToBe}
-                        probMatrixBase={probMatrixBase}
-                        probMatrixToBe={probMatrixToBe}
-                        startActivitiesAsIs={modelAsIs?.start_activities || []}
-                        startActivitiesToBe={config.startActivities || []}
-                      />
-                      {/* Scenario nav — mirrors Model Behavior nav */}
-                      <div style={{display:'flex',gap:'0',flexWrap:'wrap',marginBottom:'0.75rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.4rem',overflowX:'auto'}}>
-                        {[
-                          ['activities','Activities'],['time','Time'],['probabilities','Probabilities'],
-                          ['constraints','Constraints'],['o2o','Object-to-Object Relationships'],['objects','Object Flows'],
-                        ].map(([key,label]) => (
-                          <button key={key}
-                            className={'behavior-nav-item' + (scenarioBehaviorSection===key?' active':'')}
-                            onClick={() => setScenarioBehaviorSection(key)}
-                            style={{border:'none',borderBottom: scenarioBehaviorSection===key?'2px solid #1e293b':'2px solid transparent',
-                              background:'none',padding:'0.3rem 0.75rem',fontSize:'0.78rem',cursor:'pointer',
-                              fontWeight:scenarioBehaviorSection===key?600:400,
-                              color:scenarioBehaviorSection===key?'#1e293b':'#64748b',whiteSpace:'nowrap'}}>
-                            {label}
-                          </button>
-                        ))}
-                      </div>
+                      <div className="scenario-editor-layout">
+                        <nav className="scenario-vertical-nav">
+                          {[
+                            ['activities','A','Activities'],
+                            ['objects','F','Object Flows'],
+                            ['constraints','C','Constraints'],
+                            ['o2o','↔','O2O'],
+                            ['time','T','Time'],
+                            ['probabilities','%','Probabilities'],
+                          ].map(([key,icon,label]) => (
+                            <button key={key}
+                              className={'scenario-nav-bubble' + (scenarioBehaviorSection===key?' active':'')}
+                              onClick={() => setScenarioBehaviorSection(key)}>
+                              <span className="bubble-icon">{icon}</span>
+                              <span className="bubble-label">{label}</span>
+                            </button>
+                          ))}
+                        </nav>
+                        <div className="scenario-content">
 
                       {/* Activities */}
                       {scenarioBehaviorSection === 'activities' && (
@@ -10047,6 +10241,7 @@ function App() {
                           onStartActivitiesChange={acts => setConfig(p => ({...p, startActivities: acts}))}
                           filters={scenarioBehaviorFilters['activities'] || {}}
                           onFiltersChange={f => setScenarioBehaviorFilters(p => ({...p, activities: f}))}
+                          foldable={false}
                         />
                       )}
 
@@ -10200,6 +10395,7 @@ function App() {
                               <div style={{flex:1,minWidth:'180px'}}>
                                 <div className="behavior-sub-title">Permanent Objects</div>
                                 {allOts.length===0?<p className="behavior-empty">No object types.</p>:(
+                                  <div style={{border:'1.5px solid #1e293b',borderRadius:'6px',overflow:'hidden'}}>
                                   <table className="behavior-table">
                                     <thead><tr><th style={{width:'20px'}}/><th>Type</th><th>Pool Size</th></tr></thead>
                                     <tbody>{allOts.map(r=>{
@@ -10211,9 +10407,11 @@ function App() {
                                       </tr>);
                                     })}</tbody>
                                   </table>
+                                  </div>
                                 )}
                               </div>
                             </div>
+                            <AddObjectTypeForm model={modelToBe} onUpdate={m=>{setModelToBe(m);setActiveModel(m);handleModelEdit(m);}} />
                             <div className="behavior-sub-title">Object Flow</div>
                             {(() => {
                               const byType={};
@@ -10235,7 +10433,7 @@ function App() {
                                       <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',paddingTop:'0.55rem',whiteSpace:'nowrap',flexShrink:0}}>Object flow:</span>
                                       <div className="object-flow-track">
                                         {sorted.map(n => (
-                                          <div key={n.act} className="flow-node">
+                                          <div key={n.act} className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}>
                                             <span className="flow-node-name">{n.act}</span>
                                             {n.creates && <span className="flow-node-badge flow-node-creates">+</span>}
                                             {n.deactivates && <span className="flow-node-badge flow-node-deactivates">✕</span>}
@@ -10250,6 +10448,8 @@ function App() {
                           </div>
                         );
                       })()}
+                        </div>{/* end scenario-content */}
+                      </div>{/* end scenario-editor-layout */}
                     </>) : (
                       <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'2rem',textAlign:'center'}}>Run discoveries first to populate the model.</div>
                     )}
@@ -10292,12 +10492,21 @@ function App() {
 
                     {/* Start Activities */}
                     <div className="form-group" style={{marginBottom:'0.75rem'}}>
-                      <label>Start Activities</label>
+                      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'0.2rem'}}>
+                        <label style={{margin:0}}>Start Activities</label>
+                        <button onClick={() => setSaPickerFolded(f => !f)}
+                          style={{fontSize:'0.7rem',color:'#64748b',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.1rem 0.45rem',cursor:'pointer'}}>
+                          {saPickerFolded ? `show all (${config.startActivities.length} selected)` : 'fold'}
+                        </button>
+                      </div>
                       <div className="sa-picker">
                         {(() => {
-                          const candidates = startActivityCandidates.length > 0 ? startActivityCandidates
+                          const allCandidates = startActivityCandidates.length > 0 ? startActivityCandidates
                             : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
                             : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
+                          const candidates = saPickerFolded
+                            ? allCandidates.filter(c => config.startActivities.includes(c.activity))
+                            : allCandidates;
                           return (<>
                             <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginTop:'0.3rem'}}>
                               {candidates.map((c, i) => {
@@ -10326,11 +10535,26 @@ function App() {
                                   </button>
                                 );
                               })}
+                              {saPickerFolded && candidates.length === 0 && (
+                                <span style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>None selected — unfold to pick start activities</span>
+                              )}
                             </div>
                           </>);
                         })()}
                       </div>
                     </div>
+
+                    {/* Change vs As-Is diff */}
+                    {modelToBe && modelAsIs && (
+                      <ToBeDiffPanel
+                        modelAsIs={modelAsIs}
+                        modelToBe={modelToBe}
+                        probMatrixBase={probMatrixBase}
+                        probMatrixToBe={probMatrixToBe}
+                        startActivitiesAsIs={modelAsIs?.start_activities || []}
+                        startActivitiesToBe={config.startActivities || []}
+                      />
+                    )}
 
                     {/* Stop conditions */}
                     <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
@@ -10374,16 +10598,17 @@ function App() {
                           {discoveryResults?.ocel_time_span_s != null && (() => {
                             const s = discoveryResults.ocel_time_span_s;
                             const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                            const unitShort = { seconds:'s', minutes:'min', hours:'h', days:'d', weeks:'wk' };
                             const unit = config.maxSimTimeUnit ?? 'days';
                             const val = Math.round(s / unitToS[unit] * 10) / 10;
                             return (
                               <button
-                                style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                                style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap',marginLeft:'auto'}}
                                 onClick={() => handleConfigChange('maxSimTimeValue', val)}
                                 disabled={isSimulating}
                                 title="Use log duration as limit"
                               >
-                                ↑ log: {val} {unit}
+                                {val} {unitShort[unit] ?? unit} in log
                               </button>
                             );
                           })()}
@@ -10525,9 +10750,9 @@ function App() {
                         const badge = `${s.errors} error${s.errors!==1?'s':''}, ${s.warnings} warning${s.warnings!==1?'s':''}`;
                         return (
                           <Collapsible className="health-report-box"
-                            title={<span className={hasErr?'health-title-error':hasWarn?'health-title-warn':'health-title-ok'}>🩺 Constraint Health Report</span>}
+                            title={<span className={hasErr?'health-title-error':hasWarn?'health-title-warn':'health-title-ok'}>Constraint Health Report</span>}
                             badge={badge} defaultOpen={hasErr||hasWarn}>
-                            {healthResult.cycles?.length > 0 && <div className="health-section health-error"><div className="health-section-title">🔴 Cycles</div>{healthResult.cycles.map((cy,i)=><div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>)}</div>}
+                            {healthResult.cycles?.length > 0 && <div className="health-section health-error"><div className="health-section-title">Cycles</div>{healthResult.cycles.map((cy,i)=><div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>)}</div>}
                             {healthResult.no_input_activities?.length > 0 && <div className="health-section health-warn"><div className="health-section-title">⚠ No input constraints</div>{healthResult.no_input_activities.map((a,i)=><div key={i} className="health-item"><span className={`health-badge-${a.is_pure_start?'error':'warn'}`}>{a.is_pure_start?'START':'NO INPUT'}</span><strong>{a.activity}</strong></div>)}</div>}
                             {healthResult.weak_precedences?.length > 0 && <div className="health-section health-warn"><div className="health-section-title">⚠ Weak precedences</div>{healthResult.weak_precedences.map((wp,i)=><div key={i} className="health-item"><span className="health-badge-warn">WEAK</span>{wp.description}</div>)}</div>}
                             {!hasErr && !hasWarn && <div style={{color:'#15803d',fontSize:'0.82rem',padding:'0.5rem'}}>✓ No issues found</div>}
@@ -10651,7 +10876,7 @@ function App() {
                                     )}
                                     {entry.cascade_note && (
                                       <div style={{fontSize:'0.72rem',color:'#7c3aed',background:'#faf5ff',borderRadius:'4px',padding:'0.25rem 0.5rem',marginTop:'0.2rem'}}>
-                                        ⚡ {entry.cascade_note}
+                                        {entry.cascade_note}
                                       </div>
                                     )}
                                   </div>
@@ -10848,7 +11073,7 @@ function App() {
                                 : null;
                               return (
                                 <Collapsible className="logs-box sim-compare-box" title="Activity Distribution vs Log" defaultOpen={false}>
-                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points. Time share = activity's total sim time / sim span.</p>
+                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points.</p>
                                   <table className="metrics-table sim-compare-table">
                                     <thead>
                                       <tr>
@@ -10858,8 +11083,6 @@ function App() {
                                         <th>Sim %</th>
                                         <th>Log %</th>
                                         <th>Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
-                                        <th title="Activity's total service time as % of total simulated time span">Time share</th>
-                                        <th title="Mean service time per firing in simulation">Sim mean dur</th>
                                       </tr>
                                     </thead>
                                     <tbody>
@@ -10869,11 +11092,6 @@ function App() {
                                         const simPct = simTotal > 0 ? simCount / simTotal * 100 : 0;
                                         const logPct = logTotal > 0 ? logCount / logTotal * 100 : 0;
                                         const diff = simPct - logPct;
-                                        const meanS = simMetrics[act]?.mean_service_s ?? null;
-                                        const simSpan = r.sim_time_s ?? null;
-                                        const timeShare = (meanS != null && simCount > 0 && simSpan)
-                                          ? (meanS * simCount / simSpan * 100) : null;
-                                        const fmtDur = s => { if (s == null) return '—'; if (s < 60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s < 3600) return Math.floor(s/60)+'m'; if (s < 86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                                         const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
                                         return (
                                           <tr key={act}>
@@ -10885,8 +11103,6 @@ function App() {
                                             <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
                                             <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
                                             <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                                            <td className={timeShare != null && timeShare > 50 ? 'cmp-over' : ''}>{timeShare != null ? timeShare.toFixed(1)+'%' : '—'}</td>
-                                            <td>{fmtDur(meanS)}</td>
                                           </tr>
                                         );
                                       })}
@@ -10902,83 +11118,49 @@ function App() {
                               const simSpan = r.sim_time_s ?? null;
                               return (
                                 <Collapsible title="Objects" defaultOpen={false}>
-                                  <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
-                                    {['concurrency','lifecycle'].map(t => (
-                                      <button key={t}
-                                        onClick={() => setObjTab(t)}
-                                        style={{padding:'0.25rem 0.75rem',fontSize:'0.78rem',fontWeight:600,border:'none',borderRadius:'4px',cursor:'pointer',
-                                          background: objTab===t ? '#1e293b' : 'transparent',
-                                          color: objTab===t ? 'white' : '#64748b'}}>
-                                        {t === 'concurrency' ? 'Concurrency' : 'Object Lifecycle'}
-                                      </button>
-                                    ))}
-                                  </div>
-
-                                  {objTab === 'concurrency' && (
-                                    <div>
-                                      <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
-                                        Concurrency ratio = activity's total occupied time / total sim time. Values &gt;1.0 mean multiple instances ran simultaneously.
-                                        Self-concurrency shows whether multiple instances of the same activity ran at once.
-                                      </p>
-                                      <table className="behavior-table">
-                                        <thead>
-                                          <tr>
-                                            <th>Activity</th>
-                                            <th title="Total service time / sim span — values >1 indicate overlap">Concurrency ratio</th>
-                                            <th title="Mean duration per firing">Mean duration</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody>
-                                          {Object.entries(simMetrics)
-                                            .map(([act, m]) => {
-                                              const meanS = m.mean_service_s ?? 0;
-                                              const cnt = m.execution_count ?? 0;
-                                              const ratio = simSpan && simSpan > 0 ? (meanS * cnt / simSpan) : null;
-                                              const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
-                                              return { act, ratio, meanS, cnt };
-                                            })
-                                            .sort((a,b) => (b.ratio??0) - (a.ratio??0))
-                                            .map(({act, ratio, meanS, cnt}) => (
-                                              <tr key={act}>
-                                                <td>{act}</td>
-                                                <td style={{color: ratio != null && ratio > 1 ? '#16a34a' : '#475569', fontWeight: ratio != null && ratio > 1 ? 600 : 400}}>
-                                                  {ratio != null ? ratio.toFixed(2) + '×' : '—'}
-                                                  {ratio != null && ratio > 1 && <span style={{fontSize:'0.7rem',color:'#16a34a',marginLeft:'0.3rem'}}>parallel</span>}
-                                                </td>
-                                                <td style={{fontSize:'0.78rem',color:'#475569'}}>
-                                                  {(() => { const s=meanS; if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; })()}
-                                                </td>
-                                              </tr>
-                                            ))}
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                  )}
-
-                                  {objTab === 'lifecycle' && r.audit?.object_lifecycle_audit && (
+                                  {r.audit?.object_lifecycle_audit ? (
                                     <table className="behavior-table">
                                       <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
                                       <tbody>{Object.entries(r.audit.object_lifecycle_audit).map(([ot,a])=>(
                                         <tr key={ot}><td>{ot}</td><td>{a.instance_count}</td><td>{a.active_count}</td><td>{a.deactivated_count}</td><td><span className={`audit-badge audit-badge-${a.classification}`}>{a.classification}</span></td></tr>
                                       ))}</tbody>
                                     </table>
-                                  )}
-                                  {objTab === 'lifecycle' && !r.audit?.object_lifecycle_audit && (
+                                  ) : (
                                     <p style={{fontSize:'0.82rem',color:'#94a3b8'}}>No object lifecycle data available.</p>
                                   )}
                                 </Collapsible>
                               );
                             })()}
                             {r.metrics?.activity_metrics&&(
-                              <Collapsible title="Activity Timing" defaultOpen={false}>
+                              <Collapsible title="Time" defaultOpen={false}>
                                 <table className="behavior-table">
-                                  <thead><tr><th>Activity</th><th>Count</th><th>Mean (s)</th></tr></thead>
+                                  <thead><tr><th>Activity</th><th>Mean</th><th>Min</th><th>Max</th></tr></thead>
                                   <tbody>{Object.entries(r.metrics.activity_metrics)
                                     .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, r.object_traces)(a,b))
-                                    .map(([act,m])=>(
-                                    <tr key={act}><td>{act}</td><td>{m.execution_count}</td><td>{m.mean_service_s!=null?Math.round(m.mean_service_s):'—'}</td></tr>
-                                  ))}</tbody>
+                                    .map(([act,m])=>{
+                                      const fmt = s => { if (s==null) return '—'; if (s<60) return (Math.abs(s%1)<0.005?Math.round(s):s.toFixed(1))+'s'; if (s<3600) return Math.floor(s/60)+'m '+Math.floor(s%60)+'s'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                                      return (
+                                        <tr key={act}>
+                                          <td>{act}</td>
+                                          <td>{fmt(m.mean_service_s)}</td>
+                                          <td>{fmt(m.min_service_s)}</td>
+                                          <td>{fmt(m.max_service_s)}</td>
+                                        </tr>
+                                      );
+                                    })
+                                  }</tbody>
                                 </table>
+                                <ActivityTimeMatrix
+                                  activityMetrics={r.metrics.activity_metrics}
+                                  activeModel={activeModel}
+                                  discoveryResults={discoveryResults}
+                                  objectTraces={r.object_traces}
+                                />
+                                <ActivityGanttChart
+                                  results={r}
+                                  orderedActivities={Object.keys(r.metrics.activity_metrics).sort(makeFlowRankSorter(discoveryResults, r.object_traces))}
+                                  simMetrics={r.metrics.activity_metrics}
+                                />
                               </Collapsible>
                             )}
 
@@ -11025,64 +11207,6 @@ function App() {
                               />
                             </Collapsible>
 
-                            {/* Former Evaluation Part — immediately available after sim stop */}
-                            {r.metrics?.activity_metrics && (
-                              <Collapsible title="Former Evaluation Part" defaultOpen={false}>
-                                {/* Service & Waiting time per activity */}
-                                <Collapsible title="Service / Waiting Time per Activity" defaultOpen={false}>
-                                  <table className="behavior-table" style={{fontSize:'0.78rem'}}>
-                                    <thead><tr><th>Activity</th><th>Mean svc</th><th>Min svc</th><th>Max svc</th><th>Mean res. wait</th><th>Mean pool wait</th></tr></thead>
-                                    <tbody>{Object.entries(r.metrics.activity_metrics)
-                                      .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, r.object_traces)(a,b))
-                                      .map(([act,m])=>{
-                                        const fmtS = v => { if(!v) return '—'; if(v>=86400) return (v/86400).toFixed(1)+'d'; if(v>=3600) return (v/3600).toFixed(1)+'h'; if(v>=60) return Math.round(v/60)+'m'; return Math.round(v)+'s'; };
-                                        return (<tr key={act}>
-                                          <td>{act}</td>
-                                          <td>{fmtS(m.mean_service_s)}</td>
-                                          <td>{fmtS(m.min_service_s)}</td>
-                                          <td>{fmtS(m.max_service_s)}</td>
-                                          <td>{fmtS(m.mean_resource_wait_s)}</td>
-                                          <td>{fmtS(m.mean_wait_in_pool_s)}</td>
-                                        </tr>);
-                                      })}
-                                    </tbody>
-                                  </table>
-                                </Collapsible>
-
-                                {/* Sim Metrics vs Log Discovery */}
-                                {activeModel?.activity_durations && (() => {
-                                  const logDurs = activeModel.activity_durations || {};
-                                  const simM = r.metrics.activity_metrics;
-                                  const fmtS = v => { if(!v) return '—'; if(v>=86400) return (v/86400).toFixed(1)+'d'; if(v>=3600) return (v/3600).toFixed(1)+'h'; if(v>=60) return Math.round(v/60)+'m'; return Math.round(v)+'s'; };
-                                  const pct = (a,b) => a&&b&&a!==0 ? ((b-a)/a*100) : null;
-                                  const fmtPct = v => v==null?'—':(v>=0?'+':'')+v.toFixed(1)+'%';
-                                  const cls = v => { if(v==null) return ''; const n=Math.abs(v); return n<10?'cmp-ok':v>0?'cmp-over':'cmp-under'; };
-                                  const acts = Object.keys(simM).sort(makeFlowRankSorter(discoveryResults, r.object_traces));
-                                  return (
-                                    <Collapsible title="Sim Metrics vs Log Discovery" defaultOpen={false}>
-                                      <table className="metrics-table" style={{fontSize:'0.78rem'}}>
-                                        <thead><tr><th>Activity</th><th>Log mean</th><th>Sim mean</th><th>Δ</th><th>Log max</th><th>Sim max</th><th>Δ</th></tr></thead>
-                                        <tbody>{acts.map(act => {
-                                          const log = logDurs[act] || {};
-                                          const sim = simM[act] || {};
-                                          const dMean = pct(log.service_mean, sim.mean_service_s);
-                                          const dMax  = pct(log.service_max,  sim.max_service_s);
-                                          return (<tr key={act}>
-                                            <td>{act}</td>
-                                            <td>{fmtS(log.service_mean)}</td>
-                                            <td>{fmtS(sim.mean_service_s)}</td>
-                                            <td className={`audit-num cmp-diff ${cls(dMean)}`}>{fmtPct(dMean)}</td>
-                                            <td>{fmtS(log.service_max)}</td>
-                                            <td>{fmtS(sim.max_service_s)}</td>
-                                            <td className={`audit-num cmp-diff ${cls(dMax)}`}>{fmtPct(dMax)}</td>
-                                          </tr>);
-                                        })}</tbody>
-                                      </table>
-                                    </Collapsible>
-                                  );
-                                })()}
-                              </Collapsible>
-                            )}
                             {r.output_file && (
                               <div style={{marginTop:'0.75rem',display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
                                 <a className="download-button"
@@ -11480,7 +11604,7 @@ function App() {
 
         {/* ── Session History ── */}
         {sessionHistory.length > 0 && (
-          <Collapsible title="🕘 Session History" badge={sessionHistory.length} defaultOpen={false}>
+          <Collapsible title="Session History" badge={sessionHistory.length} defaultOpen={false}>
             <div className="history-list">
               {[...sessionHistory].reverse().map(entry => (
                 <div key={entry.id} className="history-entry">
@@ -11714,13 +11838,13 @@ function App() {
             return (
               <Collapsible
                 className="health-report-box"
-                title={<span className={titleClass}>🩺 Constraint Health Report</span>}
+                title={<span className={titleClass}>Constraint Health Report</span>}
                 badge={badge}
                 defaultOpen={hasErrors || hasWarnings}
               >
                 {healthResult.cycles?.length > 0 && (
                   <div className="health-section health-error">
-                    <div className="health-section-title">🔴 Dependency cycles (deadlock)</div>
+                    <div className="health-section-title">Dependency cycles (deadlock)</div>
                     {healthResult.cycles.map((cy, i) => (
                       <div key={i} className="health-item"><span className="health-badge-error">CYCLE</span>{cy.description}</div>
                     ))}
@@ -11728,7 +11852,7 @@ function App() {
                 )}
                 {healthResult.permanently_blocked?.length > 0 && (
                   <div className="health-section health-error">
-                    <div className="health-section-title">🔴 Activities never reaching the pool</div>
+                    <div className="health-section-title">Activities never reaching the pool</div>
                     {healthResult.permanently_blocked.map((b, i) => (
                       <div key={i} className="health-item">
                         <span className="health-badge-error">BLOCKED</span>
@@ -11951,7 +12075,194 @@ function App() {
                 : `▶ Generate Suggestions`}
             </button>
 
-            {/* Suggestion list */}
+            {/* ── Pinpoint blocking constraints ── */}
+            <div style={{marginTop:'1rem',borderTop:'1px solid #f1f5f9',paddingTop:'1rem'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.75rem',flexWrap:'wrap'}}>
+                <button
+                  className="auto-generate-btn"
+                  style={{background:'#f8fafc',color:'#334155',border:'1px solid #e2e8f0'}}
+                  disabled={isPinpointing || !activeModel || !config.startActivities?.length}
+                  onClick={runPinpointBlocking}
+                >
+                  {isPinpointing ? 'Running…' : '▶ Pinpoint Blocking Constraints'}
+                </button>
+                <span style={{fontSize:'0.72rem',color:'#94a3b8'}}>
+                  Iteratively removes the top-blocking constraint each round to show which constraints are responsible for blocking which activities
+                </span>
+              </div>
+
+              {isPinpointing && (
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginTop:'0.5rem'}}>
+                  <div className="spinner spinner-sm"></div> Analysing…
+                </div>
+              )}
+
+              {pinpointResult && !pinpointResult.error && (() => {
+                const rounds = pinpointResult.rounds || [];
+                const remaining = pinpointResult.remaining_blocked || [];
+                return (
+                  <div style={{marginTop:'0.75rem'}}>
+                    {rounds.length === 0 && (
+                      <div style={{fontSize:'0.82rem',color:'#15803d',padding:'0.4rem 0'}}>
+                        ✓ No blocking constraints found — all activities reached the pool.
+                      </div>
+                    )}
+                    {rounds.map((r, i) => (
+                      <div key={i} style={{marginBottom:'0.5rem',padding:'0.5rem 0.75rem',background: r.constraint ? '#f8fafc' : '#fff7ed',borderLeft:`3px solid ${r.constraint ? '#6366f1' : '#f97316'}`,borderRadius:'0 4px 4px 0',fontSize:'0.82rem'}}>
+                        <div style={{display:'flex',alignItems:'baseline',gap:'0.5rem',marginBottom:'0.2rem'}}>
+                          <span style={{fontSize:'0.7rem',color:'#94a3b8',minWidth:'3rem'}}>Round {r.round}</span>
+                          {r.constraint
+                            ? <code style={{fontWeight:600,color:'#4338ca',fontSize:'0.78rem'}}>{r.constraint}</code>
+                            : <span style={{color:'#c2410c',fontWeight:600}}>no constraint rejection — object availability issue</span>
+                          }
+                          {r.block_count > 0 && (
+                            <span style={{fontSize:'0.7rem',color:'#64748b',marginLeft:'auto'}}>{r.block_count}× blocked</span>
+                          )}
+                        </div>
+                        {r.was_blocking?.length > 0 && (
+                          <div style={{fontSize:'0.75rem',color:'#475569',marginLeft:'3.5rem'}}>
+                            was blocking: {r.was_blocking.join(', ')}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    {remaining.length > 0 && (
+                      <div style={{marginTop:'0.4rem',padding:'0.4rem 0.75rem',background:'#fef2f2',borderLeft:'3px solid #dc2626',borderRadius:'0 4px 4px 0',fontSize:'0.82rem'}}>
+                        <span style={{fontWeight:600,color:'#b91c1c'}}>Still blocked after all removals:</span>{' '}
+                        <span style={{color:'#475569'}}>{remaining.join(', ')}</span>
+                      </div>
+                    )}
+                    {remaining.length === 0 && rounds.length > 0 && (
+                      <div style={{fontSize:'0.75rem',color:'#15803d',marginTop:'0.25rem'}}>
+                        ✓ All activities reach the pool after removing the {rounds.length} constraint{rounds.length !== 1 ? 's' : ''} above.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {pinpointResult?.error && (
+                <div className="error-box" style={{marginTop:'0.5rem'}}>
+                  <p>{pinpointResult.error}</p>
+                </div>
+              )}
+            </div>
+
+            {/* ── Dry Run Stats ── */}
+            <div style={{marginTop:'1rem',borderTop:'1px solid #f1f5f9',paddingTop:'1rem'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.75rem',flexWrap:'wrap'}}>
+                <button
+                  className="auto-generate-btn"
+                  style={{background:'#f8fafc',color:'#334155',border:'1px solid #e2e8f0'}}
+                  disabled={isDryRunning || !activeModel || !config.startActivities?.length}
+                  onClick={runDryRunStats}
+                >
+                  {isDryRunning ? 'Running…' : '▶ Dry Run Stats (500 steps)'}
+                </button>
+                <span style={{fontSize:'0.72rem',color:'#94a3b8'}}>
+                  Collects the most-pooled activities and most-blocking constraints over a 500-step dry run
+                </span>
+              </div>
+
+              {isDryRunning && (
+                <div style={{display:'flex',alignItems:'center',gap:'0.5rem',fontSize:'0.82rem',color:'#64748b',marginTop:'0.5rem'}}>
+                  <div className="spinner spinner-sm"></div> Running dry run…
+                </div>
+              )}
+
+              {dryRunResult && !dryRunResult.error && (() => {
+                const pooled = dryRunResult.most_pooled || [];
+                const blocking = dryRunResult.top_blocking_constraints || [];
+                const objects = dryRunResult.top_pooled_objects || [];
+                const stalled = dryRunResult.most_stalled || [];
+                const total = dryRunResult.total_steps || 1;
+                const avgPool = dryRunResult.avg_pool_size ?? '—';
+                const emptySteps = dryRunResult.empty_pool_steps ?? 0;
+                return (
+                  <div style={{marginTop:'0.75rem',fontSize:'0.82rem'}}>
+                    <div style={{display:'flex',gap:'1.5rem',marginBottom:'0.5rem',color:'#64748b'}}>
+                      <span>Steps: <b style={{color:'#1e293b'}}>{total}</b></span>
+                      <span>Avg pool size: <b style={{color:'#1e293b'}}>{avgPool}</b></span>
+                      <span>Empty-pool steps: <b style={{color: emptySteps > total * 0.1 ? '#b91c1c' : '#1e293b'}}>{emptySteps}</b></span>
+                    </div>
+
+                    {/* Most pooled activities */}
+                    {pooled.length > 0 && (
+                      <div style={{marginBottom:'0.75rem'}}>
+                        <div style={{fontWeight:600,color:'#334155',marginBottom:'0.3rem'}}>Most-pooled activities</div>
+                        <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.8rem'}}>
+                          <thead>
+                            <tr style={{background:'#f8fafc',color:'#64748b'}}>
+                              <th style={{textAlign:'left',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>Activity</th>
+                              <th style={{textAlign:'right',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>Pool appearances</th>
+                              <th style={{textAlign:'right',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>% of steps</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {pooled.map((r, i) => (
+                              <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                                <td style={{padding:'3px 6px',color:'#1e293b'}}>{r.activity}</td>
+                                <td style={{padding:'3px 6px',textAlign:'right',color:'#475569'}}>{r.count}</td>
+                                <td style={{padding:'3px 6px',textAlign:'right',color:'#64748b'}}>{r.pct}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* Top blocking constraints */}
+                    {blocking.length > 0 && (
+                      <div style={{marginBottom:'0.75rem'}}>
+                        <div style={{fontWeight:600,color:'#334155',marginBottom:'0.3rem'}}>Top blocking constraints</div>
+                        <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.8rem'}}>
+                          <thead>
+                            <tr style={{background:'#f8fafc',color:'#64748b'}}>
+                              <th style={{textAlign:'left',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>Constraint</th>
+                              <th style={{textAlign:'right',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>Rejections</th>
+                              <th style={{textAlign:'left',padding:'3px 6px',borderBottom:'1px solid #e2e8f0'}}>Affects</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {blocking.map((r, i) => (
+                              <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                                <td style={{padding:'3px 6px',color:'#1e293b',fontFamily:'monospace',fontSize:'0.77rem'}}>{r.label}</td>
+                                <td style={{padding:'3px 6px',textAlign:'right',color:'#475569'}}>{r.count}</td>
+                                <td style={{padding:'3px 6px',color:'#64748b'}}>{(r.affects || []).join(', ')}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* Top pooled objects */}
+                    {objects.length > 0 && (
+                      <div style={{marginBottom:'0.75rem'}}>
+                        <div style={{fontWeight:600,color:'#334155',marginBottom:'0.3rem'}}>Most-pooled objects</div>
+                        <div style={{display:'flex',flexWrap:'wrap',gap:'0.35rem'}}>
+                          {objects.map((r, i) => (
+                            <span key={i} style={{background:'#f1f5f9',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'2px 7px',fontSize:'0.77rem',color:'#334155'}}>
+                              {r.object_id} <span style={{color:'#94a3b8',marginLeft:'3px'}}>{r.count}×</span>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {blocking.length === 0 && pooled.length === 0 && (
+                      <div style={{color:'#15803d',fontSize:'0.8rem'}}>No blocking constraints found during the dry run.</div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {dryRunResult?.error && (
+                <div className="error-box" style={{marginTop:'0.5rem'}}>
+                  <p>{dryRunResult.error}</p>
+                </div>
+              )}
+            </div>
             {autoSuggestions.length > 0 && (
               <div className="auto-suggestions">
                 <div className="auto-suggestions-header">
@@ -12218,7 +12529,7 @@ function App() {
 
               {/* ── Evaluation ── */}
               {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (
-                <Collapsible className="logs-box" title="📋 Evaluation" badge={null} defaultOpen={false}>
+                <Collapsible className="logs-box" title="Evaluation" badge={null} defaultOpen={false}>
 
               {/* ── sim-coverage-warning ── */}
               {(() => {
@@ -12245,7 +12556,7 @@ function App() {
               {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
                 <Collapsible
                   className="logs-box sim-compare-box"
-                  title="📊 Activity Distribution vs Log"
+                  title="Activity Distribution vs Log"
                   badge={null}
                   defaultOpen={false}
                 >
@@ -12279,8 +12590,6 @@ function App() {
                               <th title="Share of all simulated events">Sim %</th>
                               <th title="Share of all log events">Log %</th>
                               <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
-                              <th title="Activity's total service time as % of total simulated time span">Time share</th>
-                              <th title="Mean service time per firing in simulation">Sim mean dur</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -12290,11 +12599,6 @@ function App() {
                               const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
                               const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
                               const diff = simPct - logPct;
-                              const meanS = simMetrics[act]?.mean_service_s ?? null;
-                              const simSpan = results?.sim_time_s ?? null;
-                              const timeShare = (meanS != null && simCount > 0 && simSpan)
-                                ? (meanS * simCount / simSpan * 100) : null;
-                              const fmtDur = s => { if (s==null) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
                               const diffClass = Math.abs(diff) < 2 ? 'cmp-ok'
                                 : diff > 0 ? 'cmp-over' : 'cmp-under';
                               return (
@@ -12309,8 +12613,6 @@ function App() {
                                   <td className={`cmp-diff ${diffClass}`}>
                                     {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
                                   </td>
-                                  <td className={timeShare != null && timeShare > 50 ? 'cmp-over' : ''}>{timeShare != null ? timeShare.toFixed(1)+'%' : '—'}</td>
-                                  <td>{fmtDur(meanS)}</td>
                                 </tr>
                               );
                             })}
@@ -12326,7 +12628,7 @@ function App() {
               {results.audit?.object_lifecycle_audit && Object.keys(results.audit.object_lifecycle_audit).length > 0 && (
                 <Collapsible
                   className="logs-box"
-                  title="🔬 Object Lifecycle Audit"
+                  title="Object Lifecycle Audit"
                   badge={(() => {
                     const a = results.audit.object_lifecycle_audit;
                     const issues = Object.values(a).filter(v => v.classification !== 'healthy').length;
@@ -12374,7 +12676,7 @@ function App() {
               {results.audit?.activity_participation_audit && Object.keys(results.audit.activity_participation_audit).length > 0 && (
                 <Collapsible
                   className="logs-box"
-                  title="🎯 Activity Participation Audit"
+                  title="Activity Participation Audit"
                   badge={(() => {
                     const a = results.audit.activity_participation_audit;
                     const issues = Object.values(a).filter(v => v.classification !== 'healthy' && v.classification !== 'never_fired').length;
@@ -12542,7 +12844,7 @@ function App() {
                   {results.metrics.activity_metrics && Object.keys(results.metrics.activity_metrics).length > 0 && (
                     <Collapsible
                       className="logs-box timing-metrics-box"
-                      title="⏱ Activity Timing"
+                      title="Time"
                       badge={Object.keys(results.metrics.activity_metrics).length}
                       defaultOpen={false}
                     >
@@ -12585,7 +12887,7 @@ function App() {
                       {/* ── Concurrency indicator ── */}
                       {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
                         <div className="concurrency-summary">
-                          <span className="concurrency-summary-title">⚡ Concurrent activity pairs (from log)</span>
+                          <span className="concurrency-summary-title">Concurrent activity pairs (from log)</span>
                           <div className="concurrency-pills">
                             {results.concurrency_pairs.map(({ a, b, p }) => (
                               <span key={`${a}|||${b}`} className="concurrency-pill" title={`${a} and ${b} fire concurrently ${Math.round(p * 100)}% of the time`}>
@@ -12635,7 +12937,7 @@ function App() {
                   {results.metrics_file && (
                     <Collapsible
                       className="logs-box timing-metrics-box"
-                      title="📦 Object Lifetimes"
+                      title="Object Lifetimes"
                       badge={objectMetricsData ? Object.keys(objectMetricsData).length : results.objects_count}
                       defaultOpen={false}
                     >
@@ -12715,7 +13017,7 @@ function App() {
           {results && results.object_links && (
             <Collapsible
               className="logs-box object-tracer-box"
-              title="🔗 Object Tracer"
+              title="Object Tracer"
               badge={`${results.object_links.length} links`}
               defaultOpen={false}
             >
@@ -12776,7 +13078,7 @@ function App() {
         <div className="workflow-container run-history-container">
           <Collapsible
             className="run-history-panel"
-            title="🕘 Run History"
+            title="Run History"
             badge={runHistory.length}
             defaultOpen={false}
           >

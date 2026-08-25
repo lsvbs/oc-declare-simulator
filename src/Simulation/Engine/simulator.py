@@ -18,7 +18,7 @@ from src.Simulation.Engine.candidategeneration import (
 from src.Simulation.Engine.semantics import _count_activity_for_object
 
 
-def _apply_attribute_update(obj, upd: dict) -> None:
+def _apply_attribute_update(obj, upd: dict, timestamp=None) -> None:
     """Apply a single attribute update dict to a RuntimeObject in-place."""
     attr = upd.get('attribute', '')
     op   = upd.get('op', 'set')
@@ -30,6 +30,8 @@ def _apply_attribute_update(obj, upd: dict) -> None:
         obj.attributes[attr] = obj.attributes.get(attr, 0) + upd.get('by', 1)
     elif op == 'decrement':
         obj.attributes[attr] = obj.attributes.get(attr, 0) - upd.get('by', 1)
+    # Phase 4: record timestamped change in attribute history
+    obj.attribute_history.append((timestamp, attr, obj.attributes[attr]))
 
 
 def apply_conservative_link_policy(static_model, participating_ids, created_object_ids, state):
@@ -823,8 +825,6 @@ class Simulator:
 
         return scope_ids
 
-        return scope_ids
-
     def _get_activity_by_name(self, activity_name: str) -> Optional[Activity]:
         # #1: O(1) dict lookup using cached _act_by_name built in __init__
         return self._act_by_name.get(activity_name)
@@ -903,6 +903,10 @@ class Simulator:
             defaults = attribute_defaults.get(object_type, {})
             obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
+            # Phase 4: record initial attribute values in history
+            if defaults:
+                for attr_name, attr_val in defaults.items():
+                    obj.attribute_history.append((state.current_time, attr_name, attr_val))
             # Phase 3: add newly created object to eligibility for start activities only.
             # Non-start activities are updated via _update_eligibility when prerequisites fire.
             for act_name in self._start_names_set:
@@ -1010,12 +1014,31 @@ class Simulator:
                     obj = state.objects.get(oid)
                     if obj and obj.object_type == binding.object_type:
                         for upd in updates:
-                            _apply_attribute_update(obj, upd)
+                            _apply_attribute_update(obj, upd, timestamp=in_prog.complete_at)
+
+            # Phase 3: capture event-level attributes
+            evt_attrs: dict = {}
+            for cap in getattr(activity, 'event_attributes', ()) or ():
+                source = cap.get('source')
+                name   = cap.get('name', '')
+                if not name:
+                    continue
+                if source == 'static':
+                    evt_attrs[name] = cap.get('value')
+                elif source == 'object':
+                    cap_type = cap.get('object_type', '')
+                    cap_attr = cap.get('attribute', '')
+                    for oid in in_prog.participating_object_ids:
+                        obj = state.objects.get(oid)
+                        if obj and obj.object_type == cap_type:
+                            evt_attrs[name] = obj.attributes.get(cap_attr)
+                            break
 
         executed_event = state.record_event(
             activity_name=in_prog.candidate_activity_name,
             participating_object_ids=in_prog.participating_object_ids,
             timestamp=in_prog.complete_at,
+            attributes=evt_attrs if activity else {},
         )
         state.current_time = in_prog.complete_at
 

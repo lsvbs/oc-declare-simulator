@@ -32,6 +32,25 @@ def _labelled(constraint) -> str:
     sk     = getattr(scope, "kind",        "global") if scope else "global"
     st     = getattr(scope, "object_type", "")       if scope else ""
     nmin   = getattr(constraint, "nmin", None)
+
+
+def _labelled_dict(c: dict) -> str:
+    """Same label format as _labelled but for raw constraint dicts."""
+    ctype = c.get("constraint_type", "?")
+    src   = c.get("source_activity", c.get("source", "?"))
+    tgt   = c.get("target_activity", c.get("target", "?"))
+    scope = c.get("scope") or {}
+    sk    = scope.get("kind", "global")
+    st    = scope.get("object_type", "")
+    nmin  = c.get("nmin")
+    parts = [f"{ctype}({src}→{tgt})"]
+    if sk == "each" and st:
+        parts.append(f"each {st}")
+    if nmin is not None:
+        parts.append(f"nmin={nmin}")
+    return " ".join(parts)
+
+
     parts  = [f"{ctype}({src}→{tgt})"]
     if sk == "each" and st:
         parts.append(f"each {st}")
@@ -250,11 +269,46 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 50
     if orig_build_sim is not None:
         _sim_mod.build_candidate_for_activity = _inst_build
 
+    from src.Simulation.Engine.candidategeneration import _apply_guard_filter as _agf
+
     _sem.check_constraint = _inst_check
     _sem.check_o2o_rules  = _inst_o2o
-    _cgen.check_all_constraints = lambda sm, cand, st: all(
-        _inst_check(c, cand, st) for c in sm.constraints
-    )
+
+    def _inst_check_all(sm, cand, st):
+        relevant = sm.constraints_for_activity(cand.activity_name)
+        if not relevant:
+            return True
+        resource_types = getattr(st, '_resource_types', set()) or set()
+        scope_ids_cache: dict = {}
+        for oid in getattr(cand, 'participating_object_ids', []) or []:
+            runtime = st.objects.get(oid)
+            if runtime is None or runtime.object_type in resource_types:
+                continue
+            scope_ids_cache.setdefault(runtime.object_type, []).append(oid)
+        inactive_types = getattr(st, '_inactive_scope_types', None)
+        creates_set = set(getattr(cand, 'object_types_to_create', []) or [])
+        for c in relevant:
+            if inactive_types is not None:
+                scope_type = getattr(c.scope, 'object_type', None)
+                if scope_type and scope_type in inactive_types and scope_type not in creates_set:
+                    continue
+            c_guard = getattr(c, 'guard', None)
+            if c_guard:
+                scope_type = getattr(c.scope, 'object_type', None)
+                if scope_type:
+                    original_ids = scope_ids_cache.get(scope_type, [])
+                    guarded_ids = _agf(original_ids, c_guard, st)
+                    if not guarded_ids:
+                        continue
+                    local_cache = {**scope_ids_cache, scope_type: guarded_ids}
+                    if not _inst_check(c, cand, st):
+                        return False
+                    continue
+            if not _inst_check(c, cand, st):
+                return False
+        return True
+
+    _cgen.check_all_constraints = _inst_check_all
     _cgen.check_o2o_rules = _inst_o2o
 
     step_pool:   dict[int, list] = {}
@@ -290,9 +344,7 @@ def _run_simulation_checks(static_model, start_activities: list, steps: int = 50
         # Always restore original functions
         _sem.check_constraint        = orig_check
         _sem.check_o2o_rules         = orig_o2o
-        _cgen.check_all_constraints  = lambda sm, cand, st: all(
-            orig_check(c, cand, st) for c in sm.constraints
-        )
+        _cgen.check_all_constraints  = _sem.check_all_constraints
         _cgen.check_o2o_rules = orig_o2o
         _cgen.build_candidate_for_activity = orig_build
         if orig_build_sim is not None:
@@ -458,6 +510,196 @@ def run_health_check(
         "exclusion_reasons":        exclusion_reasons,
         "no_input_activities":      no_input_activities,
         "summary":                  {"errors": errors, "warnings": warnings},
+    }
+
+
+# ── Iterative blocking pinpointer ─────────────────────────────────────────────
+
+def pinpoint_blocking_constraints(
+    model_dict: dict,
+    start_activities: list,
+    steps: int = 200,
+    max_rounds: int = 12,
+) -> dict:
+    """Iteratively identify which constraints are responsible for blocking activities.
+
+    Each round:
+      1. Run a short simulation to find permanently blocked activities.
+      2. Find the constraint that rejected blocked activities most often.
+      3. Remove it and record which activities it was responsible for.
+      4. Repeat until nothing is blocked or max_rounds is reached.
+
+    Returns:
+        {
+            "rounds": [
+                {
+                    "constraint": "<label>",
+                    "was_blocking": ["act1", "act2"],
+                    "block_count": N,
+                    "round": 1,
+                }
+            ],
+            "remaining_blocked": ["actX"],   # still blocked after all removals
+            "removed_constraints": ["<label>", ...]
+        }
+    """
+    from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
+    from collections import Counter as _Counter, defaultdict as _dd
+
+    current_constraints = list(model_dict.get("constraints", []))
+    rounds: list[dict] = []
+    removed_labels: list[str] = []
+
+    for round_num in range(1, max_rounds + 1):
+        current_model = {**model_dict, "constraints": current_constraints}
+        try:
+            static = parse_ocdeclare_dict(current_model)
+        except Exception as e:
+            break
+
+        rejection_log, step_pool, _, exclusion_log = _run_simulation_checks(
+            static, start_activities, steps=steps
+        )
+
+        seen: set[str] = set()
+        for pool in step_pool.values():
+            for act_name, _ in pool:
+                seen.add(act_name)
+
+        all_act_names = [a.name for a in static.activities]
+        blocked = [a for a in all_act_names if a not in seen and a not in start_activities]
+
+        if not blocked:
+            break
+
+        # Count constraint rejections for blocked activities only
+        label_counts: _Counter = _Counter()
+        label_blocks: dict = _dd(set)
+        for _step, activity, objs, label, kind in rejection_log:
+            if activity in blocked and kind == "CONSTRAINT":
+                label_counts[label] += 1
+                label_blocks[label].add(activity)
+
+        if not label_counts:
+            # Blocked activities never reached constraint checking — object availability issue
+            rounds.append({
+                "constraint": None,
+                "was_blocking": blocked,
+                "block_count": 0,
+                "round": round_num,
+                "reason": "no_objects_or_never_attempted",
+            })
+            break
+
+        top_label, top_count = label_counts.most_common(1)[0]
+
+        # Find and remove the matching constraint dict
+        new_constraints = [c for c in current_constraints if _labelled_dict(c) != top_label]
+        if len(new_constraints) == len(current_constraints):
+            # Label didn't match any dict — stop to avoid infinite loop
+            break
+
+        current_constraints = new_constraints
+        removed_labels.append(top_label)
+        rounds.append({
+            "constraint": top_label,
+            "was_blocking": sorted(label_blocks[top_label]),
+            "block_count": top_count,
+            "round": round_num,
+        })
+
+    # Final check: which activities remain blocked after all removals
+    remaining_blocked: list[str] = []
+    if rounds:
+        try:
+            final_model = {**model_dict, "constraints": current_constraints}
+            static = parse_ocdeclare_dict(final_model)
+            _, step_pool, _, _ = _run_simulation_checks(static, start_activities, steps=steps)
+            seen = {a for pool in step_pool.values() for a, _ in pool}
+            remaining_blocked = [
+                a.name for a in static.activities
+                if a.name not in seen and a.name not in start_activities
+            ]
+        except Exception:
+            pass
+
+    return {
+        "rounds": rounds,
+        "remaining_blocked": remaining_blocked,
+        "removed_constraints": removed_labels,
+    }
+
+
+# ── Dry-run pool statistics ────────────────────────────────────────────────────
+
+def dry_run_stats(model_dict: dict, start_activities: list, steps: int = 500) -> dict:
+    """Run a dry simulation and collect pool/blocking statistics.
+
+    Returns:
+        {
+            "total_steps": int,
+            "avg_pool_size": float,
+            "empty_pool_steps": int,
+            "most_pooled":            [{"activity", "count", "pct"}],
+            "most_stalled":           [{"activity", "count", "pct"}],
+            "top_blocking_constraints": [{"label", "count", "affects"}],
+            "top_pooled_objects":     [{"object_id", "count"}],
+        }
+    """
+    from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
+
+    static = parse_ocdeclare_dict(model_dict)
+    rejection_log, step_pool, step_chosen, _ = _run_simulation_checks(
+        static, start_activities, steps=steps
+    )
+
+    total_steps = max(len(step_pool), 1)
+
+    pool_counts     = Counter()
+    pool_not_chosen = Counter()
+    obj_pool_counts = Counter()
+
+    for step, pool in step_pool.items():
+        chosen = step_chosen.get(step)
+        for act_name, obj_ids in pool:
+            pool_counts[act_name] += 1
+            if act_name != chosen:
+                pool_not_chosen[act_name] += 1
+            for oid in (obj_ids or []):
+                obj_pool_counts[oid] += 1
+
+    constraint_counts: Counter = Counter()
+    constraint_acts: dict = defaultdict(set)
+    for _step, activity, _objs, label, kind in rejection_log:
+        if kind == "CONSTRAINT":
+            constraint_counts[label] += 1
+            constraint_acts[label].add(activity)
+
+    pool_sizes = [len(pool) for pool in step_pool.values()]
+    avg_pool_size   = sum(pool_sizes) / len(pool_sizes) if pool_sizes else 0
+    empty_pool_steps = sum(1 for s in pool_sizes if s == 0)
+
+    return {
+        "total_steps":      total_steps,
+        "avg_pool_size":    round(avg_pool_size, 1),
+        "empty_pool_steps": empty_pool_steps,
+        "most_pooled": [
+            {"activity": act, "count": cnt, "pct": round(cnt / total_steps * 100, 1)}
+            for act, cnt in pool_counts.most_common(15)
+        ],
+        "most_stalled": [
+            {"activity": act, "count": cnt, "pct": round(cnt / total_steps * 100, 1)}
+            for act, cnt in pool_not_chosen.most_common(10)
+            if cnt > 0
+        ],
+        "top_blocking_constraints": [
+            {"label": lbl, "count": cnt, "affects": sorted(constraint_acts[lbl])}
+            for lbl, cnt in constraint_counts.most_common(10)
+        ],
+        "top_pooled_objects": [
+            {"object_id": oid, "count": cnt}
+            for oid, cnt in obj_pool_counts.most_common(15)
+        ],
     }
 
 
