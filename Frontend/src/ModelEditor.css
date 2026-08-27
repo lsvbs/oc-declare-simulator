@@ -759,6 +759,28 @@
 .constraint-type-badge.exactly             { background: #ffedd5; color: #c2410c; }
 .constraint-type-badge.init                { background: #fef9c3; color: #713f12; }
 
+.constraint-obj-group {
+  position: relative;
+  border: 1.5px solid #cbd5e1;
+  border-radius: 7px;
+  padding: 1.35rem 0.4rem 0.4rem;
+  margin-bottom: 0.65rem;
+}
+.constraint-obj-group-label {
+  position: absolute;
+  top: -0.58rem;
+  left: 0.7rem;
+  background: white;
+  padding: 0 0.3rem;
+  font-size: 0.69rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #64748b;
+  line-height: 1.2;
+  pointer-events: none;
+}
+
 .constraint-src, .constraint-tgt { font-weight: 500; color: #1e293b; }
 .constraint-arrow { color: #94a3b8; }
 .constraint-scope { color: #64748b; font-style: italic; font-size: 0.75rem; }

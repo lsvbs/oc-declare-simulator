@@ -217,9 +217,14 @@ function SortHdr({col, s, cycle, children, style={}}) {
     </span>
   );
 }
-function SortSelect({s, set, columns}) {
+function SortSelect({s, set, columns, tips}) {
   const val = s.col ? `${s.col}:${s.dir}` : 'log';
   const active = !!s.col;
+  const tipContent = tips ? (
+    <span>{columns.map((c, i) => (
+      <span key={c.col}>{i > 0 && <><br/><br/></>}<strong>{c.label}:</strong> {tips[c.col]}</span>
+    ))}</span>
+  ) : null;
   return (
     <div style={{display:'inline-flex',alignItems:'center',gap:'0.3rem',padding:'0.3rem 0.5rem',
       background:'#f8fafc',border:'1px solid',borderColor:active?'#6366f1':'#e2e8f0',
@@ -237,6 +242,7 @@ function SortSelect({s, set, columns}) {
           ])}
         </optgroup>
       </select>
+      {tipContent && <HelpTip text={tipContent}/>}
     </div>
   );
 }
@@ -578,6 +584,7 @@ export default function ModelEditor({
   }, [constraints]);
 
   const [conSpecialFilter, setConSpecialFilter] = useState(''); // '' | 'selfloop' | 'multi_response'
+  const [groupByObjType, setGroupByObjType] = useState(false);
 
   const filteredConstraints = constraints.filter(c => {
     const textMatch = !conFilter ||
@@ -595,13 +602,59 @@ export default function ModelEditor({
     }
     return true;
   });
-  const sortedConstraints = sortedBy(filteredConstraints, sortCon, (c, col) => {
-    if (col==='type') return c.constraint_type||'';
-    if (col==='source') return c.source_activity||'';
-    if (col==='target') return c.target_activity||'';
-    if (col==='scope') return c.scope?.object_type||'';
-    return '';
-  });
+  const sortedConstraints = (() => {
+    // Topological BFS layers for Activity Order sort
+    const inDeg = {}, outEdges = {}, allActs = new Set();
+    constraints.forEach(c => {
+      const src = c.source_activity, tgt = c.target_activity;
+      if (!src || !tgt || src === tgt) return;
+      allActs.add(src); allActs.add(tgt);
+      outEdges[src] = outEdges[src] || [];
+      outEdges[src].push(tgt);
+      inDeg[tgt] = (inDeg[tgt] || 0) + 1;
+      if (inDeg[src] === undefined) inDeg[src] = 0;
+    });
+    const actLayer = {};
+    const bfsQ = [];
+    for (const act of allActs) {
+      if ((inDeg[act] || 0) === 0) { actLayer[act] = 0; bfsQ.push(act); }
+    }
+    for (let i = 0; i < bfsQ.length; i++) {
+      const act = bfsQ[i];
+      for (const tgt of (outEdges[act] || [])) {
+        if (actLayer[tgt] === undefined || actLayer[tgt] < actLayer[act] + 1) {
+          actLayer[tgt] = actLayer[act] + 1;
+          bfsQ.push(tgt);
+        }
+      }
+    }
+    const conKey = (c, col) => {
+      if (col === 'type') return c.constraint_type || '';
+      if (col === 'source') return c.source_activity || '';
+      if (col === 'target') return c.target_activity || '';
+      if (col === 'scope') return c.scope?.object_type || '';
+      if (col === 'activity_order') {
+        const sl = String(actLayer[c.source_activity] ?? 999).padStart(4, '0');
+        const tl = String(actLayer[c.target_activity] ?? 999).padStart(4, '0');
+        return `${sl}.${tl}.${c.source_activity||''}.${c.target_activity||''}`;
+      }
+      return '';
+    };
+    const cmpFn = (a, b) => {
+      if (!sortCon.col) return 0;
+      const va = conKey(a, sortCon.col), vb = conKey(b, sortCon.col);
+      const isNum = v => v !== '' && v != null && !isNaN(+v);
+      const cmp = isNum(va) && isNum(vb) ? +va - +vb : String(va ?? '').localeCompare(String(vb ?? ''));
+      return sortCon.dir === 'asc' ? cmp : -cmp;
+    };
+    if (groupByObjType) {
+      return [...filteredConstraints].sort((a, b) => {
+        const objCmp = (a.scope?.object_type || '').localeCompare(b.scope?.object_type || '');
+        return objCmp !== 0 ? objCmp : cmpFn(a, b);
+      });
+    }
+    return sortedBy(filteredConstraints, sortCon, conKey);
+  })();
 
   // ── Timing helpers ────────────────────────────────────────────────────────
   const DIST_TYPES = ['lognormal', 'normal', 'exponential', 'fixed'];
@@ -1335,11 +1388,16 @@ export default function ModelEditor({
         {activeTab === 'constraints' && (
           <div>
             <div style={{fontSize:'0.95rem',fontWeight:600,marginBottom:'0.5rem'}}>{constraints.length} Constraints</div>
-            <div style={{display:'flex',gap:'0.4rem',alignItems:'center',marginBottom:'0.4rem'}}>
+            <div style={{display:'flex',gap:'0.4rem',alignItems:'center',marginBottom:'0.4rem',flexWrap:'wrap'}}>
               <SortSelect s={sortCon} set={setSortCon} columns={[
                 {col:'type',label:'Type'},{col:'source',label:'Source'},
-                {col:'target',label:'Target'},{col:'scope',label:'Scope type'},
-              ]}/>
+                {col:'target',label:'Target'},{col:'activity_order',label:'Activity Order'},
+              ]} tips={{
+                type: 'Groups all constraints of the same type together (response, precedence, not_coexistence, etc.).',
+                source: 'Alphabetical by source activity name.',
+                target: 'Alphabetical by target activity name.',
+                activity_order: 'Process-flow order: constraints from "entry" activities (no predecessors in the constraint graph) appear first, then activities reachable from them layer by layer, ending with activities that are only ever targets.',
+              }}/>
               <div className="toolbar-row" style={{flex:1,marginBottom:0}}>
                 <input
                   className="filter-input"
@@ -1371,103 +1429,127 @@ export default function ModelEditor({
                 Multiple responses before
                 {activitiesWithMultipleResponsesBefore.size > 0 && <span className="con-filter-badge">{activitiesWithMultipleResponsesBefore.size}</span>}
               </button>
+              <label title="When checked, constraints are grouped by their scope object type, shown in bordered boxes with the type name as a title. The selected sort applies within each group."
+                className={`con-filter-btn${groupByObjType ? ' active' : ''}`}
+                style={{display:'inline-flex',alignItems:'center',gap:'0.3rem',cursor:'pointer',userSelect:'none'}}>
+                <input type="checkbox" checked={groupByObjType} onChange={e => setGroupByObjType(e.target.checked)}
+                  style={{margin:0,accentColor:'#6366f1'}}/>
+                Group by object type
+              </label>
             </div>
 
             <div className="constraints-list">
               {filteredConstraints.length === 0 && (
                 <p className="empty-notice">No constraints match the filter.</p>
               )}
-              {sortedConstraints.map((c, idx) => {
-                const realIdx = constraints.indexOf(c);
-                const isEditing = editingConIdx === realIdx;
-                const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
-                  : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
-                  : undefined;
-                return (
-                  <div key={idx} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}
-                    style={rowBg ? {background:rowBg} : undefined}>
-                    <span
-                      className={`constraint-type-badge ${c.constraint_type}`}
-                      title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g, ' ')}
-                    >
-                      {c.constraint_type.replace(/_/g, ' ')}
-                    </span>
-                    <span className="constraint-src">{c.source_activity}</span>
-                    <span className="constraint-arrow">→</span>
-                    <span className="constraint-tgt">{c.target_activity}</span>
-                    {!isEditing ? (
-                      <>
-                        <span className="constraint-scope">
-                          [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
-                        </span>
-                        {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
-                          ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
-                          <span className="constraint-card">
-                            {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
+              {(() => {
+                const renderRow = (c, key) => {
+                  const realIdx = constraints.indexOf(c);
+                  const isEditing = editingConIdx === realIdx;
+                  const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                    : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                    : undefined;
+                  return (
+                    <div key={key} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}
+                      style={rowBg ? {background:rowBg} : undefined}>
+                      <span
+                        className={`constraint-type-badge ${c.constraint_type}`}
+                        title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g, ' ')}
+                      >
+                        {c.constraint_type.replace(/_/g, ' ')}
+                      </span>
+                      <span className="constraint-src">{c.source_activity}</span>
+                      <span className="constraint-arrow">→</span>
+                      <span className="constraint-tgt">{c.target_activity}</span>
+                      {!isEditing ? (
+                        <>
+                          <span className="constraint-scope">
+                            [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
                           </span>
-                        )}
-                        <button className="row-edit-btn" onClick={() => setEditingConIdx(realIdx)} title="Edit constraint">✏</button>
-                      </>
-                    ) : (
-                      <div className="constraint-edit-inline">
-                        <label className="constraint-edit-label"><HelpTip text="each = constraint applies per individual object instance; any = at least one instance satisfies it; all = every instance must satisfy it.">scope kind:</HelpTip>
-                          <select
-                            className="constraint-edit-select"
-                            value={c.scope?.kind || 'each'}
-                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, kind: e.target.value } })}
-                          >
-                            <option value="each">each — per individual object</option>
-                            <option value="any">any — at least one object</option>
-                            <option value="all">all — every object</option>
-                          </select>
-                        </label>
-                        <label className="constraint-edit-label"><HelpTip text="The object type whose instances the constraint is evaluated against.">scope type:</HelpTip>
-                          <select
-                            className="constraint-edit-select"
-                            value={c.scope?.object_type || ''}
-                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, object_type: e.target.value } })}
-                          >
-                            <option value="">—</option>
-                            {otNames.map(t => <option key={t} value={t}>{t}</option>)}
-                          </select>
-                        </label>
-                        <label className="constraint-edit-label"><HelpTip text="Minimum Source firings required before Target may fire (nmin). Default 0 = no minimum.">n≥:</HelpTip>
-                          <input type="number" min={0} className="constraint-edit-num"
-                            value={c.nmin ?? 0}
-                            onChange={e => updateConstraint(realIdx, { nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) })}
-                          />
-                        </label>
-                        <label className="constraint-edit-label"><HelpTip text="Maximum Source firings before Target must have fired (nmax). Leave blank for no upper bound.">n≤:</HelpTip>
-                          <input type="number" min={0} className="constraint-edit-num"
-                            placeholder="∞"
-                            value={c.nmax ?? ''}
-                            onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
-                          />
-                        </label>
-                        <label className="constraint-edit-label">
-                          <HelpTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint. Same attribute/op/value format as binding guards.">guard:</HelpTip>
-                          {c.guard ? (
-                            <span style={{display:'flex',gap:'0.25rem',alignItems:'center'}}>
-                              <input className="constraint-edit-num" style={{width:'5rem'}} placeholder="attribute"
-                                value={c.guard.attribute||''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, attribute: e.target.value} })} />
-                              <select className="constraint-edit-select" style={{width:'3.5rem'}} value={c.guard.op||'=='} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, op: e.target.value} })}>
-                                {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
-                              </select>
-                              <input className="constraint-edit-num" style={{width:'4rem'}} placeholder="value"
-                                value={c.guard.value??''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, value: e.target.value} })} />
-                              <button className="row-delete-btn" title="Remove guard" onClick={() => updateConstraint(realIdx, { guard: null })}>✕</button>
+                          {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
+                            ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
+                            <span className="constraint-card">
+                              {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
                             </span>
-                          ) : (
-                            <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
                           )}
-                        </label>
-                        <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
-                      </div>
-                    )}
-                    <button className="row-delete-btn" onClick={() => { deleteConstraint(realIdx); setEditingConIdx(null); }} title="Remove">✕</button>
-                  </div>
-                );
-              })}
+                          <button className="row-edit-btn" onClick={() => setEditingConIdx(realIdx)} title="Edit constraint">✏</button>
+                        </>
+                      ) : (
+                        <div className="constraint-edit-inline">
+                          <label className="constraint-edit-label"><HelpTip text="each = constraint applies per individual object instance; any = at least one instance satisfies it; all = every instance must satisfy it.">scope kind:</HelpTip>
+                            <select
+                              className="constraint-edit-select"
+                              value={c.scope?.kind || 'each'}
+                              onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, kind: e.target.value } })}
+                            >
+                              <option value="each">each — per individual object</option>
+                              <option value="any">any — at least one object</option>
+                              <option value="all">all — every object</option>
+                            </select>
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="The object type whose instances the constraint is evaluated against.">scope type:</HelpTip>
+                            <select
+                              className="constraint-edit-select"
+                              value={c.scope?.object_type || ''}
+                              onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, object_type: e.target.value } })}
+                            >
+                              <option value="">—</option>
+                              {otNames.map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="Minimum Source firings required before Target may fire (nmin). Default 0 = no minimum.">n≥:</HelpTip>
+                            <input type="number" min={0} className="constraint-edit-num"
+                              value={c.nmin ?? 0}
+                              onChange={e => updateConstraint(realIdx, { nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) })}
+                            />
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="Maximum Source firings before Target must have fired (nmax). Leave blank for no upper bound.">n≤:</HelpTip>
+                            <input type="number" min={0} className="constraint-edit-num"
+                              placeholder="∞"
+                              value={c.nmax ?? ''}
+                              onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
+                            />
+                          </label>
+                          <label className="constraint-edit-label">
+                            <HelpTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint. Same attribute/op/value format as binding guards.">guard:</HelpTip>
+                            {c.guard ? (
+                              <span style={{display:'flex',gap:'0.25rem',alignItems:'center'}}>
+                                <input className="constraint-edit-num" style={{width:'5rem'}} placeholder="attribute"
+                                  value={c.guard.attribute||''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, attribute: e.target.value} })} />
+                                <select className="constraint-edit-select" style={{width:'3.5rem'}} value={c.guard.op||'=='} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, op: e.target.value} })}>
+                                  {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
+                                </select>
+                                <input className="constraint-edit-num" style={{width:'4rem'}} placeholder="value"
+                                  value={c.guard.value??''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, value: e.target.value} })} />
+                                <button className="row-delete-btn" title="Remove guard" onClick={() => updateConstraint(realIdx, { guard: null })}>✕</button>
+                              </span>
+                            ) : (
+                              <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
+                            )}
+                          </label>
+                          <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
+                        </div>
+                      )}
+                      <button className="row-delete-btn" onClick={() => { deleteConstraint(realIdx); setEditingConIdx(null); }} title="Remove">✕</button>
+                    </div>
+                  );
+                };
+                if (groupByObjType) {
+                  const groups = [];
+                  sortedConstraints.forEach(c => {
+                    const ot = c.scope?.object_type || '';
+                    if (!groups.length || groups[groups.length - 1].ot !== ot) groups.push({ ot, items: [] });
+                    groups[groups.length - 1].items.push(c);
+                  });
+                  return groups.map((g, gi) => (
+                    <div key={gi} className="constraint-obj-group">
+                      <span className="constraint-obj-group-label">{g.ot || '(no object type)'}</span>
+                      {g.items.map((c, li) => renderRow(c, `g${gi}-${li}`))}
+                    </div>
+                  ));
+                }
+                return sortedConstraints.map((c, idx) => renderRow(c, idx));
+              })()}
             </div>
 
             <div className="add-form-header">+ Add Constraint</div>

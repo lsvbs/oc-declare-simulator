@@ -11056,61 +11056,6 @@ function App() {
                               })()}
                               {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
                             </div>
-                            {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
-                              const simMetrics = r.metrics.activity_metrics;
-                              const logCounts = discoveryResults.activity_counts || {};
-                              const logRepeat = discoveryResults.activity_repeat_stats || {};
-                              const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
-                              const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                              const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                                .sort(makeFlowRankSorter(discoveryResults, r.object_traces));
-                              const wmape = logTotal > 0 && simTotal > 0
-                                ? allActs.reduce((s, act) => {
-                                    const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
-                                    const lp = (logCounts[act]||0) / logTotal * 100;
-                                    return s + Math.abs(sp - lp);
-                                  }, 0)
-                                : null;
-                              return (
-                                <Collapsible className="logs-box sim-compare-box" title="Activity Distribution vs Log" defaultOpen={false}>
-                                  <p className="sim-compare-hint">Proportional share of total events (simulation vs log). Diff = sim% − log% in percentage points.</p>
-                                  <table className="metrics-table sim-compare-table">
-                                    <thead>
-                                      <tr>
-                                        <th>Activity</th>
-                                        <th>Sim count</th>
-                                        <th>Log count</th>
-                                        <th>Sim %</th>
-                                        <th>Log %</th>
-                                        <th>Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {allActs.map(act => {
-                                        const simCount = simMetrics[act]?.execution_count ?? 0;
-                                        const logCount = logCounts[act] ?? 0;
-                                        const simPct = simTotal > 0 ? simCount / simTotal * 100 : 0;
-                                        const logPct = logTotal > 0 ? logCount / logTotal * 100 : 0;
-                                        const diff = simPct - logPct;
-                                        const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
-                                        return (
-                                          <tr key={act}>
-                                            <td className="metrics-act-name">
-                                              <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
-                                            </td>
-                                            <td>{simCount || '—'}</td>
-                                            <td>{logCount || '—'}</td>
-                                            <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                                            <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                                            <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
-                                </Collapsible>
-                              );
-                            })()}
 
                             {/* Objects — tabbed: Concurrency + Object Lifecycle */}
                             {(() => {
