@@ -1111,7 +1111,7 @@ function ObjectTracer({ links = [], typesMap = {}, objectMetrics = {}, resourceT
         <span className="tracer-obj">
           <span className="tracer-type-chip" style={{ background: typeColor(otype) }}>{otype}</span>
           <span className="tracer-id">{id}</span>
-          {isResource && <span className="tracer-resource-badge" title="Resource object — excluded from chain timing">resource</span>}
+          {isResource && <span className="tracer-resource-badge" title="Permanent object — excluded from chain timing">resource</span>}
           {!isResource && lifetime != null && (
             <span className="tracer-obj-lifetime" title="Service time: first to last event on this object">
               {_fmtChainTime(lifetime)}
@@ -7565,11 +7565,12 @@ function App() {
   const [applyNminNmaxFromModelCheck, setApplyNminNmaxFromModelCheck] = useState(true);
   const [lifecycleResult, setLifecycleResult] = useState(null);   // {summary, method} or {error}
   const [lifecycleError, setLifecycleError] = useState(null);
-  const [resourceResult, setResourceResult] = useState(null);     // [{type, instance_count}]
-  const [resourceError, setResourceError] = useState(null);
+  const [permanentResult, setPermanentResult] = useState(null);     // [{type, instance_count}]
+  const [permanentError, setPermanentError] = useState(null);
   const [o2oResult, setO2oResult] = useState(null);               // {count}
   const [o2oError, setO2oError] = useState(null);
-  const [resourceThreshold, setResourceThreshold] = useState(50);
+  const [permanentThreshold, setPermanentThreshold] = useState(50);
+  const [suggestedPermanentThreshold, setSuggestedPermanentThreshold] = useState(null);
 
   // ── Automated post-processing state ───────────────────────────────────────
   const [autoConfig, setAutoConfig] = useState({
@@ -7696,6 +7697,25 @@ function App() {
     setOcdeclareDiscoveryResults(null);
     setOcdeclareDiscoveryError(null);
   };
+
+  // Auto-suggest permanent object threshold when the event log changes
+  React.useEffect(() => {
+    const file = ocdeclareDiscoveryConfig.eventLogFile;
+    if (!file) { setSuggestedPermanentThreshold(null); return; }
+    let cancelled = false;
+    axios.post('/api/suggest-permanent-threshold', { eventLogFile: file })
+      .then(res => {
+        if (cancelled) return;
+        const t = res.data?.suggested_threshold ?? null;
+        setSuggestedPermanentThreshold(t);
+        if (t != null) {
+          setOcdeclareDiscoveryConfig(prev => ({ ...prev, resourceThreshold: t }));
+          setPermanentThreshold(t);
+        }
+      })
+      .catch(() => { if (!cancelled) setSuggestedPermanentThreshold(null); });
+    return () => { cancelled = true; };
+  }, [ocdeclareDiscoveryConfig.eventLogFile]);
 
   const handleConstraintTypeChange = (constraintType, checked) => {
     setOcdeclareDiscoveryConfig(prev => ({
@@ -7938,13 +7958,13 @@ function App() {
     }
   }, [config.ocdeclareFile, discoveryConfig.eventLogFile]);
 
-  const runResourceDiscovery = useCallback(async () => {
-    setResourceError(null);
-    setResourceResult(null);
+  const runPermanentObjectDiscovery = useCallback(async () => {
+    setPermanentError(null);
+    setPermanentResult(null);
     try {
       const res = await axios.post('/api/discover-resources', {
         eventLogFile: discoveryConfig.eventLogFile,
-        resourceThreshold,
+        resourceThreshold: permanentThreshold,
       });
       if (res.data.success) {
         const newTypes = res.data.resource_types;
@@ -7957,14 +7977,14 @@ function App() {
           return { ...(prev || {}), resource_types: newTypes, resource_pool_sizes: newPool };
         });
         setModelEdited(true);
-        setResourceResult(res.data.resource_info);
+        setPermanentResult(res.data.resource_info);
       } else {
-        setResourceError(res.data.error || 'Discovery failed');
+        setPermanentError(res.data.error || 'Discovery failed');
       }
     } catch (err) {
-      setResourceError(err.response?.data?.error || err.message);
+      setPermanentError(err.response?.data?.error || err.message);
     }
-  }, [discoveryConfig.eventLogFile, resourceThreshold]);
+  }, [discoveryConfig.eventLogFile, permanentThreshold]);
 
   const runO2ODiscovery = useCallback(async () => {
     setO2oError(null);
@@ -8419,7 +8439,7 @@ function App() {
 
     const allSteps = [
       { key: 'lifecycle', label: 'Object Constraints',           fn: runLifecycleDerivation },
-      { key: 'resources', label: 'Resource Objects',             fn: runResourceDiscovery },
+      { key: 'resources', label: 'Permanent Objects',             fn: runPermanentObjectDiscovery },
       { key: 'timing',    label: 'Timing',                       fn: runTimingDiscovery },
       { key: 'o2o',       label: 'Object-to-Object Relationships',  fn: runO2ODiscovery },
       { key: 'startProb', label: 'Start Activity + Probability', fn: applyStartProbability },
@@ -8485,7 +8505,7 @@ function App() {
     }
   }, [discoveryChecks, discoveryConfig.eventLogFile, dropZeroConfConstraints, logConfResults,
       applyNminNmaxFromModelCheck, runLogModelCheck,
-      runLifecycleDerivation, runResourceDiscovery, runTimingDiscovery, runO2ODiscovery,
+      runLifecycleDerivation, runPermanentObjectDiscovery, runTimingDiscovery, runO2ODiscovery,
       applyStartProbability, runHealthCheck]);
 
   const restoreFromHistory = useCallback((entry) => {
@@ -8573,6 +8593,29 @@ function App() {
     return null;
   }, []);
 
+  const autoDiscoverOCDeclare = useCallback(async (eventLogFilename) => {
+    setIsOcdeclareDiscovering(true);
+    setOcdeclareDiscoveryError(null);
+    setOcdeclareDiscoveryResults(null);
+    try {
+      const payload = { ...ocdeclareDiscoveryConfig, eventLogFile: eventLogFilename };
+      const response = await axios.post('/api/discover-ocdeclare', payload);
+      if (response.data.success) {
+        setOcdeclareDiscoveryResults(response.data);
+        await loadAvailableFiles({ preserveSelections: true });
+        if (response.data.filename) {
+          setConfig(prev => ({ ...prev, ocdeclareFile: response.data.filename }));
+        }
+      } else {
+        setOcdeclareDiscoveryError(response.data.error || 'OC-Declare discovery failed');
+      }
+    } catch (err) {
+      setOcdeclareDiscoveryError(err.response?.data?.error || err.message || 'OC-Declare discovery failed');
+    } finally {
+      setIsOcdeclareDiscovering(false);
+    }
+  }, [ocdeclareDiscoveryConfig, loadAvailableFiles]);
+
   const handleFileUpload = useCallback(async (file, type) => {
     if (!file) return;
     const formData = new FormData();
@@ -8587,7 +8630,10 @@ function App() {
         const filename = res.data.filename;
         if (type === 'eventlog') {
           handleDiscoveryConfigChange('eventLogFile', filename);
-          if (workflowMode === 'external-ocel') setTimeout(() => runDiscovery(filename), 0);
+          if (workflowMode === 'external-ocel') {
+            setTimeout(() => runDiscovery(filename), 0);
+            autoDiscoverOCDeclare(filename);
+          }
         } else if (type === 'ocdeclare') {
           handleConfigChange('ocdeclareFile', filename);
         } else if (type === 'parameters') {
@@ -8599,7 +8645,7 @@ function App() {
     } catch (err) {
       alert(`Upload failed: ${err.response?.data?.error || err.message}`);
     }
-  }, [loadAvailableFiles, handleDiscoveryConfigChange, handleConfigChange, handleLoadParameters, workflowMode, runDiscovery]);
+  }, [loadAvailableFiles, handleDiscoveryConfigChange, handleConfigChange, handleLoadParameters, workflowMode, runDiscovery, autoDiscoverOCDeclare]);
 
   const handleDownloadParameters = useCallback(() => {
     if (!activeModel || Array.isArray(activeModel)) return;
@@ -9681,10 +9727,10 @@ function App() {
                           </div>
                         </div>
 
-                        {/* Resource threshold */}
+                        {/* Permanent object threshold */}
                         <div className="landing-option-group">
                           <label className="landing-option-label" style={{display:'flex',alignItems:'center',gap:'0.35rem'}}>
-                            Resource Threshold
+                            Permanent Object Threshold
                             {/* ? popup with repeat stats */}
                             {discoveryResults?.object_type_stats && (() => {
                               const ots = discoveryResults.object_type_stats;
@@ -9711,7 +9757,7 @@ function App() {
                                     boxShadow:'0 4px 20px rgba(0,0,0,0.12)',padding:'0.6rem 0.8rem',
                                     minWidth:'280px',maxWidth:'360px',fontSize:'0.74rem',color:'#475569'}}>
                                     <div style={{fontWeight:700,color:'#1e293b',marginBottom:'0.3rem',fontSize:'0.78rem'}}>
-                                      Resource Threshold
+                                      Permanent Object Threshold
                                     </div>
                                     <p style={{margin:'0 0 0.4rem',lineHeight:1.4}}>
                                       Object types whose instances are reused ≥ threshold times are treated as <strong>permanent objects</strong> (pre-populated pool, never deactivated). Min/obj = least reused instance; Max/obj = most reused instance.
@@ -9720,7 +9766,7 @@ function App() {
                                       <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:'5px',
                                         padding:'0.3rem 0.5rem',marginBottom:'0.4rem',fontSize:'0.73rem',color:'#1d4ed8'}}>
                                         Suggested: <strong>{suggested}</strong> — lowest max reuse across all object types
-                                        <button onClick={()=>setResourceThreshold(suggested)}
+                                        <button onClick={()=>setPermanentThreshold(suggested)}
                                           style={{marginLeft:'0.5rem',fontSize:'0.7rem',padding:'1px 6px',
                                             background:'#1d4ed8',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>
                                           Apply
@@ -9735,7 +9781,7 @@ function App() {
                                     <div style={{maxHeight:'160px',overflowY:'auto'}}>
                                       {types.map(t => {
                                         const r = ots[t];
-                                        const isHighlighted = r?.max_reuse != null && r.max_reuse >= resourceThreshold;
+                                        const isHighlighted = r?.max_reuse != null && r.max_reuse >= permanentThreshold;
                                         return (
                                           <div key={t} style={{display:'grid',gridTemplateColumns:'1fr auto auto',
                                             gap:'0 0.75rem',padding:'1px 0',
@@ -9749,15 +9795,15 @@ function App() {
                                       })}
                                     </div>
                                     <div style={{fontSize:'0.68rem',color:'#94a3b8',marginTop:'0.3rem'}}>
-                                      Green = max/obj ≥ current threshold ({resourceThreshold})
+                                      Green = max/obj ≥ current threshold ({permanentThreshold})
                                     </div>
                                   </div>
                                 </span>
                               );
                             })()}
                           </label>
-                          <input type="number" min={1} value={resourceThreshold}
-                            onChange={e => setResourceThreshold(Math.max(1, parseInt(e.target.value)||1))}
+                          <input type="number" min={1} value={permanentThreshold}
+                            onChange={e => setPermanentThreshold(Math.max(1, parseInt(e.target.value)||1))}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
                           <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>max same-activity repetitions/instance</div>
                         </div>
@@ -9783,53 +9829,47 @@ function App() {
                     onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
                 </div>
 
-                {/* OC-Declare section — shown after OCEL loaded */}
+                {/* OC-Declare auto-discovery status — Küsters & van der Aalst (2025) algorithm */}
                 {discoveryConfig.eventLogFile && (
                   <div className="landing-ocdecl-section">
                     <div
                       className={`ocel-drop-zone${config.ocdeclareFile ? ' loaded' : ''}`}
-                      style={{minHeight:'70px',padding:'1rem 1.25rem'}}
-                      onClick={e => { if (!e.target.closest('select')) ocdeclFileRef.current?.click(); }}
-                      onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
-                      onDragLeave={e => e.currentTarget.classList.remove('drag-over')}
-                      onDrop={e => {
-                        e.preventDefault(); e.currentTarget.classList.remove('drag-over');
-                        const f = e.dataTransfer.files[0];
-                        if (f) handleFileUpload(f, 'ocdeclare');
-                      }}
+                      style={{minHeight:'70px',padding:'1rem 1.25rem',cursor:'default'}}
                     >
-                      {/* File info top-left */}
-                      {config.ocdeclareFile && (
-                        <div className="ocel-drop-zone-info">
-                          <div className="file-name">{config.ocdeclareFile}</div>
-                          {activeModel && !Array.isArray(activeModel) && discoveryResults?.activities && (() => {
-                            const logActs = new Set(discoveryResults.activities);
-                            const modelActs = (activeModel.activities || []).map(a => typeof a === 'string' ? a : a.name);
-                            const missing = modelActs.filter(a => !logActs.has(a));
-                            return (
-                              <div className="file-meta">
-                                {missing.length === 0
-                                  ? <span style={{color:'#15803d'}}>✓ All activities match</span>
-                                  : <span style={{color:'#b45309'}}>⚠ {missing.length} not in log</span>}
-                              </div>
-                            );
-                          })()}
+                      {isOcdeclareDiscovering ? (
+                        <div style={{display:'flex',alignItems:'center',gap:'0.75rem'}}>
+                          <div className="spinner spinner-sm" />
+                          <div>
+                            <div style={{fontWeight:600,color:'#6366f1',fontSize:'0.9rem'}}>Discovering OC-Declare constraints…</div>
+                            <div style={{fontSize:'0.75rem',color:'#94a3b8',marginTop:'0.15rem'}}>
+                              Running Küsters &amp; van der Aalst (2025) algorithm with default options
+                            </div>
+                          </div>
+                        </div>
+                      ) : ocdeclareDiscoveryError ? (
+                        <div style={{color:'#dc2626',fontSize:'0.85rem'}}>
+                          <div style={{fontWeight:600}}>⚠ OC-Declare discovery failed</div>
+                          <div style={{marginTop:'0.25rem',color:'#64748b'}}>{ocdeclareDiscoveryError}</div>
+                        </div>
+                      ) : config.ocdeclareFile ? (
+                        <div>
+                          <div className="ocel-drop-zone-info">
+                            <div className="file-name">{config.ocdeclareFile}</div>
+                            <div className="file-meta" style={{color:'#15803d'}}>
+                              ✓ Auto-discovered · {ocdeclareDiscoveryResults?.stats?.num_constraints ?? ''} constraints
+                            </div>
+                          </div>
+                          <div style={{marginTop:'0.6rem',fontSize:'0.72rem',color:'#64748b',fontStyle:'italic'}}>
+                            Discovered using the algorithm by Küsters &amp; van der Aalst (2025) —{' '}
+                            <em>OC-DECLARE: Discovering Object-Centric Declarative Patterns with Synchronization</em>.
+                            Default options: noise threshold 0.2, lossless reduction, arrow types AS/EF/EP.
+                          </div>
+                        </div>
+                      ) : (
+                        <div style={{color:'#94a3b8',fontSize:'0.85rem',textAlign:'center',padding:'0.5rem'}}>
+                          Waiting for OCEL to finish uploading…
                         </div>
                       )}
-
-                      {/* Drop prompt or loaded state */}
-                      <div style={{display:'flex',alignItems:'center',justifyContent:'center',paddingTop: config.ocdeclareFile ? '1.5rem' : '0'}}>
-                        {!config.ocdeclareFile && (
-                          <div className="ocel-drop-prompt" style={{gap:'0.2rem'}}>
-                            
-                            <div className="ocel-drop-label" style={{fontSize:'0.9rem'}}>Drop OC-Declare file here</div>
-                            <div className="ocel-drop-sub">or click to browse (.json)</div>
-                          </div>
-                        )}
-                      </div>
-
-                      <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
-                        onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
                     </div>
                   </div>
                 )}
@@ -9863,7 +9903,7 @@ function App() {
                   </button>
                   <button
                     className="simulate-button"
-                    disabled={!discoveryConfig.eventLogFile || isRunningDiscoveries || isDiscovering || !(discoveryConfig.startActivityProbSelected?.length > 0)}
+                    disabled={!discoveryConfig.eventLogFile || isOcdeclareDiscovering || isRunningDiscoveries || isDiscovering || !(discoveryConfig.startActivityProbSelected?.length > 0)}
                     onClick={runAllDiscoveries}
                     style={{minWidth:'260px'}}
                   >
@@ -11285,9 +11325,9 @@ function App() {
                 </div>
                 <div className="form-group">
                   <label>
-                    Resource Threshold
-                    <HelpTip text={'Object types whose average events/instance exceeds this are treated as reusable resources and never deactivated.\n\nHigh → almost nothing classified as resource.\nLow → many types become resources.\n\nDefault: 50'} />
-                    <span className="help-text">avg events/instance above which type is a resource</span>
+                    Permanent Object Threshold
+                    <HelpTip text={'Object types whose average events/instance exceeds this are treated as permanent objects and never deactivated.\n\nHigh → almost nothing classified as permanent.\nLow → many types become permanent objects.\n\nAuto-detected from the log on load; you can override.'} />
+                    <span className="help-text">avg events/instance above which type is a permanent object</span>
                   </label>
                   <input
                     type="number"
@@ -11296,6 +11336,11 @@ function App() {
                     min="1" step="5"
                     disabled={isOcdeclareDiscovering}
                   />
+                  {suggestedPermanentThreshold != null && (
+                    <div style={{fontSize:'0.7rem',color:'#2563eb',marginTop:'0.2rem'}}>
+                      Auto-detected: {suggestedPermanentThreshold}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -11691,7 +11736,7 @@ function App() {
                     <div className="object-info-title">ℹ Object Lifecycle</div>
                     {resources.length > 0 && (
                       <div className="object-info-group">
-                        <div className="object-info-label">Resources (always active)</div>
+                        <div className="object-info-label">Permanent Objects (always active)</div>
                         <ul className="object-info-list">
                           {resources.map(t => <li key={t}>{t}</li>)}
                         </ul>
