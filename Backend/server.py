@@ -26,7 +26,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules, discover_resource_types
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -1657,43 +1657,24 @@ def get_iteration_log(run_id):
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])
 def run_ocdeclare_discovery():
-    """Discover OC-Declare model from OCEL 2.0 event log."""
+    """Discover OC-Declare model from OCEL 2.0 event log using Küsters & van der Aalst (2025)."""
     try:
         data = request.json
-        event_log_file = data.get('eventLogFile')
-        min_support = data.get('minSupport', 0.7)
-        min_confidence = data.get('minConfidence', 0.85)
-        noise_threshold = data.get('noiseThreshold', 0.15)
-        lifecycle_threshold = data.get('lifecycleThreshold', 0.5)
-        resource_threshold = data.get('resourceThreshold', 50.0)
-        constraint_types = data.get('constraintTypes', {
-            'precedence': True,
-            'response': True,
-            'not_coexistence': False,
-            'chain_precedence': False,
-            'chain_response': False,
-            'coexistence': False,
-            'absence': False
-        })
-        # Per-constraint-type thresholds (optional). Each key maps to a dict
-        # with optional 'minSupport', 'minConfidence', 'noiseThreshold'.
-        # Falls back to the global values above for any missing key or field.
-        constraint_params = data.get('constraintParams', {})
-        
+        event_log_file      = data.get('eventLogFile')
+        noise_threshold     = float(data.get('noiseThreshold', 0.2))
+        arc_types           = data.get('arcTypes', ['EF', 'EP', 'AS'])
+        reduction           = data.get('reduction', 'Lossless')
+        lifecycle_threshold = float(data.get('lifecycleThreshold', 0.5))
+        permanent_threshold = float(data.get('resourceThreshold', 50.0))
+
         if not event_log_file:
             return jsonify({'error': 'Missing event log file'}), 400
-        
-        # Validate parameters
-        if not (0 <= min_support <= 1):
-            return jsonify({'error': 'min_support must be between 0 and 1'}), 400
-        if not (0 <= min_confidence <= 1):
-            return jsonify({'error': 'min_confidence must be between 0 and 1'}), 400
         if not (0 <= noise_threshold <= 1):
-            return jsonify({'error': 'noise_threshold must be between 0 and 1'}), 400
+            return jsonify({'error': 'noiseThreshold must be between 0 and 1'}), 400
         if not (0 <= lifecycle_threshold <= 1):
-            return jsonify({'error': 'lifecycle_threshold must be between 0 and 1'}), 400
-        if resource_threshold < 1:
-            return jsonify({'error': 'resource_threshold must be >= 1'}), 400
+            return jsonify({'error': 'lifecycleThreshold must be between 0 and 1'}), 400
+        if permanent_threshold < 1:
+            return jsonify({'error': 'resourceThreshold must be >= 1'}), 400
 
         log_path = EVENTLOG_DIR / event_log_file
         if not log_path.exists():
@@ -1708,13 +1689,11 @@ def run_ocdeclare_discovery():
         # Run discovery
         result = discover_ocdeclare_model(
             event_log_path=str(log_path),
-            min_support=min_support,
-            min_confidence=min_confidence,
             noise_threshold=noise_threshold,
+            arc_types=arc_types,
+            reduction=reduction,
             lifecycle_threshold=lifecycle_threshold,
-            resource_threshold=resource_threshold,
-            constraint_types=constraint_types,
-            constraint_params=constraint_params,
+            permanent_threshold=permanent_threshold,
             output_filename=output_filename,
             output_dir=str(OCDECLARE_DIR)
         )
@@ -2644,7 +2623,7 @@ def discover_resources():
     try:
         data = request.json or {}
         event_log_file = data.get('eventLogFile')
-        resource_threshold = float(data.get('resourceThreshold', 50.0))
+        permanent_threshold = float(data.get('resourceThreshold', 50.0))
 
         if not event_log_file:
             return jsonify({'error': 'Missing eventLogFile parameter'}), 400
@@ -2654,7 +2633,7 @@ def discover_resources():
             return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
 
         event_log = load_ocel2(str(log_path))
-        resource_type_names = discover_resource_types(event_log, resource_threshold)
+        resource_type_names = discover_permanent_object_types(event_log, permanent_threshold)
 
         # Count individual object instances per resource type
         objects_raw = event_log.get('objects', {})
@@ -2674,6 +2653,33 @@ def discover_resources():
             'resource_types': resource_type_names,
             'resource_info': resource_info,
         })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/suggest-permanent-threshold', methods=['POST'])
+def suggest_permanent_threshold():
+    """Suggest a permanent-object threshold via gap detection on the OCEL.
+
+    Body JSON:
+      eventLogFile – filename in EVENTLOG_DIR (required)
+
+    Returns:
+      { suggested_threshold: float | null }
+      null means the log's reuse distribution has no clear bimodal gap.
+    """
+    try:
+        data = request.json or {}
+        event_log_file = data.get('eventLogFile')
+        if not event_log_file:
+            return jsonify({'error': 'Missing eventLogFile parameter'}), 400
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
+        event_log = load_ocel2(str(log_path))
+        threshold = suggest_permanent_object_threshold(event_log)
+        return jsonify({'suggested_threshold': threshold})
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500

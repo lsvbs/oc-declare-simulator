@@ -1459,25 +1459,10 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
 
   const ocelFile     = discoveryConfig.eventLogFile || null;
   const ocdeclFile   = config.ocdeclareFile || null;
-  const modeLabel    = workflowMode === 'internal'       ? 'Internal'
-                     : workflowMode === 'external-ocel'  ? 'External + OCEL'
-                     : workflowMode === 'external-empty' ? 'External (no files)'
-                     : null;
 
   return (
     <div className="workflow-topbar" ref={barRef}>
       <div className="topbar-files">
-        {modeLabel && (
-          <span className="topbar-mode-section">
-            <span className="topbar-mode-label">Mode:</span>
-            <span className="topbar-mode-badge">{modeLabel}</span>
-            {onChangeMode && (
-              <button className="mode-switch-btn topbar-mode-change-btn" onClick={onChangeMode} title="Switch workflow mode">
-                ↩ Change
-              </button>
-            )}
-          </span>
-        )}
         <span className={`topbar-file-pill ${ocelFile ? 'loaded' : ''}`}>
           {ocelFile || 'No OCEL loaded'}
         </span>
@@ -7511,9 +7496,8 @@ function App() {
   const [timingError,           setTimingError]           = useState(null);
 
   // ── Workflow mode ─────────────────────────────────────────────────────────
-  const [workflowMode, setWorkflowMode] = useState(null);
+  const [workflowMode, setWorkflowMode] = useState('external-ocel');
   const [landingDragOver, setLandingDragOver] = useState(false);
-  // null = not chosen yet | 'internal' | 'external-ocel' | 'external-empty'
   const [paramDiscoveryEnabled, setParamDiscoveryEnabled] = useState({
     probability: true, lifecycle: true, time: true,
   });
@@ -8598,7 +8582,14 @@ function App() {
     setOcdeclareDiscoveryError(null);
     setOcdeclareDiscoveryResults(null);
     try {
-      const payload = { ...ocdeclareDiscoveryConfig, eventLogFile: eventLogFilename };
+      const payload = {
+        eventLogFile:       eventLogFilename,
+        noiseThreshold:     0.2,
+        arcTypes:           ['EF', 'EP', 'AS'],
+        reduction:          'Lossless',
+        lifecycleThreshold: 0.5,
+        resourceThreshold:  50.0,
+      };
       const response = await axios.post('/api/discover-ocdeclare', payload);
       if (response.data.success) {
         setOcdeclareDiscoveryResults(response.data);
@@ -8614,7 +8605,7 @@ function App() {
     } finally {
       setIsOcdeclareDiscovering(false);
     }
-  }, [ocdeclareDiscoveryConfig, loadAvailableFiles]);
+  }, [loadAvailableFiles]);
 
   const handleFileUpload = useCallback(async (file, type) => {
     if (!file) return;
@@ -9192,7 +9183,7 @@ function App() {
         timingDiscoveryResult={timingDiscoveryResult}
         results={results}
         workflowMode={workflowMode}
-        onChangeMode={workflowMode ? () => setWorkflowMode(null) : null}
+        onChangeMode={null}
       />
 
       <header className="header" style={{textAlign:'center', marginTop:'2rem', padding:'1.5rem 1rem 1rem'}}>
@@ -9247,33 +9238,9 @@ function App() {
         </div>
       )}
 
-      {/* ── Mode selector ── */}
-      {!workflowMode && (
-        <div className="mode-selector">
-          <h2 className="mode-selector-title">Choose your workflow</h2>
-          <div className="mode-cards">
-            <div className="mode-card" onClick={() => setWorkflowMode('internal')}>
-              <div className="mode-card-icon">◈</div>
-              <div className="mode-card-label">Internal Discovery</div>
-              <div className="mode-card-desc">Load an OCEL log and discover everything — constraints, probabilities, and timing — from scratch.</div>
-            </div>
-            <div className="mode-card" onClick={() => setWorkflowMode('external-ocel')}>
-              <div className="mode-card-icon">◉</div>
-              <div className="mode-card-label">External OC-Declare + OCEL</div>
-              <div className="mode-card-desc">Bring your own OC-Declare constraint file and an OCEL log for parameter discovery.</div>
-            </div>
-            <div className="mode-card" onClick={() => setWorkflowMode('external-empty')}>
-              <div className="mode-card-icon">◎</div>
-              <div className="mode-card-label">Manual / No Files</div>
-              <div className="mode-card-desc">Build the model entirely in the editor. Discovery features unavailable without an OCEL log.</div>
-            </div>
-          </div>
-          {/* Small link to switch later */}
-          <p className="mode-selector-hint">You can change mode at any time using the button below.</p>
-        </div>
-      )}
+      {/* ── Mode selector removed — always external-ocel ── */}
 
-      <div className="workflow-container" style={!workflowMode ? {display:'none'} : {}}>
+      <div className="workflow-container">
         {/* ── STEP 1: Parameter Discovery (internal mode only) ── */}
         {workflowMode === 'internal' && (
         <div className="discovery-section">
@@ -9893,7 +9860,6 @@ function App() {
                 {/* Actions */}
                 <div className="landing-actions">
                   <button className="start-over-link" onClick={() => {
-                    setWorkflowMode(null);
                     handleConfigChange('ocdeclareFile', '');
                     handleDiscoveryConfigChange('eventLogFile', '');
                     setDiscoveryResults(null);
