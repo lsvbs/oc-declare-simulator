@@ -535,11 +535,12 @@
   border-radius: 8px;
 }
 
-/* ── Transition Flow Chart ─────────────────────────────────────────────────── */
+/* ── Discovery results collapsibles ───────────────────────────────────────── */
 .discovery-transition-collapsible {
   margin-top: 1rem;
 }
 
+/* ── Constraint Flow Graph (shared tfc-* classes) ──────────────────────────── */
 .tfc-wrap {
   padding: 0.4rem 0 0.25rem;
 }
@@ -551,41 +552,6 @@
   margin-bottom: 0.5rem;
   flex-wrap: wrap;
 }
-
-.tfc-threshold-label {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-size: 0.75rem;
-  color: #475569;
-  font-weight: 500;
-}
-
-.tfc-slider {
-  width: 90px;
-  accent-color: #6366f1;
-  cursor: pointer;
-}
-
-.tfc-threshold-val {
-  font-weight: 700;
-  color: #6366f1;
-  min-width: 2rem;
-}
-
-.act-marker {
-  display: inline-block;
-  font-size: 0.65rem;
-  margin-right: 0.3rem;
-  vertical-align: middle;
-}
-.act-marker-start { color: #16a34a; }
-.act-marker-end   { color: #dc2626; }
-
-.end-prob-cell      { font-size: 0.78rem; font-weight: 600; padding: 0.1rem 0.3rem; border-radius: 3px; }
-.end-prob-cell.high { color: #dc2626; background: #fee2e2; }
-.end-prob-cell.mid  { color: #d97706; background: #fef3c7; }
-.end-prob-cell.low  { color: #64748b; }
 
 .tfc-reset-btn {
   font-size: 0.72rem;
@@ -626,6 +592,20 @@
 .tfc-svg {
   display: block;
 }
+
+.act-marker {
+  display: inline-block;
+  font-size: 0.65rem;
+  margin-right: 0.3rem;
+  vertical-align: middle;
+}
+.act-marker-start { color: #16a34a; }
+.act-marker-end   { color: #dc2626; }
+
+.end-prob-cell      { font-size: 0.78rem; font-weight: 600; padding: 0.1rem 0.3rem; border-radius: 3px; }
+.end-prob-cell.high { color: #dc2626; background: #fee2e2; }
+.end-prob-cell.mid  { color: #d97706; background: #fef3c7; }
+.end-prob-cell.low  { color: #64748b; }
 
 .discovery-results h3 {
   margin-top: 0;

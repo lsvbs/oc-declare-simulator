@@ -30,6 +30,25 @@ function makeFlowRankSorter(discoveryResults, objectTraces) {
   };
 }
 
+// ── Scope formatter ───────────────────────────────────────────────────────────
+// Returns "each manuscript" for single-type, "Each(editor,version), All(invitation)"
+// for multi-type bindings.
+function formatScope(scope) {
+  if (!scope) return '';
+  const bindings = scope.bindings || [];
+  if (bindings.length <= 1) {
+    if (scope.kind && scope.object_type) return `${scope.kind} ${scope.object_type}`;
+    return scope.object_type || scope.kind || '';
+  }
+  const groups = {};
+  for (const [t, inv] of bindings) {
+    (groups[inv] = groups[inv] || []).push(t);
+  }
+  return Object.entries(groups)
+    .map(([inv, types]) => `${inv.charAt(0).toUpperCase() + inv.slice(1)}(${types.join(',')})`)
+    .join(', ');
+}
+
 // ── ConstraintFlowGraph ───────────────────────────────────────────────────────
 // Possible-routes graph derived purely from activities + constraints.
 // Edges represent "A can directly precede B" based on precedence/response/succession
@@ -38,12 +57,25 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
   const [nodeOverrides, setNodeOverrides] = React.useState({});
   const [pan, setPan] = React.useState({ x: 0, y: 0 });
   const [svgTip, setSvgTip] = React.useState(null); // {text, x, y}
+  const [containerW, setContainerW] = React.useState(800);
   const dragRef = React.useRef({ type: null });
   const svgRef = React.useRef(null);
+  const wrapRef = React.useRef(null);
   const PAD = 44, R = 22, HGAP = 80;
 
   // Reset overrides when inputs change
   React.useEffect(() => { setNodeOverrides({}); setPan({ x: 0, y: 0 }); }, [activities, constraints]);
+
+  // Track container width for dynamic HGAP
+  React.useEffect(() => {
+    const el = wrapRef.current; if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect?.width;
+      if (w > 0) setContainerW(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const { nodes, edges, pos, svgW, svgH, startSet, endSet, actCreates, actDeactivates } = React.useMemo(() => {
     const actNames = (activities || []).map(a => typeof a === 'string' ? a : a.name).filter(Boolean);
@@ -192,7 +224,10 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       edgeCount[key] = matching.length;
       edgeType[key] = matching[0]?.constraint_type || 'precedence';
       // Collect all distinct scope types backing this edge
-      const scopes = [...new Set(matching.map(c => c.scope?.object_type || c.scope_object_type || null).filter(Boolean))];
+      const scopes = [...new Set(matching.map(c => {
+        const b = c.scope?.bindings || [];
+        return b.length > 1 ? b.map(([t]) => t).join(',') : (c.scope?.object_type || c.scope_object_type || null);
+      }).filter(Boolean))];
       edgeCount[key + '__scopes'] = scopes;
     });
 
@@ -212,8 +247,11 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
     });
 
     const pos = {};
+    const dynamicHGAP = numRanks > 1
+      ? Math.max(HGAP, Math.floor((containerW - 2 * (PAD + R) - 10) / (numRanks - 1)) - 2 * R)
+      : HGAP;
     byRank.forEach((layer, r) => {
-      const x = PAD + R + r * (R * 2 + HGAP);
+      const x = PAD + R + r * (R * 2 + dynamicHGAP);
       const spineNode = layer.find(n => spineSet.has(n)) || layer[0];
       const others = layer.filter(n => n !== spineNode);
       const above = [], below = [];
@@ -239,7 +277,7 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       count: edgeCount[`${e.src}→${e.tgt}`] || 1,
       scopes: edgeCount[`${e.src}→${e.tgt}__scopes`] || [],
     })), pos, svgW, svgH, startSet, endSet, actCreates, actDeactivates };
-  }, [activities, constraints, startActivities]);
+  }, [activities, constraints, startActivities, containerW]);
 
 
   // Compute max probability across all edges for stroke-width scaling
@@ -266,6 +304,12 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
     const tp = pt.matrixTransform(ctm.inverse());
     return { x: tp.x - pan.x, y: tp.y - pan.y };
   }
+  function svgCoord(e) {
+    const svg = svgRef.current; if (!svg) return { x: e.clientX, y: e.clientY };
+    const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+    const ctm = svg.getScreenCTM(); if (!ctm) return { x: e.clientX, y: e.clientY };
+    return pt.matrixTransform(ctm.inverse());
+  }
   function onNodeMouseDown(e, name) {
     e.stopPropagation();
     const { x, y } = getSVGPoint(e);
@@ -274,7 +318,8 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
   }
   function onSVGMouseDown(e) {
     if (dragRef.current.type) return;
-    dragRef.current = { type: 'pan', startX: e.clientX, startY: e.clientY, origPanX: pan.x, origPanY: pan.y };
+    const { x, y } = svgCoord(e);
+    dragRef.current = { type: 'pan', startX: x, startY: y, origPanX: pan.x, origPanY: pan.y };
   }
   function onMouseMove(e) {
     const d = dragRef.current; if (!d.type) return;
@@ -282,7 +327,8 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       const { x, y } = getSVGPoint(e);
       setNodeOverrides(prev => ({ ...prev, [d.name]: { x: d.origX + x - d.startX, y: d.origY + y - d.startY } }));
     } else {
-      setPan({ x: d.origPanX + e.clientX - d.startX, y: d.origPanY + e.clientY - d.startY });
+      const { x, y } = svgCoord(e);
+      setPan({ x: d.origPanX + x - d.startX, y: d.origPanY + y - d.startY });
     }
   }
   function onMouseUp() { dragRef.current = { type: null }; }
@@ -346,7 +392,7 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
           <span style={{color:'#94a3b8'}}>- -</span> single constraint
         </span>
       </div>
-      <div className="tfc-scroll" onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
+      <div ref={wrapRef} className="tfc-scroll" onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
         <svg ref={svgRef} width={svgW} height={svgH} className="tfc-svg"
           onMouseDown={onSVGMouseDown} style={{cursor:'grab'}}>
           <defs>
@@ -373,8 +419,8 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
               const sw = probMatrix
                 ? 0.8 + (prob / maxProb) * 2.7
                 : 1.5;
-              // Abbreviate each scope type: first letter of each word
-              const scopeLabels = scopes.map(s => s.split(/\s+/).map(w => w[0].toUpperCase()).join(''));
+              // Abbreviate scope: first letter of each type, joined
+              const scopeLabels = scopes.map(s => s.split(/[,\s]+/).map(w => w[0].toUpperCase()).join(''));
               const lineH = 10;
               const maxW = Math.max(...scopeLabels.map(l => l.length * 6.4 + 4), 0);
               return (
@@ -464,441 +510,6 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
   );
 }
 
-const TFC_R = 22;
-const TFC_HGAP = 80;
-const TFC_PAD  = 44;
-
-function tfc_layout(matrix, threshold, startSet, endSet, tracePosition, forbiddenEdges) {
-  // ── Edges ──────────────────────────────────────────────────────────────────
-  const edges = [];
-  Object.entries(matrix).forEach(([src, tgts]) => {
-    Object.entries(tgts)
-      .filter(([tgt, p]) => tgt !== src && p >= threshold && !(forbiddenEdges && forbiddenEdges.has(`${src}→${tgt}`)))
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .forEach(([tgt, p]) => edges.push({ src, tgt, p }));
-  });
-
-  const nodeSet = new Set(Object.keys(matrix));
-  edges.forEach(e => { nodeSet.add(e.src); nodeSet.add(e.tgt); });
-  const nodes = [...nodeSet];
-
-  // ── Rank assignment (longest-path, cycle-safe) ────────────────────────────
-  // ── Rank assignment ───────────────────────────────────────────────────────
-  // When trace positions are available, bucket each activity into a rank column
-  // proportional to its mean normalised position (0=first, 1=last in traces).
-  // This gives columns that reflect the actual process timeline.
-  // Without positions, fall back to longest-path from start nodes.
-  const rankOf = {};
-  const hasPositions = tracePosition && Object.keys(tracePosition).length > 0;
-
-  if (hasPositions) {
-    // Determine number of columns: use enough buckets to spread nodes without
-    // crowding. Aim for at most ~4 nodes per column on average.
-    const numBuckets = Math.max(3, Math.ceil(nodes.length / 3));
-    nodes.forEach(n => {
-      const p = tracePosition[n];
-      if (p === undefined) {
-        // Unknown position: place in middle
-        rankOf[n] = Math.floor(numBuckets / 2);
-      } else {
-        // Bucket: position 0 → rank 0, position 1 → rank numBuckets-1
-        rankOf[n] = Math.min(numBuckets - 1, Math.floor(p * numBuckets));
-      }
-    });
-  } else {
-    // Fallback: longest-path from start nodes
-    nodes.forEach(n => { rankOf[n] = startSet.has(n) ? 0 : -1; });
-    if (![...startSet].some(n => nodes.includes(n))) {
-      const hasIn = new Set(edges.map(e => e.tgt));
-      nodes.forEach(n => { if (!hasIn.has(n)) rankOf[n] = 0; });
-    }
-    nodes.forEach(n => { if (rankOf[n] < 0) rankOf[n] = 0; });
-    for (let pass = 0; pass < nodes.length * 2; pass++) {
-      let changed = false;
-      edges.forEach(({ src, tgt }) => {
-        if (endSet.has(src)) return;
-        if (!startSet.has(tgt) && rankOf[src] + 1 > rankOf[tgt]) {
-          rankOf[tgt] = rankOf[src] + 1; changed = true;
-        }
-      });
-      if (!changed) break;
-    }
-    endSet.forEach(n => {
-      const preds = edges.filter(e => e.tgt === n && !endSet.has(e.src));
-      rankOf[n] = preds.length ? Math.max(...preds.map(e => rankOf[e.src])) + 1 : rankOf[n];
-    });
-  }
-
-  // ── Enforce "best outgoing edge always goes right" ────────────────────────
-  // Regardless of how ranks were assigned, the highest-probability outgoing
-  // edge from each node must point strictly rightward. Cascade until stable.
-  for (let pass = 0; pass < nodes.length * 2; pass++) {
-    let changed = false;
-    nodes.forEach(src => {
-      if (endSet.has(src)) return;
-      const outgoing = edges.filter(e => e.src === src).sort((a, b) => b.p - a.p);
-      if (!outgoing.length) return;
-      const tgt = outgoing[0].tgt;
-      if (startSet.has(tgt)) return;
-      if (rankOf[tgt] <= rankOf[src]) {
-        rankOf[tgt] = rankOf[src] + 1;
-        changed = true;
-      }
-    });
-    if (!changed) break;
-  }
-
-  const distinctRanks = [...new Set(Object.values(rankOf))].sort((a, b) => a - b);
-  const rankMap = {};
-  distinctRanks.forEach((r, i) => { rankMap[r] = i; });
-  nodes.forEach(n => { rankOf[n] = rankMap[rankOf[n]]; });
-  const numRanks = Math.max(...Object.values(rankOf)) + 1;
-
-  const byRank = Array.from({ length: numRanks }, () => []);
-  nodes.forEach(n => byRank[rankOf[n]].push(n));
-
-  // ── Trace the highest-probability spine ───────────────────────────────────
-  const spineSet = new Set();
-  const seeds = [...startSet].filter(n => nodes.includes(n));
-  if (!seeds.length) seeds.push(...(byRank[0] || []));
-
-  seeds.forEach(start => {
-    spineSet.add(start);
-    let cur = start;
-    for (let r = rankOf[start]; r < numRanks - 1; r++) {
-      const fwd = edges.filter(e => e.src === cur && rankOf[e.tgt] === r + 1)
-                       .sort((a, b) => b.p - a.p);
-      if (!fwd.length) break;
-      cur = fwd[0].tgt;
-      spineSet.add(cur);
-    }
-  });
-
-  // For each branch node: also apply the same rule recursively
-  // (each branch node's best forward edge goes to a node at rank+1)
-  // This is already guaranteed by the rank assignment — nothing extra needed.
-
-  // ── Build best-incoming-prob index ───────────────────────────────────────
-  const bestIn = {};
-  edges.forEach(({ tgt, p }) => { if (!bestIn[tgt] || p > bestIn[tgt]) bestIn[tgt] = p; });
-
-  // ── Adaptive pitch based on tallest column ────────────────────────────────
-  // Target: comfortable vertical spread. Formula scales down for large graphs.
-  const maxColSize = Math.max(...byRank.map(l => l.length), 1);
-  // pitch = distance between node centres (diameter + gap)
-  // Small graphs: generous spacing. Large graphs: compact but readable.
-  const adaptiveGap = Math.max(14, Math.round(120 / Math.max(maxColSize, 1)));
-  const pitch = TFC_R * 2 + adaptiveGap;
-
-  // ── Column-by-column Y placement ─────────────────────────────────────────
-  // Spine node → midY (shared across all columns so the spine is horizontal).
-  // Other nodes → alternate above/below in order of bestIn probability,
-  // so the highest-probability branch is closest to the spine.
-  const midY = TFC_PAD + TFC_R + Math.floor((maxColSize - 1) / 2) * pitch;
-
-  const pos = {};
-  byRank.forEach((layer, r) => {
-    const x = TFC_PAD + TFC_R + r * (TFC_R * 2 + TFC_HGAP);
-
-    // Find the spine node for this column (prefer explicit spine, else highest bestIn)
-    const spineNode = layer.find(n => spineSet.has(n))
-      || layer.sort((a, b) => (bestIn[b] || 0) - (bestIn[a] || 0))[0];
-
-    // Sort non-spine nodes by bestIn prob desc so highest branch is nearest spine
-    const others = layer.filter(n => n !== spineNode)
-      .sort((a, b) => (bestIn[b] || 0) - (bestIn[a] || 0));
-
-    // Build ordered placement: interleave above/below
-    // [above2, above1, spine, below1, below2, ...]
-    const above = [], below = [];
-    others.forEach((n, i) => { if (i % 2 === 0) above.unshift(n); else below.push(n); });
-    const ordered = [...above, spineNode, ...below];
-
-    const spineIdx = ordered.indexOf(spineNode);
-    ordered.forEach((n, i) => {
-      pos[n] = {
-        x,
-        y: midY + (i - spineIdx) * pitch,
-        rank: r,
-        order: i,
-        isSpine: spineSet.has(n),
-      };
-    });
-  });
-
-  // ── Barycenter crossing reduction (2 passes after spine placement) ────────
-  // Operates only on non-spine nodes within each column to reduce edge crossings
-  // without disturbing the spine's horizontal alignment.
-  const posInLayer = {};
-  byRank.forEach(layer => layer.forEach((n, i) => { posInLayer[n] = i; }));
-
-  for (let pass = 0; pass < 2; pass++) {
-    for (let r = 1; r < numRanks; r++) {
-      const free = byRank[r].filter(n => !spineSet.has(n) && !startSet.has(n) && !endSet.has(n));
-      if (!free.length) continue;
-      const bcs = free.map(n => {
-        const nbrs = edges.filter(e => e.tgt === n && rankOf[e.src] < r)
-                          .map(e => ({ pos: posInLayer[e.src], w: e.p }));
-        if (!nbrs.length) return { n, bc: posInLayer[n] };
-        const wSum = nbrs.reduce((s, x) => s + x.w, 0);
-        return { n, bc: nbrs.reduce((s, x) => s + x.pos * x.w, 0) / wSum };
-      });
-      bcs.sort((a, b) => a.bc - b.bc);
-      // Re-place around spine: top-half get above, bottom-half below
-      const spineNode = byRank[r].find(n => spineSet.has(n));
-      const spineIdx = spineNode ? byRank[r].indexOf(spineNode) : Math.floor(byRank[r].length / 2);
-      const freeAbove = bcs.slice(0, Math.ceil(bcs.length / 2)).reverse();
-      const freeBelow = bcs.slice(Math.ceil(bcs.length / 2));
-      const layer = byRank[r].filter(n => spineSet.has(n) || startSet.has(n) || endSet.has(n));
-      // Reinsert free nodes
-      freeAbove.forEach(({ n }) => layer.unshift(n));
-      freeBelow.forEach(({ n }) => layer.push(n));
-      byRank[r] = layer;
-      byRank[r].forEach((n, i) => { posInLayer[n] = i; });
-
-      // Update pixel positions for this column
-      const spN = byRank[r].find(n => spineSet.has(n)) || byRank[r][0];
-      const spI = byRank[r].indexOf(spN);
-      byRank[r].forEach((n, i) => {
-        if (pos[n]) pos[n].y = midY + (i - spI) * pitch;
-      });
-    }
-  }
-
-  const allY = Object.values(pos).map(p => p.y);
-  const minY = Math.min(...allY) - TFC_R - TFC_PAD;
-  const dy = minY < 0 ? -minY : 0;
-  if (dy > 0) Object.values(pos).forEach(p => { p.y += dy; });
-
-  const maxX = Math.max(...Object.values(pos).map(p => p.x)) + TFC_R + TFC_PAD;
-  const maxY = Math.max(...Object.values(pos).map(p => p.y)) + TFC_R + 24 + TFC_PAD;
-  return { pos, edges, width: maxX, height: maxY };
-}
-
-function TransitionFlowChart({ matrix, activityCounts, startActivities, traceEndProb, likelyEndActivities, tracePosition, constraints }) {
-  const [threshold, setThreshold] = useState(0.05);
-
-  // Compute forbidden directed pairs from constraints
-  const forbiddenEdges = useMemo(() => {
-    const set = new Set();
-    (constraints || []).forEach(c => {
-      const src = c.source_activity;
-      const tgt = c.target_activity;
-      if (!src || !tgt) return;
-      // not_coexistence: neither can follow the other
-      if (c.constraint_type === 'not_coexistence') {
-        set.add(`${src}→${tgt}`);
-        set.add(`${tgt}→${src}`);
-      }
-      // not_succession: tgt cannot follow src
-      if (c.constraint_type === 'not_succession') {
-        set.add(`${src}→${tgt}`);
-      }
-      // not_precedence: tgt cannot be preceded by src (same direction)
-      if (c.constraint_type === 'not_precedence') {
-        set.add(`${src}→${tgt}`);
-      }
-      // not_chain_succession: tgt cannot immediately follow src
-      if (c.constraint_type === 'not_chain_succession') {
-        set.add(`${src}→${tgt}`);
-      }
-    });
-    return set;
-  }, [constraints]);
-
-  const { startNodes, endNodes } = useMemo(() => {
-    const starts = new Set((startActivities || []).slice(0, 3));
-    // End nodes: provided likely-end list, or nodes with high trace-end probability, or true sinks
-    const ends = new Set(likelyEndActivities || []);
-    if (!ends.size && traceEndProb) {
-      Object.entries(traceEndProb).forEach(([act, p]) => { if (p >= 0.5) ends.add(act); });
-    }
-    if (!ends.size) {
-      const hasOut = new Set();
-      Object.entries(matrix).forEach(([src, tgts]) =>
-        Object.entries(tgts).forEach(([tgt, p]) => { if (tgt !== src && p >= threshold) hasOut.add(src); })
-      );
-      new Set(Object.keys(matrix)).forEach(n => { if (!hasOut.has(n)) ends.add(n); });
-    }
-    return { startNodes: starts, endNodes: ends };
-  }, [matrix, startActivities, likelyEndActivities, traceEndProb, threshold]);
-
-  const { pos: layoutPos, edges, width: layoutW, height: layoutH } = useMemo(
-    () => tfc_layout(matrix, threshold, startNodes, endNodes, tracePosition || {}, forbiddenEdges),
-    [matrix, threshold, startNodes, endNodes, tracePosition, forbiddenEdges]
-  );
-
-  // ── Draggable positions ───────────────────────────────────────────────────
-  const [nodeOverrides, setNodeOverrides] = useState({});
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const dragRef = useRef({ type: null });
-  const svgRef = useRef(null);
-
-  const pos = useMemo(() => {
-    const m = {};
-    Object.entries(layoutPos).forEach(([n, p]) => { m[n] = nodeOverrides[n] ? { ...p, ...nodeOverrides[n] } : p; });
-    return m;
-  }, [layoutPos, nodeOverrides]);
-
-  const { svgW, svgH } = useMemo(() => {
-    const xs = Object.values(pos).map(p => p.x), ys = Object.values(pos).map(p => p.y);
-    return { svgW: Math.max(layoutW, xs.length ? Math.max(...xs) + TFC_R + TFC_PAD : layoutW),
-             svgH: Math.max(layoutH, ys.length ? Math.max(...ys) + TFC_R + TFC_PAD : layoutH) };
-  }, [pos, layoutW, layoutH]);
-
-  const maxProb = useMemo(() => Math.max(...edges.map(e => e.p), 0.01), [edges]);
-
-  if (!Object.keys(matrix).length) return null;
-
-  function getSVGPoint(e) {
-    const svg = svgRef.current; if (!svg) return { x: e.clientX, y: e.clientY };
-    const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
-    const ctm = svg.getScreenCTM(); if (!ctm) return { x: e.clientX, y: e.clientY };
-    const tp = pt.matrixTransform(ctm.inverse());
-    return { x: tp.x - pan.x, y: tp.y - pan.y };
-  }
-  function onNodeMouseDown(e, name) {
-    e.stopPropagation();
-    const { x, y } = getSVGPoint(e);
-    const cur = pos[name];
-    dragRef.current = { type: 'node', name, startX: x, startY: y, origX: cur.x, origY: cur.y };
-  }
-  function onSVGMouseDown(e) {
-    if (dragRef.current.type) return;
-    dragRef.current = { type: 'pan', startX: e.clientX, startY: e.clientY, origPanX: pan.x, origPanY: pan.y };
-  }
-  function onMouseMove(e) {
-    const d = dragRef.current; if (!d.type) return;
-    if (d.type === 'node') {
-      const { x, y } = getSVGPoint(e);
-      setNodeOverrides(prev => ({ ...prev, [d.name]: { x: d.origX + x - d.startX, y: d.origY + y - d.startY } }));
-    } else {
-      setPan({ x: d.origPanX + e.clientX - d.startX, y: d.origPanY + e.clientY - d.startY });
-    }
-  }
-  function onMouseUp() { dragRef.current = { type: null }; }
-
-  // Edge path
-  function edgePath(src, tgt, idx, total) {
-    const s = pos[src], t = pos[tgt]; if (!s || !t) return { d: '', lx: 0, ly: 0 };
-    const dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx*dx+dy*dy) || 1;
-    const ux = dx/dist, uy = dy/dist, px = -uy, py = ux;
-    const spread = (idx - (total-1)/2) * 14;
-    const ox = px*spread, oy = py*spread;
-    const sx = s.x + ux*TFC_R + ox, sy = s.y + uy*TFC_R + oy;
-    const ex = t.x - ux*TFC_R + ox, ey = t.y - uy*TFC_R + oy;
-    let h = 0; for (let i = 0; i < (src+tgt).length; i++) h = (h * 31 + (src+tgt).charCodeAt(i)) & 0xffff;
-    const pairBow = (h % 13) - 6;
-    if (t.x < s.x || (t.x === s.x && (t.rank??0) <= (s.rank??0))) {
-      const bow = 55 + Math.abs(s.y-t.y)*0.35 + Math.abs(s.x-t.x)*0.25;
-      const dir = idx % 2 === 0 ? -1 : 1;
-      return { d: `M ${sx} ${sy} C ${sx} ${sy+dir*bow} ${ex} ${ey+dir*bow} ${ex} ${ey}`,
-               lx: (sx+ex)/2, ly: Math.min(sy,ey)-bow*0.55 };
-    }
-    const bendMag = Math.abs(dy)*0.18 + spread*0.4 + pairBow;
-    const midX = (sx+ex)/2 + px*bendMag, midY = (sy+ey)/2 + py*bendMag;
-    const t1 = 0.4;
-    return { d: `M ${sx} ${sy} Q ${midX} ${midY} ${ex} ${ey}`,
-             lx: (1-t1)*(1-t1)*sx + 2*(1-t1)*t1*midX + t1*t1*ex,
-             ly: (1-t1)*(1-t1)*sy + 2*(1-t1)*t1*midY + t1*t1*ey - 5 };
-  }
-
-  const pairGroups = {};
-  edges.forEach(e => { const k=`${e.src}||${e.tgt}`; (pairGroups[k]=pairGroups[k]||[]).push(e); });
-
-  function nodeLabel(name, cx, cy) {
-    const words = name.split(/\s+/), MAX = TFC_R*1.7;
-    if (words.join('').length * 5 <= MAX * 1.3 && name.length <= 12)
-      return <text x={cx} y={cy+3.5} textAnchor="middle" fontSize={8.5} fill="#111"
-        style={{pointerEvents:'none',userSelect:'none'}}>{name}</text>;
-    let best=1, bestDiff=Infinity;
-    for (let i=1;i<words.length;i++) {
-      const d=Math.abs(words.slice(0,i).join(' ').length-words.slice(i).join(' ').length);
-      if(d<bestDiff){bestDiff=d;best=i;}
-    }
-    const trunc = s => s.length*5>MAX ? s.slice(0,Math.floor(MAX/5)-1)+'…' : s;
-    return (<>
-      <text x={cx} y={cy-3} textAnchor="middle" fontSize={8.5} fill="#111"
-        style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(0,best).join(' '))}</text>
-      <text x={cx} y={cy+8} textAnchor="middle" fontSize={8.5} fill="#111"
-        style={{pointerEvents:'none',userSelect:'none'}}>{trunc(words.slice(best).join(' '))}</text>
-    </>);
-  }
-
-  return (
-    <div className="tfc-wrap">
-      <div className="tfc-controls">
-        <label className="tfc-threshold-label">
-          Min prob
-          <input type="range" min={0.02} max={0.5} step={0.01} value={threshold}
-            onChange={e => setThreshold(parseFloat(e.target.value))} className="tfc-slider" />
-          <span className="tfc-threshold-val">{(threshold*100).toFixed(0)}%</span>
-        </label>
-        <span className="tfc-edge-count">{edges.length} transitions</span>
-        <button className="tfc-reset-btn" onClick={() => { setNodeOverrides({}); setPan({x:0,y:0}); }}>↺ Reset</button>
-        <span className="tfc-legend">
-          <span style={{color:'#16a34a',fontWeight:700}}>◎</span> start &nbsp;
-          <span style={{color:'#dc2626',fontWeight:700}}>◎</span> end
-        </span>
-      </div>
-      <div className="tfc-scroll" onMouseMove={onMouseMove} onMouseUp={onMouseUp} onMouseLeave={onMouseUp}>
-        <svg ref={svgRef} width={svgW} height={svgH} className="tfc-svg"
-          onMouseDown={onSVGMouseDown} style={{cursor: dragRef.current?.type==='pan' ? 'grabbing' : 'grab'}}>
-          <defs>
-            <marker id="tfc-arr" markerWidth="7" markerHeight="7" refX="6.5" refY="3.5" orient="auto">
-              <path d="M0,0 L7,3.5 L0,7 Z" fill="#333" />
-            </marker>
-          </defs>
-          <g transform={`translate(${pan.x},${pan.y})`}>
-            {/* Edges */}
-            {edges.map(({ src, tgt, p }) => {
-              const key = `${src}||${tgt}`;
-              const group = pairGroups[key] || [{ p }];
-              const idx = group.findIndex(e => e.p === p);
-              const { d, lx, ly } = edgePath(src, tgt, idx, group.length);
-              const sw = 0.6 + (p / maxProb) * 3.0;
-              return (
-                <g key={`${src}->${tgt}`}>
-                  <path d={d} fill="none" stroke="#333" strokeWidth={sw} markerEnd="url(#tfc-arr)" />
-                  <rect x={lx-10} y={ly-8} width={20} height={11} rx={2} fill="white" opacity={0.85} />
-                  <text x={lx} y={ly} textAnchor="middle" fontSize={8.5} fill="#333"
-                    style={{pointerEvents:'none',userSelect:'none'}}>{p.toFixed(2)}</text>
-                </g>
-              );
-            })}
-            {/* Nodes */}
-            {Object.entries(pos).map(([name, { x, y }]) => {
-              const isStart = startNodes.has(name), isEnd = endNodes.has(name);
-              const ep = traceEndProb?.[name] || 0;
-              return (
-                <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
-                  {/* Opaque background mask — gaps any edge path passing through this node */}
-                  <circle cx={x} cy={y} r={isStart || isEnd ? TFC_R+7 : TFC_R+4} fill="#fafbff" />
-                  {(isStart || isEnd) && (
-                    <circle cx={x} cy={y} r={TFC_R+5} fill="none"
-                      stroke={isStart ? '#16a34a' : '#dc2626'} strokeWidth={1.5} />
-                  )}
-                  <circle cx={x} cy={y} r={TFC_R} fill="white" stroke="#333" strokeWidth={1.5} />
-                  {ep > 0 && (
-                    <text x={x} y={y+TFC_R+11} textAnchor="middle" fontSize={8}
-                      fill={ep>=0.7?'#dc2626':ep>=0.3?'#d97706':'#64748b'}
-                      style={{pointerEvents:'none',userSelect:'none'}}>
-                      end {(ep*100).toFixed(0)}%
-                    </text>
-                  )}
-                  {nodeLabel(name, x, y)}
-                </g>
-              );
-            })}
-          </g>
-        </svg>
-      </div>
-    </div>
-  );
-}
-
-
 // ── HelpTip (shared with ModelEditor — CSS lives in ModelEditor.css which is
 //    bundled together, so the same class names work here too) ──────────────────
 // Hover popup showing all constraints connected to an activity
@@ -957,8 +568,8 @@ function ActivityConstraintTooltip({ activityName, constraints }) {
                 <span style={{color: c.target_activity === activityName ? '#1e293b' : '#94a3b8', fontWeight: c.target_activity === activityName ? 600 : 400}}>
                   {c.target_activity || '—'}
                 </span>
-                {(c.scope?.object_type || c.scope_object_type) && (
-                  <span style={{color:'#64748b',fontSize:'0.65rem'}}>[{c.scope?.object_type || c.scope_object_type}]</span>
+                {(c.scope?.object_type || c.scope_object_type || (c.scope?.bindings?.length > 0)) && (
+                  <span style={{color:'#64748b',fontSize:'0.65rem'}}>[{formatScope(c.scope) || c.scope_object_type}]</span>
                 )}
                 {(c.nmin != null || c.nmax != null) && (
                   <span style={{color:'#475569',fontSize:'0.65rem',marginLeft:'auto',whiteSpace:'nowrap'}}>
@@ -989,7 +600,7 @@ function HelpTip({ text }) {
 // Keeps the outer `className` so existing CSS selectors (e.g. `.object-types ul`)
 // keep matching. The header gets both the caller's look (via the wrapper class)
 // and the shared `.collapsible-header` behaviour.
-function Collapsible({ title, badge, defaultOpen = false, className = '', children }) {
+function Collapsible({ title, badge, defaultOpen = false, className = '', children, preview, stickyContent }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <div className={className}>
@@ -998,8 +609,33 @@ function Collapsible({ title, badge, defaultOpen = false, className = '', childr
         <span className="collapsible-title">{title}</span>
         {badge != null && <span className="collapsible-badge">{badge}</span>}
       </h4>
+      {stickyContent}
+      {!open && preview}
       {open && (typeof children === 'function' ? children() : children)}
     </div>
+  );
+}
+
+function InfoTip({ text }) {
+  const [show, setShow] = React.useState(false);
+  return (
+    <span
+      style={{position:'relative', display:'inline-block', marginLeft:'3px', cursor:'help', color:'#94a3b8', fontSize:'0.85em', lineHeight:1}}
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      ⓘ
+      {show && (
+        <span style={{
+          position:'absolute', bottom:'calc(100% + 5px)', left:'50%', transform:'translateX(-50%)',
+          background:'#1e293b', color:'#f1f5f9', padding:'6px 9px', borderRadius:'6px',
+          fontSize:'0.72rem', lineHeight:'1.45', width:'220px', zIndex:1000,
+          pointerEvents:'none', whiteSpace:'normal', boxShadow:'0 4px 14px rgba(0,0,0,0.25)',
+        }}>
+          {text}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -1111,7 +747,7 @@ function ObjectTracer({ links = [], typesMap = {}, objectMetrics = {}, resourceT
         <span className="tracer-obj">
           <span className="tracer-type-chip" style={{ background: typeColor(otype) }}>{otype}</span>
           <span className="tracer-id">{id}</span>
-          {isResource && <span className="tracer-resource-badge" title="Permanent object — excluded from chain timing">resource</span>}
+          {isResource && <span className="tracer-resource-badge" title="Immutable object — excluded from chain timing">immutable</span>}
           {!isResource && lifetime != null && (
             <span className="tracer-obj-lifetime" title="Service time: first to last event on this object">
               {_fmtChainTime(lifetime)}
@@ -2273,14 +1909,6 @@ function ConformanceSection({ results, activeModel, onConformanceSaved, onEvents
               <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Enabled = all precedence constraints satisfied at this point (source_count ≥ nmin)</div>
             </>}
           />
-          <MetricLine label="Con. Fitness" value={fitC.constraintFitness}
-            tip={<>
-              <div>{fitC.constraintSatisfied ?? '—'} of {fitC.constraintTotal ?? '—'} constraint-trace pairs satisfied.</div>
-              <div style={{marginTop:'0.35rem',color:'#a5b4fc',fontWeight:600}}>Formula</div>
-              <div style={{color:'#cbd5e1'}}>satisfied (constraint, object) pairs ÷ evaluated pairs</div>
-              <div style={{marginTop:'0.2rem',color:'#94a3b8',fontSize:'0.68rem'}}>Evaluated at end of each object trace: response → target followed? precedence → source preceded? not_coexistence → only one occurred?</div>
-            </>}
-          />
           <MetricLine label="Precision" value={fitC.precision}
             tip={<>
               <div>{fitC.precisionAllowed ?? '—'} of {fitC.precisionTotal ?? '—'} transitions were in the allowed set.</div>
@@ -2416,7 +2044,7 @@ function LogInspection({ eventLogFiles, handleFileUpload }) {
                 {(eventLogFiles || []).map(f => <option key={f} value={f}>{f}</option>)}
               </select>
               <button className="browse-btn" onClick={() => fileInputRef.current?.click()} title="Browse and upload">…</button>
-              <input ref={fileInputRef} type="file" accept=".json,.xml" style={{display:'none'}}
+              <input ref={fileInputRef} type="file" accept=".json,.jsonocel,.xml,.csv" style={{display:'none'}}
                 onChange={e => { if (e.target.files[0]) handleUpload(e.target.files[0]); e.target.value=''; }} />
             </div>
           </div>
@@ -3566,15 +3194,39 @@ function computeOCCoverage(results, model, discoveryResults) {
   };
 }
 
-function OCCoveragePanel({ results, model, discoveryResults }) {
+function OCCoveragePanel({ results, model, discoveryResults, logResults }) {
   const cov = React.useMemo(
     () => computeOCCoverage(results, model, discoveryResults),
     [results, model, discoveryResults]
+  );
+  const logCov = React.useMemo(
+    () => logResults ? computeOCCoverage(logResults, model, discoveryResults) : null,
+    [logResults, model, discoveryResults]
   );
   if (!cov) return <div style={{color:'#94a3b8',fontSize:'0.82rem'}}>Run a simulation to compute coverage.</div>;
 
   const fmt   = v => v == null ? 'N/A' : (v*100).toFixed(1)+'%';
   const color = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
+
+  const scoreBar = (simVal, logVal) => {
+    const sp = simVal == null ? 0 : Math.max(0, Math.min(100, simVal * 100));
+    const lp = logVal == null ? 0 : Math.max(0, Math.min(100, logVal * 100));
+    const c  = color(simVal);
+    return (
+      <div style={{minWidth:'85px'}}>
+        <div style={{display:'flex', gap:'0.3rem', alignItems:'baseline', marginBottom:'2px'}}>
+          <span style={{fontSize:'0.72rem', fontWeight:700, color:c}}>{fmt(simVal)}</span>
+          {logVal != null && <span style={{fontSize:'0.63rem', color:'#94a3b8'}}>{fmt(logVal)}</span>}
+        </div>
+        <div style={{position:'relative', height:'5px', borderRadius:'3px', background:'#f1f5f9', overflow:'hidden'}}>
+          {logVal != null && (
+            <div style={{position:'absolute', left:0, top:0, height:'100%', width:`${lp}%`, background:'#cbd5e1'}}/>
+          )}
+          <div style={{position:'absolute', left:0, top:0, height:'100%', width:`${sp}%`, background:c, opacity:0.88}}/>
+        </div>
+      </div>
+    );
+  };
 
   // ── Radar axes (5 dimensions — Jalali C.E/C.A/C.I/C.C/C.R) ─────────────────
   // cov_guard excluded: it measures attribute selectivity, not log-derived coverage.
@@ -3612,6 +3264,15 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
 
   const dataPoints = axes.map((ax, i) => spoke(i, R * Math.max(0, ax.value ?? 0)));
   const dataPath   = dataPoints.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
+
+  // Log reference polygon
+  const logPath = logCov ? (() => {
+    const lce   = (() => { const vs=[logCov.cov_act.value,logCov.cov_ot.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+    const lcard = (() => { const vs=[logCov.cov_min.value,logCov.cov_max.value,logCov.cov_neg.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+    const lvals = [lce, logCov.cov_activation.value, logCov.cov_inv.value, lcard, logCov.cov_arrow.value];
+    const lpts  = lvals.map((v, i) => spoke(i, R * Math.max(0, v ?? 0)));
+    return lpts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
+  })() : null;
 
   const radarColor = v => v == null ? '#94a3b8' : v >= 0.9 ? '#16a34a' : v >= 0.6 ? '#d97706' : '#dc2626';
   const overallVal = axes.filter(a => a.value != null).reduce((s, a) => s + a.value, 0) /
@@ -3653,6 +3314,8 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
             return <line key={i} x1={CX} y1={CY} x2={tip.x.toFixed(1)} y2={tip.y.toFixed(1)}
                          stroke="#e2e8f0" strokeWidth={1}/>;
           })}
+          {/* Log reference polygon (drawn behind sim) */}
+          {logPath && <path d={logPath} fill="#94a3b820" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="4 2"/>}
           {/* Data polygon */}
           <path d={dataPath} fill={`${radarColor(overallVal)}22`} stroke={radarColor(overallVal)} strokeWidth={2}/>
           {/* Data points */}
@@ -3702,6 +3365,18 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
             <span style={{color:'#d97706',fontWeight:700}}>●</span> ≥60% &nbsp;
             <span style={{color:'#dc2626',fontWeight:700}}>●</span> &lt;60%
           </div>
+          {logPath && (
+            <div style={{marginTop:'0.5rem',display:'flex',gap:'0.75rem',fontSize:'0.68rem',color:'#64748b'}}>
+              <span style={{display:'flex',alignItems:'center',gap:'0.25rem'}}>
+                <svg width="18" height="8"><line x1="0" y1="4" x2="18" y2="4" stroke={radarColor(overallVal)} strokeWidth="2"/></svg>
+                Simulation
+              </span>
+              <span style={{display:'flex',alignItems:'center',gap:'0.25rem'}}>
+                <svg width="18" height="8"><line x1="0" y1="4" x2="18" y2="4" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="4 2"/></svg>
+                Input log
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -3709,12 +3384,13 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
       <p style={{fontSize:'0.72rem',color:'#64748b',marginBottom:'0.5rem'}}>
         Full detail — Green ≥90%, amber ≥60%, red &lt;60%.
         Axis scores: C.E = mean(act, ot) · C.C = mean(nmin, nmax, neg).
+        {logCov && <> · Coloured bar = simulation · <span style={{color:'#94a3b8'}}>grey bar</span> = input log.</>}
       </p>
       <table className="behavior-table" style={{fontSize:'0.78rem'}}>
         <thead><tr>
           <th title="Jalali axis this measure contributes to" style={{width:'52px'}}>Axis</th>
           <th title="Name of the coverage or quality measure">Measure</th>
-          <th title="Computed score for this measure (0–1 or %)" style={{width:'70px',textAlign:'center'}}>Score</th>
+          <th title="Computed score for this measure (0–1 or %). Coloured bar = simulation; grey bar = input log (when available)." style={{width:'100px',textAlign:'left'}}>Score</th>
           <th title="What a high or low score means for simulation quality">What it indicates</th>
           <th title="Raw counts or values behind the score">Detail</th>
         </tr></thead>
@@ -3726,14 +3402,14 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.E</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Activity coverage</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_act.value)}}>{fmt(cov.cov_act.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_act.value, logCov?.cov_act.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of model activities that appeared in sim output</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_act.fired}/{cov.cov_act.total} activities fired</td>
           </tr>
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.E</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Object type coverage</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_ot.value)}}>{fmt(cov.cov_ot.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_ot.value, logCov?.cov_ot.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of model object types instantiated</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_ot.fired}/{cov.cov_ot.total} types seen</td>
           </tr>
@@ -3744,7 +3420,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.A</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Constraint activation</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_activation.value)}}>{fmt(cov.cov_activation.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_activation.value, logCov?.cov_activation.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of constraints with ≥1 source event (non-vacuous)</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_activation.fired}/{cov.cov_activation.total} non-vacuous, median src events: {cov.cov_activation.median??'—'}</td>
           </tr>
@@ -3755,7 +3431,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.I</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Involvement testability</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_inv.value)}}>{fmt(cov.cov_inv.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_inv.value, logCov?.cov_inv.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of (constraint, obj_type) pairs where |obj^ot(e)|≥2 — distinguishes Each/All/Any</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_inv.tested}/{cov.cov_inv.total} pairs testable</td>
           </tr>
@@ -3766,21 +3442,21 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>nmin discriminability</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_min.value)}}>{fmt(cov.cov_min.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_min.value, logCov?.cov_min.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of constraints where cascade count &gt; nmin — tighter bound distinguishable</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_min.dist}/{cov.cov_min.total} constraints</td>
           </tr>
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>nmax reachability</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_max.value)}}>{fmt(cov.cov_max.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_max.value, logCov?.cov_max.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of finite-nmax constraints where the max was actually reached</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_max.reached}/{cov.cov_max.total} constraints (finite nmax only)</td>
           </tr>
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.C</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Negative constraint test</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_neg.value)}}>{fmt(cov.cov_neg.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_neg.value, logCov?.cov_neg.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of nmax=0 constraints where target activity appeared (non-trivial test)</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_neg.nonTrivial}/{cov.cov_neg.total} non-trivial</td>
           </tr>
@@ -3791,7 +3467,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>C.R</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Arrow discriminability</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_arrow.value)}}>{fmt(cov.cov_arrow.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_arrow.value, logCov?.cov_arrow.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_arrow.dist}/{cov.cov_arrow.total} response/precedence constraints</td>
           </tr>
@@ -3802,7 +3478,7 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
           <tr>
             <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>—</td>
             <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Guard coverage</td>
-            <td style={{textAlign:'center',fontWeight:700,color:color(cov.cov_guard.value)}}>{fmt(cov.cov_guard.value)}</td>
+            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_guard.value, logCov?.cov_guard.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of binding/constraint guard evaluations where objects passed the attribute predicate (from simulation)</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_guard.total > 0 ? `${cov.cov_guard.passed}/${cov.cov_guard.total} evaluations passed` : 'No guards defined in model'}</td>
           </tr>
@@ -3812,12 +3488,30 @@ function OCCoveragePanel({ results, model, discoveryResults }) {
   );
 }
 
+// ── Normalized color gradient: red (min) → amber → green (max) ───────────────
+// higherIsBetter=false inverts the scale (e.g. violation rate: lower = better).
+const normColor = (val, allVals, higherIsBetter = true) => {
+  const valid = allVals.filter(v => v != null && isFinite(v));
+  if (valid.length === 0 || val == null) return '#64748b';
+  const mn = Math.min(...valid), mx = Math.max(...valid);
+  if (mn === mx) return '#16a34a';
+  let t = (val - mn) / (mx - mn);
+  if (!higherIsBetter) t = 1 - t;
+  t = Math.max(0, Math.min(1, t));
+  if (t <= 0.5) {
+    const u = t * 2;
+    return `rgb(${Math.round(220+u*(217-220))},${Math.round(38+u*(119-38))},${Math.round(38+u*(6-38))})`;
+  }
+  const u = (t - 0.5) * 2;
+  return `rgb(${Math.round(217+u*(22-217))},${Math.round(119+u*(163-119))},${Math.round(6+u*(74-6))})`;
+};
+
 // ── OCPQPanel ─────────────────────────────────────────────────────────────────
-function OCPQPanel({ results }) {
+function OCPQPanel({ results, onTotalsComputed }) {
   const [data, setData] = React.useState(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState(null);
-  const [sortKey, setSortKey] = React.useState('support');
+  const [sortKey, setSortKey] = React.useState('reach');
   const [sortDir, setSortDir] = React.useState(-1); // -1 desc, 1 asc
   const loadedFor = React.useRef(null);
 
@@ -3829,7 +3523,13 @@ function OCPQPanel({ results }) {
     setData(null);
     setError(null);
     axios.get(`/api/run-history/${encodeURIComponent(runId)}/ocpq`)
-      .then(r => setData(r.data))
+      .then(r => { setData(r.data); return r.data; })
+      .then(d => {
+        if (!onTotalsComputed) return;
+        const all = d.schemas || [];
+        const _mean = (arr, k) => { const v = arr.map(r => r[k]).filter(x => x != null); return v.length ? v.reduce((s,x) => s+x, 0)/v.length : null; };
+        onTotalsComputed({ reach: _mean(all,'reach'), exclusivity: _mean(all,'exclusivity') });
+      })
       .catch(e => setError(e.response?.data?.error || e.message))
       .finally(() => setLoading(false));
   }, [results?.output_file]);
@@ -3881,14 +3581,9 @@ function OCPQPanel({ results }) {
   const cols = [
     { key: 'source_activity', label: 'Source',      tip: 'Source activity — the activity that precedes the target on the same object',           fmt: v => v, color: () => '#1e293b' },
     { key: 'target_activity', label: 'Target',      tip: 'Target activity — the activity that follows the source on the same object',            fmt: v => v, color: () => '#1e293b' },
-    { key: 'support',         label: 'Support',     tip: 'Number of consecutive same-object (source → target) event pairs observed',             fmt: v => v?.toLocaleString(), color: () => '#1e293b' },
-    { key: 'coverage',        label: 'Coverage',    tip: 'Fraction of source-activity firings that were followed by this target (support ÷ total source firings)',    fmt: fmtPct, color: v => colColor('coverage', v) },
-    { key: 'selectivity',     label: 'Selectivity', tip: 'How discriminating this path is — 1 = each source leads to exactly one target, <1 = fan-out (support ÷ total target firings)', fmt: fmtSel, color: v => colColor('selectivity', v) },
-    { key: 'reach',           label: 'Reach',       tip: 'Fraction of target-activity firings reached from this source (connected targets ÷ total target firings)',   fmt: fmtPct, color: v => colColor('reach', v) },
-    { key: 'exclusivity',     label: 'Exclusivity', tip: 'How exclusively this source leads to the target — 1 = one-to-one, <1 = fan-in from multiple sources (1 ÷ avg sources per target)', fmt: fmtSel, color: v => colColor('exclusivity', v) },
-    { key: 'throughput_s',    label: 'Throughput',  tip: 'Mean elapsed time from source event to target event on the same object',               fmt: fmtDur, color: () => '#1e293b' },
-    { key: 'eq_class',        label: 'Eq',          tip: 'Equivalence class hash — rows with the same hash share the exact same set of object connections',          fmt: v => v ? v.slice(0,6) : '—', color: () => '#94a3b8' },
-  ];
+    { key: 'reach',           label: 'Reach',       tip: 'Fraction of target-activity firings reached from this source (connected targets ÷ total target firings)',   fmt: fmtPct, color: v => normColor(v, allSchemas.map(s => s.reach)) },
+    { key: 'exclusivity',     label: 'Exclusivity', tip: 'How exclusively this source leads to the target — 1 = one-to-one, <1 = fan-in from multiple sources (1 ÷ avg sources per target)', fmt: fmtSel, color: v => normColor(v, allSchemas.map(s => s.exclusivity)) },
+  ].filter(c => c.key !== 'eq_class');
 
   const thStyle = key => ({
     padding: '0.35rem 0.5rem', fontSize: '0.72rem', fontWeight: 700, color: '#475569',
@@ -3911,14 +3606,22 @@ function OCPQPanel({ results }) {
           <thead>
             <tr>
               {cols.map(c => (
-                <th key={c.key} title={c.tip} style={thStyle(c.key)} onClick={() => onSort(c.key)}>
-                  {c.label}{sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}
+                <th key={c.key} style={thStyle(c.key)} onClick={() => onSort(c.key)}>
+                  {c.label}<InfoTip text={c.tip} />{sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}
                 </th>
               ))}
-              <th title="Object types involved in this transition and how many per event" style={{...thStyle('object_types'), cursor:'default'}}>Objects</th>
+              <th style={{...thStyle('object_types'), cursor:'default'}}>Objects<InfoTip text="Object types involved in this transition and the average count per event (abbreviation × count)." /></th>
             </tr>
           </thead>
           <tbody>
+            <tr style={{borderBottom:'2px solid #cbd5e1',background:'#f8fafc'}}>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'left'}}>Overall</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#64748b',textAlign:'left'}}>{allSchemas.length} paths</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:normColor(totals.reach, allSchemas.map(s => s.reach)),textAlign:'center'}}>{fmtPct(totals.reach)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:normColor(totals.exclusivity, allSchemas.map(s => s.exclusivity)),textAlign:'center'}}>{fmtSel(totals.exclusivity)}</td>
+              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#94a3b8',textAlign:'center',fontFamily:'monospace'}}>{totals.eq_class} unique</td>
+              <td/>
+            </tr>
             {schemas.map((s, i) => (
               <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
                 {cols.map(c => (
@@ -3938,38 +3641,18 @@ function OCPQPanel({ results }) {
               </tr>
             ))}
           </tbody>
-          <tfoot>
-            <tr style={{borderTop:'2px solid #cbd5e1',background:'#f8fafc'}}>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'left'}}>Overall</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#64748b',textAlign:'left'}}>{allSchemas.length} paths</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'center'}}>{totals.support.toLocaleString()}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('coverage', totals.coverage),textAlign:'center'}}>{fmtPct(totals.coverage)}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('selectivity', totals.selectivity),textAlign:'center'}}>{fmtSel(totals.selectivity)}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('reach', totals.reach),textAlign:'center'}}>{fmtPct(totals.reach)}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:colColor('exclusivity', totals.exclusivity),textAlign:'center'}}>{fmtSel(totals.exclusivity)}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.72rem',fontWeight:700,color:'#334155',textAlign:'center'}}>{fmtDur(totals.throughput_s)}</td>
-              <td style={{padding:'0.35rem 0.5rem',fontSize:'0.7rem',color:'#94a3b8',textAlign:'center',fontFamily:'monospace'}}>{totals.eq_class} unique</td>
-              <td/>
-            </tr>
-          </tfoot>
         </table>
       </div>
       <div style={{marginTop:'0.5rem',fontSize:'0.7rem',color:'#94a3b8',display:'flex',gap:'1.5rem',flexWrap:'wrap'}}>
-        <span><span style={{color:'#16a34a',fontWeight:700}}>■</span> ≥80%</span>
-        <span><span style={{color:'#ca8a04',fontWeight:700}}>■</span> 50–80%</span>
-        <span><span style={{color:'#dc2626',fontWeight:700}}>■</span> &lt;50% (coverage/reach)</span>
-        <span>Selectivity/Exclusivity: 1 = one-to-one, &lt;1 = fan-out/fan-in</span>
+        <span><strong style={{color:'#475569'}}>Reach:</strong> fraction of all target-activity firings that are reachable from this source</span>
+        <span><strong style={{color:'#475569'}}>Exclusivity:</strong> 1.0 = each target event has exactly one source (one-to-one); values below 1 indicate fan-in (multiple sources feed the same target)</span>
       </div>
       <div style={{marginTop:'0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.6rem 0.85rem'}}>
         <div style={{fontSize:'0.7rem',fontWeight:700,color:'#475569',marginBottom:'0.4rem',textTransform:'uppercase',letterSpacing:'0.05em'}}>Formulas</div>
         <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))',gap:'0.3rem 1.5rem'}}>
           {[
-            ['Support',     'count of consecutive same-object (source → target) pairs'],
-            ['Coverage',    'support ÷ total source-activity firings'],
-            ['Selectivity', 'support ÷ total target-activity firings'],
-            ['Reach',       'distinct objects on this path ÷ all objects of relevant type'],
-            ['Exclusivity', 'support ÷ all outgoing consecutive pairs from source'],
-            ['Throughput',  'mean elapsed time from source event to target event (same object)'],
+            ['Reach',       'distinct target events reached ÷ all target-activity firings'],
+            ['Exclusivity', '1 ÷ avg sources per target event (1 = one-to-one)'],
           ].map(([name, formula]) => (
             <div key={name} style={{display:'flex',gap:'0.35rem',alignItems:'baseline'}}>
               <span style={{fontSize:'0.72rem',fontWeight:700,color:'#334155',minWidth:'82px',flexShrink:0}}>{name}</span>
@@ -3982,544 +3665,337 @@ function OCPQPanel({ results }) {
   );
 }
 
-// ── FurtherEvaluations — E1/E2/E3/E5/E6/E4/E7 evaluation panels ─────────────
-function FurtherEvaluations({ results, activeModel, discoveryResults, eventLogFile, startActivities }) {
-  const outputFile    = results?.output_file || null;
-  const constraints   = activeModel?.constraints || [];
-  const ocdeclareFile = activeModel?._source_file || null;
-  const modelOverride = activeModel || null;
+// ── VerificationMatrix — activity × object-type cross-matrix ─────────────────
+function VerificationMatrix({ results, discoveryResults, activeModel, modelBase }) {
+  const [verifyMode,  setVerifyMode]  = React.useState('frequency');
+  const [timeSubMode, setTimeSubMode] = React.useState('mean');
 
-  // ── E1: Post-hoc conformance check ───────────────────────────────────────
-  const [confData,    setConfData]    = React.useState(null);
-  const [confLoading, setConfLoading] = React.useState(false);
-  const [confError,   setConfError]   = React.useState(null);
+  const VERIFY_MODES = [
+    { key: 'frequency',   label: 'Event Frequency' },
+    { key: 'time',        label: 'Time per Event' },
+    { key: 'cardinality', label: 'Objects per Event' },
+  ];
 
-  const runConformanceCheck = async () => {
-    if (!outputFile) return;
-    setConfLoading(true); setConfError(null); setConfData(null);
-    try {
-      const r = await axios.post('/api/further-eval/conformance-check', {
-        outputFile, ocdeclareFile, modelOverride,
-      });
-      setConfData(r.data);
-    } catch(e) { setConfError(e.response?.data?.error || e.message); }
-    finally { setConfLoading(false); }
+  const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s%1)<0.005?Math.round(s)+'s':s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+
+  const logActivityCounts = discoveryResults?.activity_counts || {};
+  const logObjectTypes    = discoveryResults?.object_type_stats || {};
+
+  if (!results) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No run available.</div>;
+
+  const metrics       = results.metrics?.activity_metrics || {};
+  const serviceByType = results.metrics?.activity_service_by_type || {};
+  const resourceTypes = new Set(results.resource_types || []);
+  const audit         = results.audit?.object_lifecycle_audit || {};
+  const activities    = Object.keys(metrics).sort(makeFlowRankSorter(discoveryResults, results.object_traces));
+  const objTypes      = Object.keys(audit).filter(t => !resourceTypes.has(t));
+
+  const actBindings = {};
+  const modelToUse  = activeModel || modelBase;
+  if (modelToUse?.activities) {
+    modelToUse.activities.forEach(a => {
+      const types = new Set((a.bindings||[]).map(b=>b.object_type).filter(t=>!resourceTypes.has(t)));
+      actBindings[a.name] = types;
+    });
+  }
+
+  const simObjTypes = results.object_types || {};
+  const cols = objTypes.length > 0 ? objTypes
+    : [...new Set(Object.values(actBindings).flatMap(s => [...s]))].sort();
+
+  if (!activities.length) return (
+    <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No activity metrics available. Run a simulation first.</div>
+  );
+
+  const getCellVal = (act, ot) => {
+    const m = metrics[act] || {};
+    const participates = !actBindings[act] || actBindings[act].size === 0 || actBindings[act].has(ot);
+    if (verifyMode === 'frequency') {
+      const cnt = serviceByType?.[act]?.[ot]?.count ?? null;
+      return cnt != null && cnt > 0 ? cnt : null;
+    }
+    if (verifyMode === 'time') {
+      if (!participates) return null;
+      const perType = serviceByType?.[act]?.[ot];
+      if (perType) {
+        const val = timeSubMode === 'min' ? perType.min_s : timeSubMode === 'max' ? perType.max_s : perType.mean_s;
+        return (val != null && val > 0) ? val : null;
+      }
+      const val = timeSubMode === 'min' ? m.min_service_s : timeSubMode === 'max' ? m.max_service_s : m.mean_service_s;
+      return (val != null && val > 0) ? val : null;
+    }
+    if (verifyMode === 'cardinality') {
+      if (!participates) return null;
+      const objCount = simObjTypes[ot] || 0;
+      const fires = m.execution_count || 0;
+      if (!fires || !objCount) return null;
+      const ratio = objCount / fires;
+      return ratio > 0 ? ratio : null;
+    }
+    return null;
   };
 
-  // ── E2: Log fidelity ──────────────────────────────────────────────────────
-  const [fidelityData,    setFidelityData]    = React.useState(null);
-  const [fidelityLoading, setFidelityLoading] = React.useState(false);
-  const [fidelityError,   setFidelityError]   = React.useState(null);
-
-  const runFidelity = async () => {
-    if (!outputFile || !eventLogFile) return;
-    setFidelityLoading(true); setFidelityError(null); setFidelityData(null);
-    try {
-      const r = await axios.post('/api/further-eval/log-fidelity', { outputFile, eventLogFile });
-      setFidelityData(r.data);
-    } catch(e) { setFidelityError(e.response?.data?.error || e.message); }
-    finally { setFidelityLoading(false); }
+  const fmtCell = val => {
+    if (verifyMode === 'time') return fmtDur(val);
+    if (verifyMode === 'cardinality') return val.toFixed(1);
+    return val?.toLocaleString() ?? '—';
   };
 
-  // ── E3: Per-constraint obligation stats (from simulation result) ──────────
-  const constraintStats = results?.constraint_obligation_stats || {};
-  const obligationsViolated = results?.obligations_violated ?? 0;
-  const obligationsFulfilled = results?.obligations_fulfilled ?? 0;
-  const obligationsCancelled = results?.obligations_cancelled ?? 0;
-
-  // ── Multi-seed variance ───────────────────────────────────────────────────
-  const [multiSeeds,    setMultiSeeds]    = React.useState('42,99,123,456,789');
-  const [multiData,     setMultiData]     = React.useState(null);
-  const [multiLoading,  setMultiLoading]  = React.useState(false);
-  const [multiError,    setMultiError]    = React.useState(null);
-  const safeStartActivities = Array.isArray(startActivities) && startActivities.length > 0
-    ? startActivities
-    : [];
-
-  const runMultiSeed = async () => {
-    const seeds = multiSeeds.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (!seeds.length) return;
-    setMultiLoading(true); setMultiError(null); setMultiData(null);
-    try {
-      const r = await axios.post('/api/further-eval/multi-run', {
-        seeds, ocdeclareFile, modelOverride,
-        eventLogFile,
-        startActivities: safeStartActivities,
-        maxEvents: 50000,
-      });
-      setMultiData(r.data);
-    } catch(e) { setMultiError(e.response?.data?.error || e.message); }
-    finally { setMultiLoading(false); }
+  const getLogVal = (act, ot) => {
+    if (verifyMode === 'frequency') {
+      const cnt = logActivityCounts[act];
+      return cnt > 0 ? cnt.toLocaleString() : null;
+    }
+    if (verifyMode === 'cardinality') {
+      const logOtCount = logObjectTypes[ot]?.count || 0;
+      const logActCount = logActivityCounts[act] || 0;
+      if (!logActCount || !logOtCount) return null;
+      const ratio = logOtCount / logActCount;
+      return ratio > 0 ? ratio.toFixed(1) : null;
+    }
+    return null;
   };
 
-  // ── E6: Cardinality fidelity ──────────────────────────────────────────────
-  const [cardData,    setCardData]    = React.useState(null);
-  const [cardLoading, setCardLoading] = React.useState(false);
-  const [cardError,   setCardError]   = React.useState(null);
-
-  const runCardinality = async () => {
-    if (!outputFile || !eventLogFile) return;
-    setCardLoading(true); setCardError(null); setCardData(null);
-    try {
-      const r = await axios.post('/api/further-eval/cardinality-fidelity', { outputFile, eventLogFile });
-      setCardData(r.data);
-    } catch(e) { setCardError(e.response?.data?.error || e.message); }
-    finally { setCardLoading(false); }
-  };
-
-  const fmtPct  = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
-  const fmtNum  = v => v == null ? '—' : Number.isInteger(v) ? v.toLocaleString() : v.toFixed(3);
-  const fmtDur  = s => {
-    if (s == null) return '—';
-    if (s >= 86400) return `${(s/86400).toFixed(1)} d`;
-    if (s >= 3600)  return `${(s/3600).toFixed(1)} h`;
-    if (s >= 60)    return `${Math.round(s/60)} min`;
-    return `${Math.round(s)} s`;
-  };
-  const pctCls  = d => d == null ? '' : Math.abs(d) < 10 ? 'cmp-ok' : Math.abs(d) < 30 ? 'cmp-under' : 'cmp-over';
-
-  const noOutput = !outputFile;
-  const noLog    = !eventLogFile;
+  const showLogRef = verifyMode === 'frequency' || verifyMode === 'cardinality';
+  const vertStyle  = { writingMode:'vertical-rl', transform:'rotate(180deg)', whiteSpace:'nowrap',
+    fontSize:'0.7rem', padding:'0.25rem 0.1rem', maxHeight:'120px', textOverflow:'ellipsis', overflow:'hidden' };
 
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:'1.25rem',padding:'0.25rem 0'}}>
-
-      {/* ── Per-constraint obligation fulfillment (always shown from sim results) ── */}
-      <Collapsible className="eval-section" title="Per-Constraint Obligation Rates" defaultOpen={true}>
-        {!results ? (
-          <p className="empty-notice">Run a simulation first.</p>
-        ) : (
-          <div>
-            {/* Legend */}
-            <div style={{fontSize:'0.72rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.5rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
-              <strong>Fulfillment Rate</strong> = obligations fulfilled ÷ (fulfilled + violated). An obligation is created each time a response constraint's source activity fires for a scope object. It is <em>fulfilled</em> when the target activity later fires for that object, and <em>violated</em> when the object is deactivated (case closed) before the target ever fires. <em>Cancelled</em> obligations are a subset of violations — they are removed at case-close time. A rate of 0% means the model has response constraints but the response activity never fired before cases ended; this commonly means the constraint is unenforced or the simulation terminates too early.
-            </div>
-            <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-              {[
-                {label:'Fulfilled',  val:obligationsFulfilled, color:'#16a34a'},
-                {label:'Violated',   val:obligationsViolated,  color:'#dc2626'},
-                {label:'Cancelled',  val:obligationsCancelled, color:'#ca8a04'},
-              ].map(({label,val,color}) => (
-                <div key={label} className="behavior-stat-card" style={{minWidth:'100px'}}>
-                  <div className="behavior-stat-val" style={{color}}>{val.toLocaleString()}</div>
-                  <div className="behavior-stat-label">{label}</div>
-                </div>
-              ))}
-            </div>
-            {Object.keys(constraintStats).length === 0 ? (
-              (() => {
-                const hasResponseConstraints = (activeModel?.constraints || [])
-                  .some(c => c.constraint_type === 'response' || c.constraint_type === 'chain_response');
-                return (
-                  <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>
-                    {!hasResponseConstraints
-                      ? 'No response constraints in the active model — obligation tracking only applies to response/chain_response constraints.'
-                      : 'Response constraints exist but no obligations were recorded in this run. This may mean the source activities never fired, or the model was not loaded when the simulation ran (re-simulate to populate).'}
-                  </p>
-                );
-              })()
-            ) : (
-              <table className="conf-detail-table" style={{width:'100%'}}>
-                <thead>
-                  <tr>
-                    <th title="The declarative constraint (type, source → target)" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                    <th className="audit-num" title="Number of times an obligation was created and later met (target fired before case closed)">Fulfilled</th>
-                    <th className="audit-num" title="Number of obligations that were not met — target never fired before case closed">Violated</th>
-                    <th className="audit-num" title="Obligations removed at case-close without being fulfilled or recorded as violated">Cancelled</th>
-                    <th className="audit-num" title="Fulfilled ÷ (Fulfilled + Violated) — fraction of obligations that were met">Fulfillment Rate</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(constraintStats).sort((a,b) => {
-                    const ra = a[1].violated/(a[1].fulfilled+a[1].violated||1);
-                    const rb = b[1].violated/(b[1].fulfilled+b[1].violated||1);
-                    return rb - ra;
-                  }).map(([key, stats]) => {
-                    const total = stats.fulfilled + stats.violated;
-                    const rate  = total > 0 ? stats.fulfilled / total : null;
-                    return (
-                      <tr key={key}>
-                        <td style={{fontSize:'0.72rem',color:'#475569',fontFamily:'monospace'}}>{key}</td>
-                        <td className="audit-num" style={{color:'#16a34a'}}>{stats.fulfilled}</td>
-                        <td className="audit-num" style={{color:'#dc2626'}}>{stats.violated}</td>
-                        <td className="audit-num" style={{color:'#ca8a04'}}>{stats.cancelled}</td>
-                        <td className="audit-num">
-                          <span style={{
-                            color: rate == null ? '#94a3b8' : rate >= 0.9 ? '#16a34a' : rate >= 0.7 ? '#ca8a04' : '#dc2626',
-                            fontWeight: 600,
-                          }}>
-                            {rate == null ? '—' : fmtPct(rate)}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </div>
-        )}
-      </Collapsible>
-
-      {/* ── Post-hoc conformance check ── */}
-      <Collapsible className="eval-section" title="Post-hoc Conformance Check" defaultOpen={false}>
-        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-          Replays the generated OCEL through the OC-Declare constraint checker and reports
-          per-constraint violation rates. Catches constraints not enforced eagerly (responded_existence,
-          exactly lower-bound, exclusive-choice lower-bound).
-        </p>
-        {noOutput ? (
-          <p className="empty-notice">No simulation output — run a simulation first.</p>
-        ) : (
-          <>
-            <button className="simulate-button"
-              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
-                      background: confLoading ? '#94a3b8' : '#6366f1'}}
-              onClick={runConformanceCheck} disabled={confLoading}>
-              {confLoading ? 'Checking…' : 'Run Conformance Check'}
-            </button>
-            {confError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{confError}</p>}
-            {confData && (
-              <div>
-                <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-                  {[
-                    {label:'Overall Fitness', val: confData.overall_fitness != null ? fmtPct(confData.overall_fitness) : '—', color: confData.overall_fitness >= 0.9 ? '#16a34a' : confData.overall_fitness >= 0.7 ? '#ca8a04' : '#dc2626'},
-                    {label:'Constraints Checked', val: confData.num_constraints, color:'#1e293b'},
-                    {label:'Scope Objects Checked', val: confData.total_checked, color:'#1e293b'},
-                    {label:'Violations', val: confData.total_violated, color: confData.total_violated > 0 ? '#dc2626' : '#16a34a'},
-                  ].map(({label,val,color}) => (
-                    <div key={label} className="behavior-stat-card" style={{minWidth:'120px'}}>
-                      <div className="behavior-stat-val" style={{color}}>{typeof val === 'number' ? val.toLocaleString() : val}</div>
-                      <div className="behavior-stat-label">{label}</div>
-                    </div>
-                  ))}
-                </div>
-                <table className="conf-detail-table" style={{width:'100%'}}>
-                  <thead>
-                    <tr>
-                      <th title="The declarative constraint checked" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                      <th className="audit-num" title="Object type scope for which this constraint is evaluated">Scope Type</th>
-                      <th className="audit-num" title="Total number of constraint instances evaluated across all objects">Checked</th>
-                      <th className="audit-num" title="Number of instances where the constraint was not satisfied">Violated</th>
-                      <th className="audit-num" title="Violated ÷ Checked — fraction of instances that violated the constraint">Violation Rate</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(confData.constraint_results || []).sort((a,b) => (b.violation_rate||0)-(a.violation_rate||0)).map((r,i) => (
-                      <tr key={i}>
-                        <td style={{fontSize:'0.72rem',fontFamily:'monospace',color:'#475569'}}>{r.constraint}</td>
-                        <td className="audit-num" style={{color:'#64748b',fontSize:'0.7rem'}}>{r.scope_type || '—'}</td>
-                        <td className="audit-num">{r.checked}</td>
-                        <td className="audit-num" style={{color: r.violated > 0 ? '#dc2626' : '#16a34a'}}>{r.violated}</td>
-                        <td className="audit-num">
-                          <span style={{color: r.violation_rate == null ? '#94a3b8' : r.violation_rate === 0 ? '#16a34a' : r.violation_rate < 0.1 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
-                            {r.violation_rate == null ? '—' : fmtPct(r.violation_rate)}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </>
-        )}
-      </Collapsible>
-
-      {/* ── Log fidelity ── */}
-      <Collapsible className="eval-section" title="Cross-Log Fidelity (Simulated vs Real)" defaultOpen={false}>
-        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-          Compares activity frequency distributions (KL divergence), object type counts, and
-          inter-event timing (Earth Mover Distance) between the real input log and simulation output.
-        </p>
-        {noOutput || noLog ? (
-          <p className="empty-notice">{noOutput ? 'No simulation output — run a simulation first.' : 'No input event log loaded.'}</p>
-        ) : (
-          <>
-            <button className="simulate-button"
-              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
-                      background: fidelityLoading ? '#94a3b8' : '#6366f1'}}
-              onClick={runFidelity} disabled={fidelityLoading}>
-              {fidelityLoading ? 'Computing…' : 'Compute Fidelity Metrics'}
-            </button>
-            {fidelityError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{fidelityError}</p>}
-            {fidelityData && (
-              <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
-                {/* Summary cards */}
-                <div style={{display:'flex',gap:'1rem',flexWrap:'wrap'}}>
-                  {[
-                    {label:'Activity KL Divergence', val: fidelityData.activity_kl_divergence?.toFixed(4), hint:'0 = identical distributions'},
-                    {label:'Object Type KL Divergence', val: fidelityData.object_type_kl_divergence?.toFixed(4), hint:'0 = identical counts'},
-                    {label:'Timing EMD (s)', val: fidelityData.timing_emd_s?.toFixed(1) ?? '—', hint:'Wasserstein-1 on inter-event gaps'},
-                    {label:'Real Events', val: fidelityData.real_event_count?.toLocaleString(), hint:''},
-                    {label:'Sim Events',  val: fidelityData.sim_event_count?.toLocaleString(),  hint:''},
-                  ].map(({label,val,hint}) => (
-                    <div key={label} className="behavior-stat-card" style={{minWidth:'130px'}}>
-                      <div className="behavior-stat-val">{val ?? '—'}</div>
-                      <div className="behavior-stat-label">{label}</div>
-                      {hint && <div style={{fontSize:'0.63rem',color:'#94a3b8',marginTop:'0.2rem'}}>{hint}</div>}
-                    </div>
-                  ))}
-                </div>
-
-                {/* Timing summary */}
-                {fidelityData.timing_summary && (
-                  <details>
-                    <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Timing Summary</summary>
-                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginTop:'0.5rem'}}>
-                      {[
-                        {label:'Real Mean Gap', val: fmtDur(fidelityData.timing_summary.real_gap_mean_s)},
-                        {label:'Sim Mean Gap',  val: fmtDur(fidelityData.timing_summary.sim_gap_mean_s)},
-                        {label:'Real Median Gap', val: fmtDur(fidelityData.timing_summary.real_gap_median_s)},
-                        {label:'Sim Median Gap',  val: fmtDur(fidelityData.timing_summary.sim_gap_median_s)},
-                      ].map(({label,val}) => (
-                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
-                          <div className="behavior-stat-val">{val}</div>
-                          <div className="behavior-stat-label">{label}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                )}
-
-                {/* Activity frequency table */}
-                <details open>
-                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Activity Frequency Comparison</summary>
-                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                    <table className="conf-detail-table" style={{width:'100%'}}>
-                      <thead>
-                        <tr>
-                          <th title="Activity name" style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
-                          <th className="audit-num" title="Total event count for this activity in the real input log">Real Count</th>
-                          <th className="audit-num" title="Total event count for this activity in the simulation output">Sim Count</th>
-                          <th className="audit-num" title="Fraction of all events this activity accounts for in the real log">Real Freq</th>
-                          <th className="audit-num" title="Fraction of all events this activity accounts for in the simulation">Sim Freq</th>
-                          <th className="audit-num" title="Sim Freq − Real Freq in percentage points (positive = over-represented in simulation)">Δ Freq</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(fidelityData.activity_freq_table || []).map((row,i) => {
-                          const diff = row.sim_freq - row.real_freq;
-                          return (
-                            <tr key={i}>
-                              <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
-                              <td className="audit-num">{row.real_count.toLocaleString()}</td>
-                              <td className="audit-num">{row.sim_count.toLocaleString()}</td>
-                              <td className="audit-num">{(row.real_freq*100).toFixed(1)}%</td>
-                              <td className="audit-num">{(row.sim_freq*100).toFixed(1)}%</td>
-                              <td className={`audit-num cmp-diff ${pctCls(diff*100)}`}>
-                                {diff >= 0 ? '+' : ''}{(diff*100).toFixed(1)}pp
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </details>
-
-                {/* Object type table */}
-                <details>
-                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Object Type Count Comparison</summary>
-                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                    <table className="conf-detail-table" style={{width:'100%'}}>
-                      <thead>
-                        <tr>
-                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Object Type</th>
-                          <th className="audit-num">Real Count</th>
-                          <th className="audit-num">Sim Count</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(fidelityData.object_type_table || []).map((row,i) => (
-                          <tr key={i}>
-                            <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.object_type}</td>
-                            <td className="audit-num">{row.real_count.toLocaleString()}</td>
-                            <td className="audit-num">{row.sim_count.toLocaleString()}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </details>
-              </div>
-            )}
-          </>
-        )}
-      </Collapsible>
-
-      {/* ── Multi-seed variance ── */}
-      <Collapsible className="eval-section" title="Multi-Seed Variance Analysis" defaultOpen={false}>
-        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-          Runs the simulation with multiple random seeds and reports mean ± std for key metrics,
-          quantifying reproducibility and sensitivity to seed choice.
-        </p>
-        <div style={{display:'flex',gap:'0.5rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-          <label style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Seeds (comma-separated):</label>
-          <input
-            value={multiSeeds}
-            onChange={e => setMultiSeeds(e.target.value)}
-            style={{padding:'0.3rem 0.5rem',fontSize:'0.8rem',border:'1px solid #e2e8f0',borderRadius:'4px',width:'220px'}}
-            placeholder="42, 99, 123, 456, 789"
-          />
-          <button className="simulate-button"
-            style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',
-                    background: multiLoading ? '#94a3b8' : '#6366f1'}}
-            onClick={runMultiSeed} disabled={multiLoading || !safeStartActivities.length}>
-            {multiLoading ? 'Running…' : 'Run Multi-Seed Analysis'}
+    <div>
+      <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',flexWrap:'wrap',alignItems:'center'}}>
+        <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginRight:'0.25rem'}}>Mode:</span>
+        {VERIFY_MODES.map(m => (
+          <button key={m.key} onClick={() => setVerifyMode(m.key)}
+            style={{padding:'0.2rem 0.65rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
+              border: verifyMode===m.key ? '2px solid #1e293b' : '1px solid #e2e8f0',
+              background: verifyMode===m.key ? '#1e293b' : 'white',
+              color: verifyMode===m.key ? 'white' : '#475569'}}>
+            {m.label}
           </button>
-        </div>
-        {!safeStartActivities.length && (
-          <p style={{fontSize:'0.78rem',color:'#ca8a04'}}>Start activities not detected — load a discovery result first.</p>
-        )}
-        {multiError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{multiError}</p>}
-        {multiData && (
-          <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
-            {/* Summary stats */}
-            <div style={{overflowX:'auto'}}>
-              <table className="conf-detail-table" style={{width:'100%'}}>
-                <thead>
-                  <tr>
-                    <th title="Simulation metric name" style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
-                    <th className="audit-num" title="Mean value across all seeds">Mean</th>
-                    <th className="audit-num" title="Standard deviation across seeds — lower = more stable">Std Dev</th>
-                    <th className="audit-num" title="Lowest value observed across all seeds">Min</th>
-                    <th className="audit-num" title="Highest value observed across all seeds">Max</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(multiData.summary || {}).map(([key, s]) => (
-                    <tr key={key}>
-                      <td style={{fontSize:'0.72rem',color:'#475569'}}>{key.replace(/_/g,' ')}</td>
-                      <td className="audit-num">{fmtNum(s.mean)}</td>
-                      <td className="audit-num">{fmtNum(s.std)}</td>
-                      <td className="audit-num">{fmtNum(s.min)}</td>
-                      <td className="audit-num">{fmtNum(s.max)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Per-constraint fulfillment rates across seeds */}
-            {Object.keys(multiData.constraint_summary || {}).length > 0 && (
-              <details>
-                <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Constraint Fulfillment Rate (across seeds)</summary>
-                <table className="conf-detail-table" style={{width:'100%',marginTop:'0.5rem'}}>
-                  <thead>
-                    <tr>
-                      <th title="Declarative constraint identifier" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                      <th className="audit-num" title="Mean fulfillment rate across all seeds (Fulfilled ÷ (Fulfilled + Violated))">Mean Rate</th>
-                      <th className="audit-num" title="Standard deviation of fulfillment rate across seeds — lower = more consistent">Std Dev</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(multiData.constraint_summary).map(([ck, s]) => (
-                      <tr key={ck}>
-                        <td style={{fontSize:'0.7rem',fontFamily:'monospace',color:'#475569'}}>{ck}</td>
-                        <td className="audit-num">
-                          <span style={{color: s.mean == null ? '#94a3b8' : s.mean >= 0.9 ? '#16a34a' : s.mean >= 0.7 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
-                            {s.mean != null ? fmtPct(s.mean) : '—'}
-                          </span>
-                        </td>
-                        <td className="audit-num">{s.std != null ? `±${fmtPct(s.std)}` : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </details>
-            )}
-
-            {/* Per-seed breakdown */}
-            <details>
-              <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Seed Breakdown</summary>
-              <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                <table className="conf-detail-table" style={{width:'100%'}}>
-                  <thead>
-                    <tr>
-                      <th className="audit-num" title="Random seed used for this simulation run">Seed</th>
-                      <th className="audit-num" title="Total number of events fired in this run">Events</th>
-                      <th className="audit-num" title="Total number of objects instantiated in this run">Objects</th>
-                      <th className="audit-num" title="Number of object traces that completed (lifecycle ended)">Traces</th>
-                      <th className="audit-num" title="Number of response-constraint obligations that were fulfilled">Obl. Fulfilled</th>
-                      <th className="audit-num" title="Number of response-constraint obligations that were violated (case closed before target fired)">Obl. Violated</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(multiData.runs || []).map(r => (
-                      <tr key={r.seed}>
-                        <td className="audit-num" style={{fontWeight:600}}>{r.seed}</td>
-                        <td className="audit-num">{r.events_count.toLocaleString()}</td>
-                        <td className="audit-num">{r.objects_count.toLocaleString()}</td>
-                        <td className="audit-num">{r.completed_traces.toLocaleString()}</td>
-                        <td className="audit-num" style={{color:'#16a34a'}}>{r.obligations_fulfilled}</td>
-                        <td className="audit-num" style={{color: r.obligations_violated > 0 ? '#dc2626' : '#16a34a'}}>{r.obligations_violated}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </details>
-          </div>
-        )}
-      </Collapsible>
-
-      {/* ── Object cardinality fidelity ── */}
-      <Collapsible className="eval-section" title="Object Cardinality Fidelity" defaultOpen={false}>
-        <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-          Compares mean objects-per-event firing between the real log and simulation output per activity.
-          Highlights where the simulator creates fewer or more objects than the real process.
-        </p>
-        {noOutput || noLog ? (
-          <p className="empty-notice">{noOutput ? 'No simulation output.' : 'No input event log loaded.'}</p>
-        ) : (
+        ))}
+        {verifyMode === 'time' && (
           <>
-            <button className="simulate-button"
-              style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',marginBottom:'0.75rem',
-                      background: cardLoading ? '#94a3b8' : '#6366f1'}}
-              onClick={runCardinality} disabled={cardLoading}>
-              {cardLoading ? 'Computing…' : 'Compute Cardinality Fidelity'}
-            </button>
-            {cardError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{cardError}</p>}
-            {cardData && (
-              <div style={{overflowX:'auto'}}>
-                <table className="conf-detail-table" style={{width:'100%'}}>
-                  <thead>
-                    <tr>
-                      <th title="Activity name" style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
-                      <th className="audit-num" title="Mean objects-per-event (OPE) in the real input log — average number of objects involved per firing">Real Mean OPE</th>
-                      <th className="audit-num" title="Mean objects-per-event (OPE) in the simulation output">Sim Mean OPE</th>
-                      <th className="audit-num" title="Absolute difference between real and simulated mean OPE">Δ Mean</th>
-                      <th className="audit-num" title="Number of events for this activity in the real log">Real Count</th>
-                      <th className="audit-num" title="Number of events for this activity in the simulation output">Sim Count</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(cardData.table || []).map((row, i) => {
-                      const diff = row.mean_diff;
-                      const absDiff = diff != null ? Math.abs(diff) : null;
-                      return (
-                        <tr key={i}>
-                          <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
-                          <td className="audit-num">{row.real?.mean?.toFixed(2) ?? '—'}</td>
-                          <td className="audit-num">{row.sim?.mean?.toFixed(2) ?? '—'}</td>
-                          <td className={`audit-num cmp-diff ${absDiff == null ? '' : absDiff < 0.5 ? 'cmp-ok' : absDiff < 1.5 ? 'cmp-under' : 'cmp-over'}`}>
-                            {diff != null ? `${diff >= 0 ? '+' : ''}${diff.toFixed(2)}` : '—'}
-                          </td>
-                          <td className="audit-num" style={{color:'#94a3b8'}}>{row.real?.count ?? 0}</td>
-                          <td className="audit-num" style={{color:'#94a3b8'}}>{row.sim?.count ?? 0}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                <p style={{fontSize:'0.68rem',color:'#94a3b8',marginTop:'0.5rem'}}>OPE = Objects Per Event firing</p>
-              </div>
-            )}
+            <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginLeft:'0.75rem',marginRight:'0.25rem'}}>Aggregation:</span>
+            {['mean','min','max'].map(sub => (
+              <button key={sub} onClick={() => setTimeSubMode(sub)}
+                style={{padding:'0.2rem 0.55rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
+                  border: timeSubMode===sub ? '2px solid #1d4ed8' : '1px solid #e2e8f0',
+                  background: timeSubMode===sub ? '#1d4ed8' : 'white',
+                  color: timeSubMode===sub ? 'white' : '#475569'}}>
+                {sub.charAt(0).toUpperCase()+sub.slice(1)}
+              </button>
+            ))}
           </>
         )}
-      </Collapsible>
+      </div>
+      <div style={{overflowX:'auto'}}>
+        <table className="behavior-table" style={{fontSize:'0.75rem',borderCollapse:'collapse'}}>
+          <thead>
+            <tr style={{verticalAlign:'bottom'}}>
+              <th style={{minWidth:'130px',fontSize:'0.72rem',textAlign:'left',paddingBottom:'0.35rem'}}>Activity</th>
+              {cols.map(ot => (
+                <th key={ot} title={ot} style={{...vertStyle,fontWeight:600,color:'#475569',border:'1px solid #e2e8f0',background:'#f8fafc'}}>{ot}</th>
+              ))}
+              {showLogRef && <th title="Reference value from the input event log (read-only)" style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {activities.map(act => (
+              <tr key={act}>
+                <td style={{fontWeight:600,fontSize:'0.72rem',whiteSpace:'nowrap',paddingRight:'0.5rem'}}>{act}</td>
+                {cols.map(ot => {
+                  const val = getCellVal(act, ot);
+                  const hasVal = val != null && val !== 0;
+                  return (
+                    <td key={ot} style={{textAlign:'center',border:'1px solid #f1f5f9',
+                      background: hasVal ? (verifyMode==='time'?'#eff6ff':verifyMode==='frequency'?'#f0fdf4':'#fefce8') : 'transparent',
+                      color: hasVal ? (verifyMode==='time'?'#1d4ed8':verifyMode==='frequency'?'#166534':'#78350f') : '#cbd5e1',
+                      fontWeight: hasVal ? 600 : 400, fontSize:'0.72rem', padding:'0.2rem 0.3rem',
+                    }}>
+                      {hasVal ? fmtCell(val) : '—'}
+                    </td>
+                  );
+                })}
+                {showLogRef && (
+                  <td style={{color:'#94a3b8',textAlign:'center',fontSize:'0.7rem',border:'1px solid #f1f5f9'}}>
+                    {getLogVal(act, cols[0]) ?? '—'}
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 
+function computeNGD(simTraces, realTraces, n = 2) {
+  const dummy = '◦';
+  const countNgrams = (traces) => {
+    const map = {};
+    Object.values(traces).forEach(trace => {
+      if (!trace || trace.length === 0) return;
+      const seq = [...Array(n - 1).fill(dummy), ...trace, ...Array(n - 1).fill(dummy)];
+      for (let i = 0; i <= seq.length - n; i++) {
+        const key = seq.slice(i, i + n).join(' → ');
+        map[key] = (map[key] || 0) + 1;
+      }
+    });
+    return map;
+  };
+  const ng1 = countNgrams(simTraces);
+  const ng2 = countNgrams(realTraces);
+  const allKeys = new Set([...Object.keys(ng1), ...Object.keys(ng2)]);
+  let sumDiff = 0, sumTotal = 0;
+  const rows = [];
+  allKeys.forEach(k => {
+    const f1 = ng1[k] || 0;
+    const f2 = ng2[k] || 0;
+    sumDiff += Math.abs(f1 - f2);
+    sumTotal += f1 + f2;
+    rows.push({ ngram: k, sim: f1, real: f2, absDiff: Math.abs(f1 - f2) });
+  });
+  rows.sort((a, b) => b.absDiff - a.absDiff);
+  return {
+    ngd: sumTotal > 0 ? sumDiff / sumTotal : 0,
+    n,
+    rows,
+    totalSimNgrams: Object.values(ng1).reduce((s, v) => s + v, 0),
+    totalRealNgrams: Object.values(ng2).reduce((s, v) => s + v, 0),
+    uniqueNgrams: allKeys.size,
+  };
+}
+
+function CoverageRadarMini({ results, model, discoveryResults, logResults }) {
+  const [hoveredAxis, setHoveredAxis] = React.useState(null);
+  const [tipPos,      setTipPos]      = React.useState(null);
+  const cov = React.useMemo(
+    () => computeOCCoverage(results, model, discoveryResults),
+    [results, model, discoveryResults]
+  );
+  const logCov = React.useMemo(
+    () => logResults ? computeOCCoverage(logResults, model, discoveryResults) : null,
+    [logResults, model, discoveryResults]
+  );
+  if (!cov) return <span style={{fontSize:'0.72rem',color:'#94a3b8',fontStyle:'italic'}}>No coverage data</span>;
+
+  const ceVal = (() => { const vs=[cov.cov_act.value,cov.cov_ot.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+  const cardVal = (() => { const vs=[cov.cov_min.value,cov.cov_max.value,cov.cov_neg.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+  const axes = [
+    { key:'C.E', label:'Element',    value: ceVal,                    hint:'Fraction of constraint elements observed in the simulation output.\nAverages activity coverage (which activities fired) and object-type coverage (which object types appeared).\nLow value → the sim never invoked some activities or object types referenced in the model.' },
+    { key:'C.A', label:'Activation', value: cov.cov_activation.value, hint:'Fraction of constraints that were triggered (activated) at least once during the simulation.\nLow value → entire constraints went untested — the sim conditions that would fire them never occurred.' },
+    { key:'C.I', label:'Involvement',value: cov.cov_inv.value,        hint:'Fraction of constraints where every involved activity and object type participated at least once.\nReflects how thoroughly the full scope of each constraint was exercised.' },
+    { key:'C.C', label:'Count',      value: cardVal,                  hint:'How well the simulation exercises cardinality bounds (min/max occurrence counts) defined in constraints.\nAverages min-bound, max-bound, and negation coverage.\nLow value → cardinality rules were rarely or never tested.' },
+    { key:'C.R', label:'Arrow',      value: cov.cov_arrow.value,      hint:'Fraction of constraint relations (response edges, exclusion pairs, etc.) that were exercised.\nLow value → most constraint links were never traversed during the simulation.' },
+  ];
+
+  // Log reference polygon values (same axis order)
+  const logAxisValues = logCov ? (() => {
+    const lce = (() => { const vs=[logCov.cov_act.value,logCov.cov_ot.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+    const lcard = (() => { const vs=[logCov.cov_min.value,logCov.cov_max.value,logCov.cov_neg.value].filter(v=>v!=null); return vs.length?vs.reduce((s,v)=>s+v,0)/vs.length:null; })();
+    return [lce, logCov.cov_activation.value, logCov.cov_inv.value, lcard, logCov.cov_arrow.value];
+  })() : null;
+  const CX=105,CY=100,R=72,N=axes.length;
+  const angleOf=i=>(Math.PI*2*i)/N-Math.PI/2;
+  const spoke=(i,r)=>({x:CX+r*Math.cos(angleOf(i)),y:CY+r*Math.sin(angleOf(i))});
+  const ringLevels=[0.25,0.5,0.75,1.0];
+  const ringColor=['#f1f5f9','#e2e8f0','#cbd5e1','#94a3b8'];
+  const rc=v=>v==null?'#94a3b8':v>=0.9?'#16a34a':v>=0.6?'#d97706':'#dc2626';
+  const overall=axes.filter(a=>a.value!=null).reduce((s,a)=>s+a.value,0)/Math.max(1,axes.filter(a=>a.value!=null).length);
+  const pts=axes.map((ax,i)=>spoke(i,R*Math.max(0,ax.value??0)));
+  const path=pts.map((p,i)=>`${i===0?'M':'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')+' Z';
+
+  const hovered = hoveredAxis != null ? axes[hoveredAxis] : null;
+  const tipW = 230;
+
+  // Build log reference SVG path if available
+  const logPath = logAxisValues ? (() => {
+    const lpts = logAxisValues.map((v, i) => spoke(i, R * Math.max(0, v ?? 0)));
+    return lpts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ') + ' Z';
+  })() : null;
+
+  return (
+    <div style={{display:'inline-block'}}>
+      <svg width={210} height={200} style={{overflow:'visible'}}>
+        {ringLevels.map((lvl,li)=>{const rpts=axes.map((_,i)=>spoke(i,R*lvl));const d=rpts.map((p,i)=>`${i===0?'M':'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')+' Z';return(<g key={li}><path d={d} fill="none" stroke={ringColor[li]} strokeWidth={li===3?1.5:1}/></g>);})}
+        {axes.map((_,i)=>{const tip=spoke(i,R);return<line key={i} x1={CX} y1={CY} x2={tip.x.toFixed(1)} y2={tip.y.toFixed(1)} stroke="#e2e8f0" strokeWidth={1}/>;} )}
+        {/* Log reference polygon (drawn behind sim) */}
+        {logPath && <path d={logPath} fill="#94a3b820" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="3 2"/>}
+        {/* Sim polygon */}
+        <path d={path} fill={`${rc(overall)}22`} stroke={rc(overall)} strokeWidth={2}/>
+        {pts.map((p,i)=>(<circle key={i} cx={p.x.toFixed(1)} cy={p.y.toFixed(1)} r={3} fill={rc(axes[i].value)} stroke="white" strokeWidth={1.5}><title>{axes[i].label}: {axes[i].value!=null?(axes[i].value*100).toFixed(1)+'%':'N/A'}</title></circle>))}
+        {axes.map((ax,i)=>{
+          const tip=spoke(i,R+18);
+          const anchor=tip.x<CX-5?'end':tip.x>CX+5?'start':'middle';
+          return (
+            <text key={i} x={tip.x.toFixed(1)} y={tip.y.toFixed(1)}
+              textAnchor={anchor} fontSize="8.5" fontWeight="600"
+              fill={hoveredAxis===i?'#2563eb':'#475569'}
+              style={{cursor:'help'}}
+              onMouseEnter={e=>{
+                const left = Math.min(Math.max(8, e.clientX + 12), window.innerWidth - tipW - 8);
+                setTipPos({ left, top: Math.max(8, e.clientY - 50) });
+                setHoveredAxis(i);
+              }}
+              onMouseLeave={()=>{ setHoveredAxis(null); setTipPos(null); }}>
+              {ax.label}
+            </text>
+          );
+        })}
+        <circle cx={CX} cy={CY} r={18} fill="white" stroke={rc(overall)} strokeWidth={1.5}/>
+        <text x={CX} y={CY-3} textAnchor="middle" fontSize="9.5" fontWeight="700" fill={rc(overall)}>{(overall*100).toFixed(0)}%</text>
+        <text x={CX} y={CY+9} textAnchor="middle" fontSize="7.5" fill="#64748b">overall</text>
+      </svg>
+      {/* Legend — only shown when log reference is present */}
+      {logPath && (
+        <div style={{display:'flex',gap:'0.75rem',fontSize:'0.62rem',color:'#64748b',marginTop:'0.1rem'}}>
+          <span style={{display:'flex',alignItems:'center',gap:'0.25rem'}}>
+            <svg width="18" height="8"><line x1="0" y1="4" x2="18" y2="4" stroke={rc(overall)} strokeWidth="2"/></svg>
+            Simulation
+          </span>
+          <span style={{display:'flex',alignItems:'center',gap:'0.25rem'}}>
+            <svg width="18" height="8"><line x1="0" y1="4" x2="18" y2="4" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="3 2"/></svg>
+            Input log
+          </span>
+        </div>
+      )}
+      {hovered && tipPos && ReactDOM.createPortal(
+        <div style={{position:'fixed',left:tipPos.left,top:tipPos.top,background:'#1e293b',color:'white',padding:'0.5rem 0.65rem',borderRadius:'6px',fontSize:'0.72rem',lineHeight:'1.45',width:tipW+'px',textAlign:'left',zIndex:9999,pointerEvents:'none',whiteSpace:'pre-wrap',boxShadow:'0 4px 12px rgba(0,0,0,0.18)'}}>
+          <div style={{fontWeight:700,marginBottom:'0.25rem'}}>{hovered.label} ({hovered.key}) — {hovered.value!=null?(hovered.value*100).toFixed(1)+'%':'N/A'}</div>
+          {hovered.hint}
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+
+function SummaryMetricCard({ m }) {
+  const [tipPos, setTipPos] = React.useState(null);
+  const ref = React.useRef(null);
+  const handleMouseEnter = () => {
+    if (!m.hint) return;
+    const rect = ref.current?.getBoundingClientRect();
+    if (!rect) return;
+    const tipW = 230;
+    const left = Math.min(Math.max(8, rect.left + rect.width / 2 - tipW / 2), window.innerWidth - tipW - 8);
+    setTipPos({ left, bottom: window.innerHeight - rect.top + 6 });
+  };
+  return (
+    <div ref={ref}
+      style={{minWidth:'88px',padding:'0.35rem 0.5rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',textAlign:'center',flex:'0 0 auto',cursor:m.hint?'help':'default'}}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={() => setTipPos(null)}
+    >
+      <div style={{fontSize:'1.05rem',fontWeight:700,color:m.color,lineHeight:1.1}}>{m.display}</div>
+      <div style={{fontSize:'0.58rem',color:'#64748b',marginTop:'3px',lineHeight:1.2}}>{m.label}</div>
+      {tipPos && m.hint && ReactDOM.createPortal(
+        <div style={{position:'fixed',left:tipPos.left,bottom:tipPos.bottom,background:'#1e293b',color:'white',padding:'0.5rem 0.65rem',borderRadius:'6px',fontSize:'0.72rem',lineHeight:'1.45',width:'230px',textAlign:'left',zIndex:9999,pointerEvents:'none',whiteSpace:'pre-wrap',boxShadow:'0 4px 12px rgba(0,0,0,0.18)'}}>
+          {m.hint}
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
@@ -4529,8 +4005,96 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   const hasBoth = !!(resultsAsIs && resultsToBe);
   const rAsis = resultsAsIs ?? results;
   const rTobe = resultsToBe;
-  const [verifyMode, setVerifyMode] = React.useState('frequency');
-  const [evalTab, setEvalTab] = React.useState('comparison'); // 'comparison' | 'traces' | 'matrix' | 'asis' | 'tobe'
+  const [evalTab, setEvalTab] = React.useState('conformance');
+  const [cmpSections, setCmpSections] = React.useState({conformance: true});
+  const [ocpqTotals,        setOcpqTotals]        = React.useState(null);
+  const [liveConfScores,    setLiveConfScores]    = React.useState(null);
+  const [ocpqTotalsTobe,    setOcpqTotalsTobe]    = React.useState(null);
+  const [liveConfScoresTobe,setLiveConfScoresTobe] = React.useState(null);
+
+  // Reset live scores when the run changes
+  React.useEffect(() => { setLiveConfScores(null); setOcpqTotals(null); }, [rAsis?.output_file]);
+  React.useEffect(() => { setLiveConfScoresTobe(null); setOcpqTotalsTobe(null); }, [rTobe?.output_file]);
+
+  // WMAPE: sim mean vs log mean — computed from rAsis metrics + model durations
+  const wmapeAsis = React.useMemo(() => {
+    const sm = rAsis?.metrics?.activity_metrics || {};
+    const ld = activeModel?.activity_durations || {};
+    let num = 0, den = 0;
+    Object.keys({...sm, ...ld}).forEach(a => {
+      const sim = sm[a]?.mean_service_s, log = ld[a]?.service_mean, w = sm[a]?.execution_count || 1;
+      if (sim != null && log != null && log > 0) { num += Math.abs(sim - log) * w; den += log * w; }
+    });
+    return den > 0 ? (num / den * 100) : null;
+  }, [rAsis?.output_file, activeModel]);
+
+  const confScores     = liveConfScores     || rAsis?.conformance;
+  const confScoresTobe = liveConfScoresTobe || rTobe?.conformance;
+
+  const wmapeTobe = React.useMemo(() => {
+    const sm = rTobe?.metrics?.activity_metrics || {};
+    const ld = activeModel?.activity_durations || {};
+    let num = 0, den = 0;
+    Object.keys({...sm, ...ld}).forEach(a => {
+      const sim = sm[a]?.mean_service_s, log = ld[a]?.service_mean, w = sm[a]?.execution_count || 1;
+      if (sim != null && log != null && log > 0) { num += Math.abs(sim - log) * w; den += log * w; }
+    });
+    return den > 0 ? (num / den * 100) : null;
+  }, [rTobe?.output_file, activeModel]);
+
+  // Weighted mean real sojourn time — used to normalise W1 colour grading
+  const meanSojourn = React.useMemo(() => {
+    const sm = rAsis?.metrics?.activity_metrics || {};
+    const ld = activeModel?.activity_durations || {};
+    let weightedSum = 0, totalW = 0;
+    Object.keys(ld).forEach(a => {
+      const mean = ld[a]?.service_mean;
+      const w = (sm[a]?.execution_count) || 1;
+      if (mean != null && mean > 0) { weightedSum += mean * w; totalW += w; }
+    });
+    return totalW > 0 ? weightedSum / totalW : null;
+  }, [rAsis?.output_file, activeModel]);
+
+  // Satisfiability + cross-object inconsistency from model constraints
+  const modelQuality = React.useMemo(() => {
+    const constraints = activeModel?.constraints || [];
+    const activities  = activeModel?.activities  || [];
+    if (!constraints.length || !activities.length) return null;
+    const actNames = new Set(activities.map(a => a.name || a));
+    const precFwd = {}, respEdges = {}, notCoex = [], absences = new Set();
+    constraints.forEach(c => {
+      if (c.constraint_type === 'precedence') { (precFwd[c.source_activity] = precFwd[c.source_activity]||[]).push(c.target_activity); }
+      else if (c.constraint_type === 'response') { (respEdges[c.source_activity] = respEdges[c.source_activity]||[]).push(c.target_activity); }
+      else if (c.constraint_type === 'not_coexistence') { notCoex.push([c.source_activity, c.target_activity]); }
+      else if (c.constraint_type === 'absence' && (c.nmax === 0 || c.nmax === null)) { absences.add(c.source_activity || c.target_activity); }
+    });
+    const visited = new Set();
+    const hasCycle = (node, path) => { if (path.includes(node)) return true; if (visited.has(node)) return false; visited.add(node); return (precFwd[node]||[]).some(n => hasCycle(n, [...path, node])); };
+    let satisfOk = true;
+    for (const a of actNames) { if (hasCycle(a, [])) { satisfOk = false; break; } }
+    if (satisfOk) notCoex.forEach(([a,b]) => { if ((respEdges[a]||[]).includes(b)||(respEdges[b]||[]).includes(a)) satisfOk = false; });
+    if (satisfOk) absences.forEach(act => { if (Object.values(respEdges).some(tgts => tgts.includes(act))) satisfOk = false; });
+    const actBindings = {};
+    activities.forEach(a => { actBindings[a.name||a] = a.bindings || []; });
+    let crossOk = true;
+    constraints.forEach(c => {
+      if (c.scope?.kind !== 'each' || !c.scope?.object_type) return;
+      const stype = c.scope.object_type;
+      if (actNames.has(c.source_activity) && !(actBindings[c.source_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
+      if (!['not_coexistence','absence','exactly','init'].includes(c.constraint_type) && actNames.has(c.target_activity) && !(actBindings[c.target_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
+    });
+    return { satisfOk, crossOk };
+  }, [activeModel]);
+
+  const vacuityStatus = React.useMemo(() => {
+    const constraints = activeModel?.constraints || [];
+    const objectTraces = rAsis?.object_traces || {};
+    if (!constraints.length || Object.keys(objectTraces).length === 0) return null;
+    const fired = new Set();
+    Object.values(objectTraces).forEach(trace => trace.forEach(act => fired.add(act)));
+    const count = constraints.filter(c => c.source_activity && !fired.has(c.source_activity)).length;
+    return { ok: count === 0, count };
+  }, [activeModel, rAsis]);
 
   const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
 
@@ -4555,235 +4119,192 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   // Log trace completion from discoveryResults
   const logTraces = discoveryResults?.log_object_trace_count ?? null;
 
-  // ── Compute verification matrix ────────────────────────────────────────────
-  const [timeSubMode, setTimeSubMode] = React.useState('mean'); // mean | min | max
+  const [distFidAsis,    setDistFidAsis]    = React.useState(null);
+  const [distFidTobe,    setDistFidTobe]    = React.useState(null);
+  const [distFidLoading, setDistFidLoading] = React.useState(false);
+  const [distFidError,   setDistFidError]   = React.useState(null);
+  const [distFidOpen,    setDistFidOpen]    = React.useState(true);
 
-  const buildMatrix = (r) => {
-    if (!r) return null;
-    const metrics = r.metrics?.activity_metrics || {};
-    const serviceByType = r.metrics?.activity_service_by_type || {};
-    const resourceTypes = new Set(r.resource_types || []);
-    const audit = r.audit?.object_lifecycle_audit || {};
-    const activities = Object.keys(metrics).sort(makeFlowRankSorter(discoveryResults, r.object_traces));
-    const objTypes = Object.keys(audit).filter(t => !resourceTypes.has(t));
-
-    const actBindings = {};
-    const modelToUse = activeModel || modelBase;
-    if (modelToUse?.activities) {
-      modelToUse.activities.forEach(a => {
-        const types = new Set((a.bindings||[]).map(b=>b.object_type).filter(t=>!resourceTypes.has(t)));
-        actBindings[a.name] = types;
-      });
+  const runDistFidelity = async () => {
+    if (!rAsis?.output_file || !inputEventLogFile) return;
+    setDistFidLoading(true);
+    setDistFidError(null);
+    setDistFidAsis(null);
+    setDistFidTobe(null);
+    try {
+      const promises = [
+        axios.post('/api/further-eval/distribution-fidelity', {
+          outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
+        })
+      ];
+      if (rTobe?.output_file) {
+        promises.push(axios.post('/api/further-eval/distribution-fidelity', {
+          outputFile: rTobe.output_file, eventLogFile: inputEventLogFile,
+        }));
+      }
+      const [asisRes, tobeRes] = await Promise.all(promises);
+      setDistFidAsis(asisRes.data);
+      if (tobeRes) setDistFidTobe(tobeRes.data);
+    } catch (e) {
+      setDistFidError(e.response?.data?.error || e.message);
+    } finally {
+      setDistFidLoading(false);
     }
-
-    const simObjTypes = r.object_types || {};
-    return { activities, objTypes, metrics, serviceByType, audit, simObjTypes, actBindings };
   };
 
-  const matrixAsis = buildMatrix(rAsis);
-  const matrixTobe = buildMatrix(rTobe);
-  const logActivityCounts = discoveryResults?.activity_counts || {};
-  const logObjectTypes = discoveryResults?.object_type_stats || {};
+  const [xlogData,    setXlogData]    = React.useState(null);
+  const [xlogLoading, setXlogLoading] = React.useState(false);
+  const [xlogError,   setXlogError]   = React.useState(null);
 
-  const VERIFY_MODES = [
-    { key: 'frequency',   label: 'Event Frequency' },
-    { key: 'time',        label: 'Time per Event' },
-    { key: 'cardinality', label: 'Objects per Event' },
-    { key: 'obj_time',    label: 'Time per Object Type' },
-  ];
+  const [ngdData,    setNgdData]    = React.useState(null);
+  const [ngdLoading, setNgdLoading] = React.useState(false);
+  const [ngdError,   setNgdError]   = React.useState(null);
+
+  // Input log coverage reference — synthetic results-like object for CoverageRadarMini
+  const [inputLogCovResults, setInputLogCovResults] = React.useState(null);
+  React.useEffect(() => {
+    if (!inputEventLogFile) { setInputLogCovResults(null); return; }
+    axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
+      .then(resp => {
+        const evts = resp.data.events || [];
+        const tmap = resp.data.object_types_map || {};
+        const traces = {};
+        evts.forEach(e => { (e.object_ids || []).forEach(oid => { (traces[oid] = traces[oid] || []).push(e.activity); }); });
+        const objTypes = {};
+        Object.entries(tmap).forEach(([oid, ot]) => { objTypes[ot] = (objTypes[ot] || 0) + 1; });
+        setInputLogCovResults({ activity_sequence: evts.map(e => e.activity), object_types: objTypes, object_traces: traces, object_types_map: tmap });
+      })
+      .catch(() => setInputLogCovResults(null));
+  }, [inputEventLogFile]);
+
+
+  const runXlogFidelity = async () => {
+    if (!rAsis?.output_file || !inputEventLogFile) return;
+    setXlogLoading(true); setXlogError(null); setXlogData(null);
+    try {
+      const r = await axios.post('/api/further-eval/log-fidelity', {
+        outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
+      });
+      setXlogData(r.data);
+    } catch (e) { setXlogError(e.response?.data?.error || e.message); }
+    finally { setXlogLoading(false); }
+  };
+
+  const ocdeclareFile = activeModel?._source_file || null;
+  const modelOverride = activeModel || null;
+  const safeStartActivities = discoveryResults?.strict_start_activities || discoveryResults?.likely_start_activities || [];
+  const constraintStats = rAsis?.constraint_obligation_stats || {};
+  const obligationsFulfilled = rAsis?.obligations_fulfilled ?? 0;
+  const obligationsViolated  = rAsis?.obligations_violated  ?? 0;
+  const obligationsCancelled = rAsis?.obligations_cancelled ?? 0;
+  const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+  const fmtNum = v => v == null ? '—' : Number.isInteger(v) ? v.toLocaleString() : v.toFixed(3);
+
+  const [confData,    setConfData]    = React.useState(null);
+  const [confLoading, setConfLoading] = React.useState(false);
+  const [confError,   setConfError]   = React.useState(null);
+
+  const runConformanceCheck = async () => {
+    if (!rAsis?.output_file) return;
+    setConfLoading(true); setConfError(null); setConfData(null);
+    try {
+      const r = await axios.post('/api/further-eval/conformance-check', { outputFile: rAsis.output_file, ocdeclareFile, modelOverride });
+      setConfData(r.data);
+    } catch(e) { setConfError(e.response?.data?.error || e.message); }
+    finally { setConfLoading(false); }
+  };
+
+  // Run all summary-strip metrics when Run Evaluation is clicked
+  React.useEffect(() => {
+    if (!rAsis?.output_file) return;
+
+    // Fitness / Precision / OC-Declare Confidence — synchronous from object_traces
+    const computeAndSetConf = (r, setter) => {
+      if (!r?.object_traces) return;
+      const s = computeConformance(r.object_traces, activeModel?.constraints || [], activeModel?.activities || []);
+      if (s.fitness != null) setter({ fitness: s.fitness, constraint_fitness: s.constraintFitness, precision: s.precision });
+    };
+    computeAndSetConf(rAsis, setLiveConfScores);
+    if (rTobe?.output_file) computeAndSetConf(rTobe, setLiveConfScoresTobe);
+
+    // Overall Reach / Exclusivity — async OCPQ fetch
+    const fetchOcpq = async (outputFile, setter) => {
+      try {
+        const resp = await axios.get(`/api/run-history/${encodeURIComponent(outputFile)}/ocpq`);
+        const all = resp.data.schemas || [];
+        const _mean = (arr, k) => { const vs = arr.map(x => x[k]).filter(x => x != null); return vs.length ? vs.reduce((s,x) => s+x, 0)/vs.length : null; };
+        setter({ reach: _mean(all,'reach'), exclusivity: _mean(all,'exclusivity') });
+      } catch(e) {}
+    };
+    fetchOcpq(rAsis.output_file, setOcpqTotals);
+    if (rTobe?.output_file) fetchOcpq(rTobe.output_file, setOcpqTotalsTobe);
+
+    // Post-hoc Fitness — async conformance check
+    runConformanceCheck();
+
+    // Distribution + cross-log fidelity — require event log
+    if (inputEventLogFile) {
+      runDistFidelity();
+      runXlogFidelity();
+
+      // NGD — load real log traces and compute n-gram distance (n=2)
+      if (rAsis?.object_traces) {
+        setNgdData(null); setNgdError(null); setNgdLoading(true);
+        axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
+          .then(resp => {
+            const evts = resp.data.events || [];
+            const realTraces = {};
+            evts.forEach(e => {
+              (e.object_ids || []).forEach(oid => {
+                (realTraces[oid] = realTraces[oid] || []).push(e.activity);
+              });
+            });
+            setNgdData(computeNGD(rAsis.object_traces, realTraces, 2));
+          })
+          .catch(e => setNgdError(e.response?.data?.error || e.message))
+          .finally(() => setNgdLoading(false));
+      }
+    }
+  }, [evalRunCount]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [multiSeeds,   setMultiSeeds]   = React.useState('42,99,123,456,789');
+  const [multiData,    setMultiData]    = React.useState(null);
+  const [multiLoading, setMultiLoading] = React.useState(false);
+  const [multiError,   setMultiError]   = React.useState(null);
+
+  const runMultiSeed = async () => {
+    const seeds = multiSeeds.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    if (!seeds.length) return;
+    setMultiLoading(true); setMultiError(null); setMultiData(null);
+    try {
+      const r = await axios.post('/api/further-eval/multi-run', {
+        seeds, ocdeclareFile, modelOverride, eventLogFile: inputEventLogFile,
+        startActivities: safeStartActivities, maxEvents: 50000,
+      });
+      setMultiData(r.data);
+    } catch(e) { setMultiError(e.response?.data?.error || e.message); }
+    finally { setMultiLoading(false); }
+  };
 
   // Tab buttons for top navigation
   const tabs = [
-    { key: 'comparison', label: 'Comparison' },
-    { key: 'coverage',   label: 'Coverage' },
-    { key: 'matrix',     label: 'Verification Matrix' },
-    { key: 'ocpq',       label: 'OCPQ' },
-    { key: 'further',    label: 'Further Evaluations' },
+    { key: 'conformance',    label: 'Conformance' },
+    { key: 'coverage',       label: 'Coverage' },
+    { key: 'time',           label: 'Time' },
+    { key: 'log-comparison', label: 'Log comparison' },
   ];
-
-  const renderTracePanel = (tc, label, logCount) => {
-    if (!tc) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No {label} run yet.</div>;
-    return (
-      <div>
-        <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-          <div className="behavior-stat-card">
-            <div className="behavior-stat-val">{tc.deactAll.toLocaleString()}</div>
-            <div className="behavior-stat-label">Completed traces</div>
-          </div>
-          <div className="behavior-stat-card">
-            <div className="behavior-stat-val">{tc.totalAll.toLocaleString()}</div>
-            <div className="behavior-stat-label">Total objects</div>
-          </div>
-          <div className={`behavior-stat-card`} style={{background: tc.pct>=80?'#f0fdf4':tc.pct>=50?'#fffbeb':'#fff1f2'}}>
-            <div className="behavior-stat-val">{tc.pct}%</div>
-            <div className="behavior-stat-label">Completion rate</div>
-          </div>
-          {logCount != null && (
-            <div className="behavior-stat-card">
-              <div className="behavior-stat-val">{logCount.toLocaleString()}</div>
-              <div className="behavior-stat-label">Log objects</div>
-            </div>
-          )}
-        </div>
-        <table className="behavior-table">
-          <thead><tr>
-            <th title="Object type name as defined in the model">Object Type</th>
-            <th title="Total number of objects of this type instantiated in the simulation">Total</th>
-            <th title="Objects whose lifecycle ended (deactivated) — fully completed traces">Completed</th>
-            <th title="Objects still active (not yet deactivated) at the end of the simulation">Active</th>
-            <th title="Fraction of objects that completed their lifecycle (Completed ÷ Total)">Rate</th>
-            {logObjectTypes && <th title="Number of objects of this type in the input event log">Log count</th>}
-          </tr></thead>
-          <tbody>
-            {Object.entries(tc.totalByType).map(([ot, tot]) => {
-              const deact = tc.deactByType[ot] || 0;
-              const active = tot - deact;
-              const pct = tot > 0 ? Math.round(deact/tot*100) : 0;
-              const logCnt = logObjectTypes[ot]?.count ?? null;
-              return (
-                <tr key={ot}>
-                  <td>{ot}</td>
-                  <td>{tot}</td>
-                  <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{deact}</td>
-                  <td style={{color:'#64748b'}}>{active}</td>
-                  <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'80px',overflow:'hidden'}}>
-                    <div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/>
-                  </div><span style={{fontSize:'0.72rem',color:'#64748b',marginLeft:'4px'}}>{pct}%</span></td>
-                  {logObjectTypes && <td style={{color:'#94a3b8'}}>{logCnt != null ? logCnt.toLocaleString() : '—'}</td>}
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    );
-  };
-
-  const renderVerifyMatrix = (matrix, label) => {
-    if (!matrix) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No {label} run yet.</div>;
-    const { activities, objTypes, metrics, serviceByType, audit, simObjTypes, actBindings } = matrix;
-    if (!activities.length) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No activity metrics available for {label}. Run a simulation first to populate the matrix.</div>;
-    // If no object type audit data, use all object types from actBindings
-    const cols = objTypes.length > 0 ? objTypes
-      : [...new Set(Object.values(actBindings).flatMap(s => [...s]))].sort();
-
-    // For time mode, columns are object types; service time shown per (activity, object_type)
-    const getCellVal = (act, ot) => {
-      const m = metrics[act] || {};
-      const a = audit[ot] || {};
-      const participates = !actBindings[act] || actBindings[act].size === 0 || actBindings[act].has(ot);
-
-      if (verifyMode === 'frequency') {
-        const cnt = serviceByType?.[act]?.[ot]?.count ?? null;
-        return cnt != null && cnt > 0 ? cnt : null;
-      }
-      if (verifyMode === 'time') {
-        if (!participates) return null;
-        // Use per-(activity, object_type) breakdown if available
-        const perType = serviceByType?.[act]?.[ot];
-        if (perType) {
-          const val = timeSubMode === 'min' ? perType.min_s
-                    : timeSubMode === 'max' ? perType.max_s
-                    : perType.mean_s;
-          return (val != null && val > 0) ? val : null;
-        }
-        // Fallback: activity-level metric (same for all participating types)
-        const val = timeSubMode === 'min' ? m.min_service_s
-                  : timeSubMode === 'max' ? m.max_service_s
-                  : m.mean_service_s;
-        return (val != null && val > 0) ? val : null;
-      }
-      if (verifyMode === 'cardinality') {
-        if (!participates) return null;
-        const objCount = simObjTypes[ot] || 0;
-        const fires = m.execution_count || 0;
-        if (!fires || !objCount) return null;
-        const ratio = objCount / fires;
-        return ratio > 0 ? ratio : null;
-      }
-      if (verifyMode === 'obj_time') {
-        const lt = a.event_count_stats;
-        return lt?.mean != null && lt.mean > 0 ? lt.mean : null;
-      }
-      return null;
-    };
-
-    const fmtCell = (val) => {
-      if (verifyMode === 'time') return fmtDur(val);
-      if (verifyMode === 'cardinality') return val.toFixed(1);
-      if (verifyMode === 'obj_time') return val.toFixed(1)+' ev';
-      return val?.toLocaleString() ?? '—';
-    };
-
-    const getLogVal = (act, ot) => {
-      if (verifyMode === 'frequency') {
-        const cnt = logActivityCounts[act];
-        return cnt > 0 ? cnt.toLocaleString() : null;
-      }
-      if (verifyMode === 'cardinality') {
-        const logOtCount = logObjectTypes[ot]?.count || 0;
-        const logActCount = logActivityCounts[act] || 0;
-        if (!logActCount || !logOtCount) return null;
-        const ratio = logOtCount / logActCount;
-        return ratio > 0 ? ratio.toFixed(1) : null;
-      }
-      return null;
-    };
-
-    const showLogRef = verifyMode === 'frequency' || verifyMode === 'cardinality';
-    const vertStyle = { writingMode:'vertical-rl', transform:'rotate(180deg)', whiteSpace:'nowrap',
-      fontSize:'0.7rem', padding:'0.25rem 0.1rem', maxHeight:'120px', textOverflow:'ellipsis', overflow:'hidden' };
-
-    return (
-      <div style={{overflowX:'auto'}}>
-        <table className="behavior-table" style={{fontSize:'0.75rem',borderCollapse:'collapse'}}>
-          <thead>
-            <tr style={{verticalAlign:'bottom'}}>
-              <th title="Activity name" style={{minWidth:'130px',fontSize:'0.72rem',textAlign:'left',paddingBottom:'0.35rem'}}>Activity</th>
-              {cols.map(ot => (
-                <th key={ot} title={ot} style={{...vertStyle,fontWeight:600,color:'#475569',border:'1px solid #e2e8f0',background:'#f8fafc'}}>
-                  {ot}
-                </th>
-              ))}
-              {showLogRef && <th title="Reference value from the input event log (read-only)" style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {activities.map(act => {
-              const m = metrics[act] || {};
-              return (
-                <tr key={act}>
-                  <td style={{fontWeight:600,fontSize:'0.72rem',whiteSpace:'nowrap',paddingRight:'0.5rem'}}>{act}</td>
-                  {cols.map(ot => {
-                    const val = getCellVal(act, ot);
-                    const hasVal = val != null && val !== 0;
-                    return (
-                      <td key={ot} style={{textAlign:'center',border:'1px solid #f1f5f9',
-                        background: hasVal ? (verifyMode==='time'?'#eff6ff':verifyMode==='frequency'?'#f0fdf4':'#fefce8') : 'transparent',
-                        color: hasVal ? (verifyMode==='time'?'#1d4ed8':verifyMode==='frequency'?'#166534':'#78350f') : '#cbd5e1',
-                        fontWeight: hasVal ? 600 : 400,
-                        fontSize:'0.72rem', padding:'0.2rem 0.3rem',
-                      }}>
-                        {hasVal ? fmtCell(val) : '—'}
-                      </td>
-                    );
-                  })}
-                  {showLogRef && (
-                    <td style={{color:'#94a3b8',textAlign:'center',fontSize:'0.7rem',border:'1px solid #f1f5f9'}}>
-                      {getLogVal(act, cols[0]) ?? '—'}
-                    </td>
-                  )}
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    );
-  };
 
   return (
     <div>
+      {/* Model / run header */}
+      {rAsis && (
+        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.75rem',padding:'0.4rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',fontSize:'0.78rem',color:'#475569'}}>
+          <span style={{fontWeight:600}}>Evaluating:</span>
+          <span>{(activeModel?.activities||[]).length > 0 ? `${(activeModel.activities||[]).length} activities · ${(activeModel.constraints||[]).length} constraints` : 'Current model'}</span>
+          {inputEventLogFile && <><span style={{color:'#cbd5e1'}}>·</span><span style={{color:'#64748b'}}>compared against <strong style={{color:'#475569'}}>{inputEventLogFile.split('/').pop()}</strong></span></>}
+        </div>
+      )}
+
       {/* Re-run button mirrored from Results tab */}
       {onRerunEvaluation && (
         <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'0.75rem'}}>
@@ -4794,6 +4315,101 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
           </button>
         </div>
       )}
+
+      {/* ── Key Metrics Summary Strip ── */}
+      {(() => {
+        const pct  = v => v == null ? null : `${(v * 100).toFixed(1)}%`;
+        const fmtW = v => {
+          if (v == null) return null;
+          if (v >= 86400) { const d=Math.floor(v/86400), h=Math.floor((v%86400)/3600); return h>0?`${d}d ${h}h`:`${d}d`; }
+          if (v >= 3600)  { const h=Math.floor(v/3600),  m=Math.floor((v%3600)/60);   return m>0?`${h}h ${m}m`:`${h}h`; }
+          if (v >= 60)    { const m=Math.floor(v/60),    s=Math.floor(v%60);           return s>0?`${m}m ${s}s`:`${m}m`; }
+          return v < 10 ? `${v.toFixed(1)}s` : `${Math.round(v)}s`;
+        };
+        const ga = (v, hi, mid) => v == null ? '#64748b' : v >= hi ? '#16a34a' : v >= mid ? '#d97706' : '#dc2626';
+        const ra = (v, lo, mid) => v == null ? '#64748b' : v <= lo ? '#16a34a' : v <= mid ? '#d97706' : '#dc2626';
+
+        const secLabel = txt => (
+          <div style={{fontSize:'0.57rem',fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.09em',padding:'0.45rem 0.75rem 0.2rem'}}>
+            {txt}
+          </div>
+        );
+        const secRow = children => (
+          <div style={{padding:'0.2rem 0.75rem 0.55rem',display:'flex',alignItems:'center',gap:'0.65rem',flexWrap:'wrap'}}>
+            {children}
+          </div>
+        );
+        const inlineMeasure = (label, value, ok, hint) => (
+          <div key={label} style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.74rem',color:'#475569'}}>
+            <span style={{color:'#64748b'}}>{label}{hint && <InfoTip text={hint}/>}:</span>
+            <span style={{fontWeight:700,color:ok===true?'#16a34a':ok===false?'#dc2626':'#64748b'}}>{value}</span>
+          </div>
+        );
+
+        const hasConformance = confData?.overall_fitness != null || modelQuality;
+        const hasCoverage    = !!(rAsis?.output_file || rAsis?.metrics);
+        const hasTime        = distFidAsis?.overall_w1_s != null || wmapeAsis != null;
+        const hasLogComp     = xlogData?.activity_kl_divergence != null || true; // always show (NGD placeholder)
+        if (!hasConformance && !hasCoverage && !hasTime) return null;
+
+        return (
+          <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'8px',overflow:'hidden'}}>
+
+            {/* CONFORMANCE */}
+            {hasConformance && (<>
+              {secLabel('Conformance')}
+              {secRow(<>
+                {confData?.overall_fitness != null && (
+                  <SummaryMetricCard m={{label:'Post-hoc Fitness',display:pct(confData.overall_fitness),color:ga(confData.overall_fitness,0.9,0.7),hint:'Post-hoc OC-Declare conformance — fraction of constraint checks that passed when replaying the output OCEL.\nHigher is better: ≥90% excellent · ≥70% acceptable.'}} />
+                )}
+                {modelQuality && inlineMeasure('Satisfiability', modelQuality.satisfOk?'✓ OK':'✗ Issues', modelQuality.satisfOk, 'Checks whether the constraint set can ever be satisfied — detects logical conflicts where no valid execution trace could satisfy all constraints simultaneously.')}
+                {modelQuality && inlineMeasure('Cross-object inconsistency', modelQuality.crossOk?'✓ OK':'✗ Issues', modelQuality.crossOk, 'Checks whether constraints referencing the same activities across different object types are mutually consistent — e.g. one type requires A before B while another requires B before A.')}
+           {vacuityStatus && inlineMeasure('Vacuity conformance', vacuityStatus.ok?'✓ OK':`✗ ${vacuityStatus.count} vacuous`, vacuityStatus.ok, "Checks whether every constraint's source activity fired at least once. A constraint whose trigger never occurred is technically satisfied but only vacuously — it was never actually tested.")}
+              </>)}
+            </>)}
+
+            {/* COVERAGE */}
+            {hasCoverage && (
+              <div style={{borderTop:'1px solid #f1f5f9'}}>
+                {secLabel('Coverage')}
+                <div style={{padding:'0.1rem 0.75rem 0.5rem'}}>
+                  <CoverageRadarMini results={rAsis} model={activeModel} discoveryResults={discoveryResults} logResults={inputLogCovResults} />
+                </div>
+              </div>
+            )}
+
+            {/* TIME */}
+            {hasTime && (
+              <div style={{borderTop:'1px solid #f1f5f9'}}>
+                {secLabel('Time')}
+                {secRow(<>
+                  {wmapeAsis != null && <SummaryMetricCard m={{label:'WMAPE',display:`${wmapeAsis.toFixed(1)}%`,color:ra(wmapeAsis,20,50),hint:'Weighted Mean Absolute % Error — avg difference between simulated and real-log activity service times, weighted by execution count.\nLower is better: <20% excellent · <50% acceptable.'}} />}
+                  {distFidAsis?.overall_w1_s != null && (() => {
+                    const w1Pct = meanSojourn ? distFidAsis.overall_w1_s / meanSojourn * 100 : null;
+                    return <SummaryMetricCard m={{label:'Overall W1',display:fmtW(distFidAsis.overall_w1_s),color:ra(w1Pct,10,30),hint:'Wasserstein-1 on per-activity sojourn time distributions.\nColour = W1 as % of weighted mean real sojourn time.\nLower is better: <10% excellent · <30% acceptable.'}} />;
+                  })()}
+                </>)}
+              </div>
+            )}
+
+            {/* LOG COMPARISON */}
+            <div style={{borderTop:'1px solid #f1f5f9'}}>
+              {secLabel('Log Comparison')}
+              {secRow(<>
+                {xlogData?.activity_kl_divergence != null && <SummaryMetricCard m={{label:'Activity KL Div.',display:xlogData.activity_kl_divergence.toFixed(4),color:ra(xlogData.activity_kl_divergence,0.2,0.5),hint:'KL divergence on activity frequency distributions — how much the simulated activity mix differs from the real log.\n0 = identical · lower is better: <0.2 excellent · <0.5 acceptable.'}} />}
+                {ngdData != null
+                  ? <SummaryMetricCard m={{label:'NGD (n=2)',display:ngdData.ngd.toFixed(4),color:ra(ngdData.ngd,0.1,0.3),hint:'N-Gram Distance (n=2): measures how well the simulator reproduces consecutive activity pairs (bigrams) in object traces — e.g. "Create Order→Pay Invoice" is one bigram. 0 = identical pair distributions; 1 = completely different. Lower is better: <0.10 excellent · <0.30 acceptable. (Chapela-Campa et al., 2023)'}} />
+                  : ngdLoading
+                    ? <span style={{fontSize:'0.74rem',color:'#94a3b8',fontStyle:'italic'}}>NGD computing…</span>
+                    : <span style={{fontSize:'0.74rem',color:'#94a3b8',fontStyle:'italic'}}>NGD — run evaluation</span>
+                }
+              </>)}
+            </div>
+
+          </div>
+        );
+      })()}
+
       {/* Top navigation */}
       <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'1rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
         {tabs.map(t => (
@@ -4806,160 +4422,546 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         ))}
       </div>
 
-      {/* Comparison header — always shown when both exist */}
-      {hasBoth && evalTab === 'comparison' && (() => {
-        const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h'; return Math.floor(s/86400)+'d'; };
-        const pct = (a,b) => a&&b&&a!==0 ? Math.round((b-a)/Math.abs(a)*100) : null;
-        // Graduated color: magnitude of % change scaled by direction preference
-        // lower=true: decrease is good; lower=false: increase is good; lower=null: neutral grey
-        const changeColor = (p, lower) => {
-          if (p === null || lower === null) return '#64748b';
-          const goodDir = lower ? p < 0 : p > 0;
-          const mag = Math.abs(p);
-          if (goodDir) return mag > 25 ? '#16a34a' : mag > 10 ? '#65a30d' : '#64748b';
-          return mag < 10 ? '#64748b' : mag < 25 ? '#ca8a04' : mag < 50 ? '#ea580c' : '#dc2626';
-        };
-        const metrics = [
-          { label:'Events Completed',  a:rAsis?.steps_executed,          b:rTobe?.steps_executed,          fmt:v=>v?.toLocaleString(), lower:null },
-          { label:'Sim Time',          a:rAsis?.sim_time_s,               b:rTobe?.sim_time_s,               fmt:fmtDur,                 lower:true },
-          { label:'Traces Completed',  a:tracesAsis?.deactAll,            b:tracesTobe?.deactAll,            fmt:v=>v?.toLocaleString(), lower:false },
-          { label:'Trace Rate',        a:tracesAsis?.pct,                 b:tracesTobe?.pct,                 fmt:v=>v!=null?v+'%':null,  lower:false },
-          { label:'Avg Wait Time',     a:rAsis?.avg_wait_s,               b:rTobe?.avg_wait_s,               fmt:fmtDur,                 lower:true },
-          { label:'Avg Parallelism',   a:rAsis?.avg_parallelism,          b:rTobe?.avg_parallelism,          fmt:v=>v?.toFixed(2),       lower:false },
-          { label:'Pending Obligations', a:rAsis?.completed_traces,       b:rTobe?.completed_traces,         fmt:v=>v?.toLocaleString(), lower:null },
-        ];
-        return (
-          <div className="results-comparison-header" style={{marginBottom:'1rem'}}>
-            {metrics.map((m,i) => {
-              const p = pct(m.a, m.b);
-              const color = changeColor(p, m.lower);
-              return (
-                <div key={i} className="compare-metric-card">
-                  <div className="compare-metric-label">{m.label}</div>
-                  <div className="compare-metric-asis">{m.fmt(m.a) ?? '—'}</div>
-                  <div className="compare-metric-tobe" style={{color}}>
-                    {m.fmt(m.b) ?? '—'}
-                    {p!==null && <span className="compare-metric-pct"> {p>0?'+':''}{p}%</span>}
+      {evalTab === 'conformance' && (
+        <>
+          {/* ── Per-Constraint Obligation Rates ── */}
+          <Collapsible className="eval-section" title="Per-Constraint Obligation Rates" defaultOpen={false}
+            stickyContent={rAsis ? (
+              <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+                {[
+                  {label:'Fulfilled',  val:obligationsFulfilled, color:'#16a34a', tip:'Total obligations fulfilled — response target fired before the case closed.'},
+                  {label:'Violated',   val:obligationsViolated,  color:'#dc2626', tip:'Total obligations violated — case closed before the response target ever fired.'},
+                  {label:'Cancelled',  val:obligationsCancelled, color:'#ca8a04', tip:'Obligations removed at case-close without being fulfilled or counted as violated.'},
+                ].map(({label,val,color,tip}) => (
+                  <div key={label} className="behavior-stat-card" style={{minWidth:'100px'}}>
+                    <div className="behavior-stat-val" style={{color}}>{val.toLocaleString()}</div>
+                    <div className="behavior-stat-label">{label}<InfoTip text={tip} /></div>
                   </div>
+                ))}
+              </div>
+            ) : null}
+          >
+            {!rAsis ? (
+              <p className="empty-notice">Run a simulation first.</p>
+            ) : (
+              <div>
+                <div style={{fontSize:'0.72rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.5rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
+                  <strong>Fulfillment Rate</strong> = obligations fulfilled ÷ (fulfilled + violated). An obligation is created each time a response constraint's source activity fires for a scope object. It is <em>fulfilled</em> when the target activity later fires for that object, and <em>violated</em> when the object is deactivated (case closed) before the target ever fires. <em>Cancelled</em> obligations are a subset of violations — they are removed at case-close time. A rate of 0% means the model has response constraints but the response activity never fired before cases ended; this commonly means the constraint is unenforced or the simulation terminates too early.
                 </div>
-              );
-            })}
+                {Object.keys(constraintStats).length === 0 ? (
+                  (() => {
+                    const hasResponseConstraints = (activeModel?.constraints || [])
+                      .some(c => c.constraint_type === 'response' || c.constraint_type === 'chain_response');
+                    return (
+                      <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>
+                        {!hasResponseConstraints
+                          ? 'No response constraints in the active model — obligation tracking only applies to response/chain_response constraints.'
+                          : 'Response constraints exist but no obligations were recorded in this run. This may mean the source activities never fired, or the model was not loaded when the simulation ran (re-simulate to populate).'}
+                      </p>
+                    );
+                  })()
+                ) : (
+                  <table className="conf-detail-table" style={{width:'100%'}}>
+                    <thead>
+                      <tr>
+                        <th title="The declarative constraint (type, source → target)" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                        <th className="audit-num" title="Number of times an obligation was created and later met (target fired before case closed)">Fulfilled</th>
+                        <th className="audit-num" title="Number of obligations that were not met — target never fired before case closed">Violated</th>
+                        <th className="audit-num" title="Obligations removed at case-close without being fulfilled or recorded as violated">Cancelled</th>
+                        <th className="audit-num" title="Fulfilled ÷ (Fulfilled + Violated) — fraction of obligations that were met">Fulfillment Rate</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(constraintStats).sort((a,b) => {
+                        const ra = a[1].violated/(a[1].fulfilled+a[1].violated||1);
+                        const rb = b[1].violated/(b[1].fulfilled+b[1].violated||1);
+                        return rb - ra;
+                      }).map(([key, stats]) => {
+                        const total = stats.fulfilled + stats.violated;
+                        const rate  = total > 0 ? stats.fulfilled / total : null;
+                        return (
+                          <tr key={key}>
+                            <td style={{fontSize:'0.72rem',color:'#475569',fontFamily:'monospace'}}>{key}</td>
+                            <td className="audit-num" style={{color:'#16a34a'}}>{stats.fulfilled}</td>
+                            <td className="audit-num" style={{color:'#dc2626'}}>{stats.violated}</td>
+                            <td className="audit-num" style={{color:'#ca8a04'}}>{stats.cancelled}</td>
+                            <td className="audit-num">
+                              <span style={{
+                                color: rate == null ? '#94a3b8' : rate >= 0.9 ? '#16a34a' : rate >= 0.7 ? '#ca8a04' : '#dc2626',
+                                fontWeight: 600,
+                              }}>
+                                {rate == null ? '—' : fmtPct(rate)}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            )}
+          </Collapsible>
+
+          {/* ── Post-hoc Conformance Check ── */}
+          <Collapsible className="eval-section" title="Post-hoc Conformance Check" defaultOpen={false}>
+            {!rAsis?.output_file ? (
+              <p className="empty-notice">No simulation output — run a simulation first.</p>
+            ) : (
+              <>
+                {confLoading && <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.5rem',display:'flex',alignItems:'center',gap:'0.4rem'}}><span className="spinner spinner-sm"/>Checking conformance…</p>}
+                {confError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{confError}</p>}
+                {confData && (
+                  <div>
+                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+                      {[
+                        {label:'Overall Fitness', val: confData.overall_fitness != null ? fmtPct(confData.overall_fitness) : '—', color: confData.overall_fitness >= 0.9 ? '#16a34a' : confData.overall_fitness >= 0.7 ? '#ca8a04' : '#dc2626', tip:'Fraction of all constraint checks that passed — satisfied ÷ total checked.'},
+                        {label:'Constraints Checked', val: confData.num_constraints, color:'#1e293b', tip:'Number of distinct OC-Declare constraints evaluated in this replay.'},
+                        {label:'Scope Objects Checked', val: confData.total_checked, color:'#1e293b', tip:'Total number of (constraint, object) pairs evaluated during replay.'},
+                        {label:'Violations', val: confData.total_violated, color: confData.total_violated > 0 ? '#dc2626' : '#16a34a', tip:'Total number of (constraint, object) pairs where the constraint was not satisfied.'},
+                      ].map(({label,val,color,tip}) => (
+                        <div key={label} className="behavior-stat-card" style={{minWidth:'120px'}}>
+                          <div className="behavior-stat-val" style={{color}}>{typeof val === 'number' ? val.toLocaleString() : val}</div>
+                          <div className="behavior-stat-label">{label}<InfoTip text={tip} /></div>
+                        </div>
+                      ))}
+                    </div>
+                    <table className="conf-detail-table" style={{width:'100%'}}>
+                      <thead>
+                        <tr>
+                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint<InfoTip text="The OC-Declare constraint being checked." /></th>
+                          <th className="audit-num">Scope Type<InfoTip text="Object type scope for which this constraint is evaluated." /></th>
+                          <th className="audit-num">Checked<InfoTip text="Total number of (constraint, object) instances evaluated." /></th>
+                          <th className="audit-num">Violated<InfoTip text="Number of instances where the constraint was not satisfied." /></th>
+                          <th className="audit-num">Violation Rate<InfoTip text="Violated ÷ Checked — fraction of instances that violated this constraint." /></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(() => {
+                          const sorted = (confData.constraint_results || []).sort((a,b) => (b.violation_rate||0)-(a.violation_rate||0));
+                          const violRates = sorted.map(r => r.violation_rate).filter(v => v != null);
+                          const violCounts = sorted.map(r => r.violated).filter(v => v != null && v > 0);
+                          return sorted.map((r,i) => (
+                          <tr key={i}>
+                            <td style={{fontSize:'0.72rem',fontFamily:'monospace',color:'#475569'}}>{r.constraint}</td>
+                            <td className="audit-num" style={{color:'#64748b',fontSize:'0.7rem'}}>{r.scope_type || '—'}</td>
+                            <td className="audit-num">{r.checked}</td>
+                            <td className="audit-num" style={{color: r.violated > 0 ? normColor(r.violated, violCounts, false) : '#16a34a'}}>{r.violated}</td>
+                            <td className="audit-num">
+                              <span style={{color: r.violation_rate == null ? '#94a3b8' : normColor(r.violation_rate, violRates, false), fontWeight:600}}>
+                                {r.violation_rate == null ? '—' : fmtPct(r.violation_rate)}
+                              </span>
+                            </td>
+                          </tr>
+                          ));
+                        })()}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
+            )}
+          </Collapsible>
+
+          {/* ── OCPQ Analysis ── */}
+          <Collapsible className="eval-section" title="OCPQ Analysis" defaultOpen={false}>
+            <div style={{padding:'0.75rem 0'}}>
+              <OCPQPanel results={rAsis} onTotalsComputed={setOcpqTotals} />
+            </div>
+          </Collapsible>
+        </>
+      )}
+
+      {evalTab === 'time' && (
+        <>
+          {/* Distribution & Cross-Log Fidelity — merged */}
+          {inputEventLogFile && (() => {
+        const ksColor = (v) => v == null ? '#64748b' : v < 0.1 ? '#16a34a' : v < 0.2 ? '#d97706' : '#dc2626';
+        const allRows = distFidAsis?.activity_rows || [];
+        const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
+        const pctCls = d => d == null ? '' : Math.abs(d) < 10 ? 'cmp-ok' : Math.abs(d) < 30 ? 'cmp-under' : 'cmp-over';
+        return (
+          <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
+            <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap', cursor:'pointer', userSelect:'none'}} onClick={() => setDistFidOpen(o => !o)}>
+              <span style={{fontSize:'0.7rem', color:'#94a3b8', flexShrink:0}}>{distFidOpen ? '▼' : '▶'}</span>
+              <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
+                Distribution Fidelity (sim vs real log)
+              </span>
+              <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
+                W1/KS on sojourn times · KL divergence on activity &amp; object distributions · EMD on timing
+              </span>
+              {(distFidLoading || xlogLoading) && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
+            </div>
+            {distFidError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{distFidError}</p>}
+            {xlogError   && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{xlogError}</p>}
+
+            {/* Always-visible summary cards — stacked rows */}
+            {(distFidAsis || xlogData) && (
+              <div style={{display:'flex', flexDirection:'column', gap:'0.4rem', marginBottom:'0.5rem'}}>
+                {/* Row 1: Overall W1 */}
+                {distFidAsis && (
+                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
+                    <div className="compare-metric-card" style={{minWidth:'120px'}}>
+                      <div className="compare-metric-label">Overall W1 (timing)<InfoTip text="Wasserstein-1 distance between the per-activity sojourn time distributions of the simulated and real log. Computed as a weighted mean over all activities (weight = real-log sample count). Lower is better; unit is seconds." /></div>
+                      <div className="compare-metric-asis">{fmtDur(distFidAsis.overall_w1_s)}</div>
+                    </div>
+                  </div>
+                )}
+                {/* Row 2: Overall KS */}
+                {distFidAsis && (
+                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
+                    <div className="compare-metric-card" style={{minWidth:'100px'}}>
+                      <div className="compare-metric-label">Overall KS (sojourn)<InfoTip text="Kolmogorov-Smirnov statistic comparing per-activity sojourn time distributions. Weighted mean over all activities (weight = real-log sample count). Range 0–1; lower is better (0 = identical distributions, >0.2 = high divergence)." /></div>
+                      <div className="compare-metric-asis" style={{color: ksColor(distFidAsis.overall_ks_s)}}>
+                        {distFidAsis.overall_ks_s?.toFixed(3) ?? '—'}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {/* Row 3: Activity KL Div. | Object Type KL Div. | Timing EMD */}
+                {xlogData && (
+                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
+                    {[
+                      {label:'Activity KL Div.',    val: xlogData.activity_kl_divergence?.toFixed(4),    tip:'KL divergence between simulated and real per-activity frequency distributions. 0 = identical; lower is better.'},
+                      {label:'Object Type KL Div.', val: xlogData.object_type_kl_divergence?.toFixed(4), tip:'KL divergence between simulated and real object type count distributions. 0 = identical; lower is better.'},
+                      {label:'Timing EMD',         val: xlogData.timing_emd_s != null ? fmtDur(xlogData.timing_emd_s) : '—',   tip:'Earth Mover\'s Distance (Wasserstein-1) on inter-event time gaps between simulation and real log. Lower is better.'},
+                    ].map(({label,val,tip}) => (
+                      <div key={label} className="compare-metric-card" style={{minWidth:'110px'}}>
+                        <div className="compare-metric-label">{label}<InfoTip text={tip} /></div>
+                        <div className="compare-metric-asis">{val ?? '—'}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Expandable detail content */}
+            {distFidOpen && (
+              <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginTop:'0.25rem'}}>
+                {/* Per-activity sojourn table */}
+                {distFidAsis && allRows.length > 0 && (
+                  <div style={{maxHeight:'260px', overflowY:'auto', fontSize:'0.7rem'}}>
+                    <table style={{width:'100%', borderCollapse:'collapse'}}>
+                      <thead>
+                        <tr style={{background:'#f1f5f9', position:'sticky', top:0}}>
+                          <th style={{textAlign:'left', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Activity</th>
+                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Real n</th>
+                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Sim n</th>
+                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>W1 (timing)<InfoTip text="Wasserstein-1 distance between sojourn time distributions for this activity. Sojourn = backward gap to the last event sharing an object. Unit: seconds; lower = closer match to the real log." /></th>
+                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>KS (sojourn)<InfoTip text="Kolmogorov-Smirnov statistic on sojourn time distributions for this activity. Range 0–1; lower = closer match." /></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allRows.map((row, i) => {
+                          const fmtVal = (v, isDur) => v != null ? (isDur ? fmtDur(v) : v.toFixed(3)) : '—';
+                          const valColor = (v) => v != null ? '#334155' : '#94a3b8';
+                          return (
+                            <tr key={row.activity} style={{background: i%2===0?'#fff':'#f8fafc', borderBottom:'1px solid #f1f5f9'}}>
+                              <td style={{padding:'3px 6px', color:'#334155'}}>{row.activity}</td>
+                              <td style={{padding:'3px 6px', textAlign:'right', color:'#64748b'}}>{row.real_n}</td>
+                              <td style={{padding:'3px 6px', textAlign:'right', color:'#64748b'}}>{row.sim_n}</td>
+                              <td style={{padding:'3px 6px', textAlign:'right', color: valColor(row.w1_s)}}>{fmtVal(row.w1_s, true)}</td>
+                              <td style={{padding:'3px 6px', textAlign:'right', color: valColor(row.ks_s)}}>{fmtVal(row.ks_s, false)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {/* Cross-log detail content */}
+                {!rAsis?.output_file ? (
+                  <p className="empty-notice">No simulation output — run a simulation first.</p>
+                ) : (distFidAsis || xlogData) && (
+                  <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap'}}>
+                      {distFidAsis && [
+                        {label:'Real Events',  val: distFidAsis.real_event_count?.toLocaleString()},
+                        {label:'Sim Events',   val: distFidAsis.sim_event_count?.toLocaleString()},
+                      ].map(({label,val}) => (
+                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
+                          <div className="behavior-stat-val">{val ?? '—'}</div>
+                          <div className="behavior-stat-label">{label}</div>
+                        </div>
+                      ))}
+                      {xlogData && [
+                        {label:'Real Events (xlog)', val: xlogData.real_event_count?.toLocaleString()},
+                        {label:'Sim Events (xlog)',  val: xlogData.sim_event_count?.toLocaleString()},
+                      ].map(({label,val}) => (
+                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
+                          <div className="behavior-stat-val">{val ?? '—'}</div>
+                          <div className="behavior-stat-label">{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {xlogData && (<>
+                    {xlogData.timing_summary && (
+                      <details>
+                        <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Timing Summary</summary>
+                        <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginTop:'0.5rem'}}>
+                          {[
+                            {label:'Real Mean Gap',   val: fmtDur(xlogData.timing_summary.real_gap_mean_s)},
+                            {label:'Sim Mean Gap',    val: fmtDur(xlogData.timing_summary.sim_gap_mean_s)},
+                            {label:'Real Median Gap', val: fmtDur(xlogData.timing_summary.real_gap_median_s)},
+                            {label:'Sim Median Gap',  val: fmtDur(xlogData.timing_summary.sim_gap_median_s)},
+                          ].map(({label,val}) => (
+                            <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
+                              <div className="behavior-stat-val">{val}</div>
+                              <div className="behavior-stat-label">{label}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    )}
+                    <details open>
+                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Activity Frequency Comparison</summary>
+                      <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                        <table className="conf-detail-table" style={{width:'100%'}}>
+                          <thead>
+                            <tr>
+                              <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
+                              <th className="audit-num" title="Count in real log">Real Count</th>
+                              <th className="audit-num" title="Count in sim log">Sim Count</th>
+                              <th className="audit-num" title="Fraction in real log">Real Freq</th>
+                              <th className="audit-num" title="Fraction in sim log">Sim Freq</th>
+                              <th className="audit-num" title="Sim − Real in percentage points">Δ Freq</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(xlogData.activity_freq_table || []).map((row,i) => {
+                              const diff = row.sim_freq - row.real_freq;
+                              return (
+                                <tr key={i}>
+                                  <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
+                                  <td className="audit-num">{row.real_count.toLocaleString()}</td>
+                                  <td className="audit-num">{row.sim_count.toLocaleString()}</td>
+                                  <td className="audit-num">{(row.real_freq*100).toFixed(1)}%</td>
+                                  <td className="audit-num">{(row.sim_freq*100).toFixed(1)}%</td>
+                                  <td className={`audit-num cmp-diff ${pctCls(diff*100)}`}>
+                                    {diff >= 0 ? '+' : ''}{(diff*100).toFixed(1)}pp
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                    <details>
+                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Object Type Count Comparison</summary>
+                      <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                        <table className="conf-detail-table" style={{width:'100%'}}>
+                          <thead>
+                            <tr>
+                              <th style={{textAlign:'left',fontSize:'0.72rem'}}>Object Type</th>
+                              <th className="audit-num">Real Count</th>
+                              <th className="audit-num">Sim Count</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(xlogData.object_type_table || []).map((row,i) => (
+                              <tr key={i}>
+                                <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.object_type}</td>
+                                <td className="audit-num">{row.real_count.toLocaleString()}</td>
+                                <td className="audit-num">{row.sim_count.toLocaleString()}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                    </>)}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         );
       })()}
 
-      {/* Side-by-side comparison of previous evaluations */}
-      {evalTab === 'comparison' && (
-        <div className="results-compare-layout">
-          {[{label:'As-Is / Base Model', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label,r}) => (
-            <div key={label} className="run-result-panel">
-              <div className="run-result-panel-header">{label}</div>
-              <div style={{padding:'0.5rem'}}>
-                <EvaluationTab
-                  results={r}
-                  discoveryResults={discoveryResults}
-                  activeModel={activeModel}
-                  serviceTimeMode={serviceTimeMode}
-                  simActivityObjectCounts={simActivityObjectCounts}
-                  onConformanceSaved={onConformanceSaved}
-                  eventLogFiles={eventLogFiles}
-                  handleFileUpload={handleFileUpload}
-                  inputLogConfResults={inputLogConfResults}
-                  inputEventLogFile={inputEventLogFile}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Verification matrix tab */}
-      {evalTab === 'matrix' && (
-        <div>
-          <div style={{display:'flex',gap:'0.5rem',marginBottom:'0.75rem',flexWrap:'wrap',alignItems:'center'}}>
-            <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginRight:'0.25rem'}}>Mode:</span>
-            {VERIFY_MODES.map(m => (
-              <button key={m.key} onClick={() => setVerifyMode(m.key)}
-                style={{padding:'0.2rem 0.65rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
-                  border: verifyMode===m.key ? '2px solid #1e293b' : '1px solid #e2e8f0',
-                  background: verifyMode===m.key ? '#1e293b' : 'white',
-                  color: verifyMode===m.key ? 'white' : '#475569'}}>
-                {m.label}
+          {/* ── Multi-Seed Variance Analysis ── */}
+          <Collapsible className="eval-section" title="Multi-Seed Variance Analysis" defaultOpen={false}>
+            <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
+              Runs the simulation with multiple random seeds and reports mean ± std for key metrics,
+              quantifying reproducibility and sensitivity to seed choice.
+            </p>
+            <div style={{display:'flex',gap:'0.5rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+              <label style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Seeds (comma-separated):</label>
+              <input
+                value={multiSeeds}
+                onChange={e => setMultiSeeds(e.target.value)}
+                style={{padding:'0.3rem 0.5rem',fontSize:'0.8rem',border:'1px solid #e2e8f0',borderRadius:'4px',width:'220px'}}
+                placeholder="42, 99, 123, 456, 789"
+              />
+              <button className="simulate-button"
+                style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',
+                        background: multiLoading ? '#94a3b8' : '#6366f1'}}
+                onClick={runMultiSeed} disabled={multiLoading || !safeStartActivities.length}>
+                {multiLoading ? 'Running…' : 'Run Multi-Seed Analysis'}
               </button>
-            ))}
-            {verifyMode === 'time' && (
-              <>
-                <span style={{fontSize:'0.75rem',fontWeight:700,color:'#64748b',marginLeft:'0.75rem',marginRight:'0.25rem'}}>Aggregation:</span>
-                {['mean','min','max'].map(sub => (
-                  <button key={sub} onClick={() => setTimeSubMode(sub)}
-                    style={{padding:'0.2rem 0.55rem',fontSize:'0.75rem',fontWeight:600,borderRadius:'4px',cursor:'pointer',
-                      border: timeSubMode===sub ? '2px solid #1d4ed8' : '1px solid #e2e8f0',
-                      background: timeSubMode===sub ? '#1d4ed8' : 'white',
-                      color: timeSubMode===sub ? 'white' : '#475569'}}>
-                    {sub.charAt(0).toUpperCase()+sub.slice(1)}
-                  </button>
-                ))}
-              </>
-            )}
-          </div>
-          <div className="results-compare-layout">
-            <div className="run-result-panel">
-              <div className="run-result-panel-header">As-Is / Base Model</div>
-              <div style={{padding:'1rem'}}>{renderVerifyMatrix(matrixAsis, 'As-Is / Base Model')}</div>
             </div>
-            {rTobe && (
-              <div className="run-result-panel">
-                <div className="run-result-panel-header">To-Be</div>
-                <div style={{padding:'1rem'}}>{renderVerifyMatrix(matrixTobe, 'To-Be')}</div>
+            {!safeStartActivities.length && (
+              <p style={{fontSize:'0.78rem',color:'#ca8a04'}}>Start activities not detected — load a discovery result first.</p>
+            )}
+            {multiError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{multiError}</p>}
+            {multiData && (
+              <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
+                <div style={{overflowX:'auto'}}>
+                  <table className="conf-detail-table" style={{width:'100%'}}>
+                    <thead>
+                      <tr>
+                        <th title="Simulation metric name" style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
+                        <th className="audit-num" title="Mean value across all seeds">Mean</th>
+                        <th className="audit-num" title="Standard deviation across seeds — lower = more stable">Std Dev</th>
+                        <th className="audit-num" title="Lowest value observed across all seeds">Min</th>
+                        <th className="audit-num" title="Highest value observed across all seeds">Max</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(multiData.summary || {}).map(([key, s]) => (
+                        <tr key={key}>
+                          <td style={{fontSize:'0.72rem',color:'#475569'}}>{key.replace(/_/g,' ')}</td>
+                          <td className="audit-num">{fmtNum(s.mean)}</td>
+                          <td className="audit-num">{fmtNum(s.std)}</td>
+                          <td className="audit-num">{fmtNum(s.min)}</td>
+                          <td className="audit-num">{fmtNum(s.max)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {Object.keys(multiData.constraint_summary || {}).length > 0 && (
+                  <details>
+                    <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Constraint Fulfillment Rate (across seeds)</summary>
+                    <table className="conf-detail-table" style={{width:'100%',marginTop:'0.5rem'}}>
+                      <thead>
+                        <tr>
+                          <th title="Declarative constraint identifier" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
+                          <th className="audit-num" title="Mean fulfillment rate across all seeds (Fulfilled ÷ (Fulfilled + Violated))">Mean Rate</th>
+                          <th className="audit-num" title="Standard deviation of fulfillment rate across seeds — lower = more consistent">Std Dev</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(multiData.constraint_summary).map(([ck, s]) => (
+                          <tr key={ck}>
+                            <td style={{fontSize:'0.7rem',fontFamily:'monospace',color:'#475569'}}>{ck}</td>
+                            <td className="audit-num">
+                              <span style={{color: s.mean == null ? '#94a3b8' : s.mean >= 0.9 ? '#16a34a' : s.mean >= 0.7 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
+                                {s.mean != null ? fmtPct(s.mean) : '—'}
+                              </span>
+                            </td>
+                            <td className="audit-num">{s.std != null ? `±${fmtPct(s.std)}` : '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </details>
+                )}
+                <details>
+                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Seed Breakdown</summary>
+                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
+                    <table className="conf-detail-table" style={{width:'100%'}}>
+                      <thead>
+                        <tr>
+                          <th className="audit-num" title="Random seed used for this simulation run">Seed</th>
+                          <th className="audit-num" title="Total number of events fired in this run">Events</th>
+                          <th className="audit-num" title="Total number of objects instantiated in this run">Objects</th>
+                          <th className="audit-num" title="Number of object traces that completed (lifecycle ended)">Traces</th>
+                          <th className="audit-num" title="Number of response-constraint obligations that were fulfilled">Obl. Fulfilled</th>
+                          <th className="audit-num" title="Number of response-constraint obligations that were violated (case closed before target fired)">Obl. Violated</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(multiData.runs || []).map(r => (
+                          <tr key={r.seed}>
+                            <td className="audit-num" style={{fontWeight:600}}>{r.seed}</td>
+                            <td className="audit-num">{r.events_count.toLocaleString()}</td>
+                            <td className="audit-num">{r.objects_count.toLocaleString()}</td>
+                            <td className="audit-num">{r.completed_traces.toLocaleString()}</td>
+                            <td className="audit-num" style={{color:'#16a34a'}}>{r.obligations_fulfilled}</td>
+                            <td className="audit-num" style={{color: r.obligations_violated > 0 ? '#dc2626' : '#16a34a'}}>{r.obligations_violated}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </div>
+            )}
+          </Collapsible>
+        </>
+      )}
+
+      {evalTab === 'log-comparison' && (
+        <>
+          {/* ── N-Gram Distance ── */}
+          {inputEventLogFile && (() => {
+        const ngdColor = v => v == null ? '#64748b' : v <= 0.1 ? '#16a34a' : v <= 0.3 ? '#d97706' : '#dc2626';
+        const freqTable = xlogData?.activity_freq_table || [];
+        const wmapeEventCount = (() => {
+          const totalReal = freqTable.reduce((s, r) => s + (r.real_count || 0), 0);
+          if (totalReal === 0) return null;
+          const sumAbsErr = freqTable.reduce((s, r) => s + Math.abs((r.sim_count || 0) - (r.real_count || 0)), 0);
+          return sumAbsErr / totalReal;
+        })();
+        return (
+          <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
+            <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap'}}>
+              <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
+                N-Gram Distance (NGD, n=2)
+              </span>
+              <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
+                consecutive activity pairs (bigrams) in object traces · sim vs real log
+              </span>
+              {ngdLoading && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
+            </div>
+            {ngdError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{ngdError}</p>}
+            {ngdData && (
+              <div style={{display:'flex', gap:'0.5rem', marginBottom:'0.5rem', flexWrap:'wrap', alignItems:'flex-start'}}>
+                <div className="compare-metric-card" style={{minWidth:'100px'}}>
+                  <div className="compare-metric-label">NGD<InfoTip text="N-Gram Distance (n=2): counts every consecutive activity pair (bigram) in each object's trace — e.g. for an object appearing in Create→Approve→Pay, the bigrams are (Create→Approve) and (Approve→Pay). Compares how often each bigram occurs in sim vs real. Low NGD = the simulator produces realistic activity orderings; high NGD = transitions between activities differ from the real log. (Chapela-Campa et al., 2023)" /></div>
+                  <div className="compare-metric-asis" style={{color: ngdColor(ngdData.ngd)}}>{ngdData.ngd.toFixed(4)}</div>
+                </div>
+                <div className="compare-metric-card" style={{minWidth:'90px'}}>
+                  <div className="compare-metric-label">Unique bigrams<InfoTip text="Number of distinct activity bigrams (consecutive pairs) observed across both logs." /></div>
+                  <div className="compare-metric-asis">{ngdData.uniqueNgrams}</div>
+                </div>
+                <div className="compare-metric-card" style={{minWidth:'90px'}}>
+                  <div className="compare-metric-label">Real bigrams<InfoTip text="Total number of activity bigrams in the real (input) log." /></div>
+                  <div className="compare-metric-asis">{ngdData.totalRealNgrams.toLocaleString()}</div>
+                </div>
+                <div className="compare-metric-card" style={{minWidth:'90px'}}>
+                  <div className="compare-metric-label">Sim bigrams<InfoTip text="Total number of activity bigrams in the simulated log." /></div>
+                  <div className="compare-metric-asis">{ngdData.totalSimNgrams.toLocaleString()}</div>
+                </div>
+                {wmapeEventCount != null && (
+                  <div className="compare-metric-card" style={{minWidth:'110px'}}>
+                    <div className="compare-metric-label">WMAPE (event count)<InfoTip text="Weighted Mean Absolute Percentage Error over per-activity event counts: Σ|sim−real| ÷ Σreal. Measures how closely the simulated activity frequencies match the real log. Lower is better." /></div>
+                    <div className="compare-metric-asis" style={{color: wmapeEventCount <= 0.2 ? '#16a34a' : wmapeEventCount <= 0.5 ? '#d97706' : '#dc2626'}}>{(wmapeEventCount * 100).toFixed(1)}%</div>
+                  </div>
+                )}
               </div>
             )}
           </div>
-        </div>
+        );
+      })()}
+
+          {/* ── Object Cardinality Fidelity moved to Further Measures strip ── */}
+        </>
       )}
 
-      {/* Coverage tab — side-by-side for As-Is and To-Be */}
+      {/* Coverage tab */}
       {evalTab === 'coverage' && (
-        <div className="results-compare-layout">
-          {[{label:'As-Is / Base Model', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
-            <div key={label} className="run-result-panel">
-              <div className="run-result-panel-header">{label}</div>
-              <div style={{padding:'1rem'}}>
-                <OCCoveragePanel results={r} model={activeModel || modelBase} discoveryResults={discoveryResults} />
-              </div>
-            </div>
-          ))}
-        </div>
+        <OCCoveragePanel results={rAsis} model={activeModel || modelBase} discoveryResults={discoveryResults} logResults={inputLogCovResults} />
       )}
 
-      {/* OCPQ tab — As-Is and To-Be side by side */}
-      {evalTab === 'ocpq' && (
-        <div className="results-compare-layout">
-          {[{label:'As-Is / Base Model', r:rAsis}, ...(rTobe?[{label:'To-Be',r:rTobe}]:[])].map(({label, r}) => (
-            <div key={label} className="run-result-panel">
-              <div className="run-result-panel-header">{label}</div>
-              <div style={{padding:'0.75rem'}}>
-                <OCPQPanel results={r} />
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Further Evaluations tab */}
-      {evalTab === 'further' && (
-        <FurtherEvaluations
-          results={rAsis}
-          activeModel={activeModel}
-          discoveryResults={discoveryResults}
-          eventLogFile={inputEventLogFile}
-          startActivities={discoveryResults?.strict_start_activities || discoveryResults?.likely_start_activities || []}
-        />
-      )}
     </div>
   );
 }
 
-function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
+function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, onScoresComputed, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
   const logDurations = activeModel?.activity_durations || {};
   const [inlineConfScores, setInlineConfScores] = React.useState(null); // live conformance scores
@@ -5157,85 +5159,6 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
       {/* ── Simulation Result ── */}
       {Object.keys(simMetrics).length > 0 && (
         <Collapsible className="eval-section" title="Simulation Result" defaultOpen={true}>
-          {/* Service time summary */}
-          {(() => {
-            const fmtS = v => {
-              if (v == null || v === 0) return '—';
-              if (v >= 86400) return `${(v/86400).toFixed(1)} d`;
-              if (v >= 3600)  return `${(v/3600).toFixed(1)} h`;
-              if (v >= 60)    return `${Math.round(v/60)} min`;
-              return `${Math.round(v)} s`;
-            };
-            // Total accumulated service time across all activities
-            const totalSvcS = orderedActivities.reduce((s, act) => {
-              const m = simMetrics[act];
-              if (!m) return s;
-              return s + (m.mean_service_s || 0) * (m.execution_count || 0);
-            }, 0);
-            const wmapeAct = logTotal > 0 && simTotal > 0
-              ? orderedActivities.reduce((s, act) => {
-                  const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
-                  const lp = (logCounts[act]||0) / logTotal * 100;
-                  return s + Math.abs(sp - lp);
-                }, 0)
-              : null;
-            return (
-              <div style={{overflowX:'auto'}}>
-              <table className="metrics-table sim-compare-table">
-                <thead>
-                  <tr>
-                    <th>Activity</th>
-                    <th title="Times fired in simulation">Sim count</th>
-                    <th title="Times fired in input log">Log count</th>
-                    <th title="Share of simulated events">Sim %</th>
-                    <th title="Share of log events">Log %</th>
-                    <th title="Sim % − Log %">Diff {wmapeAct != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmapeAct < 10 ? '#16a34a' : wmapeAct < 25 ? '#ca8a04' : wmapeAct < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmapeAct.toFixed(1)}%</span>}</th>
-                    <th title="Share of total accumulated service time across all activities">Time share</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {orderedActivities.map(act => {
-                    const m = simMetrics[act] || {};
-                    const simCount = m.execution_count ?? 0;
-                    const logCount = logCounts[act] ?? 0;
-                    const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
-                    const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
-                    const diff = simPct - logPct;
-                    const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
-                    const meanSvc = m.mean_service_s ?? null;
-                    const totalSvc = meanSvc != null ? meanSvc * simCount : null;
-                    const timeShare = totalSvcS > 0 && totalSvc != null ? totalSvc / totalSvcS * 100 : null;
-                    return (
-                      <tr key={act}>
-                        <td className="metrics-act-name">{act}</td>
-                        <td>{simCount || '—'}</td>
-                        <td>{logCount || '—'}</td>
-                        <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                        <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                        <td className={`cmp-diff ${diffClass}`}>{simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}</td>
-                        <td>
-                          {timeShare != null ? (
-                            <span style={{display:'inline-flex',alignItems:'center',gap:'0.3rem'}}>
-                              <span style={{fontSize:'0.78rem',fontWeight:600,minWidth:'36px'}}>{timeShare.toFixed(1)}%</span>
-                              <span style={{
-                                display:'inline-block', height:'8px',
-                                width:`${Math.max(2, timeShare * 1.2)}px`,
-                                maxWidth:'80px',
-                                background:`hsl(${220 - timeShare * 1.8},70%,55%)`,
-                                borderRadius:'3px', flexShrink:0
-                              }}/>
-                            </span>
-                          ) : '—'}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              </div>
-            );
-          })()}
-
           {/* ── Confidence Score (Conformance) — inline summary + collapsible detail ── */}
           <div style={{marginTop:'0.75rem'}}>
             <div style={{display:'flex',alignItems:'center',gap:'1rem',marginBottom:'0.4rem',flexWrap:'wrap'}}>
@@ -5249,7 +5172,6 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
                   return (
                     <>
                       <span style={{fontSize:'0.82rem',color:'#64748b'}}>Fitness: <strong className={cls(scores.fitness)}>{fmt(scores.fitness)}</strong></span>
-                      <span style={{fontSize:'0.82rem',color:'#64748b'}}>Con. Fitness: <strong className={cls(scores.constraint_fitness)}>{fmt(scores.constraint_fitness)}</strong></span>
                       <span style={{fontSize:'0.82rem',color:'#64748b'}}>Precision: <strong className={cls(scores.precision)}>{fmt(scores.precision)}</strong></span>
                     </>
                   );
@@ -5264,7 +5186,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
               onEventsLoadStart={() => markStart('events')}
               onEventsLoadDone={() => markDone('events')}
               onConformanceDone={() => markDone('conformance')}
-              onScoresComputed={scores => setInlineConfScores(scores)}
+              onScoresComputed={scores => { setInlineConfScores(scores); onScoresComputed?.(scores); }}
               inputLogConfResults={inputLogConfResults}
               inputEventLogFile={inputEventLogFile}
             />
@@ -5374,199 +5296,11 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           );
         })()}
 
-        {/* Service time chart */}
-        <Collapsible className="eval-subsection" title="Service Time per Activity" defaultOpen={false}>
-          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
-            Both sides use the <strong>{modeLabel[serviceTimeMode] || serviceTimeMode}</strong> discovery method.
-            Left: input OCEL log (from Parameter tab discovery). Right: simulated output log (discovered now).
-            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
-            {simDiscoverError && <span style={{marginLeft:'0.5rem',color:'#b91c1c'}}>⚠ {simDiscoverError}</span>}
-          </p>
-          <ActivityBarChart
-            logDurations={logDurations}
-            simDurations={simDiscovered || {}}
-            metric="service"
-            title="Service Time"
-            orderedActivities={orderedActivities}
-          />
-        </Collapsible>
-
-        {/* Waiting time chart */}
-        <Collapsible className="eval-subsection" title="Waiting Time per Activity" defaultOpen={false}>
-          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
-            Waiting time = sojourn − service, using the same discovery method as service time.
-            {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
-          </p>
-          <ActivityBarChart
-            logDurations={logDurations}
-            simDurations={simDiscovered || {}}
-            metric="waiting"
-            title="Waiting Time"
-            orderedActivities={orderedActivities}
-          />
-        </Collapsible>
-
-        {/* Timing Discovery Comparison table */}
-        <Collapsible className="eval-subsection" title="Timing Discovery Comparison" defaultOpen={false}>
-          {(() => {
-            const fmtS = v => {
-              if (v == null || v === 0) return '—';
-              if (v >= 86400) return `${(v/86400).toFixed(1)} d`;
-              if (v >= 3600)  return `${(v/3600).toFixed(1)} h`;
-              if (v >= 60)    return `${Math.round(v/60)} min`;
-              return `${Math.round(v)} s`;
-            };
-            const pctDiff = (a, b) => (a == null || b == null || a === 0) ? null : (b - a) / a * 100;
-            const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
-            const pctCls = v => { if (v == null) return ''; const n = Math.abs(v); return n < 5 ? 'cmp-ok' : v > 0 ? 'cmp-over' : 'cmp-under'; };
-
-            const fields = [
-              { key: 'service_mean', label: 'Service mean' },
-              { key: 'service_min',  label: 'Service min' },
-              { key: 'service_max',  label: 'Service max' },
-              { key: 'waiting_mean', label: 'Waiting mean' },
-              { key: 'sojourn_mean', label: 'Sojourn mean' },
-            ];
-            const acts = orderedActivities.filter(a => logDurations[a] || simDiscovered?.[a]);
-            if (acts.length === 0) return <p className="empty-notice">No timing data available yet.{simDiscovering && ' Discovering…'}</p>;
-
-            // WMAPE on service_mean (weighted by execution count)
-            let wmapeNum = 0, wmapeDen = 0;
-            acts.forEach(act => {
-              const lv = logDurations[act]?.service_mean;
-              const sv = simDiscovered?.[act]?.service_mean;
-              const w = simMetrics[act]?.execution_count || 1;
-              if (lv != null && sv != null && lv > 0) { wmapeNum += Math.abs(sv - lv) * w; wmapeDen += lv * w; }
-            });
-            const wmapeDisc = wmapeDen > 0 ? wmapeNum / wmapeDen * 100 : null;
-
-            // Overall relative deviation: mean of |Δ%| across all (act, field) pairs
-            let deviations = [];
-            acts.forEach(act => {
-              const log = logDurations[act] || {};
-              const sim = simDiscovered?.[act] || {};
-              fields.forEach(f => {
-                const d = pctDiff(log[f.key], sim[f.key]);
-                if (d != null) deviations.push(d);
-              });
-            });
-            const overallMeanDev = deviations.length > 0
-              ? deviations.reduce((s, v) => s + v, 0) / deviations.length : null;
-            const overallAbsDev = deviations.length > 0
-              ? deviations.reduce((s, v) => s + Math.abs(v), 0) / deviations.length : null;
-
-            return (
-              <div>
-                <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
-                  Input OCEL log vs simulated output log, both using <strong>{({minimum:'Minimum sojourn',p25:'P25 sojourn',p50:'P50 (median) sojourn'})[serviceTimeMode] || serviceTimeMode}</strong>.
-                  {simDiscovering && <span style={{marginLeft:'0.5rem',color:'#6366f1'}}>Discovering output log…</span>}
-                </p>
-
-                {/* Overall deviation summary */}
-                <div className="timing-compare-overall">
-                  {wmapeDisc != null && (
-                    <span style={{marginRight:'1.5rem',display:'inline-flex',alignItems:'center',gap:'0.4rem'}}>
-                      <span className="timing-compare-overall-label">WMAPE (service mean)</span>
-                      <span className={`timing-compare-overall-val ${wmapeDisc < 20 ? 'cmp-ok' : wmapeDisc < 50 ? '' : 'cmp-over'}`}
-                        title="Weighted Mean Absolute Percentage Error on service_mean, weighted by execution count">
-                        {wmapeDisc.toFixed(1)}%
-                      </span>
-                    </span>
-                  )}
-                  <span className="timing-compare-overall-label">Overall mean relative deviation</span>
-                  <span className={`timing-compare-overall-val ${pctCls(overallMeanDev)}`}>{fmtPct(overallMeanDev)}</span>
-                  <span className="timing-compare-overall-label" style={{marginLeft:'1.5rem'}}>Mean absolute deviation</span>
-                  <span className="timing-compare-overall-val" style={{color:'#475569'}}>{overallAbsDev != null ? overallAbsDev.toFixed(1) + '%' : '—'}</span>
-                </div>
-
-                {/* Per-activity foldable rows */}
-                <div className="timing-compare-act-list">
-                  {acts.map(act => {
-                    const log = logDurations[act] || {};
-                    const sim = simDiscovered?.[act] || {};
-                    const summaryPcts = fields.map(f => pctDiff(log[f.key], sim[f.key])).filter(v => v != null);
-                    const avgPct = summaryPcts.length > 0 ? summaryPcts.reduce((s,v)=>s+v,0)/summaryPcts.length : null;
-                    return (
-                      <details key={act} className="timing-compare-act-details">
-                        <summary className="timing-compare-act-summary">
-                          <span className="timing-compare-act-name">{act}</span>
-                          <span className="timing-compare-act-chips">
-                            {fields.map(f => {
-                              const d = pctDiff(log[f.key], sim[f.key]);
-                              return d != null ? (
-                                <span key={f.key} className={`timing-compare-chip ${pctCls(d)}`} title={f.label}>
-                                  {f.label.replace('Service ','svc ').replace('Waiting ','wait ').replace('Sojourn ','sojourn ')}:&nbsp;{fmtPct(d)}
-                                </span>
-                              ) : null;
-                            })}
-                          </span>
-                          <span className={`timing-compare-act-avg ${pctCls(avgPct)}`}>{fmtPct(avgPct)}</span>
-                        </summary>
-                        {/* Expanded detail table */}
-                        <table className="timing-compare-detail-table">
-                          <thead>
-                            <tr>
-                              <th title="Timing metric (service time, sojourn time, waiting time, etc.)">Metric</th>
-                              <th className="audit-num" title="Value measured from the input event log">Input Log</th>
-                              <th className="audit-num" title="Value measured from the simulation output">Sim Output</th>
-                              <th className="audit-num" title="Sim − Log (same unit as the metric)">Δ absolute</th>
-                              <th className="audit-num" title="(Sim − Log) ÷ Log × 100% — relative difference">Δ %</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {fields.map(f => {
-                              const lv = log[f.key], sv = sim[f.key];
-                              const da = (lv != null && sv != null) ? sv - lv : null;
-                              const dp = pctDiff(lv, sv);
-                              return (
-                                <tr key={f.key}>
-                                  <td style={{color:'#64748b',fontSize:'0.72rem'}}>{f.label}</td>
-                                  <td className="audit-num">{fmtS(lv)}</td>
-                                  <td className="audit-num">{fmtS(sv)}</td>
-                                  <td className={`audit-num cmp-diff ${pctCls(da != null ? (da > 0 ? 1 : da < 0 ? -1 : 0) : null)}`}>
-                                    {da != null ? (da >= 0 ? '+' : '') + fmtS(da) : '—'}
-                                  </td>
-                                  <td className={`audit-num cmp-diff ${pctCls(dp)}`}>{fmtPct(dp)}</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </details>
-                    );
-                  })}
-                </div>
-              </div>
-            );
-          })()}
-        </Collapsible>
-
         {/* Activity Timeline — removed from evaluation; see Time collapsible in Results tab */}
       </Collapsible>
 
-      {/* ── Trace Health ── */}
-      <TraceHealth results={results} />
-
       {/* ── Constraint Analysis ── */}
       <ConstraintAnalysis activeModel={activeModel} results={results} />
-
-      {/* ── O2O Comparison ── */}
-      <Collapsible className="eval-section" title="Object-to-object Relationships Comparison" defaultOpen={false}>
-        <div className="eval-o2o-row">
-          <div className="eval-o2o-side">
-            <div className="eval-o2o-side-label">Input Model</div>
-            {o2oRules.length > 0
-              ? <O2ODiagram rules={o2oRules} otNames={otNames} />
-              : <p className="empty-notice">No object-to-object relationships in model.</p>}
-          </div>
-          <div className="eval-o2o-side">
-            <div className="eval-o2o-side-label">Simulation Output</div>
-            {simO2ORules.length > 0
-              ? <O2ODiagram rules={simO2ORules} otNames={simOtNames} />
-              : <p className="empty-notice">No object links recorded in simulation.</p>}
-          </div>
-        </div>
-      </Collapsible>
 
       {/* ── Log Inspection — always last ── */}
       <LogInspection eventLogFiles={eventLogFiles} handleFileUpload={handleFileUpload} />
@@ -6164,14 +5898,13 @@ function ModelInfoPopup({ ocdeclareFile, eventLogFile, isScenario }) {
             <li>To edit, click on the respective field.</li>
             <li>To add constraints, configure in the <strong>Constraints</strong> section.</li>
             <li>To add activities, configure in the <strong>Activities</strong> section.</li>
-            <li>To add objects, configure in the <strong>Object Flows</strong> section.</li>
+            <li>To add objects, configure in the <strong>Object Creation/Deactivation</strong> section.</li>
             <li>To remove constraints, activities or objects, click the removal button in their section.</li>
           </ul>
           {isScenario && (
             <p style={{margin:'0.5rem 0 0',paddingTop:'0.5rem',borderTop:'1px solid #f1f5f9'}}>
-              To run, first configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
-              <strong>▶ Run As-Is / Base Model</strong> for the Base Model or{' '}
-              <strong>Run To-Be</strong> for the Alternative scenario.
+              To run, go to the <strong>Results</strong> tab and configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
+              <strong>▶ Run Base Model</strong> or <strong>▶ Run Alternative Model</strong>.
             </p>
           )}
           <div style={{textAlign:'right',marginTop:'0.5rem'}}>
@@ -6275,8 +6008,8 @@ function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, s
 
   // Resource types / pool sizes
   const asRes = new Set(asis.resource_types||[]), toRes = new Set(tobe.resource_types||[]);
-  toRes.forEach(r => { if (!asRes.has(r)) chip(`+permanent ${r}`, 'add'); });
-  asRes.forEach(r => { if (!toRes.has(r)) chip(`−permanent ${r}`, 'remove'); });
+  toRes.forEach(r => { if (!asRes.has(r)) chip(`+immutable ${r}`, 'add'); });
+  asRes.forEach(r => { if (!toRes.has(r)) chip(`−immutable ${r}`, 'remove'); });
   (tobe.resource_types||[]).forEach(r => {
     const asp = (asis.resource_pool_sizes||{})[r], top = (tobe.resource_pool_sizes||{})[r];
     if (asp != null && top != null && asp !== top) chip(`~pool ${r}: ${asp}→${top}`, 'change');
@@ -6293,9 +6026,9 @@ function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, s
 
   return (
     <div style={{marginBottom:'0.75rem',padding:'0.5rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'7px',fontSize:'0.74rem'}}>
-      <span style={{fontWeight:700,color:'#475569',marginRight:'0.5rem'}}>Changes vs As-Is / Base Model:</span>
+      <span style={{fontWeight:700,color:'#475569',marginRight:'0.5rem'}}>Changes vs Base Model:</span>
       {chips.length === 0
-        ? <span style={{color:'#94a3b8'}}>No changes from As-Is / Base Model</span>
+        ? <span style={{color:'#94a3b8'}}>No changes from Base Model</span>
         : <span style={{display:'inline-flex',gap:'0.3rem',flexWrap:'wrap'}}>
             {chips.map((c,i) => (
               <span key={i} style={{padding:'1px 7px',borderRadius:'10px',fontWeight:500,
@@ -6309,12 +6042,74 @@ function ToBeDiffPanel({ modelAsIs, modelToBe, probMatrixBase, probMatrixToBe, s
   );
 }
 
+// ── Constraint ↔ probability helpers ─────────────────────────────────────────
+function syncProbMatrixForNewActivities(matrix, allActNames, newActs) {
+  const updated = {...matrix};
+  // Add each new activity as a source row (equal dist to all other activities).
+  // Skip if onActivityAdded already populated it.
+  newActs.forEach(name => {
+    if (!(name in updated)) {
+      const others = allActNames.filter(a => a !== name);
+      const eq = others.length > 0 ? 1 / others.length : 1;
+      const row = {};
+      others.forEach(a => { row[a] = eq; });
+      updated[name] = row;
+    }
+  });
+  // Add each new activity as a target in all existing source rows at 0%.
+  // Existing probabilities are not touched — user sets the new transitions explicitly.
+  Object.keys(updated).forEach(src => {
+    const missing = newActs.filter(a => a !== src && !Object.prototype.hasOwnProperty.call(updated[src] || {}, a));
+    if (missing.length === 0) return;
+    const row = {...(updated[src] || {})};
+    missing.forEach(newAct => { row[newAct] = 0; });
+    updated[src] = row;
+  });
+  return updated;
+}
+
+function applyConstraintsToProbMatrix(matrix, constraints) {
+  if (!constraints || constraints.length === 0) return matrix;
+  let m = {...matrix};
+  constraints.forEach(c => {
+    const { constraint_type: ct, source_activity: src, target_activity: tgt } = c;
+    if (!src || !tgt) return;
+    if (ct === 'chain_response' || ct === 'chain_succession') {
+      m[src] = {[tgt]: 1.0};
+    } else if (ct === 'not_chain_succession') {
+      if (m[src]) {
+        const row = {...m[src]};
+        delete row[tgt];
+        const total = Object.values(row).reduce((s, v) => s + v, 0);
+        if (total > 1e-9) Object.keys(row).forEach(k => { row[k] /= total; });
+        m[src] = row;
+      }
+    }
+  });
+  return m;
+}
+
 // ── BehaviorProbabilitiesPanel ────────────────────────────────────────────────
-function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}, onFiltersChange }) {
-  const allActNames = Object.keys(probMatrix || {});
+function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}, onFiltersChange, allActivityNames, constraints=[] }) {
+  const allSources = React.useMemo(() => {
+    const keys = Object.keys(probMatrix || {});
+    if (!allActivityNames) return keys;
+    return [...new Set([...allActivityNames, ...keys])];
+  }, [probMatrix, allActivityNames]);
   const filtSrc = filters.from_activity || '';
   const filtTgt = filters.to_activity || '';
   const [sortProb, cycleProb, setSortProb] = useSortState();
+
+  const forcedSrcs = React.useMemo(() => {
+    const m = {};
+    (constraints || []).forEach(c => {
+      if ((c.constraint_type === 'chain_response' || c.constraint_type === 'chain_succession') && c.source_activity && c.target_activity) {
+        if (!m[c.source_activity]) m[c.source_activity] = new Set();
+        m[c.source_activity].add(c.target_activity);
+      }
+    });
+    return m;
+  }, [constraints]);
 
   return (
     <div>
@@ -6331,15 +6126,15 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
         <SortSelect s={sortProb} set={setSortProb} columns={[{col:'from',label:'From activity'}]}/>
         <TableFilterBar
           dimensions={[
-            {key:'from_activity', label:'From', options: allActNames},
-            {key:'to_activity',   label:'To',   options: allActNames},
+            {key:'from_activity', label:'From', options: allSources},
+            {key:'to_activity',   label:'To',   options: allSources},
           ]}
           filters={filters}
           onFiltersChange={onFiltersChange}
           style={{marginBottom:0,flex:1}}
         />
       </div>
-      {probMatrix && Object.keys(probMatrix).length > 0 ? (
+      {allSources.length > 0 ? (
         <table className="behavior-table">
           <thead><tr>
             <th><ColTip text="Source activity — the activity that just fired to trigger this transition.">From</ColTip></th>
@@ -6347,13 +6142,26 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
             <th style={{minWidth:'160px'}}><ColTip text="Fraction of times this transition is taken when the From activity fires (0–100%). All outgoing transitions sum to 100%.">Probability</ColTip></th>
           </tr></thead>
           <tbody>
-            {sortedBy(Object.entries(probMatrix).filter(([src]) => !filtSrc || src === filtSrc), sortProb, ([src]) => src).flatMap(([src, targets]) => {
-              const visEntries = Object.entries(targets || {}).filter(([tgt, p]) => p > 0.001 && (!filtTgt || tgt === filtTgt));
+            {sortedBy(allSources.filter(src => !filtSrc || src === filtSrc), sortProb, src => src).flatMap(src => {
+              const targets = (probMatrix || {})[src] || {};
+              const visEntries = Object.entries(targets).filter(([tgt, p]) => p >= 0 && Object.prototype.hasOwnProperty.call(targets, tgt) && (!filtTgt || tgt === filtTgt));
+              const isSrcForced = !!forcedSrcs[src];
+              if (visEntries.length === 0) {
+                return [
+                  <tr key={src+'-empty'}>
+                    <td style={{fontWeight:600}}>{src}</td>
+                    <td colSpan={2} style={{color:'#94a3b8',fontSize:'0.78rem',fontStyle:'italic'}}>— no outgoing transitions —</td>
+                  </tr>
+                ];
+              }
               return visEntries.map(([tgt, p], i) => {
                 const pct = (p * 100).toFixed(1);
+                const isForced = isSrcForced && forcedSrcs[src].has(tgt);
+                const isZero = p < 0.001;
                 const updateProb = (newPct) => {
+                  if (isForced) return;
                   const newVal = Math.min(1, Math.max(0, parseFloat(newPct)||0) / 100);
-                  const row = {...(probMatrix[src]||{})};
+                  const row = {...targets};
                   const delta = newVal - (row[tgt]||0);
                   row[tgt] = newVal;
                   const others = visEntries.map(([k])=>k).filter(k=>k!==tgt);
@@ -6362,19 +6170,20 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
                   onUpdate(src, row);
                 };
                 return (
-                  <tr key={src+'-'+tgt}>
+                  <tr key={src+'-'+tgt} style={isZero ? {opacity:0.5} : undefined}>
                     {i===0 ? <td rowSpan={visEntries.length} style={{fontWeight:600}}>{src}</td> : null}
                     <td style={{fontSize:'0.82rem'}}>{tgt}</td>
                     <td>
                       <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
-                        <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600,color:'#1e293b'}}>
-                          {editMode ? <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/> : pct+'%'}
+                        <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600,color: isForced ? '#7c3aed' : '#1e293b'}}>
+                          {editMode && !isForced ? <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/> : pct+'%'}
                         </span>
-                        {editMode && <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
+                        {editMode && !isForced && <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
                           onChange={e=>updateProb(e.target.value)}
                           style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>}
+                        {editMode && isForced && <span title="Forced by chain_response / chain_succession constraint" style={{fontSize:'0.65rem',color:'#7c3aed',background:'#f3f0ff',border:'1px solid #c4b5fd',borderRadius:'3px',padding:'1px 5px',whiteSpace:'nowrap'}}>forced</span>}
                         {!editMode && <div style={{flex:1,height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden',maxWidth:'140px'}}>
-                          <div style={{height:'100%',width:pct+'%',background:'#6366f1',borderRadius:'3px'}}/>
+                          <div style={{height:'100%',width:pct+'%',background: isForced ? '#7c3aed' : '#6366f1',borderRadius:'3px'}}/>
                         </div>}
                       </div>
                     </td>
@@ -6390,7 +6199,7 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
 }
 
 // ── BehaviorActivitiesPanel ───────────────────────────────────────────────────
-function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange, foldable }) {
+function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, onStartActivitiesChange, filters, onFiltersChange, foldable, onActivityAdded, onActivityDeleted }) {
   const [expandedRows, setExpandedRows] = React.useState(new Set());
   const [newActName, setNewActName] = React.useState('');
   const [newObjTypeName, setNewObjTypeName] = React.useState('');
@@ -6442,13 +6251,25 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
     setNewBindings(prev => ({...prev, [actName]: {ot: '', creates: false, deact: false}}));
   };
   const deleteActivity = name => {
-    updateActs(acts.filter(a => a.name !== name));
+    const newDurations = {...(model.activity_durations || {})};
+    delete newDurations[name];
+    onUpdate({...model, activities: acts.filter(a => a.name !== name), activity_durations: newDurations});
     setExpandedRows(prev => { const n = new Set(prev); n.delete(name); return n; });
+    onActivityDeleted?.(name);
   };
   const addActivity = () => {
     const name = newActName.trim();
     if (!name || acts.some(a => a.name === name)) return;
-    updateActs([...acts, {name, bindings:[]}]);
+    const updatedModel = {
+      ...model,
+      activities: [...acts, {name, bindings:[]}],
+      activity_durations: {
+        ...(model.activity_durations || {}),
+        [name]: { dist_type: 'lognormal', mean_seconds: null, std_seconds: null, min_seconds: 0, max_seconds: null },
+      },
+    };
+    onUpdate(updatedModel);
+    onActivityAdded?.(name, acts.map(a => a.name));
     setNewActName('');
   };
   const addObjectType = () => {
@@ -6487,9 +6308,9 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
         <BehaviorLegend items={[
           ['+','Activity creates a new object of that type when it fires'],
           ['−','Activity deactivates (ends lifecycle of) that object when it fires'],
-          ['·','Activity involves this type but neither creates nor deactivates it'],
+          ['●','Activity involves this type but neither creates nor deactivates it'],
           ['★','Start activity — simulation begins here'],
-          ['R (superscript)','Permanent object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
+          ['R (superscript)','Immutable object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
         ]}/>
         {editMode && <HelpTip text="Click any cell to toggle creates / deactivates. Click ▶ to expand a row and edit detailed bindings." />}
         {foldable && (
@@ -6519,6 +6340,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                 <div style={{display:'flex',flexDirection:'column',gap:'1px'}}>
                   <span style={{fontSize:'0.62rem',color:'#16a34a',fontWeight:700,lineHeight:1}}>+ creates</span>
                   <span style={{fontSize:'0.62rem',color:'#dc2626',fontWeight:700,lineHeight:1}}>− deactivates</span>
+                  <span style={{fontSize:'0.62rem',color:'#64748b',fontWeight:700,lineHeight:1}}>● involved in activity</span>
                   <ColTip text="Activity name. Expand a row (▶) to view and edit its object type bindings.">Activity</ColTip>
                 </div>
               </th>
@@ -6533,7 +6355,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                   lc.creates.length    ? `Created: ${lc.creates.join(', ')}`     : null,
                   lc.deactivates.length ? `Deactivated: ${lc.deactivates.join(', ')}` : null,
                 ].filter(Boolean);
-                const tipText = (tipLines.length ? tipLines.join('\n') : `No creates or deactivates for "${ot}"`) + '\n\nAdd/remove object types in the Object Flows tab.';
+                const tipText = (tipLines.length ? tipLines.join('\n') : `No creates or deactivates for "${ot}"`) + '\n\nAdd/remove object types in the Object Creation/Deactivation tab.';
                 return (
                   <th key={ot} style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
                     <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.75rem',fontWeight:600,lineHeight:1.1}}>
@@ -6542,7 +6364,11 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                   </th>
                 );
               })}
-              {editMode && <th style={{width:'20px'}}/>}
+              {editMode && <th style={{width:'20px',textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',borderLeft:'1px solid #cbd5e1'}}>
+                <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.65rem',fontWeight:600,color:'#fca5a5',textTransform:'uppercase',letterSpacing:'0.04em',lineHeight:1.1,whiteSpace:'nowrap'}}>
+                  Remove Activity
+                </div>
+              </th>}
             </tr>
           </thead>
           <tbody>
@@ -6576,10 +6402,10 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
                       );
                       if (creates) return <td key={ot} style={{textAlign:'center',color:'#16a34a',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'creates')}>+</td>;
                       if (deact)   return <td key={ot} style={{textAlign:'center',color:'#dc2626',fontWeight:700,cursor:editMode?'pointer':'default'}} onClick={()=>editMode&&toggleBinding(a.name,ot,'deactivates')}>−</td>;
-                      return <td key={ot} style={{textAlign:'center',color:'#94a3b8',fontSize:'0.7rem'}}>·</td>;
+                      return <td key={ot} style={{textAlign:'center',color:'#64748b',fontSize:'1rem',fontWeight:700}}>●</td>;
                     })}
                     {editMode && (
-                      <td style={{textAlign:'center'}}>
+                      <td style={{textAlign:'center',borderLeft:'1px solid #cbd5e1'}}>
                         <button onClick={()=>deleteActivity(a.name)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,fontSize:'0.8rem',padding:0}}>×</button>
                       </td>
                     )}
@@ -6641,7 +6467,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
             <button onClick={addActivity} style={{fontSize:'0.75rem',padding:'2px 8px',background:'#1e293b',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add Activity</button>
           </div>
           <div style={{fontSize:'0.7rem',color:'#64748b',fontStyle:'italic'}}>
-            To add or remove object types, use the <strong>Object Flows</strong> tab.
+            To add or remove object types, use the <strong>Object Creation/Deactivation</strong> tab.
           </div>
         </div>
       )}
@@ -6651,7 +6477,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           <span><span style={{color:'#16a34a',fontWeight:700}}>+</span> creates</span>
           <span><span style={{color:'#dc2626',fontWeight:700}}>−</span> deactivates</span>
           <span><span style={{color:'#d97706',fontWeight:700}}>+/−</span> both</span>
-          <span><sup style={{color:'#7c3aed'}}>R</sup> permanent object</span>
+          <span><sup style={{color:'#7c3aed'}}>R</sup> immutable object</span>
         </div>
       )}
     </div>
@@ -6810,15 +6636,19 @@ function renderConstraintDesc(text) {
 
 function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, onUpdate, filters={}, onFiltersChange, activities=[], onUpdateActivities=null }) {
   const [newCon, setNewCon] = React.useState(BEHAVIOR_EMPTY_CON);
+  const [conErrors, setConErrors] = React.useState({});
   const [sortCon, cycleCon, setSortCon] = useSortState();
   const isUnary = t => ['absence','exactly','init'].includes(t);
 
   const updateCon = (i, patch) => onUpdate(constraints.map((x,j) => j===i ? {...x,...patch} : x));
   const deleteCon = i => onUpdate(constraints.filter((_,j) => j!==i));
   const addCon = () => {
-    if (!newCon.constraint_type) return;
-    if (!newCon.source_activity) return;
-    if (!isUnary(newCon.constraint_type) && !newCon.target_activity) return;
+    const errs = {};
+    if (!newCon.constraint_type) errs.constraint_type = true;
+    if (!newCon.source_activity) errs.source_activity = true;
+    if (!isUnary(newCon.constraint_type) && !newCon.target_activity) errs.target_activity = true;
+    if (Object.keys(errs).length > 0) { setConErrors(errs); return; }
+    setConErrors({});
     onUpdate([...constraints, {...newCon}]);
 
     // Auto-add missing object binding if scope type is set
@@ -6911,7 +6741,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                 <th><ColTip text="each = holds per individual object; any = at least one object satisfies it; all = every object must satisfy it.">Scope</ColTip></th>
                 <th><ColTip text="Minimum Source firings required before Target may fire (nmin). Default 1.">n≥</ColTip></th>
                 <th><ColTip text="Maximum Source firings before Target must have fired (nmax). Blank = no upper bound.">n≤</ColTip></th>
-                <th><ColTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint.">Guard</ColTip></th>
+                {false && <th><ColTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint.">Guard</ColTip></th>}
               </tr>
             </thead>
             <tbody>
@@ -6935,15 +6765,17 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                           style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
                           <option value="">—</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
                         </select>
-                      : <span style={{fontWeight:scopeOt?500:400,color:scopeOt?'#1e293b':'#94a3b8'}}>{scopeOt||'—'}</span>}
+                      : <span style={{fontWeight:scopeOt?500:400,color:scopeOt?'#1e293b':'#94a3b8'}}>
+                          {(c.scope?.bindings||[]).length > 1 ? c.scope.bindings.map(([t])=>t).join(', ') : (scopeOt||'—')}
+                        </span>}
                     </td>
                     <td>{editMode ? <select value={scopeKind} onChange={e=>updateCon(origIdx,{scope:{...c.scope,kind:e.target.value}})}
                         style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
                         {BEHAVIOR_SCOPE_KIND_OPTS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-                      </select> : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{scopeKind}</span>}</td>
+                      </select> : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{(c.scope?.bindings||[]).length > 1 ? formatScope(c.scope) : scopeKind}</span>}</td>
                     <td>{editMode ? <EditableCell value={c.nmin??1} type="number" onSave={v=>updateCon(origIdx,{nmin:v})}/> : (c.nmin??'—')}</td>
                     <td>{editMode ? <EditableCell value={c.nmax??''} type="number" placeholder="∞" onSave={v=>updateCon(origIdx,{nmax:v===''||v===null?null:Number(v)})}/> : (c.nmax??'—')}</td>
-                    <td style={{minWidth:'10rem'}}>
+                    {false && <td style={{minWidth:'10rem'}}>
                       {editMode ? (
                         c.guard ? (
                           <span style={{display:'flex',gap:'0.2rem',alignItems:'center',flexWrap:'wrap'}}>
@@ -6967,7 +6799,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                           ? <span style={{fontSize:'0.72rem',color:'#6366f1',fontFamily:'monospace'}}>{c.guard.attribute} {c.guard.op} {c.guard.value}</span>
                           : <span style={{color:'#94a3b8',fontSize:'0.72rem'}}>—</span>
                       )}
-                    </td>
+                    </td>}
                   </tr>
                 );
               })}
@@ -6981,20 +6813,23 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
           <div style={{fontWeight:600,fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem'}}>Add Constraint</div>
           <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
             <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',alignItems:'center',flex:1}}>
-              <select value={newCon.constraint_type} onChange={e=>setNewCon(n=>({...n,constraint_type:e.target.value}))}
-                style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px',
+              <select value={newCon.constraint_type} onChange={e=>{setNewCon(n=>({...n,constraint_type:e.target.value}));setConErrors(p=>({...p,constraint_type:false}));}}
+                style={{fontSize:'0.75rem',padding:'1px 3px',borderRadius:'3px',
+                  border:`1px solid ${conErrors.constraint_type ? '#ef4444' : '#cbd5e1'}`,
                   color:newCon.constraint_type?'inherit':'#94a3b8'}}>
                 <option value="">constraint…</option>
                 {BEHAVIOR_CTYPES.map(o=><option key={o} value={o}>{o.replace(/_/g,' ')}</option>)}
               </select>
-              <select value={newCon.source_activity} onChange={e=>setNewCon(n=>({...n,source_activity:e.target.value}))}
-                style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+              <select value={newCon.source_activity} onChange={e=>{setNewCon(n=>({...n,source_activity:e.target.value}));setConErrors(p=>({...p,source_activity:false}));}}
+                style={{fontSize:'0.75rem',padding:'1px 3px',borderRadius:'3px',
+                  border:`1px solid ${conErrors.source_activity ? '#ef4444' : '#cbd5e1'}`}}>
                 <option value="">Source…</option>{actNames.map(a=><option key={a} value={a}>{a}</option>)}
               </select>
               {!isUnary(newCon.constraint_type) && <>
                 <span style={{color:'#94a3b8',fontSize:'0.78rem'}}>→</span>
-                <select value={newCon.target_activity} onChange={e=>setNewCon(n=>({...n,target_activity:e.target.value}))}
-                  style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+                <select value={newCon.target_activity} onChange={e=>{setNewCon(n=>({...n,target_activity:e.target.value}));setConErrors(p=>({...p,target_activity:false}));}}
+                  style={{fontSize:'0.75rem',padding:'1px 3px',borderRadius:'3px',
+                    border:`1px solid ${conErrors.target_activity ? '#ef4444' : '#cbd5e1'}`}}>
                   <option value="">Target…</option>{actNames.map(a=><option key={a} value={a}>{a}</option>)}
                 </select>
               </>}
@@ -7013,7 +6848,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
               <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>n≤</span>
               <input type="number" value={newCon.nmax??''} placeholder="∞" min={0} onChange={e=>setNewCon(n=>({...n,nmax:e.target.value===''?null:parseInt(e.target.value)}))}
                 style={{width:'45px',fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/>
-              {newCon.guard ? (
+              {false && newCon.guard ? (
                 <span style={{display:'flex',gap:'0.2rem',alignItems:'center',flexWrap:'wrap'}}>
                   <span style={{fontSize:'0.72rem',color:'#64748b'}}>guard: if</span>
                   <input style={{width:'4.5rem',fontSize:'0.72rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}} placeholder="attr"
@@ -7026,7 +6861,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                   <button onClick={()=>setNewCon(n=>({...n,guard:null}))} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 2px'}}>×</button>
                 </span>
               ) : (
-                <button onClick={()=>setNewCon(n=>({...n,guard:{attribute:'',op:'==',value:''}}))}
+                false && <button onClick={()=>setNewCon(n=>({...n,guard:{attribute:'',op:'==',value:''}}))}
                   style={{fontSize:'0.72rem',padding:'1px 6px',border:'1px solid #cbd5e1',borderRadius:'3px',background:'#f8fafc',cursor:'pointer',color:'#475569'}}>
                   + guard
                 </button>
@@ -7305,6 +7140,124 @@ function BehaviorTimePanel({ durations, editMode, onUpdate }) {
   );
 }
 
+function CaseTrackerTable({ entries, totalCases, totalDone, overallRate, fmtDur, fmtTs, activeModel }) {
+  const [expandedAct, setExpandedAct] = React.useState(null);
+
+  return (
+    <table className="metrics-table">
+      <thead>
+        <tr>
+          <th style={{width:'1.2rem'}}></th>
+          <th>Start Activity</th>
+          <th title="Number of case instances started">Cases</th>
+          <th title="Cases where all spawned objects reached their terminal activity">Completed</th>
+          <th title="Completed / total cases">Rate</th>
+          <th title="Mean time from start event to last event of all spawned objects">Avg Duration</th>
+          <th title="Shortest case duration">Min</th>
+          <th title="Longest case duration">Max</th>
+          <th title="Median case duration">Median</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map(([act, v]) => {
+          const rate = Math.round(v.completion_rate * 100);
+          const rateColor = rate >= 90 ? '#16a34a' : rate >= 60 ? '#d97706' : '#dc2626';
+          const isExpanded = expandedAct === act;
+          const hasCases = v.cases && v.cases.length > 0;
+          return (
+            <React.Fragment key={act}>
+              <tr
+                style={{cursor: hasCases ? 'pointer' : 'default'}}
+                onClick={() => hasCases && setExpandedAct(isExpanded ? null : act)}
+              >
+                <td style={{textAlign:'center', color:'#94a3b8', fontSize:'0.75rem', userSelect:'none'}}>
+                  {hasCases ? (isExpanded ? '▾' : '▸') : ''}
+                </td>
+                <td className="metrics-act-name">
+                  <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
+                </td>
+                <td>{v.case_count.toLocaleString()}</td>
+                <td>{v.completed.toLocaleString()}</td>
+                <td style={{color: rateColor, fontWeight: 600}}>{rate}%</td>
+                <td>{fmtDur(v.mean_duration_s)}</td>
+                <td>{fmtDur(v.min_duration_s)}</td>
+                <td>{fmtDur(v.max_duration_s)}</td>
+                <td>{fmtDur(v.median_duration_s)}</td>
+              </tr>
+              {isExpanded && hasCases && (
+                <tr>
+                  <td colSpan={9} style={{padding:'0 0 0.5rem 1.5rem', background:'#f8fafc'}}>
+                    {v.cases_capped && (
+                      <p style={{fontSize:'0.73rem', color:'#94a3b8', margin:'0.4rem 0 0.25rem'}}>
+                        Showing first 500 cases.
+                      </p>
+                    )}
+                    <div style={{overflowX:'auto', maxHeight:'320px', overflowY:'auto'}}>
+                      <table className="metrics-table" style={{fontSize:'0.75rem', marginBottom:0}}>
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            <th>Start</th>
+                            <th>End</th>
+                            <th>Duration</th>
+                            <th title="All objects of this case completed their lifecycle">Done</th>
+                            <th>Activity sequence</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {v.cases.map((c, i) => (
+                            <tr key={i}>
+                              <td style={{color:'#94a3b8'}}>{i + 1}</td>
+                              <td style={{whiteSpace:'nowrap'}}>{fmtTs(c.start_ts)}</td>
+                              <td style={{whiteSpace:'nowrap'}}>{fmtTs(c.end_ts)}</td>
+                              <td style={{whiteSpace:'nowrap'}}>{fmtDur(c.duration_s)}</td>
+                              <td style={{textAlign:'center'}}>{c.completed ? '✓' : '—'}</td>
+                              <td>
+                                <div style={{display:'flex', flexWrap:'wrap', gap:'2px'}}>
+                                  {c.events.map((e, j) => (
+                                    <span key={j} style={{
+                                      display:'inline-flex', alignItems:'center', gap:'3px',
+                                      background:'#e2e8f0', borderRadius:'3px',
+                                      padding:'1px 5px', fontSize:'0.7rem', whiteSpace:'nowrap',
+                                    }}>
+                                      <span style={{fontWeight:500}}>{e.activity}</span>
+                                      {e.timestamp && (
+                                        <span style={{color:'#94a3b8', fontSize:'0.65rem'}}>
+                                          @{e.timestamp.replace('T',' ').replace(/\.\d+.*$/,'')}
+                                        </span>
+                                      )}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>
+          );
+        })}
+      </tbody>
+      {entries.length > 1 && (
+        <tfoot>
+          <tr style={{fontWeight:600, borderTop:'2px solid #e2e8f0'}}>
+            <td></td>
+            <td>Total</td>
+            <td>{totalCases.toLocaleString()}</td>
+            <td>{totalDone.toLocaleString()}</td>
+            <td style={{color: overallRate>=90?'#16a34a':overallRate>=60?'#d97706':'#dc2626', fontWeight:600}}>{overallRate}%</td>
+            <td colSpan={4}></td>
+          </tr>
+        </tfoot>
+      )}
+    </table>
+  );
+}
+
 function App() {
   // Available files from backend
   const [ocdeclareFiles, setOcdeclareFiles] = useState([]);
@@ -7319,6 +7272,12 @@ function App() {
   const [discoveryResults, setDiscoveryResults] = useState(null);
   const [discoveryError, setDiscoveryError] = useState(null);
   const [discoveryLogs, setDiscoveryLogs] = useState([]);
+  const [paramDiscElapsed,  setParamDiscElapsed]  = useState(null); // seconds; null = never run
+  const paramDiscStartRef = useRef(null);
+  const paramDiscTimerRef = useRef(null);
+  const [ocelLoadElapsed,   setOcelLoadElapsed]   = useState(null);
+  const ocelLoadStartRef  = useRef(null);
+  const ocelLoadTimerRef  = useRef(null);
   
   // OC-Declare Discovery state
   const [ocdeclareDiscoveryConfig, setOcdeclareDiscoveryConfig] = useState({
@@ -7346,10 +7305,20 @@ function App() {
   const [isOcdeclareDiscovering, setIsOcdeclareDiscovering] = useState(false);
   const [ocdeclareDiscoveryResults, setOcdeclareDiscoveryResults] = useState(null);
   const [ocdeclareDiscoveryError, setOcdeclareDiscoveryError] = useState(null);
-  
+  const [ocdeclareProgress, setOcdeclareProgress] = useState({ phase: '', pct: 0 });
+  const [ocdeclareLog, setOcdeclareLog] = useState([]);
+  const [ocdeclareElapsed,  setOcdeclareElapsed]  = useState(null);
+  const ocdeclareStartRef = useRef(null);
+  const ocdeclareTimerRef = useRef(null);
+  const ocdeclarePollingRef = useRef(null);
+
   // Simulation state
   const [availableActivities, setAvailableActivities] = useState([]);
   const [startActivityCandidates, setStartActivityCandidates] = useState([]);
+  const [tobeStartActivities, setTobeStartActivities] = useState([]);
+  const [tobeStartActivityCaps, setTobeStartActivityCaps] = useState({});
+  const [baseStartFolded, setBaseStartFolded] = useState(false);
+  const [altStartFolded, setAltStartFolded] = useState(false);
   const [config, setConfig] = useState({
     ocdeclareFile: '',
     maxSteps: '',
@@ -7361,14 +7330,18 @@ function App() {
     useTimeLimit: false,
     useTraceLimit: false,
     maxTraces: '',
+    maxCases: '',
     seed: 42,
     startActivities: [],
     startActivitiesLocked: false, // true once user explicitly toggles ★
+    startActivityCaps: {},        // {activityName: maxFires | ''} — per-activity cap
   });
   const [isSimulating, setIsSimulating] = useState(false);
+  const [simulatingMode, setSimulatingMode] = useState(null); // 'asis' | 'tobe' | null
   const [liveStepCount, setLiveStepCount] = useState(null);
   const [liveSimTime,   setLiveSimTime]   = useState(null); // simulated time in seconds
   const [liveTraces,    setLiveTraces]    = useState(null); // completed object traces
+  const [liveCases,     setLiveCases]     = useState(null); // completed cases (start-activity firings)
   const [liveActiveObjects,   setLiveActiveObjects]   = useState(null);
   const [liveObligations,     setLiveObligations]     = useState(null);
   const [liveDeactivPerStep,  setLiveDeactivPerStep]  = useState(null);
@@ -7385,6 +7358,7 @@ function App() {
   const ocdeclFileRef  = useRef(null);
   const paramsFileRef  = useRef(null);
   const [results, setResults] = useState(null);
+  const [activityPopup, setActivityPopup] = useState(null);
   const [healthResult, setHealthResult] = useState(null);
   const [isCheckingHealth, setIsCheckingHealth] = useState(false);
   const [blockingResult, setBlockingResult] = useState(null);
@@ -7508,7 +7482,7 @@ function App() {
 
   const [behaviorFilters, setBehaviorFilters] = useState({}); // { sectionKey: { dimKey: value } }
   const [scenarioBehaviorSection, setScenarioBehaviorSection] = useState('activities');
-  const [saPickerFolded, setSaPickerFolded] = useState(true);
+
   const [scenarioBehaviorFilters, setScenarioBehaviorFilters] = useState({});
   const getBehaviorFilters = section => behaviorFilters[section] || {};
   const setBehaviorSectionFilters = (section, f) => setBehaviorFilters(prev => ({...prev, [section]: f}));
@@ -7615,6 +7589,13 @@ function App() {
     setDiscoveryLogs([]);
     setResults(null); // Clear previous simulation results
     setError(null);
+    // Start parameter discovery timer
+    paramDiscStartRef.current = Date.now();
+    setParamDiscElapsed(null);
+    if (paramDiscTimerRef.current) clearInterval(paramDiscTimerRef.current);
+    paramDiscTimerRef.current = setInterval(() => {
+      setParamDiscElapsed(Math.floor((Date.now() - paramDiscStartRef.current) / 1000));
+    }, 1000);
 
     try {
       const payload = overrideEventLogFile
@@ -7661,6 +7642,9 @@ function App() {
       console.error('Discovery error:', err);
     } finally {
       setIsDiscovering(false);
+      clearInterval(paramDiscTimerRef.current);
+      paramDiscTimerRef.current = null;
+      setParamDiscElapsed(Math.floor((Date.now() - (paramDiscStartRef.current || Date.now())) / 1000));
     }
   };
 
@@ -7753,27 +7737,61 @@ function App() {
     }
   }, [config.ocdeclareFile, discoveryConfig.eventLogFile, loadModelState, modelEdited]);
 
+  // Shared helper: start polling a discover-ocdeclare run and resolve when done.
+  // onProgress(phase, pct) is called on each poll tick before completion.
+  // Returns a promise that resolves to the server response data, or rejects on error.
+  const pollOcdeclareRun = useCallback((runId, onProgress) => {
+    return new Promise((resolve, reject) => {
+      const tick = async () => {
+        try {
+          const res = await axios.get(`/api/discover-ocdeclare/status/${runId}`);
+          const d = res.data;
+          if (d.error && d.done) { reject(new Error(d.error)); return; }
+          onProgress(d.phase || '', d.pct ?? 0, d.logs || []);
+          if (d.done) { resolve(d); return; }
+          ocdeclarePollingRef.current = setTimeout(tick, 1200);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      ocdeclarePollingRef.current = setTimeout(tick, 800);
+    });
+  }, []);
+
   const runOcdeclareDiscovery = async () => {
     setIsOcdeclareDiscovering(true);
     setOcdeclareDiscoveryError(null);
     setOcdeclareDiscoveryResults(null);
+    setOcdeclareProgress({ phase: 'Starting', pct: 0 });
+    setOcdeclareLog([]);
+    // Start OC-Declare discovery timer
+    ocdeclareStartRef.current = Date.now();
+    setOcdeclareElapsed(null);
+    if (ocdeclareTimerRef.current) clearInterval(ocdeclareTimerRef.current);
+    ocdeclareTimerRef.current = setInterval(() => {
+      setOcdeclareElapsed(Math.floor((Date.now() - ocdeclareStartRef.current) / 1000));
+    }, 1000);
 
     try {
-      const response = await axios.post('/api/discover-ocdeclare', ocdeclareDiscoveryConfig);
-      
-      if (response.data.success) {
-        setOcdeclareDiscoveryResults(response.data);
+      const { data: { run_id } } = await axios.post('/api/discover-ocdeclare', ocdeclareDiscoveryConfig);
+      const data = await pollOcdeclareRun(run_id, (phase, pct, logs) => {
+        setOcdeclareProgress({ phase, pct });
+        if (logs && logs.length > 0) setOcdeclareLog(logs);
+      });
+
+      if (data.success) {
+        setOcdeclareDiscoveryResults(data);
 
         // Populate editor with the freshly discovered model immediately
-        if (response.data.model && !Array.isArray(response.data.model)) {
-          setActiveModel(response.data.model);
+        if (data.model && !Array.isArray(data.model)) {
+          setActiveModel(data.model);
           // Freshly discovered model → not yet edited by the user.
           setModelEdited(false);
         }
-        
+
         // Populate activities + ranked start candidates from the discovered model
-        const modelActivities = (response.data.model?.activities || []).map(a => a.name);
-        const ranked = response.data.start_activities_ranked || [];
+        const modelActivities = (data.model?.activities || []).map(a => a.name);
+        const ranked = data.start_activities_ranked || [];
         setStartActivityCandidates(ranked.length > 0
           ? ranked
           : modelActivities.map(a => ({ activity: a, count: null, pct: null }))
@@ -7788,10 +7806,10 @@ function App() {
 
         // Reload available files (preserve current selections to avoid overwrite)
         await loadAvailableFiles({ preserveSelections: true });
-        
+
         // Select the newly discovered model in the simulation config
-        if (response.data.filename) {
-          setConfig(prev => ({ ...prev, ocdeclareFile: response.data.filename }));
+        if (data.filename) {
+          setConfig(prev => ({ ...prev, ocdeclareFile: data.filename }));
         }
 
         // Automatically run probability discovery on the same event log so the
@@ -7823,8 +7841,8 @@ function App() {
               eventLogFile: ocdeclareDiscoveryConfig.eventLogFile
             }));
             // Load normalised probability matrix for the new model file
-            if (response.data.filename) {
-              loadModelState(response.data.filename, ocdeclareDiscoveryConfig.eventLogFile);
+            if (data.filename) {
+              loadModelState(data.filename, ocdeclareDiscoveryConfig.eventLogFile);
             }
           } else {
             setOcdeclareDiscoveryError(
@@ -7838,13 +7856,18 @@ function App() {
           );
         }
       } else {
-        setOcdeclareDiscoveryError(response.data.error || 'OC-Declare discovery failed');
+        setOcdeclareDiscoveryError(data.error || 'OC-Declare discovery failed');
       }
     } catch (err) {
       setOcdeclareDiscoveryError(err.response?.data?.error || err.message || 'Failed to run OC-Declare discovery');
       console.error('OC-Declare discovery error:', err);
     } finally {
+      clearTimeout(ocdeclarePollingRef.current);
       setIsOcdeclareDiscovering(false);
+      setOcdeclareProgress({ phase: '', pct: 0 });
+      clearInterval(ocdeclareTimerRef.current);
+      ocdeclareTimerRef.current = null;
+      setOcdeclareElapsed(Math.floor((Date.now() - (ocdeclareStartRef.current || Date.now())) / 1000));
     }
   };
 
@@ -7998,7 +8021,7 @@ function App() {
     const simModel  = mode === 'asis' ? (modelAsIs ?? modelBase) : (modelToBe  ?? activeModel);
     const simMatrix = mode === 'asis' ? probMatrixBase : (probMatrixToBe ?? activeProbMatrix);
     setIsSimulating(true);
-    setLiveStepCount(0);
+    setSimulatingMode(mode);
     setActiveRunId(runId);
     // Start elapsed timer
     simStartRef.current = Date.now();
@@ -8017,7 +8040,7 @@ function App() {
     // Reset live counters
     setLiveSimTime(null);
     setLiveTraces(null);
-    setLiveActiveObjects(null);
+    setLiveCases(null);
     setLiveObligations(null);
     setLiveDeactivPerStep(null);
     setLiveObligFulfilledPerStep(null);
@@ -8030,6 +8053,7 @@ function App() {
         const r = await axios.get(`/api/simulate/status/${runId}`);
         setLiveStepCount(r.data.step_count ?? 0);
         setLiveTraces(r.data.completed_traces ?? 0);
+        setLiveCases(r.data.completed_cases ?? null);
         setLiveActiveObjects(r.data.active_objects ?? null);
         setLiveObligations(r.data.total_obligations ?? null);
         // Compute per-poll deltas (proxy for per-step rates)
@@ -8067,6 +8091,9 @@ function App() {
       const maxTraces = config.maxTraces !== '' && config.maxTraces != null && parseInt(config.maxTraces) > 0
         ? parseInt(config.maxTraces)
         : null;
+      const maxCases = config.maxCases !== '' && config.maxCases != null && parseInt(config.maxCases) > 0
+        ? parseInt(config.maxCases)
+        : null;
 
       const simulationData = {
         ...config,
@@ -8075,9 +8102,15 @@ function App() {
         eventLogFile: discoveryConfig.eventLogFile,
         maxSimTimeS,
         maxTraces,
+        maxCases,
         // Send model/probs for the chosen mode
         ...(simModel  ? { modelOverride:       simModel }  : {}),
         ...(simMatrix ? { probMatrixOverride: simMatrix } : {}),
+        // Use per-model start activities
+        ...(mode === 'tobe' ? {
+          startActivities: tobeStartActivities.length > 0 ? tobeStartActivities : config.startActivities,
+          startActivityCaps: tobeStartActivityCaps,
+        } : {}),
       };
 
       const response = await axios.post('/api/simulate', simulationData);
@@ -8123,6 +8156,7 @@ function App() {
       setLastRunDuration(duration);
       setSimElapsed(null);
       setIsSimulating(false);
+      setSimulatingMode(null);
       setActiveRunId(null);
     }
   };
@@ -8244,6 +8278,41 @@ function App() {
     setModelAsIs(m => m ? {...m, start_activities: acts} : m);
     setModelToBe(m => m ? {...m, start_activities: acts} : m);
   }, [config.startActivities]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Initialise tobeStartActivities from config.startActivities the first time it becomes non-empty.
+  React.useEffect(() => {
+    if (tobeStartActivities.length === 0 && config.startActivities.length > 0) {
+      setTobeStartActivities([...config.startActivities]);
+    }
+  }, [config.startActivities]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Sync probMatrix when activities are added from any source (BehaviorPanel or ModelEditor).
+  // Tracks previous names via ref so we only react to actual additions, not initial load.
+  const prevActNamesAsIs = React.useRef(null);
+  React.useEffect(() => {
+    const actNames = (modelAsIs?.activities || []).map(a => a.name);
+    const actKey = actNames.slice().sort().join('\0');
+    if (prevActNamesAsIs.current === null) { prevActNamesAsIs.current = actKey; return; }
+    if (actKey === prevActNamesAsIs.current) return;
+    const prevNames = prevActNamesAsIs.current.split('\0').filter(Boolean);
+    prevActNamesAsIs.current = actKey;
+    const newActs = actNames.filter(n => !prevNames.includes(n));
+    if (newActs.length === 0) return;
+    setProbMatrixBase(m => syncProbMatrixForNewActivities(m, actNames, newActs));
+  }, [modelAsIs?.activities]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const prevActNamesToBe = React.useRef(null);
+  React.useEffect(() => {
+    const actNames = (modelToBe?.activities || []).map(a => a.name);
+    const actKey = actNames.slice().sort().join('\0');
+    if (prevActNamesToBe.current === null) { prevActNamesToBe.current = actKey; return; }
+    if (actKey === prevActNamesToBe.current) return;
+    const prevNames = prevActNamesToBe.current.split('\0').filter(Boolean);
+    prevActNamesToBe.current = actKey;
+    const newActs = actNames.filter(n => !prevNames.includes(n));
+    if (newActs.length === 0) return;
+    setProbMatrixToBe(m => syncProbMatrixForNewActivities(m, actNames, newActs));
+  }, [modelToBe?.activities]); // eslint-disable-line react-hooks/exhaustive-deps
   // never reads a stale closure value.
   const startActivityProbSelectedRef = React.useRef(discoveryConfig.startActivityProbSelected);
   React.useEffect(() => {
@@ -8423,7 +8492,7 @@ function App() {
 
     const allSteps = [
       { key: 'lifecycle', label: 'Object Constraints',           fn: runLifecycleDerivation },
-      { key: 'resources', label: 'Permanent Objects',             fn: runPermanentObjectDiscovery },
+      // { key: 'resources', label: 'Permanent Objects',             fn: runPermanentObjectDiscovery },
       { key: 'timing',    label: 'Timing',                       fn: runTimingDiscovery },
       { key: 'o2o',       label: 'Object-to-Object Relationships',  fn: runO2ODiscovery },
       { key: 'startProb', label: 'Start Activity + Probability', fn: applyStartProbability },
@@ -8581,6 +8650,8 @@ function App() {
     setIsOcdeclareDiscovering(true);
     setOcdeclareDiscoveryError(null);
     setOcdeclareDiscoveryResults(null);
+    setOcdeclareProgress({ phase: 'Starting', pct: 0 });
+    setOcdeclareLog([]);
     try {
       const payload = {
         eventLogFile:       eventLogFilename,
@@ -8590,28 +8661,42 @@ function App() {
         lifecycleThreshold: 0.5,
         resourceThreshold:  50.0,
       };
-      const response = await axios.post('/api/discover-ocdeclare', payload);
-      if (response.data.success) {
-        setOcdeclareDiscoveryResults(response.data);
+      const { data: { run_id } } = await axios.post('/api/discover-ocdeclare', payload);
+      const data = await pollOcdeclareRun(run_id, (phase, pct, logs) => {
+        setOcdeclareProgress({ phase, pct });
+        if (logs && logs.length > 0) setOcdeclareLog(logs);
+      });
+      if (data.success) {
+        setOcdeclareDiscoveryResults(data);
         await loadAvailableFiles({ preserveSelections: true });
-        if (response.data.filename) {
-          setConfig(prev => ({ ...prev, ocdeclareFile: response.data.filename }));
+        if (data.filename) {
+          setConfig(prev => ({ ...prev, ocdeclareFile: data.filename }));
         }
       } else {
-        setOcdeclareDiscoveryError(response.data.error || 'OC-Declare discovery failed');
+        setOcdeclareDiscoveryError(data.error || 'OC-Declare discovery failed');
       }
     } catch (err) {
       setOcdeclareDiscoveryError(err.response?.data?.error || err.message || 'OC-Declare discovery failed');
     } finally {
+      clearTimeout(ocdeclarePollingRef.current);
       setIsOcdeclareDiscovering(false);
+      setOcdeclareProgress({ phase: '', pct: 0 });
     }
-  }, [loadAvailableFiles]);
+  }, [loadAvailableFiles, pollOcdeclareRun]);
 
   const handleFileUpload = useCallback(async (file, type) => {
     if (!file) return;
     const formData = new FormData();
     formData.append('file', file);
     formData.append('type', type);
+    if (type === 'eventlog') {
+      ocelLoadStartRef.current = Date.now();
+      setOcelLoadElapsed(null);
+      if (ocelLoadTimerRef.current) clearInterval(ocelLoadTimerRef.current);
+      ocelLoadTimerRef.current = setInterval(() => {
+        setOcelLoadElapsed(Math.floor((Date.now() - ocelLoadStartRef.current) / 1000));
+      }, 1000);
+    }
     try {
       const res = await axios.post('/api/upload-file', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
@@ -8620,10 +8705,12 @@ function App() {
         await loadAvailableFiles({ preserveSelections: true });
         const filename = res.data.filename;
         if (type === 'eventlog') {
+          clearInterval(ocelLoadTimerRef.current);
+          ocelLoadTimerRef.current = null;
+          setOcelLoadElapsed(Math.floor((Date.now() - (ocelLoadStartRef.current || Date.now())) / 1000));
           handleDiscoveryConfigChange('eventLogFile', filename);
           if (workflowMode === 'external-ocel') {
             setTimeout(() => runDiscovery(filename), 0);
-            autoDiscoverOCDeclare(filename);
           }
         } else if (type === 'ocdeclare') {
           handleConfigChange('ocdeclareFile', filename);
@@ -8631,9 +8718,11 @@ function App() {
           handleLoadParameters(filename);
         }
       } else {
+        if (type === 'eventlog') { clearInterval(ocelLoadTimerRef.current); ocelLoadTimerRef.current = null; }
         alert(`Upload failed: ${res.data.error || 'Unknown error'}`);
       }
     } catch (err) {
+      if (type === 'eventlog') { clearInterval(ocelLoadTimerRef.current); ocelLoadTimerRef.current = null; }
       alert(`Upload failed: ${err.response?.data?.error || err.message}`);
     }
   }, [loadAvailableFiles, handleDiscoveryConfigChange, handleConfigChange, handleLoadParameters, workflowMode, runDiscovery, autoDiscoverOCDeclare]);
@@ -8771,7 +8860,7 @@ function App() {
           const alreadyAdded = cycleConstraints.some(x => x === c);
           if (!alreadyAdded) {
             cycleConstraints.push(c);
-            const lbl = `${c.constraint_type}(${src}→${tgt})${c.scope?.object_type ? ' each ' + c.scope.object_type : ''} nmin=${c.nmin ?? 1}`;
+            const lbl = `${c.constraint_type}(${src}→${tgt})${c.scope ? ' ' + formatScope(c.scope) : ''} nmin=${c.nmin ?? 1}`;
             suggestions.push({
               id: id++, type: 'CYCLE',
               badgeLabel: `CYCLE nmin=${c.nmin ?? 1}`,
@@ -9022,7 +9111,7 @@ function App() {
           (c2.scope?.object_type || '') === (c1.scope?.object_type || '')
         );
         if (!stronger) return;
-        const lbl = `${c1.constraint_type}(${c1.source_activity || c1.source}→${c1.target_activity || c1.target})${c1.scope?.object_type ? ' each ' + c1.scope.object_type : ''}`;
+        const lbl = `${c1.constraint_type}(${c1.source_activity || c1.source}→${c1.target_activity || c1.target})${c1.scope ? ' ' + formatScope(c1.scope) : ''}`;
         suggestions.push({
           id: id++, type: 'REDUNDANT',
           badgeLabel: 'REDUNDANT',
@@ -9157,11 +9246,6 @@ function App() {
     window.open(`/api/download/${results.output_file}`, '_blank');
   };
 
-  const downloadMetrics = () => {
-    if (!results?.metrics_file) return;
-    window.open(`/api/download-metrics/${results.metrics_file}`, '_blank');
-  };
-
   // ── Format seconds into a human-readable string ────────────────────────────
   const fmtSeconds = (s) => {
     if (s == null) return '—';
@@ -9204,14 +9288,13 @@ function App() {
           <p style={{margin:'0'}}>
             To add constraints, configure in the <strong>Constraints</strong> section.{' '}
             To add activities, configure in the <strong>Activities</strong> section.{' '}
-            To add objects, configure in the <strong>Object Flows</strong> section.{' '}
+            To add objects, configure in the <strong>Object Creation/Deactivation</strong> section.{' '}
             To remove constraints, activities or objects, click the removal button in their section.
           </p>
           {externalTab === 'scenario' && (
             <p style={{margin:'0.35rem 0 0',paddingTop:'0.35rem',borderTop:'1px solid #bfdbfe'}}>
-              To run, first configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
-              <strong>▶ Run As-Is / Base Model</strong> for the Base Model or{' '}
-              <strong>Run To-Be</strong> for the Alternative scenario.
+              To run, go to the <strong>Results</strong> tab and configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
+              <strong>▶ Run Base Model</strong> or <strong>▶ Run Alternative Model</strong>.
             </p>
           )}
         </div>
@@ -9222,7 +9305,7 @@ function App() {
         <div className="main-tab-bar">
           {[
             { key: 'behavior',   label: 'Base Model' },
-            { key: 'scenario',   label: 'Scenario Builder / To-Be' },
+            { key: 'scenario',   label: 'Alternative Model' },
             { key: 'results',    label: 'Results' },
             { key: 'evaluation', label: 'Evaluation', disabled: !evaluationReady },
           ].map(t => (
@@ -9291,12 +9374,17 @@ function App() {
             <div className="loading-box">
               <div className="spinner"></div>
               <p>Running parameter discovery...</p>
+              {paramDiscElapsed != null && (
+                <p className="sim-elapsed-timer" style={{fontSize:'0.82rem',marginTop:'0.25rem'}}>
+                  {Math.floor(paramDiscElapsed/60).toString().padStart(2,'0')}:{(paramDiscElapsed%60).toString().padStart(2,'0')}
+                </p>
+              )}
             </div>
           )}
 
           {discoveryResults && !isDiscovering && (
             <div className="discovery-results">
-              <h3>Discovery Complete</h3>
+              <h3>Discovery Complete{paramDiscElapsed != null && <span style={{fontSize:'0.82rem',fontWeight:400,color:'#94a3b8',marginLeft:'0.5em'}}>· {paramDiscElapsed}s</span>}</h3>
 
               <div className="stat-grid">
                 <div className="stat-card">
@@ -9366,13 +9454,6 @@ function App() {
                             <th>Activity</th>
                             <th>Occurrences</th>
                             {discoveryResults.trace_end_prob && <th title="Probability this activity is last in an object trace (higher = more likely end)">P(end)</th>}
-                            {discoveryResults.activity_consec_stats && (
-                              <>
-                                <th title="Shortest consecutive run of this activity in the log">Min consec</th>
-                                <th title="Average consecutive run length in the log — use as guide for max consecutive setting">Mean consec</th>
-                                <th title="Longest consecutive run of this activity in the log">Max consec</th>
-                              </>
-                            )}
                             {discoveryResults.activity_repeat_stats && (
                               <>
                                 <th title="Fewest times this activity fired on a single object">Min /obj</th>
@@ -9387,7 +9468,6 @@ function App() {
                             .slice()
                             .sort((a, b) => (discoveryResults.activity_counts[b] || 0) - (discoveryResults.activity_counts[a] || 0))
                             .map(activity => {
-                              const cs = discoveryResults.activity_consec_stats?.[activity];
                               const rs = discoveryResults.activity_repeat_stats?.[activity];
                               const isLikelyStart = discoveryResults.likely_start_activities?.slice(0,3).includes(activity);
                               const isLikelyEnd   = discoveryResults.likely_end_activities?.includes(activity);
@@ -9413,13 +9493,6 @@ function App() {
                                         </span>
                                       ) : '—'}
                                     </td>
-                                  )}
-                                  {discoveryResults.activity_consec_stats && (
-                                    <>
-                                      <td className="activity-count-num">{cs ? cs.min : '—'}</td>
-                                      <td className="activity-count-num">{cs ? cs.mean : '—'}</td>
-                                      <td className="activity-count-num">{cs ? cs.max : '—'}</td>
-                                    </>
                                   )}
                                   {discoveryResults.activity_repeat_stats && (
                                     <>
@@ -9454,25 +9527,6 @@ function App() {
                       </div>
                     )
                   }
-                </Collapsible>
-              )}
-
-              {discoveryResults.prob_matrix && Object.keys(discoveryResults.prob_matrix).length > 0 && (
-                <Collapsible
-                  title="Transition Flow Chart"
-                  badge={`${Object.keys(discoveryResults.prob_matrix).length} activities`}
-                  defaultOpen={false}
-                  className="discovery-transition-collapsible"
-                >
-                  <TransitionFlowChart
-                    matrix={discoveryResults.prob_matrix}
-                    activityCounts={discoveryResults.activity_counts || {}}
-                    startActivities={discoveryResults.likely_start_activities || config.startActivities || []}
-                    traceEndProb={discoveryResults.trace_end_prob || {}}
-                    likelyEndActivities={discoveryResults.likely_end_activities || []}
-                    tracePosition={discoveryResults.trace_position || {}}
-                    constraints={activeModel?.constraints || []}
-                  />
                 </Collapsible>
               )}
 
@@ -9556,6 +9610,8 @@ function App() {
                         <div className="file-meta">
                           {discoveryResults.total_events != null && `${discoveryResults.total_events.toLocaleString()} events`}
                           {discoveryResults.log_object_trace_count != null && ` · ${discoveryResults.log_object_trace_count.toLocaleString()} objects`}
+                          {ocelLoadElapsed != null && <span style={{marginLeft:'0.5em',color:'#94a3b8'}}>· OCEL loaded in {ocelLoadElapsed}s</span>}
+                          {paramDiscElapsed != null && <span style={{marginLeft:'0.5em',color:'#94a3b8'}}>· params in {paramDiscElapsed}s</span>}
                         </div>
                       )}
                     </div>
@@ -9564,15 +9620,36 @@ function App() {
                   {/* Drop prompt */}
                   {!discoveryConfig.eventLogFile && (
                     <div className="ocel-drop-prompt">
-                      
                       <div className="ocel-drop-label">Drop event log here</div>
-                      <div className="ocel-drop-sub">or click to browse (.json, .xml)</div>
+                      <div className="ocel-drop-sub">or click to browse (.json, .jsonocel, .xml, .csv)</div>
+                      {eventLogFiles && eventLogFiles.length > 0 && (
+                        <div onClick={e => e.stopPropagation()} style={{marginTop:'0.75rem'}}>
+                          <select
+                            defaultValue=""
+                            style={{fontSize:'0.8rem',padding:'0.3rem 0.5rem',borderRadius:'6px',border:'1px solid #cbd5e1',background:'#fff',color:'#334155',maxWidth:'320px',width:'100%'}}
+                            onChange={e => {
+                              if (e.target.value) {
+                                handleDiscoveryConfigChange('eventLogFile', e.target.value);
+                                setTimeout(() => runDiscovery(e.target.value), 0);
+                              }
+                            }}
+                          >
+                            <option value="">— or select existing file —</option>
+                            {eventLogFiles.map(f => <option key={f} value={f}>{f}</option>)}
+                          </select>
+                        </div>
+                      )}
                     </div>
                   )}
                   {discoveryConfig.eventLogFile && isDiscovering && (
                     <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:'0.75rem',padding:'1rem 0'}}>
                       <div className="spinner"></div>
                       <span style={{fontSize:'0.85rem',color:'#64748b'}}>Analysing log…</span>
+                      {paramDiscElapsed != null && (
+                        <span className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                          {Math.floor(paramDiscElapsed/60).toString().padStart(2,'0')}:{(paramDiscElapsed%60).toString().padStart(2,'0')}
+                        </span>
+                      )}
                     </div>
                   )}
 
@@ -9694,8 +9771,8 @@ function App() {
                           </div>
                         </div>
 
-                        {/* Permanent object threshold */}
-                        <div className="landing-option-group">
+                        {/* Permanent object threshold — commented out */}
+                        {false && <div className="landing-option-group">
                           <label className="landing-option-label" style={{display:'flex',alignItems:'center',gap:'0.35rem'}}>
                             Permanent Object Threshold
                             {/* ? popup with repeat stats */}
@@ -9773,7 +9850,7 @@ function App() {
                             onChange={e => setPermanentThreshold(Math.max(1, parseInt(e.target.value)||1))}
                             style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
                           <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>max same-activity repetitions/instance</div>
-                        </div>
+                        </div>}
 
                         {/* Model check options */}
                         {config.ocdeclareFile && (
@@ -9792,52 +9869,118 @@ function App() {
                   )}
 
                   {/* Hidden file input */}
-                  <input ref={ocelFileRef} type="file" accept=".json,.xml" style={{display:'none'}}
+                  <input ref={ocelFileRef} type="file" accept=".json,.jsonocel,.xml,.csv" style={{display:'none'}}
                     onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'eventlog'); e.target.value=''; }} />
                 </div>
 
-                {/* OC-Declare auto-discovery status — Küsters & van der Aalst (2025) algorithm */}
+                {/* OC-Declare step: load file or run discovery */}
                 {discoveryConfig.eventLogFile && (
                   <div className="landing-ocdecl-section">
-                    <div
-                      className={`ocel-drop-zone${config.ocdeclareFile ? ' loaded' : ''}`}
-                      style={{minHeight:'70px',padding:'1rem 1.25rem',cursor:'default'}}
-                    >
-                      {isOcdeclareDiscovering ? (
-                        <div style={{display:'flex',alignItems:'center',gap:'0.75rem'}}>
-                          <div className="spinner spinner-sm" />
-                          <div>
-                            <div style={{fontWeight:600,color:'#6366f1',fontSize:'0.9rem'}}>Discovering OC-Declare constraints…</div>
-                            <div style={{fontSize:'0.75rem',color:'#94a3b8',marginTop:'0.15rem'}}>
-                              Running Küsters &amp; van der Aalst (2025) algorithm with default options
-                            </div>
+                    <div style={{fontWeight:600,fontSize:'0.85rem',color:'#1e293b',marginBottom:'0.6rem'}}>
+                      OC-Declare Constraints
+                    </div>
+                    {config.ocdeclareFile ? (
+                      <div className="ocel-drop-zone loaded" style={{minHeight:'70px',padding:'1rem 1.25rem',cursor:'default'}}>
+                        <div className="ocel-drop-zone-info">
+                          <div className="file-name">{config.ocdeclareFile}</div>
+                          <div className="file-meta" style={{color:'#15803d'}}>
+                            {ocdeclareDiscoveryResults
+                              ? `✓ Discovered · ${ocdeclareDiscoveryResults?.stats?.num_constraints ?? ''} constraints`
+                              : '✓ OC-Declare model loaded'}
+                            {ocdeclareElapsed != null && ocdeclareDiscoveryResults && (
+                              <span style={{color:'#94a3b8',fontWeight:400,marginLeft:'0.4em'}}>· {ocdeclareElapsed}s</span>
+                            )}
                           </div>
                         </div>
-                      ) : ocdeclareDiscoveryError ? (
-                        <div style={{color:'#dc2626',fontSize:'0.85rem'}}>
-                          <div style={{fontWeight:600}}>⚠ OC-Declare discovery failed</div>
-                          <div style={{marginTop:'0.25rem',color:'#64748b'}}>{ocdeclareDiscoveryError}</div>
-                        </div>
-                      ) : config.ocdeclareFile ? (
-                        <div>
-                          <div className="ocel-drop-zone-info">
-                            <div className="file-name">{config.ocdeclareFile}</div>
-                            <div className="file-meta" style={{color:'#15803d'}}>
-                              ✓ Auto-discovered · {ocdeclareDiscoveryResults?.stats?.num_constraints ?? ''} constraints
-                            </div>
-                          </div>
+                        {ocdeclareDiscoveryResults && (
                           <div style={{marginTop:'0.6rem',fontSize:'0.72rem',color:'#64748b',fontStyle:'italic'}}>
                             Discovered using the algorithm by Küsters &amp; van der Aalst (2025) —{' '}
                             <em>OC-DECLARE: Discovering Object-Centric Declarative Patterns with Synchronization</em>.
                             Default options: noise threshold 0.2, lossless reduction, arrow types AS/EF/EP.
                           </div>
+                        )}
+                        {ocdeclareDiscoveryResults?.filename && (
+                          <div style={{marginTop:'0.5rem'}}>
+                            <a
+                              href={`/api/download-ocdeclare/${encodeURIComponent(ocdeclareDiscoveryResults.filename)}`}
+                              download={ocdeclareDiscoveryResults.filename}
+                              style={{fontSize:'0.72rem',color:'#6366f1',textDecoration:'none',fontWeight:600}}
+                            >
+                              Download OC-Declare File
+                            </a>
+                          </div>
+                        )}
+                      </div>
+                    ) : isOcdeclareDiscovering ? (
+                      <div className="ocel-drop-zone" style={{minHeight:'70px',padding:'1rem 1.25rem',cursor:'default'}}>
+                        <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                          <div style={{display:'flex',alignItems:'center',gap:'0.75rem'}}>
+                            <div className="spinner spinner-sm" />
+                            <div>
+                              <div style={{fontWeight:600,color:'#6366f1',fontSize:'0.9rem'}}>Discovering OC-Declare constraints…</div>
+                              <div style={{fontSize:'0.75rem',color:'#94a3b8',marginTop:'0.15rem'}}>
+                                {ocdeclareProgress.phase || 'Starting'}
+                              </div>
+                            </div>
+                            <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:'0.75rem'}}>
+                              {ocdeclareElapsed != null && (
+                                <span className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                                  {Math.floor(ocdeclareElapsed/60).toString().padStart(2,'0')}:{(ocdeclareElapsed%60).toString().padStart(2,'0')}
+                                </span>
+                              )}
+                              <span style={{fontSize:'0.8rem',color:'#6366f1',fontWeight:600}}>
+                                {ocdeclareProgress.pct}%
+                              </span>
+                            </div>
+                          </div>
+                          <div style={{height:'5px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden'}}>
+                            <div style={{height:'100%',background:'#6366f1',borderRadius:'3px',transition:'width 0.4s ease',width:`${ocdeclareProgress.pct}%`}} />
+                          </div>
+                          {ocdeclareLog.length > 0 && (
+                            <div style={{marginTop:'0.25rem',background:'#0f172a',borderRadius:'5px',padding:'0.4rem 0.6rem',fontFamily:'monospace',fontSize:'0.7rem',lineHeight:'1.5',color:'#94a3b8'}}>
+                              {ocdeclareLog.slice(-5).map((entry, i) => (
+                                <div key={i} style={{whiteSpace:'pre-wrap',wordBreak:'break-all'}}>
+                                  <span style={{color:'#475569',marginRight:'0.5em'}}>{entry.t}</span>
+                                  <span style={{color: entry.msg.startsWith('[') ? '#a5b4fc' : entry.msg.startsWith('After') || entry.msg.startsWith('Discovery') ? '#86efac' : '#cbd5e1'}}>{entry.msg}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
-                      ) : (
-                        <div style={{color:'#94a3b8',fontSize:'0.85rem',textAlign:'center',padding:'0.5rem'}}>
-                          Waiting for OCEL to finish uploading…
+                      </div>
+                    ) : (
+                      <>
+                        {ocdeclareDiscoveryError && (
+                          <div style={{color:'#dc2626',fontSize:'0.82rem',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.5rem 0.75rem',marginBottom:'0.6rem'}}>
+                            <span style={{fontWeight:600}}>⚠ Discovery failed: </span>{ocdeclareDiscoveryError}
+                          </div>
+                        )}
+                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'1rem'}}>
+                          <div
+                            className="ocel-drop-zone"
+                            style={{cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:'0.4rem',minHeight:'100px',padding:'1.25rem'}}
+                            onClick={() => ocdeclFileRef.current?.click()}
+                          >
+                            <div style={{fontWeight:600,fontSize:'0.88rem'}}>Load OC-Declare File</div>
+                            <div style={{fontSize:'0.73rem',color:'#64748b',textAlign:'center'}}>Upload a pre-prepared OC-Declare model (.json)</div>
+                          </div>
+                          <div
+                            className="ocel-drop-zone"
+                            style={{cursor:'default',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:'0.6rem',minHeight:'100px',padding:'1.25rem'}}
+                          >
+                            <button className="simulate-button" style={{fontSize:'0.85rem',padding:'0.45rem 1rem'}}
+                              onClick={() => autoDiscoverOCDeclare(discoveryConfig.eventLogFile)}>
+                              ▶ Run Discovery
+                            </button>
+                            <div style={{fontSize:'0.73rem',color:'#64748b',textAlign:'center'}}>
+                              Küsters &amp; van der Aalst (2025) algorithm<br/>with default options
+                            </div>
+                          </div>
                         </div>
-                      )}
-                    </div>
+                      </>
+                    )}
+                    <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
+                      onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
                   </div>
                 )}
 
@@ -9869,7 +10012,7 @@ function App() {
                   </button>
                   <button
                     className="simulate-button"
-                    disabled={!discoveryConfig.eventLogFile || isOcdeclareDiscovering || isRunningDiscoveries || isDiscovering || !(discoveryConfig.startActivityProbSelected?.length > 0)}
+                    disabled={!discoveryConfig.eventLogFile || !config.ocdeclareFile || isOcdeclareDiscovering || isRunningDiscoveries || isDiscovering || !(discoveryConfig.startActivityProbSelected?.length > 0)}
                     onClick={runAllDiscoveries}
                     style={{minWidth:'260px'}}
                   >
@@ -9889,10 +10032,11 @@ function App() {
                 {/* Stat strip */}
                 <div className="behavior-stat-strip">
                   {[
-                    { label: 'Events Analyzed', val: discoveryResults?.total_events?.toLocaleString() },
-                    { label: 'Object Traces',   val: discoveryResults?.log_object_trace_count?.toLocaleString() },
-                    { label: 'Activity Types',  val: discoveryResults?.activity_count },
-                    { label: 'Transitions',     val: discoveryResults?.transition_count },
+                    { label: 'Events Analyzed', val: discoveryResults?.total_events?.toLocaleString(),            source: 'OCEL log' },
+                    { label: 'Object Traces',   val: discoveryResults?.log_object_trace_count?.toLocaleString(),  source: 'OCEL log' },
+                    { label: 'Activity Types',  val: discoveryResults?.activity_count,                            source: 'OCEL log' },
+                    { label: 'Transitions',     val: discoveryResults?.transition_count,                          source: 'OCEL log' },
+                    { label: 'Constraints',     val: modelAsIs?.constraints?.length,                              source: 'OC-Declare' },
                     { label: 'Log Time Span',   val: (() => {
                         const s = discoveryResults?.ocel_time_span_s;
                         if (!s) return null;
@@ -9901,11 +10045,16 @@ function App() {
                         if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
                         const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
                         return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
-                      })() },
+                      })(), source: 'OCEL log' },
                   ].filter(c => c.val != null).map((c, i) => (
                     <div key={i} className="behavior-stat-card">
                       <div className="behavior-stat-val">{c.val}</div>
                       <div className="behavior-stat-label">{c.label}</div>
+                      {c.source && (
+                        <div style={{fontSize:'0.6rem',color: c.source === 'OC-Declare' ? '#6366f1' : '#94a3b8',marginTop:'2px',fontStyle:'italic'}}>
+                          {c.source}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -9913,11 +10062,25 @@ function App() {
                 {!modelAsIs ? (
                   <div style={{padding:'2rem',textAlign:'center',color:'#94a3b8'}}>No model loaded yet.</div>
                 ) : (<>
+                  {/* Constraint Flow Graph — above model editors */}
+                  {(modelAsIs.activities?.length > 0 || modelAsIs.constraints?.length > 0) && (
+                    <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
+                      <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
+                        Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— approximated possible routes</span>
+                      </div>
+                      <ConstraintFlowGraph
+                        activities={modelAsIs.activities || []}
+                        constraints={modelAsIs.constraints || []}
+                        startActivities={config.startActivities || []}
+                        probMatrix={probMatrixBase || {}}
+                      />
+                    </div>
+                  )}
                   <div className="behavior-body">
                     <nav className="behavior-nav">
                       {[
                         ['activities',    'Activities'],
-                        ['objects',       'Object Flows'],
+                        ['objects',       'Object Creation/Deactivation'],
                         ['constraints',   'Constraints'],
                         ['o2o',           'Object-to-Object Relationships'],
                         ['time',          'Time'],
@@ -9946,6 +10109,22 @@ function App() {
                           onStartActivitiesChange={acts => setConfig(c => ({...c, startActivities: acts, startActivitiesLocked: true}))}
                           filters={getBehaviorFilters('activities')}
                           onFiltersChange={f => setBehaviorSectionFilters('activities', f)}
+                          onActivityAdded={(name, existingNames) => {
+                            const eq = existingNames.length > 0 ? 1 / existingNames.length : 1;
+                            const row = {};
+                            existingNames.forEach(a => { row[a] = eq; });
+                            setProbMatrixBase(m => ({...m, [name]: row}));
+                          }}
+                          onActivityDeleted={name => setProbMatrixBase(m => {
+                            const n = {...m};
+                            delete n[name];
+                            Object.keys(n).forEach(k => {
+                              if (n[k] && n[k][name] !== undefined) {
+                                const r = {...n[k]}; delete r[name]; n[k] = r;
+                              }
+                            });
+                            return n;
+                          })}
                         />
                       )}
 
@@ -9969,6 +10148,8 @@ function App() {
                           onUpdate={(src, row) => setProbMatrixBase(m => ({...m, [src]: row}))}
                           filters={getBehaviorFilters('probabilities')}
                           onFiltersChange={f => setBehaviorSectionFilters('probabilities', f)}
+                          allActivityNames={(modelAsIs?.activities||[]).map(a=>a.name)}
+                          constraints={modelAsIs?.constraints || []}
                         />
                       )}
 
@@ -9979,7 +10160,10 @@ function App() {
                           actNames={(modelAsIs.activities||[]).map(a=>a.name)}
                           otNames={(modelAsIs.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
                           editMode={true}
-                          onUpdate={cons => setModelAsIs(m => ({...m, constraints: cons}))}
+                          onUpdate={cons => {
+                            setModelAsIs(m => ({...m, constraints: cons}));
+                            setProbMatrixBase(m => applyConstraintsToProbMatrix(m, cons));
+                          }}
                           activities={modelAsIs.activities || []}
                           onUpdateActivities={acts => setModelAsIs(m => ({...m, activities: acts}))}
                           filters={getBehaviorFilters('constraints')}
@@ -10004,7 +10188,7 @@ function App() {
                             cellMap[r.target_type][r.source_type] = cell;
                           }
                         });
-                        const fmtCell = ({min, max}) => `${min}..${max == null ? '∞' : max}`;
+                        const fmtCell = ({min, max}) => { const s = max == null ? '∞' : max; return (max !== null && min === max) ? String(min) : `${min}-${s}`; };
                         const involved = new Set(rules.flatMap(r => [r.source_type, r.target_type]));
                         const allCols = otNames.filter(t => involved.has(t));
 
@@ -10061,11 +10245,9 @@ function App() {
                                             fontWeight: cell ? 600 : 400,
                                             color: cell ? (cell.bidir ? '#7c3aed' : '#1e293b') : '#e2e8f0'}}>
                                             {cell ? (
-                                                <span style={{display:'inline-flex',alignItems:'center',gap:'1px',fontSize:'0.78rem'}}>
-                                                  <EditableCell value={cell.min??0} type="number" onSave={v=>updateO2O('min_links',v)} style={{fontSize:'0.78rem'}}/>
-                                                  ..
-                                                  <EditableCell value={cell.max??''} type="number" placeholder="∞" onSave={v=>updateO2O('max_links',v)} style={{fontSize:'0.78rem'}}/>
-                                                  <span style={{fontSize:'0.7em',marginLeft:'2px'}}>{cell.bidir ? '↔' : '→'}</span>
+                                                <span style={{display:'inline-flex',alignItems:'center',gap:'4px',fontSize:'0.78rem'}}>
+                                                  {fmtCell(cell)}
+                                                  <span style={{fontSize:'0.7em'}}>{cell.bidir ? '↔' : '→'}</span>
                                                   <button onClick={()=>setModelAsIs(m=>({...m,o2o_rules:(m.o2o_rules||[]).filter(r=>!(r.source_type===row&&r.target_type===col)&&!(r.source_type===col&&r.target_type===row))}))} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 1px',fontSize:'0.7rem',lineHeight:1}}>×</button>
                                                 </span>
                                             ) : ''}</td>
@@ -10085,14 +10267,14 @@ function App() {
                       {/* ── OBJECT FLOWS ── */}
                       {behaviorSection === 'objects' && (
                         <div>
-                          <div className="behavior-section-title">Object Flows
+                          <div className="behavior-section-title">Object Creation/Deactivation
                             <BehaviorLegend items={[
-                              ['Permanent Objects','Object types that are pre-populated at simulation start, limited to a fixed pool size, and never deactivated (e.g. trucks, forklifts, workers). Pool size = number of simultaneously available instances.'],
-                              ['Attributes','Default values assigned to new object instances when they are first created. Only relevant if guards or attribute_updates use these fields.'],
-                              ['Object Flow track','Shows all activities that involve each object type, left to right in process order. + = creates, ✕ = deactivates.'],
+                              // ['Permanent Objects','Object types that are pre-populated at simulation start, limited to a fixed pool size, and never deactivated (e.g. trucks, forklifts, workers). Pool size = number of simultaneously available instances.'],
+                              // ['Attributes','Default values assigned to new object instances when they are first created. Only relevant if guards or attribute_updates use these fields.'],
+                              ['Object Involvement track','Shows all activities that involve each object type, left to right in process order. + = creates, ✕ = deactivates.'],
                             ]}/>
                           </div>
-                          <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
+                          {false && <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
                             <div style={{flex:1,minWidth:'180px'}}>
                               <div className="behavior-sub-title">Permanent Objects</div>
                               {(() => {
@@ -10146,14 +10328,21 @@ function App() {
                                 </table>
                               ) : <p className="behavior-empty">No attributes defined.</p>}
                             </div>
-                          </div>
+                          </div>}
                           <AddObjectTypeForm model={modelAsIs} onUpdate={m => setModelAsIs(m)} />
-                          <div className="behavior-sub-title">Object Flow</div>
+                          <div className="behavior-sub-title">Object Involvement</div>
+                          <div style={{fontSize:'0.72rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
+                            Where objects get <span style={{color:'#4ade80',fontWeight:600}}>created</span> and involved and <span style={{color:'#f87171',fontWeight:600}}>deactivated</span>
+                          </div>
                           {(() => {
                             const byType = {};
-                            (modelAsIs.activities||[]).forEach(a => (a.bindings||[]).forEach(b => {
-                              (byType[b.object_type] = byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});
-                            }));
+                            const actObjMap = {};
+                            (modelAsIs.activities||[]).forEach(a => {
+                              actObjMap[a.name] = (a.bindings||[]).filter(b=>b.object_type).map(b=>({type:b.object_type,creates:!!b.creates,deactivates:!!b.deactivates}));
+                              (a.bindings||[]).forEach(b => {
+                                (byType[b.object_type] = byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});
+                              });
+                            });
                             return Object.entries(byType).map(([ot, nodes]) => {
                               const sorted = [
                                 ...nodes.filter(n => n.creates && !n.deactivates),
@@ -10171,7 +10360,10 @@ function App() {
                                     <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',paddingTop:'0.55rem',whiteSpace:'nowrap',flexShrink:0}}>Object flow:</span>
                                     <div className="object-flow-track">
                                       {sorted.map(n => (
-                                        <div key={n.act} className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}>
+                                        <div key={n.act}
+                                          className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}
+                                          style={{cursor:'pointer'}}
+                                          onClick={() => setActivityPopup({name:n.act, objects:actObjMap[n.act]||[]})}>
                                           <span className="flow-node-name">{n.act}</span>
                                           {n.creates && <span className="flow-node-badge flow-node-creates">+</span>}
                                           {n.deactivates && <span className="flow-node-badge flow-node-deactivates">✕</span>}
@@ -10188,20 +10380,6 @@ function App() {
 
                     </div>
                   </div>
-                  {/* Constraint Flow Graph — always below the tab panels, reacts to model edits */}
-                  {modelAsIs && (modelAsIs.activities?.length > 0 || modelAsIs.constraints?.length > 0) && (
-                    <div style={{marginTop:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
-                      <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
-                        Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— possible routes · arrow width = transition probability</span>
-                      </div>
-                      <ConstraintFlowGraph
-                        activities={modelAsIs.activities || []}
-                        constraints={modelAsIs.constraints || []}
-                        startActivities={config.startActivities || []}
-                        probMatrix={probMatrixBase || {}}
-                      />
-                    </div>
-                  )}
                 </>)}
               </div>
             )}{/* end behavior tab */}
@@ -10209,19 +10387,65 @@ function App() {
             {/* ── SCENARIO BUILDER TAB ── */}
             {externalTab === 'scenario' && (
               <div className="ext-ocel-tab-content">
+
+                {/* Changes vs Base Model — top of tab */}
+                {modelToBe && modelAsIs && (
+                  <ToBeDiffPanel
+                    modelAsIs={modelAsIs}
+                    modelToBe={modelToBe}
+                    probMatrixBase={probMatrixBase}
+                    probMatrixToBe={probMatrixToBe}
+                    startActivitiesAsIs={modelAsIs?.start_activities || []}
+                    startActivitiesToBe={config.startActivities || []}
+                  />
+                )}
+                {modelBase && modelToBe && (() => {
+                  const diffC = (modelToBe.constraints||[]).length - (modelBase.constraints||[]).length;
+                  const diffO = (modelToBe.o2o_rules||[]).length - (modelBase.o2o_rules||[]).length;
+                  const baseActs = JSON.stringify((modelBase.activities||[]).map(a=>a.name).sort());
+                  const tobeActs = JSON.stringify((modelToBe.activities||[]).map(a=>a.name).sort());
+                  const actChanged = baseActs !== tobeActs;
+                  if (diffC === 0 && diffO === 0 && !actChanged) return null;
+                  return (
+                    <div className="model-diff-summary" style={{marginBottom:'0.75rem'}}>
+                      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#92400e',marginBottom:'0.3rem'}}>Changes vs Base Model</div>
+                      <div style={{display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
+                        {diffC !== 0 && <span className={'diff-badge '+(diffC>0?'diff-add':'diff-rem')}>{diffC>0?'+':''}{diffC} constraints</span>}
+                        {diffO !== 0 && <span className={'diff-badge '+(diffO>0?'diff-add':'diff-rem')}>{diffO>0?'+':''}{diffO} object-to-object relationships</span>}
+                        {actChanged && <span className="diff-badge diff-mod">activities changed</span>}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Constraint Flow Graph — above model editors */}
+                {modelToBe && (modelToBe.activities?.length > 0 || modelToBe.constraints?.length > 0) && (
+                  <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
+                    <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
+                      Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— approximated possible routes</span>
+                    </div>
+                    <ConstraintFlowGraph
+                      activities={modelToBe.activities || []}
+                      constraints={modelToBe.constraints || []}
+                      startActivities={config.startActivities || []}
+                      probMatrix={probMatrixToBe || probMatrixBase || {}}
+                    />
+                  </div>
+                )}
+
                 <div className="scenario-layout">
 
                   {/* LEFT: Inline To-Be Model Editor */}
                   <div className="scenario-editor-col" style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
                     <div className="behavior-section-title" style={{marginBottom:'0.5rem'}}>
-                      To-Be Model <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>— always editable · click any value to change</span>
+                        Alternative Model <span style={{fontSize:'0.72rem',fontWeight:400,color:'#94a3b8'}}>— always editable · click any value to change</span>
                     </div>
                     {modelToBe ? (<>
                       <div className="scenario-editor-layout">
                         <nav className="scenario-vertical-nav">
                           {[
                             ['activities','A','Activities'],
-                            ['objects','F','Object Flows'],
+                            ['objects','F','Object Creation/Deactivation'],
                             ['constraints','C','Constraints'],
                             ['o2o','↔','O2O'],
                             ['time','T','Time'],
@@ -10248,6 +10472,22 @@ function App() {
                           filters={scenarioBehaviorFilters['activities'] || {}}
                           onFiltersChange={f => setScenarioBehaviorFilters(p => ({...p, activities: f}))}
                           foldable={false}
+                          onActivityAdded={(name, existingNames) => {
+                            const eq = existingNames.length > 0 ? 1 / existingNames.length : 1;
+                            const row = {};
+                            existingNames.forEach(a => { row[a] = eq; });
+                            setProbMatrixToBe(m => ({...m, [name]: row}));
+                          }}
+                          onActivityDeleted={name => setProbMatrixToBe(m => {
+                            const n = {...m};
+                            delete n[name];
+                            Object.keys(n).forEach(k => {
+                              if (n[k] && n[k][name] !== undefined) {
+                                const r = {...n[k]}; delete r[name]; n[k] = r;
+                              }
+                            });
+                            return n;
+                          })}
                         />
                       )}
 
@@ -10265,64 +10505,21 @@ function App() {
                       )}
 
                       {/* Probabilities */}
-                      {scenarioBehaviorSection === 'probabilities' && (() => {
-                        const allActNames = Object.keys(probMatrixToBe || {});
-                        const pf = scenarioBehaviorFilters['probabilities'] || {};
-                        const filtSrc = pf.from_activity || '', filtTgt = pf.to_activity || '';
-                        return (
-                          <div>
-                            <div className="behavior-section-title">Transition Probabilities
-                              <BehaviorLegend items={[
-                                ['From → To','Source and destination activity for this transition'],
-                                ['Probability','Fraction of times this transition is taken (0–100%)'],
-                                ['Slider','Drag to adjust; others in the row scale proportionally'],
-                              ]}/>
-                            </div>
-                            <TableFilterBar
-                              dimensions={[{key:'from_activity',label:'From',options:allActNames},{key:'to_activity',label:'To',options:allActNames}]}
-                              filters={pf} onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,probabilities:f}))}
-                            />
-                            {probMatrixToBe && Object.keys(probMatrixToBe).length > 0 ? (
-                              <table className="behavior-table">
-                                <thead><tr><th>From</th><th>To</th><th style={{minWidth:'160px'}}>Probability</th></tr></thead>
-                                <tbody>
-                                  {Object.entries(probMatrixToBe).filter(([src])=>!filtSrc||src===filtSrc).flatMap(([src,targets])=>{
-                                    const vis = Object.entries(targets||{}).filter(([tgt,p])=>p>0.001&&(!filtTgt||tgt===filtTgt));
-                                    return vis.map(([tgt,p],i) => {
-                                      const pct = (p*100).toFixed(1);
-                                      const updateProb = newPct => {
-                                        const newVal = Math.min(1,Math.max(0,parseFloat(newPct)||0)/100);
-                                        const row = {...(probMatrixToBe[src]||{})};
-                                        const delta = newVal - (row[tgt]||0);
-                                        row[tgt] = newVal;
-                                        const others = vis.map(([k])=>k).filter(k=>k!==tgt);
-                                        const otherSum = others.reduce((s,k)=>s+(row[k]||0),0);
-                                        if (otherSum>1e-9) others.forEach(k=>{row[k]=Math.max(0,(row[k]||0)-delta*(row[k]/otherSum));});
-                                        const newMatrix = {...probMatrixToBe,[src]:row};
-                                        setProbMatrixToBe(newMatrix); setActiveProbMatrix(newMatrix);
-                                      };
-                                      return (
-                                        <tr key={src+'-'+tgt}>
-                                          {i===0?<td rowSpan={vis.length} style={{fontWeight:600}}>{src}</td>:null}
-                                          <td style={{fontSize:'0.82rem'}}>{tgt}</td>
-                                          <td><div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}>
-                                            <span style={{minWidth:'38px',fontSize:'0.82rem',fontWeight:600}}>
-                                              <EditableCell value={pct} type="number" placeholder="0" onSave={updateProb}/>
-                                            </span>
-                                            <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
-                                              onChange={e=>updateProb(e.target.value)}
-                                              style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>
-                                          </div></td>
-                                        </tr>
-                                      );
-                                    });
-                                  })}
-                                </tbody>
-                              </table>
-                            ) : <p className="behavior-empty">No probability data.</p>}
-                          </div>
-                        );
-                      })()}
+                      {scenarioBehaviorSection === 'probabilities' && (
+                        <BehaviorProbabilitiesPanel
+                          probMatrix={probMatrixToBe}
+                          editMode={true}
+                          onUpdate={(src, row) => {
+                            const newMatrix = {...probMatrixToBe, [src]: row};
+                            setProbMatrixToBe(newMatrix);
+                            setActiveProbMatrix(newMatrix);
+                          }}
+                          filters={scenarioBehaviorFilters['probabilities'] || {}}
+                          onFiltersChange={f => setScenarioBehaviorFilters(p => ({...p, probabilities: f}))}
+                          allActivityNames={(modelToBe?.activities||[]).map(a=>a.name)}
+                          constraints={modelToBe?.constraints || []}
+                        />
+                      )}
 
                       {/* Constraints */}
                       {scenarioBehaviorSection === 'constraints' && (
@@ -10331,7 +10528,11 @@ function App() {
                           actNames={(modelToBe.activities||[]).map(a=>a.name)}
                           otNames={(modelToBe.object_types||[]).map(t=>typeof t==='string'?t:t.name)}
                           editMode={true}
-                          onUpdate={cons => { const m={...modelToBe,constraints:cons}; setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
+                          onUpdate={cons => {
+                            const m = {...modelToBe, constraints: cons};
+                            setModelToBe(m); setActiveModel(m); handleModelEdit(m);
+                            setProbMatrixToBe(mx => applyConstraintsToProbMatrix(mx, cons));
+                          }}
                           activities={modelToBe.activities || []}
                           onUpdateActivities={acts => { const m={...modelToBe,activities:acts}; setModelToBe(m); setActiveModel(m); handleModelEdit(m); }}
                           filters={scenarioBehaviorFilters['constraints']||{}}
@@ -10351,7 +10552,7 @@ function App() {
                           cellMap[r.source_type][r.target_type]=cell;
                           if(r.bidirectional){if(!cellMap[r.target_type])cellMap[r.target_type]={};cellMap[r.target_type][r.source_type]=cell;}
                         });
-                        const fmtCell=({min,max})=>`${min}..${max==null?'∞':max}`;
+                        const fmtCell=({min,max})=>{const s=max==null?'∞':max;return(max!==null&&min===max)?String(min):`${min}-${s}`;};
                         const involved=new Set(rules.flatMap(r=>[r.source_type,r.target_type]));
                         const oF=scenarioBehaviorFilters['o2o']||{};
                         const allCols=otNames.filter(t=>involved.has(t));
@@ -10373,9 +10574,8 @@ function App() {
                                       const cell=cellMap[row]?.[col];
                                       if(row===col)return<td key={col} style={{background:'#f1f5f9',textAlign:'center',color:'#cbd5e1'}}>—</td>;
                                       return(<td key={col} style={{textAlign:'center',fontWeight:cell?600:400,color:cell?(cell.bidir?'#7c3aed':'#1e293b'):'#e2e8f0'}}>
-                                        {cell?(<span style={{display:'inline-flex',alignItems:'center',gap:'1px',fontSize:'0.78rem'}}>
-                                          <EditableCell value={cell.min??0} type="number" onSave={v=>updateO2O(row,col,'min_links',v)} style={{fontSize:'0.78rem'}}/>
-                                          ..<EditableCell value={cell.max??''} type="number" placeholder="∞" onSave={v=>updateO2O(row,col,'max_links',v)} style={{fontSize:'0.78rem'}}/>
+                                        {cell?(<span style={{display:'inline-flex',alignItems:'center',gap:'4px',fontSize:'0.78rem'}}>
+                                          {fmtCell(cell)}
                                           <span style={{fontSize:'0.7em'}}>{cell.bidir?'↔':'→'}</span>
                                           <button onClick={()=>{const m={...modelToBe,o2o_rules:(modelToBe.o2o_rules||[]).filter(r=>!(r.source_type===row&&r.target_type===col)&&!(r.source_type===col&&r.target_type===row))};setModelToBe(m);setActiveModel(m);handleModelEdit(m);}} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 1px',fontSize:'0.7rem',lineHeight:1}}>×</button>
                                         </span>):''}</td>);
@@ -10384,6 +10584,7 @@ function App() {
                                 ))}</tbody>
                               </table>
                             </div>
+                            <O2ODiagram rules={rules} otNames={otNames} />
                             <AddO2ORuleForm otNames={otNames} onAdd={rule=>{const m={...modelToBe,o2o_rules:[...(modelToBe.o2o_rules||[]),rule]};setModelToBe(m);setActiveModel(m);handleModelEdit(m);}}/>
                           </div>
                         );
@@ -10396,8 +10597,8 @@ function App() {
                         const toggleRes=ot=>{const rt=modelToBe.resource_types||[];const m={...modelToBe,resource_types:rt.includes(ot)?rt.filter(t=>t!==ot):[...rt,ot]};setModelToBe(m);setActiveModel(m);handleModelEdit(m);};
                         return (
                           <div>
-                            <div className="behavior-section-title">Object Flows<BehaviorLegend items={[['Permanent Objects','Fixed pool size, never deactivated'],['Pool size','Number of simultaneous instances']]}/></div>
-                            <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
+                            <div className="behavior-section-title">Object Creation/Deactivation</div>
+                            {false && <div style={{display:'flex',gap:'2rem',flexWrap:'wrap',marginBottom:'1.5rem'}}>
                               <div style={{flex:1,minWidth:'180px'}}>
                                 <div className="behavior-sub-title">Permanent Objects</div>
                                 {allOts.length===0?<p className="behavior-empty">No object types.</p>:(
@@ -10416,12 +10617,19 @@ function App() {
                                   </div>
                                 )}
                               </div>
-                            </div>
+                            </div>}
                             <AddObjectTypeForm model={modelToBe} onUpdate={m=>{setModelToBe(m);setActiveModel(m);handleModelEdit(m);}} />
-                            <div className="behavior-sub-title">Object Flow</div>
+                            <div className="behavior-sub-title">Object Involvement</div>
+                            <div style={{fontSize:'0.72rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
+                              Where objects get <span style={{color:'#4ade80',fontWeight:600}}>created</span> and involved and <span style={{color:'#f87171',fontWeight:600}}>deactivated</span>
+                            </div>
                             {(() => {
                               const byType={};
-                              (modelToBe.activities||[]).forEach(a=>(a.bindings||[]).forEach(b=>{(byType[b.object_type]=byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});}));
+                              const actObjMap={};
+                              (modelToBe.activities||[]).forEach(a=>{
+                                actObjMap[a.name]=(a.bindings||[]).filter(b=>b.object_type).map(b=>({type:b.object_type,creates:!!b.creates,deactivates:!!b.deactivates}));
+                                (a.bindings||[]).forEach(b=>{(byType[b.object_type]=byType[b.object_type]||[]).push({act:a.name,creates:b.creates,deactivates:b.deactivates});});
+                              });
                               return Object.entries(byType).map(([ot,nodes]) => {
                                 const sorted = [
                                   ...nodes.filter(n => n.creates && !n.deactivates),
@@ -10439,7 +10647,10 @@ function App() {
                                       <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',paddingTop:'0.55rem',whiteSpace:'nowrap',flexShrink:0}}>Object flow:</span>
                                       <div className="object-flow-track">
                                         {sorted.map(n => (
-                                          <div key={n.act} className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}>
+                                          <div key={n.act}
+                                            className={`flow-node${n.creates && n.deactivates ? ' flow-node-both' : n.creates ? ' flow-node-creates' : n.deactivates ? ' flow-node-deactivates' : ''}`}
+                                            style={{cursor:'pointer'}}
+                                            onClick={() => setActivityPopup({name:n.act, objects:actObjMap[n.act]||[]})}>
                                             <span className="flow-node-name">{n.act}</span>
                                             {n.creates && <span className="flow-node-badge flow-node-creates">+</span>}
                                             {n.deactivates && <span className="flow-node-badge flow-node-deactivates">✕</span>}
@@ -10461,285 +10672,8 @@ function App() {
                     )}
 
                     {/* Constraint Flow Graph — always shown when activities/constraints exist */}
-                    {modelToBe && (modelToBe.activities?.length > 0 || modelToBe.constraints?.length > 0) && (
-                      <div style={{marginTop:'1.5rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
-                        <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
-                          Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— possible routes from activities &amp; constraints (transitive reduction)</span>
-                        </div>
-                        <ConstraintFlowGraph
-                          activities={modelToBe.activities || []}
-                          constraints={modelToBe.constraints || []}
-                          startActivities={config.startActivities || []}
-                          probMatrix={probMatrixToBe || probMatrixBase || {}}
-                        />
-                      </div>
-                    )}
-
                   </div>
-
-                  {/* RIGHT: Simulation */}
-                  <div className="scenario-sim-col">
-                    <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
-
-                    {/* Run buttons */}
-                    <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem'}}>
-                      <button className="simulate-button" style={{flex:1,fontSize:'0.9rem',padding:'0.7rem',background:'#334155'}}
-                        disabled={isSimulating || !modelBase}
-                        onClick={() => runSimulation('asis')}>
-                        {isSimulating ? 'Running…' : '▶ Run As-Is / Base Model'}
-                      </button>
-                      <button className="simulate-button" style={{flex:1,fontSize:'0.9rem',padding:'0.7rem'}}
-                        disabled={isSimulating || !modelToBe || config.startActivities.length === 0 || !resultsAsIs}
-                        title={!resultsAsIs ? 'Run As-Is / Base Model first to establish a baseline' : undefined}
-                        onClick={() => runSimulation('tobe')}>
-                        {isSimulating ? 'Running…' : '▶ Run To-Be'}
-                      </button>
-                    </div>
-
-                    {/* Start Activities */}
-                    <div className="form-group" style={{marginBottom:'0.75rem'}}>
-                      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'0.2rem'}}>
-                        <label style={{margin:0}}>Start Activities</label>
-                        <button onClick={() => setSaPickerFolded(f => !f)}
-                          style={{fontSize:'0.7rem',color:'#64748b',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.1rem 0.45rem',cursor:'pointer'}}>
-                          {saPickerFolded ? `show all (${config.startActivities.length} selected)` : 'fold'}
-                        </button>
-                      </div>
-                      <div className="sa-picker">
-                        {(() => {
-                          const allCandidates = startActivityCandidates.length > 0 ? startActivityCandidates
-                            : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
-                            : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
-                          const candidates = saPickerFolded
-                            ? allCandidates.filter(c => config.startActivities.includes(c.activity))
-                            : allCandidates;
-                          return (<>
-                            <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginTop:'0.3rem'}}>
-                              {candidates.map((c, i) => {
-                                const selected = config.startActivities.includes(c.activity);
-                                return (
-                                  <button key={c.activity}
-                                    onClick={() => {
-                                      const n = selected
-                                        ? config.startActivities.filter(a => a !== c.activity)
-                                        : [...config.startActivities, c.activity];
-                                      setConfig(p => ({...p, startActivities: n}));
-                                    }}
-                                    style={{
-                                      padding:'0.3rem 0.7rem',
-                                      fontSize:'0.82rem',
-                                      borderRadius:'20px',
-                                      border: selected ? '2px solid #1e293b' : '1px solid #cbd5e1',
-                                      background: selected ? '#1e293b' : 'white',
-                                      color: selected ? 'white' : '#475569',
-                                      cursor:'pointer',
-                                      fontWeight: selected ? 600 : 400,
-                                      transition:'all 0.12s',
-                                    }}>
-                                    {i === 0 && c.pct !== null && '★ '}{c.activity}
-                                    {c.pct !== null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
-                                  </button>
-                                );
-                              })}
-                              {saPickerFolded && candidates.length === 0 && (
-                                <span style={{fontSize:'0.78rem',color:'#94a3b8',fontStyle:'italic'}}>None selected — unfold to pick start activities</span>
-                              )}
-                            </div>
-                          </>);
-                        })()}
-                      </div>
-                    </div>
-
-                    {/* Change vs As-Is diff */}
-                    {modelToBe && modelAsIs && (
-                      <ToBeDiffPanel
-                        modelAsIs={modelAsIs}
-                        modelToBe={modelToBe}
-                        probMatrixBase={probMatrixBase}
-                        probMatrixToBe={probMatrixToBe}
-                        startActivitiesAsIs={modelAsIs?.start_activities || []}
-                        startActivitiesToBe={config.startActivities || []}
-                      />
-                    )}
-
-                    {/* Stop conditions */}
-                    <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
-                      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
-                        Stop conditions
-                      </div>
-                      <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                        {/* Max events */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max events</span>
-                          <input type="text" inputMode="numeric" value={config.maxSteps ?? ''}
-                            placeholder="e.g. 500"
-                            onChange={e => handleConfigChange('maxSteps', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
-                            disabled={isSimulating}
-                            style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                          {discoveryResults?.total_events != null && (
-                            <button
-                              style={{fontSize:'0.7rem',color:'#475569',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
-                              onClick={() => handleConfigChange('maxSteps', discoveryResults.total_events)}
-                              disabled={isSimulating}
-                              title="Use log event count as limit"
-                            >{discoveryResults.total_events.toLocaleString()} in log</button>
-                          )}
-                        </div>
-                        {/* Simulated time */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
-                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Simulated time</span>
-                          <input type="text" inputMode="numeric" value={config.maxSimTimeValue ?? ''}
-                            placeholder="e.g. 450"
-                            onChange={e => handleConfigChange('maxSimTimeValue', e.target.value === '' ? '' : parseFloat(e.target.value))}
-                            disabled={isSimulating}
-                            style={{width:'60px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                          <select value={config.maxSimTimeUnit ?? 'days'}
-                            onChange={e => handleConfigChange('maxSimTimeUnit', e.target.value)}
-                            disabled={isSimulating}
-                            style={{fontSize:'0.82rem',padding:'0.2rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px'}}>
-                            <option value="seconds">sec</option><option value="minutes">min</option>
-                            <option value="hours">hrs</option><option value="days">days</option><option value="weeks">wks</option>
-                          </select>
-                          {/* Suggestion from log time span */}
-                          {discoveryResults?.ocel_time_span_s != null && (() => {
-                            const s = discoveryResults.ocel_time_span_s;
-                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
-                            const unitShort = { seconds:'s', minutes:'min', hours:'h', days:'d', weeks:'wk' };
-                            const unit = config.maxSimTimeUnit ?? 'days';
-                            const val = Math.round(s / unitToS[unit] * 10) / 10;
-                            return (
-                              <button
-                                style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap',marginLeft:'auto'}}
-                                onClick={() => handleConfigChange('maxSimTimeValue', val)}
-                                disabled={isSimulating}
-                                title="Use log duration as limit"
-                              >
-                                {val} {unitShort[unit] ?? unit} in log
-                              </button>
-                            );
-                          })()}
-                        </div>
-                        {/* Completed traces */}
-                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                          <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Completed traces</span>
-                          <input type="text" inputMode="numeric" value={config.maxTraces ?? ''}
-                            placeholder="e.g. 100"
-                            onChange={e => handleConfigChange('maxTraces', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
-                            disabled={isSimulating}
-                            style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                          {discoveryResults?.log_object_trace_count != null && (
-                            <button
-                              style={{fontSize:'0.7rem',color:'#475569',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
-                              onClick={() => handleConfigChange('maxTraces', discoveryResults.log_object_trace_count)}
-                              disabled={isSimulating}
-                              title="Use log trace count as limit"
-                            >{discoveryResults.log_object_trace_count.toLocaleString()} in log</button>
-                          )}
-                        </div>
-                        <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
-                      </div>
-                    </div>
-
-                    {/* Seed */}
-                    <div className="form-row" style={{marginBottom:'0.75rem'}}>
-                      <div className="form-group">
-                        <label>Random Seed</label>
-                        <input type="number" value={config.seed} onChange={e => handleConfigChange('seed', parseInt(e.target.value))} disabled={isSimulating} />
-                      </div>
-                    </div>
-
-                    {/* Progress */}
-                    {isSimulating && (
-                      <div className="loading-box" style={{padding:'1.5rem'}}>
-                        <div className="spinner"></div>
-                        <p>Running… <span className="sim-step-counter">completed events {liveStepCount ?? 0}</span></p>
-                        {liveSimTime != null && (
-                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                            {'🕐 simulated time '}
-                            {(() => {
-                              const s = liveSimTime;
-                              if (s < 60) return `${Math.floor(s)}s`;
-                              if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
-                              if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-                              const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
-                              return `${d}d ${h}h`;
-                            })()}
-                            {config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && (() => {
-                              const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
-                              const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
-                              return ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}`;
-                            })()}
-                          </p>
-                        )}
-                        {liveTraces != null && liveTraces > 0 && (
-                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                            {'📦 completed traces: '}{liveTraces}
-                            {config.maxTraces !== '' && config.maxTraces != null ? ` / ${config.maxTraces}` : ''}
-                          </p>
-                        )}
-                        <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `⏱ ${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
-                        {liveActiveObjects != null && (
-                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>🟢 {liveActiveObjects.toLocaleString()} active objects</p>
-                        )}
-                        {liveObligations != null && (
-                          <p className="sim-elapsed-timer" style={{fontSize:'0.82rem',color: liveObligations > 100 ? '#dc2626' : liveObligations > 20 ? '#d97706' : '#64748b'}}>
-                            🔗 {liveObligations.toLocaleString()} pending obligations
-                          </p>
-                        )}
-                        {liveDeactivPerStep != null && (
-                          <p className="sim-elapsed-timer" style={{fontSize:'0.78rem',color:'#64748b'}}>
-                            📤 {liveDeactivPerStep}/step deactivated · ✅ {liveObligFulfilledPerStep ?? 0}/step obligations removed
-                          </p>
-                        )}
-                        <button className="sim-stop-btn" onClick={stopSimulation}>⏹ Stop</button>
-                      </div>
-                    )}
-
-                    {/* Completion banner */}
-                    {!isSimulating && lastCompletedMode && (
-                      <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:'8px',padding:'0.9rem 1rem',display:'flex',alignItems:'center',justifyContent:'space-between',gap:'1rem',marginBottom:'0.75rem'}}>
-                        <div>
-                          <div style={{fontWeight:700,color:'#166534',fontSize:'0.9rem'}}>
-                            ✓ {lastCompletedMode === 'asis' ? 'As-Is / Base Model' : 'To-Be'} simulation complete
-                          </div>
-                          {lastRunDuration != null && (
-                            <div style={{fontSize:'0.75rem',color:'#15803d',marginTop:'0.15rem'}}>
-                              ⏱ {Math.floor(lastRunDuration/60).toString().padStart(2,'0')}:{(lastRunDuration%60).toString().padStart(2,'0')} wall-clock
-                            </div>
-                          )}
-                        </div>
-                        <button
-                          className="simulate-button"
-                          style={{width:'auto',padding:'0.5rem 1.1rem',fontSize:'0.85rem',background:'#166534'}}
-                          onClick={() => setExternalTab('results')}
-                        >
-                          View Results →
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Model diff */}
-                    {modelBase && modelToBe && (() => {
-                      const diffC = (modelToBe.constraints||[]).length - (modelBase.constraints||[]).length;
-                      const diffO = (modelToBe.o2o_rules||[]).length - (modelBase.o2o_rules||[]).length;
-                      const baseActs = JSON.stringify((modelBase.activities||[]).map(a=>a.name).sort());
-                      const tobeActs = JSON.stringify((modelToBe.activities||[]).map(a=>a.name).sort());
-                      const actChanged = baseActs !== tobeActs;
-                      if (diffC === 0 && diffO === 0 && !actChanged) return null;
-                      return (
-                        <div className="model-diff-summary">
-                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#92400e',marginBottom:'0.3rem'}}>Changes vs Base Model</div>
-                          <div style={{display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
-                            {diffC !== 0 && <span className={'diff-badge '+(diffC>0?'diff-add':'diff-rem')}>{diffC>0?'+':''}{diffC} constraints</span>}
-                            {diffO !== 0 && <span className={'diff-badge '+(diffO>0?'diff-add':'diff-rem')}>{diffO>0?'+':''}{diffO} object-to-object relationships</span>}
-                            {actChanged && <span className="diff-badge diff-mod">activities changed</span>}
-                          </div>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Post-Processing */}
-                    <Collapsible
+                  {false && <Collapsible
                       className="postprocessing-result-section"
                       title="Post-Processing"
                       badge={healthResult && !healthResult.error ? (() => {
@@ -10892,9 +10826,8 @@ function App() {
                           );
                         })()}
                       </div>
-                    </Collapsible>
+                    </Collapsible>}
 
-                  </div>
                 </div>
               </div>
             )}{/* end scenario tab */}
@@ -10902,6 +10835,335 @@ function App() {
             {/* ── RESULTS TAB ── */}
             {externalTab === 'results' && (
               <div className="ext-ocel-tab-content">
+
+                {/* Simulation controls */}
+                <div style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem',marginBottom:'1.25rem'}}>
+                  <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
+
+                  {/* Run buttons + start activities — two-column layout aligned per model */}
+                  <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem',alignItems:'flex-start'}}>
+
+                    {/* ── Base Model ── */}
+                    <div style={{flex:1,display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                      {(() => {
+                        const missing = (modelBase?.activities||[])
+                          .map(a => a.name)
+                          .filter(n => { const d = (modelBase?.activity_durations||{})[n]; return !d || !d.sample_count; });
+                        const noTiming = missing.length > 0;
+                        return (<>
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || noTiming ? 0.45 : 1, cursor: noTiming ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelBase || noTiming}
+                            title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}` : undefined}
+                            onClick={() => runSimulation('asis')}>
+                            {simulatingMode==='asis' ? 'Running…' : '▶ Run Base Model'}
+                          </button>
+                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
+                        </>);
+                      })()}
+                      <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
+                        <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
+                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities</div>
+                          <button onClick={() => setBaseStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
+                            {baseStartFolded ? '▶' : '▼'}
+                          </button>
+                        </div>
+                        <div style={{display:'flex',gap:'0.35rem',flexWrap:'wrap',marginBottom:'0.4rem'}}>
+                          {(() => {
+                            const cands = startActivityCandidates.length > 0 ? startActivityCandidates
+                              : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
+                              : (modelBase?.activities||[]).map(a => ({activity:a.name,pct:null})));
+                            const visible = baseStartFolded ? cands.filter(c => config.startActivities.includes(c.activity)) : cands;
+                            return visible.map((c, i) => {
+                              const sel = config.startActivities.includes(c.activity);
+                              return (
+                                <button key={c.activity}
+                                  onClick={() => {
+                                    const n = sel
+                                      ? config.startActivities.filter(a => a !== c.activity)
+                                      : [...config.startActivities, c.activity];
+                                    setConfig(p => {
+                                      const caps = {...(p.startActivityCaps||{})};
+                                      if (sel) delete caps[c.activity];
+                                      return {...p, startActivities: n, startActivityCaps: caps};
+                                    });
+                                  }}
+                                  style={{
+                                    padding:'0.25rem 0.6rem',fontSize:'0.8rem',borderRadius:'20px',
+                                    border: sel ? '2px solid #334155' : '1px solid #cbd5e1',
+                                    background: sel ? '#334155' : 'white',
+                                    color: sel ? 'white' : '#475569',
+                                    cursor:'pointer',fontWeight: sel ? 600 : 400,transition:'all 0.12s',
+                                  }}>
+                                  {i===0 && c.pct!==null && '★ '}{c.activity}
+                                  {c.pct!==null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
+                                </button>
+                              );
+                            });
+                          })()}
+                        </div>
+                        {config.startActivities.length > 0 && (
+                          <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
+                            {config.startActivities.map(act => {
+                              const logCount = discoveryResults?.activity_counts?.[act];
+                              const capVal = config.startActivityCaps?.[act] ?? '';
+                              return (
+                                <div key={act} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.8rem'}}>
+                                  <span style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'#334155',fontWeight:500}}>{act}</span>
+                                  <input type="text" inputMode="numeric" placeholder="∞" value={capVal}
+                                    onChange={e => {
+                                      const raw = e.target.value.replace(/\D/g,'');
+                                      setConfig(p => ({...p, startActivityCaps:{...(p.startActivityCaps||{}),[act]: raw===''?'':parseInt(raw)||1}}));
+                                    }}
+                                    style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
+                                    title="Max times this activity may start (leave blank for unlimited)"
+                                  />
+                                  {logCount != null && (
+                                    <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* ── Alternative Model ── */}
+                    <div style={{flex:1,display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                      {(() => {
+                        const missing = (modelToBe?.activities||[])
+                          .map(a => a.name)
+                          .filter(n => { const d = (modelToBe?.activity_durations||{})[n]; return !d || !d.sample_count; });
+                        const noTiming = missing.length > 0;
+                        const noBaseline = !resultsAsIs;
+                        const tooltipMsg = noTiming
+                          ? `Cannot run: missing timing data for: ${missing.join(', ')}`
+                          : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
+                        return (<>
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || noTiming ? 0.45 : 1, cursor: noTiming ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || noTiming}
+                            title={tooltipMsg}
+                            onClick={() => runSimulation('tobe')}>
+                            {simulatingMode==='tobe' ? 'Running…' : '▶ Run Alternative Model'}
+                          </button>
+                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
+                        </>);
+                      })()}
+                      <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
+                        <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
+                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities</div>
+                          <button onClick={() => setAltStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
+                            {altStartFolded ? '▶' : '▼'}
+                          </button>
+                        </div>
+                        <div style={{display:'flex',gap:'0.35rem',flexWrap:'wrap',marginBottom:'0.4rem'}}>
+                          {(() => {
+                            const cands = startActivityCandidates.length > 0 ? startActivityCandidates
+                              : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
+                              : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
+                            const visible = altStartFolded ? cands.filter(c => tobeStartActivities.includes(c.activity)) : cands;
+                            return visible.map((c, i) => {
+                              const sel = tobeStartActivities.includes(c.activity);
+                              return (
+                                <button key={c.activity}
+                                  onClick={() => {
+                                    const n = sel
+                                      ? tobeStartActivities.filter(a => a !== c.activity)
+                                      : [...tobeStartActivities, c.activity];
+                                    setTobeStartActivities(n);
+                                    if (sel) setTobeStartActivityCaps(prev => { const caps = {...prev}; delete caps[c.activity]; return caps; });
+                                  }}
+                                  style={{
+                                    padding:'0.25rem 0.6rem',fontSize:'0.8rem',borderRadius:'20px',
+                                    border: sel ? '2px solid #2563eb' : '1px solid #cbd5e1',
+                                    background: sel ? '#2563eb' : 'white',
+                                    color: sel ? 'white' : '#475569',
+                                    cursor:'pointer',fontWeight: sel ? 600 : 400,transition:'all 0.12s',
+                                  }}>
+                                  {i===0 && c.pct!==null && '★ '}{c.activity}
+                                  {c.pct!==null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
+                                </button>
+                              );
+                            });
+                          })()}
+                        </div>
+                        {tobeStartActivities.length > 0 && (
+                          <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
+                            {tobeStartActivities.map(act => {
+                              const logCount = discoveryResults?.activity_counts?.[act];
+                              const capVal = tobeStartActivityCaps?.[act] ?? '';
+                              return (
+                                <div key={act} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.8rem'}}>
+                                  <span style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'#2563eb',fontWeight:500}}>{act}</span>
+                                  <input type="text" inputMode="numeric" placeholder="∞" value={capVal}
+                                    onChange={e => {
+                                      const raw = e.target.value.replace(/\D/g,'');
+                                      setTobeStartActivityCaps(p => ({...p,[act]: raw===''?'':parseInt(raw)||1}));
+                                    }}
+                                    style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
+                                    title="Max times this activity may start (leave blank for unlimited)"
+                                  />
+                                  {logCount != null && (
+                                    <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                  </div>
+
+                  {/* Stop conditions */}
+                  <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
+                    <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
+                      Stop conditions
+                    </div>
+                    <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max events</span>
+                        <input type="text" inputMode="numeric" value={config.maxSteps ?? ''}
+                          placeholder="e.g. 500"
+                          onChange={e => handleConfigChange('maxSteps', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
+                          disabled={isSimulating}
+                          style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                        {discoveryResults?.total_events != null && (
+                          <button
+                            style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                            onClick={() => handleConfigChange('maxSteps', discoveryResults.total_events)}
+                            disabled={isSimulating}
+                            title="Use log event count as limit"
+                          >{discoveryResults.total_events.toLocaleString()} in log</button>
+                        )}
+                      </div>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
+                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Simulated time</span>
+                        <input type="text" inputMode="numeric" value={config.maxSimTimeValue ?? ''}
+                          placeholder="e.g. 450"
+                          onChange={e => handleConfigChange('maxSimTimeValue', e.target.value === '' ? '' : parseFloat(e.target.value))}
+                          disabled={isSimulating}
+                          style={{width:'60px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                        <select value={config.maxSimTimeUnit ?? 'days'}
+                          onChange={e => handleConfigChange('maxSimTimeUnit', e.target.value)}
+                          disabled={isSimulating}
+                          style={{fontSize:'0.82rem',padding:'0.2rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px'}}>
+                          <option value="seconds">sec</option><option value="minutes">min</option>
+                          <option value="hours">hrs</option><option value="days">days</option><option value="weeks">wks</option>
+                        </select>
+                        {discoveryResults?.ocel_time_span_s != null && (() => {
+                          const s = discoveryResults.ocel_time_span_s;
+                          const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                          const unitShort = { seconds:'s', minutes:'min', hours:'h', days:'d', weeks:'wk' };
+                          const unit = config.maxSimTimeUnit ?? 'days';
+                          const val = Math.round(s / unitToS[unit] * 10) / 10;
+                          return (
+                            <button
+                          style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                              onClick={() => handleConfigChange('maxSimTimeValue', val)}
+                              disabled={isSimulating}
+                              title="Use log duration as limit"
+                            >
+                              {val} {unitShort[unit] ?? unit} in log
+                            </button>
+                          );
+                        })()}
+                      </div>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Completed cases</span>
+                        <input type="text" inputMode="numeric" value={config.maxCases ?? ''}
+                          placeholder="e.g. 100"
+                          onChange={e => handleConfigChange('maxCases', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
+                          disabled={isSimulating}
+                          style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                        {(() => {
+                          const logCaseCount = (config.startActivities || []).reduce((sum, act) => sum + (discoveryResults?.activity_counts?.[act] || 0), 0);
+                          return logCaseCount > 0 ? (
+                            <button
+                              style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
+                              onClick={() => handleConfigChange('maxCases', logCaseCount)}
+                              disabled={isSimulating}
+                              title="Use log case count as limit"
+                            >{logCaseCount.toLocaleString()} in log</button>
+                          ) : null;
+                        })()}
+                      </div>
+                      <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
+                    </div>
+                  </div>
+
+                  {/* Seed */}
+                  <div className="form-row" style={{marginBottom:'0.5rem'}}>
+                    <div className="form-group">
+                      <label>Random Seed</label>
+                      <input type="number" value={config.seed} onChange={e => handleConfigChange('seed', parseInt(e.target.value))} disabled={isSimulating} />
+                    </div>
+                  </div>
+
+                  {/* Progress */}
+                  {isSimulating && (
+                    <div className="loading-box" style={{padding:'1.5rem',marginTop:'0.75rem'}}>
+                      <div className="spinner"></div>
+                      <p>Running… <span className="sim-step-counter">completed events {liveStepCount ?? 0}</span></p>
+                      {liveSimTime != null && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                          {'simulated time '}
+                          {(() => {
+                            const s = liveSimTime;
+                            if (s < 60) return `${Math.floor(s)}s`;
+                            if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
+                            if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+                            const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                            return `${d}d ${h}h`;
+                          })()}
+                          {config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && (() => {
+                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
+                            const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
+                            return ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}`;
+                          })()}
+                        </p>
+                      )}
+                      {liveCases != null && liveCases > 0 && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                          {'completed cases: '}{liveCases.toLocaleString()}
+                          {config.maxCases !== '' && config.maxCases != null ? ` / ${config.maxCases}` : ''}
+                        </p>
+                      )}
+                      <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
+                      {liveActiveObjects != null && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>{liveActiveObjects.toLocaleString()} active objects</p>
+                      )}
+                      {liveObligations != null && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem',color: liveObligations > 100 ? '#dc2626' : liveObligations > 20 ? '#d97706' : '#64748b'}}>
+                          {liveObligations.toLocaleString()} pending obligations
+                        </p>
+                      )}
+                      {liveDeactivPerStep != null && (
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.78rem',color:'#64748b'}}>
+                          {liveDeactivPerStep}/step deactivated · ✓ {liveObligFulfilledPerStep ?? 0}/step obligations removed
+                        </p>
+                      )}
+                      <button className="sim-stop-btn" onClick={stopSimulation}>Stop</button>
+                    </div>
+                  )}
+
+                  {/* Completion banner */}
+                  {!isSimulating && lastCompletedMode && (
+                    <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:'8px',padding:'0.9rem 1rem',display:'flex',alignItems:'center',justifyContent:'space-between',gap:'1rem',marginTop:'0.75rem'}}>
+                      <div>
+                        <div style={{fontWeight:700,color:'#166534',fontSize:'0.9rem'}}>
+                          ✓ {lastCompletedMode === 'asis' ? 'Base Model' : 'Alternative Model'} simulation complete
+                        </div>
+                        {lastRunDuration != null && (
+                          <div style={{fontSize:'0.75rem',color:'#15803d',marginTop:'0.15rem'}}>
+                            {Math.floor(lastRunDuration/60).toString().padStart(2,'0')}:{(lastRunDuration%60).toString().padStart(2,'0')} wall-clock
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
 
                 {/* ── Comparison header (only when both runs exist) ── */}
                 {resultsAsIs && resultsToBe && (() => {
@@ -10919,7 +11181,7 @@ function App() {
                   };
                   const metrics = [
                     {
-                      label: 'Avg Trace Duration',
+                      label: 'Avg Object Trace Duration',
                       asis: resultsAsIs.avg_trace_lifetime_s,
                       tobe: resultsToBe.avg_trace_lifetime_s,
                       fmt: fmtDur,
@@ -10954,9 +11216,23 @@ function App() {
                       lowerIsBetter: null,
                     },
                     {
-                      label: 'Avg Connected Trace Duration',
+                      label: 'Avg Connected Object Trace Duration',
                       asis: resultsAsIs.avg_connected_trace_duration_s,
                       tobe: resultsToBe.avg_connected_trace_duration_s,
+                      fmt: fmtDur,
+                      lowerIsBetter: true,
+                    },
+                    {
+                      label: 'Cases Started',
+                      asis: Object.values(resultsAsIs.case_tracker||{}).reduce((s,v)=>s+v.case_count,0)||null,
+                      tobe: Object.values(resultsToBe.case_tracker||{}).reduce((s,v)=>s+v.case_count,0)||null,
+                      fmt: v => v == null ? '—' : v.toLocaleString(),
+                      lowerIsBetter: null,
+                    },
+                    {
+                      label: 'Avg Case Duration',
+                      asis: (()=>{ const ct=resultsAsIs.case_tracker||{}; const w=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0); const n=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0); return n>0?w/n:null; })(),
+                      tobe: (()=>{ const ct=resultsToBe.case_tracker||{}; const w=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0); const n=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0); return n>0?w/n:null; })(),
                       fmt: fmtDur,
                       lowerIsBetter: true,
                     },
@@ -10966,7 +11242,7 @@ function App() {
                       <div className="compare-metric-card" style={{paddingRight:'0.75rem'}}>
                         <div className="compare-metric-label" style={{visibility:'hidden'}}>·</div>
                         <div className="compare-metric-asis" style={{color:'#94a3b8',fontWeight:600}}>Base model</div>
-                        <div className="compare-metric-tobe" style={{color:'#94a3b8'}}>To-Be</div>
+                        <div className="compare-metric-tobe" style={{color:'#94a3b8'}}>Alternative Model</div>
                       </div>
                       {metrics.map((m) => {
                         const p = pct(m.asis, m.tobe);
@@ -11028,7 +11304,7 @@ function App() {
                 )}
 
                 <div className="results-compare-layout">
-                  {[{label:'As-Is / Base Model', r:resultsAsIs, objTab:objTabAsIs, setObjTab:setObjTabAsIs}, {label:'To-Be', r:resultsToBe, objTab:objTabToBe, setObjTab:setObjTabToBe}].map(({label, r, objTab, setObjTab}) => (
+                  {[{label:'Base Model', r:resultsAsIs, objTab:objTabAsIs, setObjTab:setObjTabAsIs}, {label:'Alternative Model', r:resultsToBe, objTab:objTabToBe, setObjTab:setObjTabToBe}].map(({label, r, objTab, setObjTab}) => (
                     <div key={label} className="run-result-panel">
                       <div className="run-result-panel-header">{label}</div>
                       {!r ? (
@@ -11040,39 +11316,156 @@ function App() {
                         return (
                           <div style={{padding:'1rem'}}>
                             <div className="stat-grid" style={{marginBottom:'1rem'}}>
-                              <div className="stat-card"><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Completed</div></div>
-                              <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')}>
+                              <div className="stat-card" title="Total number of activity events fired during this simulation run."><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Completed</div></div>
+                              <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')} title={discoveredTypes.length>0?`${coverage} of ${discoveredTypes.length} activity types defined in the model fired at least once. Yellow = some types never fired.`:'Number of distinct activity types that fired.'}>
                                 <div className="stat-value">{coverage}{discoveredTypes.length>0&&<span className="stat-value-denom"> / {discoveredTypes.length}</span>}</div>
                                 <div className="stat-label">Activity Types</div>
                               </div>
-                              <div className="stat-card"><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
-                              {r.sim_time_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
-                              {r.completed_traces!=null&&(()=>{
-                                const logTraceCount = discoveryResults?.log_object_trace_count;
-                                const cardClass = logTraceCount==null ? '' : r.completed_traces >= logTraceCount ? ' stat-card-ok' : r.completed_traces >= logTraceCount * 0.75 ? ' stat-card-warn' : ' stat-card-bad';
-                                return (
-                                  <div className={'stat-card'+cardClass}>
-                                    <div className="stat-value">
-                                      {r.completed_traces.toLocaleString()}
-                                      {logTraceCount!=null && <span className="stat-value-denom"> / {logTraceCount.toLocaleString()}</span>}
-                                    </div>
-                                    <div className="stat-label">Traces Completed</div>
-                                  </div>
-                                );
+                              <div className="stat-card" title="Total number of objects created across all object types during this simulation run."><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
+                              {r.sim_time_s!=null&&<div className="stat-card" title="Total simulated time elapsed from the first to the last event in the simulation."><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
+                              {r.case_tracker && Object.keys(r.case_tracker).length > 0 && (()=>{
+                                const ct = r.case_tracker;
+                                const totalCases = Object.values(ct).reduce((s,v)=>s+v.case_count,0);
+                                const weightedDur = Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0);
+                                const countWithDur = Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0);
+                                const avgDur = countWithDur > 0 ? weightedDur/countWithDur : null;
+                                const fmtD = s => { if(s==null)return '—'; if(s<60)return Math.round(s)+'s'; if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s'; if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
+                                return (<>
+                                  <div className="stat-card" title="Total number of process instances started — one per firing of a start activity. Each case groups all objects born from that single start event."><div className="stat-value">{totalCases.toLocaleString()}</div><div className="stat-label">Cases Started</div></div>
+                                  {avgDur!=null&&<div className="stat-card" title="Mean time from a start-activity event to the last event of all non-immutable objects it spawned, weighted across all start activities."><div className="stat-value">{fmtD(avgDur)}</div><div className="stat-label">Avg Case Duration</div></div>}
+                                </>);
                               })()}
-                              {r.avg_connected_trace_duration_s!=null&&<div className="stat-card"><div className="stat-value">{(()=>{const s=r.avg_connected_trace_duration_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d';})()}</div><div className="stat-label">Avg Trace Duration</div></div>}
                             </div>
+
+                            {/* Verification Matrix */}
+                            <VerificationMatrix
+                              results={r}
+                              discoveryResults={discoveryResults}
+                              activeModel={activeModel}
+                              modelBase={modelBase}
+                            />
+
+                            {/* Activity Distribution vs Log */}
+                            {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
+                              const simMetrics = r.metrics.activity_metrics;
+                              const logCounts = discoveryResults.activity_counts || {};
+                              const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
+                              const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
+                              const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
+                                .sort(makeFlowRankSorter(discoveryResults, r.object_traces));
+                              const wmape = logTotal > 0 && simTotal > 0
+                                ? allActs.reduce((s, act) => {
+                                    const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
+                                    const lp = (logCounts[act]||0) / logTotal * 100;
+                                    return s + Math.abs(sp - lp);
+                                  }, 0)
+                                : null;
+                              return (
+                                <Collapsible
+                                  className="logs-box sim-compare-box"
+                                  title="Activity Distribution vs Log"
+                                  badge={null}
+                                  defaultOpen={false}
+                                  preview={
+                                    <table className="metrics-table sim-compare-table">
+                                      <thead>
+                                        <tr>
+                                          <th>Activity</th>
+                                          <th title="Times fired in this simulation run">Sim count</th>
+                                          <th title="Times fired in the input event log">Log count</th>
+                                          <th title="Share of all simulated events">Sim %</th>
+                                          <th title="Share of all log events">Log %</th>
+                                          <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        <tr>
+                                          <td><strong>All</strong></td>
+                                          <td>{simTotal}</td>
+                                          <td>{logTotal}</td>
+                                          <td></td>
+                                          <td></td>
+                                          <td></td>
+                                        </tr>
+                                      </tbody>
+                                    </table>
+                                  }
+                                >
+                                  <p className="sim-compare-hint">
+                                    Proportional share of total events (simulation vs log). Difference column shows sim − log in percentage points.
+                                  </p>
+                                  <table className="metrics-table sim-compare-table">
+                                    <thead>
+                                      <tr>
+                                        <th>Activity</th>
+                                        <th title="Times fired in this simulation run">Sim count</th>
+                                        <th title="Times fired in the input event log">Log count</th>
+                                        <th title="Share of all simulated events">Sim %</th>
+                                        <th title="Share of all log events">Log %</th>
+                                        <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {allActs.map(act => {
+                                        const simCount = simMetrics[act]?.execution_count ?? 0;
+                                        const logCount = logCounts[act] ?? 0;
+                                        const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
+                                        const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
+                                        const diff = simPct - logPct;
+                                        const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
+                                        return (
+                                          <tr key={act}>
+                                            <td className="metrics-act-name">
+                                              <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
+                                            </td>
+                                            <td>{simCount || '—'}</td>
+                                            <td>{logCount || '—'}</td>
+                                            <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
+                                            <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
+                                            <td className={`cmp-diff ${diffClass}`}>
+                                              {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </Collapsible>
+                              );
+                            })()}
 
                             {/* Objects — tabbed: Concurrency + Object Lifecycle */}
                             {(() => {
                               const simMetrics = r.metrics?.activity_metrics || {};
                               const simSpan = r.sim_time_s ?? null;
+                              const audit = r.audit?.object_lifecycle_audit;
+                              const auditVals = audit ? Object.values(audit) : [];
+                              const sumCreated = auditVals.reduce((s, a) => s + (a.instance_count || 0), 0);
+                              const sumActive  = auditVals.reduce((s, a) => s + (a.active_count   || 0), 0);
+                              const sumDeact   = auditVals.reduce((s, a) => s + (a.deactivated_count || 0), 0);
                               return (
-                                <Collapsible title="Objects" defaultOpen={false}>
-                                  {r.audit?.object_lifecycle_audit ? (
+                                <Collapsible
+                                  title="Object Creation/Deactivation"
+                                  defaultOpen={false}
+                                  preview={audit ? (
                                     <table className="behavior-table">
                                       <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
-                                      <tbody>{Object.entries(r.audit.object_lifecycle_audit).map(([ot,a])=>(
+                                      <tbody>
+                                        <tr>
+                                          <td><strong>All</strong></td>
+                                          <td>{sumCreated}</td>
+                                          <td>{sumActive}</td>
+                                          <td>{sumDeact}</td>
+                                          <td></td>
+                                        </tr>
+                                      </tbody>
+                                    </table>
+                                  ) : null}
+                                >
+                                  {audit ? (
+                                    <table className="behavior-table">
+                                      <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
+                                      <tbody>{Object.entries(audit).map(([ot,a])=>(
                                         <tr key={ot}><td>{ot}</td><td>{a.instance_count}</td><td>{a.active_count}</td><td>{a.deactivated_count}</td><td><span className={`audit-badge audit-badge-${a.classification}`}>{a.classification}</span></td></tr>
                                       ))}</tbody>
                                     </table>
@@ -11082,80 +11475,80 @@ function App() {
                                 </Collapsible>
                               );
                             })()}
-                            {r.metrics?.activity_metrics&&(
-                              <Collapsible title="Time" defaultOpen={false}>
-                                <table className="behavior-table">
-                                  <thead><tr><th>Activity</th><th>Mean</th><th>Min</th><th>Max</th></tr></thead>
-                                  <tbody>{Object.entries(r.metrics.activity_metrics)
-                                    .sort(([a],[b]) => makeFlowRankSorter(discoveryResults, r.object_traces)(a,b))
-                                    .map(([act,m])=>{
-                                      const fmt = s => { if (s==null) return '—'; if (s<60) return (Math.abs(s%1)<0.005?Math.round(s):s.toFixed(1))+'s'; if (s<3600) return Math.floor(s/60)+'m '+Math.floor(s%60)+'s'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
-                                      return (
-                                        <tr key={act}>
-                                          <td>{act}</td>
-                                          <td>{fmt(m.mean_service_s)}</td>
-                                          <td>{fmt(m.min_service_s)}</td>
-                                          <td>{fmt(m.max_service_s)}</td>
-                                        </tr>
-                                      );
-                                    })
-                                  }</tbody>
-                                </table>
-                                <ActivityTimeMatrix
-                                  activityMetrics={r.metrics.activity_metrics}
-                                  activeModel={activeModel}
-                                  discoveryResults={discoveryResults}
-                                  objectTraces={r.object_traces}
-                                />
-                                <ActivityGanttChart
-                                  results={r}
-                                  orderedActivities={Object.keys(r.metrics.activity_metrics).sort(makeFlowRankSorter(discoveryResults, r.object_traces))}
-                                  simMetrics={r.metrics.activity_metrics}
-                                />
-                              </Collapsible>
-                            )}
+                            {/* Dev measures */}
+                            <Collapsible title="Dev measures" defaultOpen={false}>
+                              {/* Case Tracker */}
+                              {r.case_tracker && Object.keys(r.case_tracker).length > 0 && (() => {
+                                const fmtDur = s => {
+                                  if (s == null) return '—';
+                                  if (s < 60) return Math.round(s) + 's';
+                                  if (s < 3600) return Math.floor(s/60) + 'm ' + Math.floor(s%60) + 's';
+                                  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+                                  const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
+                                  return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
+                                };
+                                const fmtTs = ts => ts ? ts.replace('T', ' ').replace(/\.\d+.*$/, '') : '—';
+                                const entries = Object.entries(r.case_tracker);
+                                const totalCases = entries.reduce((s,[,v])=>s+v.case_count,0);
+                                const totalDone = entries.reduce((s,[,v])=>s+v.completed,0);
+                                const overallRate = totalCases > 0 ? Math.round(totalDone/totalCases*100) : 0;
+                                return (
+                                  <Collapsible
+                                    title="Case Tracker"
+                                    badge={`${totalDone}/${totalCases} complete`}
+                                    defaultOpen={false}
+                                  >
+                                    <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
+                                      A case starts with each start-activity firing and ends when all non-immutable
+                                      objects created by that event are deactivated. Click a row to expand individual cases.
+                                    </p>
+                                    <CaseTrackerTable
+                                      entries={entries}
+                                      totalCases={totalCases}
+                                      totalDone={totalDone}
+                                      overallRate={overallRate}
+                                      fmtDur={fmtDur}
+                                      fmtTs={fmtTs}
+                                      activeModel={activeModel}
+                                    />
+                                  </Collapsible>
+                                );
+                              })()}
 
-                            {/* Trace Completion — moved from Evaluation tab */}
-                            {r.audit?.object_lifecycle_audit && (() => {
-                              const resourceTypes = new Set(r.resource_types||[]);
-                              const audit = r.audit.object_lifecycle_audit;
-                              const logObjTypes = discoveryResults?.object_type_stats || {};
-                              const logTotal = discoveryResults?.log_object_trace_count ?? null;
-                              const nonRes = Object.entries(audit).filter(([ot])=>!resourceTypes.has(ot));
-                              const totalAll = nonRes.reduce((s,[,a])=>s+(a.instance_count||0),0);
-                              const deactAll = nonRes.reduce((s,[,a])=>s+(a.deactivated_count||0),0);
-                              const pctAll = totalAll>0?Math.round(deactAll/totalAll*100):0;
-                              return (
-                                <Collapsible title="Trace Completion" defaultOpen={false}>
-                                  <div style={{display:'flex',gap:'0.75rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-                                    <div className="behavior-stat-card"><div className="behavior-stat-val">{deactAll.toLocaleString()}</div><div className="behavior-stat-label">Completed</div></div>
-                                    <div className="behavior-stat-card"><div className="behavior-stat-val">{totalAll.toLocaleString()}</div><div className="behavior-stat-label">Total objects</div></div>
-                                    <div className="behavior-stat-card" style={{background:pctAll>=80?'#f0fdf4':pctAll>=50?'#fffbeb':'#fff1f2'}}><div className="behavior-stat-val">{pctAll}%</div><div className="behavior-stat-label">Rate</div></div>
-                                    {logTotal!=null&&<div className="behavior-stat-card"><div className="behavior-stat-val">{logTotal.toLocaleString()}</div><div className="behavior-stat-label">Log objects</div></div>}
-                                  </div>
-                                  <table className="behavior-table">
-                                    <thead><tr><th>Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>{Object.keys(logObjTypes).length>0&&<th>Log count</th>}</tr></thead>
-                                    <tbody>{nonRes.map(([ot,a])=>{
-                                      const pct=a.instance_count>0?Math.round(a.deactivated_count/a.instance_count*100):0;
-                                      return (<tr key={ot}><td>{ot}</td><td>{a.instance_count}</td>
-                                        <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{a.deactivated_count}</td>
-                                        <td>{a.instance_count-a.deactivated_count}</td>
-                                        <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'60px',overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:'4px'}}><div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/></div>{pct}%</td>
-                                        {Object.keys(logObjTypes).length>0&&<td style={{color:'#94a3b8'}}>{logObjTypes[ot]?.count!=null?logObjTypes[ot].count.toLocaleString():'—'}</td>}
-                                      </tr>);
-                                    })}</tbody>
-                                  </table>
-                                </Collapsible>
-                              );
-                            })()}
+                              {/* Object Trace Completion */}
+                              {r.audit?.object_lifecycle_audit && (() => {
+                                const resourceTypes = new Set(r.resource_types||[]);
+                                const audit = r.audit.object_lifecycle_audit;
+                                const logObjTypes = discoveryResults?.object_type_stats || {};
+                                const logTotal = discoveryResults?.log_object_trace_count ?? null;
+                                const nonRes = Object.entries(audit).filter(([ot])=>!resourceTypes.has(ot));
+                                const totalAll = nonRes.reduce((s,[,a])=>s+(a.instance_count||0),0);
+                                const deactAll = nonRes.reduce((s,[,a])=>s+(a.deactivated_count||0),0);
+                                const pctAll = totalAll>0?Math.round(deactAll/totalAll*100):0;
+                                return (
+                                  <Collapsible title="Object Trace Completion" defaultOpen={false}>
+                                    <div style={{display:'flex',gap:'0.75rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
+                                      <div className="behavior-stat-card"><div className="behavior-stat-val">{deactAll.toLocaleString()}</div><div className="behavior-stat-label">Completed</div></div>
+                                      <div className="behavior-stat-card"><div className="behavior-stat-val">{totalAll.toLocaleString()}</div><div className="behavior-stat-label">Total objects</div></div>
+                                      <div className="behavior-stat-card" style={{background:pctAll>=80?'#f0fdf4':pctAll>=50?'#fffbeb':'#fff1f2'}}><div className="behavior-stat-val">{pctAll}%</div><div className="behavior-stat-label">Rate</div></div>
+                                      {logTotal!=null&&<div className="behavior-stat-card"><div className="behavior-stat-val">{logTotal.toLocaleString()}</div><div className="behavior-stat-label">Log objects</div></div>}
+                                    </div>
+                                    <table className="behavior-table">
+                                      <thead><tr><th>Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>{Object.keys(logObjTypes).length>0&&<th>Log count</th>}</tr></thead>
+                                      <tbody>{nonRes.map(([ot,a])=>{
+                                        const pct=a.instance_count>0?Math.round(a.deactivated_count/a.instance_count*100):0;
+                                        return (<tr key={ot}><td>{ot}</td><td>{a.instance_count}</td>
+                                          <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{a.deactivated_count}</td>
+                                          <td>{a.instance_count-a.deactivated_count}</td>
+                                          <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'60px',overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:'4px'}}><div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/></div>{pct}%</td>
+                                          {Object.keys(logObjTypes).length>0&&<td style={{color:'#94a3b8'}}>{logObjTypes[ot]?.count!=null?logObjTypes[ot].count.toLocaleString():'—'}</td>}
+                                        </tr>);
+                                      })}</tbody>
+                                    </table>
+                                  </Collapsible>
+                                );
+                              })()}
 
-                            {/* OC-Declare Coverage Measures */}
-                            <Collapsible title="OC-Declare Coverage" defaultOpen={false}>
-                              <OCCoveragePanel
-                                results={r}
-                                model={activeModel || modelBase}
-                                discoveryResults={discoveryResults}
-                              />
                             </Collapsible>
 
                             {r.output_file && (
@@ -11163,15 +11556,8 @@ function App() {
                                 <a className="download-button"
                                   href={`/api/download/${encodeURIComponent(r.output_file)}`}
                                   download={r.output_file}>
-                                  ⬇ Download Event Log
+                                  Download Event Log
                                 </a>
-                                {r.metrics_file && (
-                                  <a className="download-button download-button-secondary"
-                                    href={`/api/download-metrics/${encodeURIComponent(r.metrics_file)}`}
-                                    download={r.metrics_file}>
-                                    ⬇ Download Metrics
-                                  </a>
-                                )}
                                 {r.iteration_log_file && (
                                   <button className="download-button download-button-secondary"
                                     onClick={async () => {
@@ -11186,7 +11572,7 @@ function App() {
                                         URL.revokeObjectURL(url);
                                       } catch {}
                                     }}>
-                                    ⬇ Download Iteration Trace
+                                    Download Iteration Trace
                                   </button>
                                 )}
                               </div>
@@ -11289,7 +11675,7 @@ function App() {
                     disabled={isOcdeclareDiscovering}
                   />
                 </div>
-                <div className="form-group">
+                {false && <div className="form-group">
                   <label>
                     Permanent Object Threshold
                     <HelpTip text={'Object types whose average events/instance exceeds this are treated as permanent objects and never deactivated.\n\nHigh → almost nothing classified as permanent.\nLow → many types become permanent objects.\n\nAuto-detected from the log on load; you can override.'} />
@@ -11307,7 +11693,7 @@ function App() {
                       Auto-detected: {suggestedPermanentThreshold}
                     </div>
                   )}
-                </div>
+                </div>}
               </div>
 
               {/* ── Constraint types + per-type parameters ───────────────── */}
@@ -11398,15 +11784,47 @@ function App() {
           )}
 
           {isOcdeclareDiscovering && (
-            <div className="loading-box">
-              <div className="spinner"></div>
-              <p>Discovering OC-Declare model from event log...</p>
+            <div className="loading-box" style={{flexDirection:'column',gap:'0.6rem',alignItems:'stretch'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.75rem'}}>
+                <div className="spinner"></div>
+                <span>Discovering OC-Declare model… {ocdeclareProgress.phase || 'Starting'}</span>
+                <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:'0.75rem'}}>
+                  {ocdeclareElapsed != null && (
+                    <span className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                      {Math.floor(ocdeclareElapsed/60).toString().padStart(2,'0')}:{(ocdeclareElapsed%60).toString().padStart(2,'0')}
+                    </span>
+                  )}
+                  <span style={{fontWeight:600}}>{ocdeclareProgress.pct}%</span>
+                </div>
+              </div>
+              <div style={{height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden'}}>
+                <div style={{height:'100%',background:'#6366f1',borderRadius:'3px',transition:'width 0.4s ease',width:`${ocdeclareProgress.pct}%`}} />
+              </div>
+              {ocdeclareLog.length > 0 && (
+                <div style={{background:'#0f172a',borderRadius:'5px',padding:'0.4rem 0.6rem',fontFamily:'monospace',fontSize:'0.7rem',lineHeight:'1.5',color:'#94a3b8'}}>
+                  {ocdeclareLog.slice(-5).map((entry, i) => (
+                    <div key={i} style={{whiteSpace:'pre-wrap',wordBreak:'break-all'}}>
+                      <span style={{color:'#475569',marginRight:'0.5em'}}>{entry.t}</span>
+                      <span style={{color: entry.msg.startsWith('[') ? '#a5b4fc' : entry.msg.startsWith('After') || entry.msg.startsWith('Discovery') ? '#86efac' : '#cbd5e1'}}>{entry.msg}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
           {ocdeclareDiscoveryResults && !isOcdeclareDiscovering && (
             <div className="ocdeclare-discovery-results">
-              <h3>Model Discovered: {ocdeclareDiscoveryResults.filename}</h3>
+              <h3>Model Discovered: {ocdeclareDiscoveryResults.filename}{ocdeclareElapsed != null && <span style={{fontSize:'0.82rem',fontWeight:400,color:'#94a3b8',marginLeft:'0.5em'}}>· {ocdeclareElapsed}s</span>}</h3>
+              <div style={{marginBottom:'0.75rem'}}>
+                <a
+                  className="download-button"
+                  href={`/api/download-ocdeclare/${encodeURIComponent(ocdeclareDiscoveryResults.filename)}`}
+                  download={ocdeclareDiscoveryResults.filename}
+                >
+                  Download OC-Declare File
+                </a>
+              </div>
               
               <div className="stat-grid">
                 <div className="stat-card">
@@ -11460,7 +11878,7 @@ function App() {
                           {constraint.source} → {constraint.target}
                         </span>
                         <span className="constraint-scope">
-                          (scope: {constraint.scope.kind} {constraint.scope.object_type})
+                          (scope: {formatScope(constraint.scope)})
                         </span>
                         <span className="constraint-metrics">
                           [support: {(constraint.support * 100).toFixed(0)}%, 
@@ -11590,7 +12008,7 @@ function App() {
         )}
 
         {/* ── Post-Processing section ── */}
-        {workflowMode !== 'external-ocel' && (
+        {false && workflowMode !== 'external-ocel' && (
         <>
         <div className="post-processing-section">
           <div className="section-header">
@@ -11700,7 +12118,7 @@ function App() {
                 return (
                   <div className="object-info-box">
                     <div className="object-info-title">ℹ Object Lifecycle</div>
-                    {resources.length > 0 && (
+                    {false && resources.length > 0 && (
                       <div className="object-info-group">
                         <div className="object-info-label">Permanent Objects (always active)</div>
                         <ul className="object-info-list">
@@ -11772,7 +12190,7 @@ function App() {
         )}
 
         {/* ── Post-Processing Result section ── */}
-        {workflowMode !== 'external-ocel' && (
+        {false && workflowMode !== 'external-ocel' && (
         <div className="postprocessing-result-section">
           <div className="section-header">
             <h2>Post-Processing Result</h2>
@@ -12437,7 +12855,7 @@ function App() {
                 </span>
               </p>
               <button className="sim-stop-btn" onClick={stopSimulation}>
-                ⏹ Stop
+                Stop
               </button>
             </div>
           )}
@@ -12696,6 +13114,8 @@ function App() {
                 </Collapsible>
               )}{/* end Evaluation */}
 
+              <TraceHealth results={results} />
+
               {results.activity_sequence && results.activity_sequence.length > 0 && (
                 <div className="flow-chart-section">
                   <h4>Process Flow</h4>
@@ -12785,11 +13205,6 @@ function App() {
                   <button className="download-button" onClick={downloadEventLog}>
                     Download Event Log
                   </button>
-                  {results.metrics_file && (
-                    <button className="download-button download-button-secondary" onClick={downloadMetrics}>
-                      Download Metrics
-                    </button>
-                  )}
                 </div>
               )}
 
@@ -12840,20 +13255,6 @@ function App() {
                           </div>
                         );
                       })()}
-                      {/* ── Concurrency indicator ── */}
-                      {results.concurrency_pairs && results.concurrency_pairs.length > 0 && (
-                        <div className="concurrency-summary">
-                          <span className="concurrency-summary-title">Concurrent activity pairs (from log)</span>
-                          <div className="concurrency-pills">
-                            {results.concurrency_pairs.map(({ a, b, p }) => (
-                              <span key={`${a}|||${b}`} className="concurrency-pill" title={`${a} and ${b} fire concurrently ${Math.round(p * 100)}% of the time`}>
-                                <span className="concurrency-pill-acts">{a} ∥ {b}</span>
-                                <span className="concurrency-pill-p">{Math.round(p * 100)}%</span>
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
                       <table className="metrics-table">
                         <thead>
                           <tr>
@@ -12909,7 +13310,7 @@ function App() {
                             disabled={isLoadingObjMetrics}
                             onClick={loadObjectMetrics}
                           >
-                            {isLoadingObjMetrics ? 'Loading…' : '⬇ Load Object Lifetimes'}
+                            {isLoadingObjMetrics ? 'Loading…' : 'Load Object Lifetimes'}
                           </button>
                         </div>
                       ) : (
@@ -13006,7 +13407,7 @@ function App() {
                   document.body.removeChild(a); URL.revokeObjectURL(url);
                 }}
               >
-                ⬇ Download Iteration Trace
+                Download Iteration Trace
               </button>
               <span style={{fontSize:'0.72rem',color:'#94a3b8',marginLeft:'0.5rem'}}>
                 JSONL — candidates, weights, chosen activity, timestamps
@@ -13108,10 +13509,7 @@ function App() {
                           <td className="rh-actions" onClick={e => e.stopPropagation()}>
                             <button className="rh-btn" onClick={() => reRunFromHistory(run)} title="Restore these settings into the editor">↩ Restore</button>
                             {run.output_file && (
-                              <button className="rh-btn" onClick={() => window.open(`/api/download/${run.output_file}`, '_blank')} title="Download event log">⬇ Log</button>
-                            )}
-                            {run.metrics_file && (
-                              <button className="rh-btn" onClick={() => window.open(`/api/download-metrics/${run.metrics_file}`, '_blank')} title="Download metrics">⬇ Metrics</button>
+                              <button className="rh-btn" onClick={() => window.open(`/api/download/${run.output_file}`, '_blank')} title="Download event log">Log</button>
                             )}
                           </td>
                         </tr>
@@ -13180,6 +13578,48 @@ function App() {
         </div>
       )}
     </div>
+
+  {/* Activity involvement popup */}
+  {activityPopup && (
+    <div
+      style={{position:'fixed',inset:0,zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',background:'rgba(0,0,0,0.25)'}}
+      onClick={() => setActivityPopup(null)}
+    >
+      <div
+        style={{background:'white',borderRadius:'10px',padding:'1.25rem 1.5rem',boxShadow:'0 8px 32px rgba(0,0,0,0.18)',minWidth:'260px',maxWidth:'380px',width:'90%'}}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{fontWeight:700,fontSize:'0.95rem',marginBottom:'0.75rem',color:'#1e293b'}}>{activityPopup.name}</div>
+        <div style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem',fontWeight:600}}>Object Involvement</div>
+        {activityPopup.objects.length === 0 ? (
+          <div style={{fontSize:'0.8rem',color:'#94a3b8'}}>No object bindings.</div>
+        ) : (
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:'0.82rem'}}>
+            <thead>
+              <tr style={{borderBottom:'1px solid #e2e8f0'}}>
+                <th style={{textAlign:'left',padding:'0.25rem 0.4rem 0.35rem 0',color:'#64748b',fontWeight:600}}>Object Type</th>
+                <th style={{textAlign:'center',padding:'0.25rem 0.4rem 0.35rem',color:'#16a34a',fontWeight:700}}>Creates</th>
+                <th style={{textAlign:'center',padding:'0.25rem 0 0.35rem 0.4rem',color:'#dc2626',fontWeight:700}}>Deactivates</th>
+              </tr>
+            </thead>
+            <tbody>
+              {activityPopup.objects.map((o, i) => (
+                <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                  <td style={{padding:'0.3rem 0.4rem 0.3rem 0',color:'#1e293b'}}>{o.type}</td>
+                  <td style={{textAlign:'center',padding:'0.3rem 0.4rem'}}>{o.creates ? <span style={{color:'#16a34a',fontWeight:700}}>✓</span> : <span style={{color:'#cbd5e1'}}>—</span>}</td>
+                  <td style={{textAlign:'center',padding:'0.3rem 0 0.3rem 0.4rem'}}>{o.deactivates ? <span style={{color:'#dc2626',fontWeight:700}}>✓</span> : <span style={{color:'#cbd5e1'}}>—</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <button
+          style={{marginTop:'0.85rem',fontSize:'0.75rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.3rem 0.8rem',cursor:'pointer'}}
+          onClick={() => setActivityPopup(null)}
+        >Close</button>
+      </div>
+    </div>
+  )}
   </div>
   );
 }

@@ -7,26 +7,6 @@ from src.Simulation.Domain.ir import StaticModel
 from src.Simulation.Domain.state import SimulationState
 
 
-def _move_seen_activities_to_back(pool: list[Any], state: SimulationState) -> list[Any]:
-    """Reorder candidates so that activities that already happened in this run come last.
-
-    This is a small, test-oriented helper: it preserves the original relative order
-    of candidates, but groups them such that candidates whose activity has not yet
-    appeared in `state.executed_events` are placed first, and candidates for
-    activities that already occurred are moved to the back of the list.
-    """
-    seen = set(state._events_by_activity.keys())
-    unseen_candidates: list[Any] = []
-    seen_candidates: list[Any] = []
-
-    for c in pool:
-        if c.activity_name in seen:
-            seen_candidates.append(c)
-        else:
-            unseen_candidates.append(c)
-
-    return unseen_candidates + seen_candidates
-
 
 def select_candidate(
     candidates: list[Any],
@@ -114,9 +94,6 @@ def select_candidate(
     # else:
     #     print(f"DEBUG: No pending obligations")
     # (obligations filter disabled — response constraints don't force immediate selection)
-
-    # Reorder pool so that already-executed activities are moved to the back.
-    pool = _move_seen_activities_to_back(pool, state)
 
     # Step 4: decision by transition matrix or deterministic first
     if transition_matrix:

@@ -8,16 +8,22 @@ EVENT_LOG_DIR = os.path.join(os.path.dirname(__file__), '../Simulation/IO/input/
 
 
 def _load_raw(filename: str):
-    """Load a JSON or XML event log file into a raw Python object.
+    """Load a JSON, JSONOCEL, XML, or CSV event log file into a raw Python object.
 
-    For XML files delegates to load_ocel2_xml which returns the normalised
-    internal dict (events keyed by id, objects keyed by id).  For JSON files
-    returns whatever json.load produces.
+    XML, CSV, and JSONOCEL files are converted to the normalised internal OCEL
+    dict (events keyed by id, objects keyed by id).  JSON files are returned as-is.
     """
     from pathlib import Path
-    if Path(filename).suffix.lower() == '.xml':
+    suffix = Path(filename).suffix.lower()
+    if suffix == '.xml':
         from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2_xml
         return load_ocel2_xml(filename)
+    if suffix == '.csv':
+        from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2_csv
+        return load_ocel2_csv(filename)
+    if suffix == '.jsonocel':
+        from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2
+        return load_ocel2(filename)
     with open(filename, 'r', encoding='utf-8') as f:
         return json.load(f)
 

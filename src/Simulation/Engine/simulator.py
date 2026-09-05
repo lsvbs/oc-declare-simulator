@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, field
+from itertools import product as _iproduct
 from typing import Optional
 
 from src.Simulation.Domain.ir import StaticModel, Activity
@@ -244,14 +245,22 @@ class Simulator:
         return self.run_des(state)
 
     def _is_start_activity_blocked(self, candidate, state: SimulationState) -> bool:
-        """Return True if this start activity has hit its max_case_starts cap."""
+        """Return True if this start activity has hit its cap (global or per-activity)."""
         start_names = set(self.config.start_policy.start_activity_names)
-        if candidate.activity_name not in start_names:
+        act = candidate.activity_name
+        if act not in start_names:
             return False
+        # Global cap
         max_starts = self.config.start_policy.max_case_starts
-        if max_starts is None:
-            return False
-        return self._count_started_cases(state) >= max_starts
+        if max_starts is not None and state._start_event_count >= max_starts:
+            return True
+        # Per-activity cap
+        caps = self.config.start_policy.start_activity_caps or {}
+        if act in caps and caps[act] is not None:
+            fired = state._start_event_count_by_activity.get(act, 0)
+            if fired >= caps[act]:
+                return True
+        return False
 
     def _should_stop(self, state: SimulationState) -> bool:
         # Time-based limit (primary)
@@ -264,6 +273,11 @@ class Simulator:
         max_tr = getattr(self.config, 'max_traces', None)
         if max_tr is not None:
             if state.completed_trace_count >= max_tr:
+                return True
+        # Case-based limit: stop when start-activity firings reach the target
+        max_ca = getattr(self.config, 'max_cases', None)
+        if max_ca is not None:
+            if state._start_event_count >= max_ca:
                 return True
         # Event/step cap (safety backstop — always applies)
         if state.step_count >= self.config.max_steps:
@@ -351,9 +365,8 @@ class Simulator:
                 continue
 
             # Expand: one candidate per active object of the primary binding type.
-            # Cap at 32 to avoid O(n_objects) work when many objects accumulate.
             primary_type = primary_bindings[0].object_type
-            active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
+            active_ids = list(state._active_by_type.get(primary_type, set()))
 
             # Pre-compute cheap precedence gates for this activity (nmin and nmax)
             # using only the primary object id — avoids building the full candidate.
@@ -730,12 +743,13 @@ class Simulator:
             if state._obligations_count.pop((act, oid), None) is not None:
                 state._obligations_ready.pop((act, oid), None)
                 _record_fulfillment((act, oid))
-        # Discharge all-mode frozenset obligations
+        # Discharge all-mode frozenset obligations (single-type all AND multi-type each-combos)
         all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
         for k in all_keys:
-            if k[1].issubset(fired_oids):
+            if k[1].issubset(fired_oids) and self._check_obligation_binding_satisfied(k, fired_oids, state):
                 state._obligations_count.pop(k, None)
                 state._obligations_ready.pop(k, None)
+                state._obligation_bindings.pop(k, None)
                 _record_fulfillment(k)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
@@ -747,7 +761,54 @@ class Simulator:
                 constraint.target_activity,
                 getattr(constraint.scope, 'kind', 'each'),
             )
-            if constraint.scope.kind == "each":
+            if constraint.scope.bindings and len(constraint.scope.bindings) > 1:
+                # Multi-type: build one obligation per Cartesian combination of each-type objects.
+                # Secondary any/all bindings are stored and verified at fulfillment time.
+                event_oids_by_type: dict = {}
+                for oid in executed_event.object_ids:
+                    rt = state.objects.get(oid)
+                    if rt:
+                        event_oids_by_type.setdefault(rt.object_type, []).append(oid)
+
+                each_types = [t for t, inv in constraint.scope.bindings if inv == 'each']
+                other_bindings = [(t, inv) for t, inv in constraint.scope.bindings if inv != 'each']
+                each_oid_lists = [event_oids_by_type.get(t, []) for t in each_types]
+
+                if each_types and any(not lst for lst in each_oid_lists):
+                    pass  # Required each-type missing from source event — no obligation
+                else:
+                    secondary_info = [
+                        (t, inv, frozenset(event_oids_by_type.get(t, [])))
+                        for t, inv in other_bindings
+                        if event_oids_by_type.get(t)
+                    ]
+                    if each_types:
+                        for combo in _iproduct(*each_oid_lists):
+                            key = (constraint.target_activity, frozenset(combo))
+                            if key not in state._obligations_count:
+                                state._obligations_count[key] = 1
+                                state._obligation_to_constraint[key] = c_key
+                                if secondary_info:
+                                    state._obligation_bindings[key] = secondary_info
+                                state._obligations_ready[key] = 1
+                    else:
+                        # Only any/all bindings — key on primary type's object set
+                        primary_type, _ = constraint.scope.bindings[0]
+                        primary_oids = frozenset(event_oids_by_type.get(primary_type, []))
+                        if primary_oids:
+                            key = (constraint.target_activity, primary_oids)
+                            if key not in state._obligations_count:
+                                state._obligations_count[key] = 1
+                                state._obligation_to_constraint[key] = c_key
+                                remaining = [
+                                    (t, inv, frozenset(event_oids_by_type.get(t, [])))
+                                    for t, inv in constraint.scope.bindings[1:]
+                                    if event_oids_by_type.get(t)
+                                ]
+                                if remaining:
+                                    state._obligation_bindings[key] = remaining
+                                state._obligations_ready[key] = 1
+            elif constraint.scope.kind == "each":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
@@ -824,6 +885,29 @@ class Simulator:
                 scope_ids.append(object_id)
 
         return scope_ids
+
+    def _check_obligation_binding_satisfied(self, key, fired_oids: set, state: SimulationState) -> bool:
+        """Check secondary any/all bindings for a multi-type obligation against the fired event."""
+        binding_info = state._obligation_bindings.get(key)
+        if not binding_info:
+            return True
+        fired_by_type: dict = {}
+        for oid in fired_oids:
+            obj = state.objects.get(oid)
+            if obj:
+                fired_by_type.setdefault(obj.object_type, set()).add(oid)
+        for obj_type, inv, required_oids in binding_info:
+            present = fired_by_type.get(obj_type, set())
+            if not present:
+                return False
+            if inv == 'any':
+                if not (required_oids & present):
+                    return False
+            else:  # 'all'
+                if not required_oids.issubset(present):
+                    return False
+        return True
+
 
     def _get_activity_by_name(self, activity_name: str) -> Optional[Activity]:
         # #1: O(1) dict lookup using cached _act_by_name built in __init__

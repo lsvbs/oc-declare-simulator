@@ -154,13 +154,8 @@ def build_candidate_for_activity(
         # input requirements.
 
         if not binding.creates:
-            # For simulation eligibility, require at least 1 object regardless of
-            # binding.min_count.  Log-derived min_counts are batch-size statistics
-            # (e.g. Depart: min=2 because ships always left with ≥2 containers),
-            # NOT logical preconditions.  We still try to select min_count objects
-            # when they are available, but we never block the activity if only 1 exists.
-            eligibility_count = 1
-            target_count = max(binding.min_count, eligibility_count)
+            eligibility_count = binding.min_count
+            target_count = binding.min_count
 
             # Use already existing active objects first (but do not exceed max_count)
             if binding.max_count is None:
@@ -183,23 +178,16 @@ def build_candidate_for_activity(
 
             participating_object_ids.extend(selected_ids)
         else:
-            # Output binding: this activity instantiates a new object of this type.
+            # Output binding: this activity instantiates new objects of this type.
             #
-            # Creation count is always exactly 1 per firing — regardless of
-            # min_count. min_count comes from log-discovery and represents the
-            # average NUMBER OF OBJECTS THAT PARTICIPATED in events of this
-            # activity (including existing ones), not how many new ones to
-            # create on each firing. Using it directly causes an explosion
-            # (e.g. min_count=50 containers → 50 new objects every step).
-            #
-            # Reuse: if max_count is set, fill up to (max_count - 1) slots
+            # Reuse: if max_count is set, fill up to (max_count - create_count) slots
             # with existing linked objects. If max_count is None, no reuse —
-            # the newly created object is the sole participant of this type.
+            # the newly created objects are the sole participants of this type.
             #
             # Resource types come from the pre-populated pool only.
             if binding.object_type in _resource_types:
-                eligibility_count = 1
-                target_count = max(binding.min_count, eligibility_count)
+                eligibility_count = binding.min_count
+                target_count = binding.min_count
                 selected_from_existing = min(len(existing_ids), target_count,
                                              binding.max_count if binding.max_count is not None else len(existing_ids))
                 selected_ids = existing_ids[:selected_from_existing]
@@ -208,12 +196,12 @@ def build_candidate_for_activity(
                 participating_object_ids.extend(selected_ids)
                 continue
 
-            create_count = 1  # always create exactly one new instance
+            create_count = max(1, binding.min_count)
 
             if binding.max_count is not None:
                 reuse_limit = min(len(existing_ids), max(0, binding.max_count - create_count))
             else:
-                reuse_limit = 0  # no reuse when unbounded — created object is the sole participant
+                reuse_limit = 0  # no reuse when unbounded — created objects are the sole participants
 
             selected_ids = _find_objects_preferring_linked(
                 state, existing_ids, participating_object_ids, reuse_limit

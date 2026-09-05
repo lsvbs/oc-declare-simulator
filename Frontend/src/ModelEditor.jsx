@@ -1,6 +1,23 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import './ModelEditor.css';
 
+// ── Scope formatter ───────────────────────────────────────────────────────────
+function formatScope(scope) {
+  if (!scope) return '';
+  const bindings = scope.bindings || [];
+  if (bindings.length <= 1) {
+    if (scope.kind && scope.object_type) return `${scope.kind} ${scope.object_type}`;
+    return scope.object_type || scope.kind || '';
+  }
+  const groups = {};
+  for (const [t, inv] of bindings) {
+    (groups[inv] = groups[inv] || []).push(t);
+  }
+  return Object.entries(groups)
+    .map(([inv, types]) => `${inv.charAt(0).toUpperCase() + inv.slice(1)}(${types.join(',')})`)
+    .join(', ');
+}
+
 // ── O2O UML Diagram ───────────────────────────────────────────────────────────
 const NODE_R   = 34;
 const O2O_PALETTE = ['#667eea','#10b981','#f59e0b','#ef4444','#8b5cf6',
@@ -554,11 +571,11 @@ export default function ModelEditor({
     { id: 'activities',   label: 'Activities',   count: activities.length },
     { id: 'constraints',  label: 'Constraints',  count: constraints.length },
     { id: 'o2o',          label: 'Obj-to-Obj', count: o2oRules.length },
-    { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
-    { id: 'resources',    label: 'Permanent Objects', count: resourceTypes.length || null },
+    // { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
+    // { id: 'resources',    label: 'Permanent Objects', count: resourceTypes.length || null },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
-    { id: 'flow',         label: 'Object Flow',  count: null },
+    { id: 'flow',         label: 'Object Involvement',  count: null },
   ];
 
   // Pre-compute special filter sets
@@ -779,7 +796,7 @@ export default function ModelEditor({
                 disabled={!selectedParamFile}
                 title="Load the selected parameter file into the editor"
               >
-                ⬆ Load
+                Load
               </button>
             </div>
             <button
@@ -787,7 +804,7 @@ export default function ModelEditor({
               onClick={downloadModel}
               title="Download the current parameters (activities, bindings, constraints, object-to-object relationships, timing, max-consecutive and edited probabilities) as a JSON file. A copy is also saved to IO/input/parameters so you can reload it later."
             >
-              ⬇ Download JSON
+              Download JSON
             </button>
           </div>
         </div>
@@ -852,6 +869,7 @@ export default function ModelEditor({
               <span><span style={{fontWeight:700,color:'#16a34a',marginRight:'3px'}}>+</span>Creates new objects of that type</span>
               <span><span style={{fontWeight:700,color:'#dc2626',marginRight:'3px'}}>−</span>Deactivates (ends lifecycle of) objects of that type</span>
               <span><span style={{fontWeight:700,color:'#f59e0b',marginRight:'3px'}}>★</span>Start activity — simulation begins here</span>
+              <span><span style={{fontWeight:700,color:'#64748b',marginRight:'3px'}}>●</span>Activity involves this type (binding, no create/deactivate)</span>
             </div>
             {onStartActivitiesChange && activities.length > 0 && (
               <div style={{display:'flex',justifyContent:'flex-end',paddingRight:'0.5rem',marginBottom:'0.15rem'}}>
@@ -939,7 +957,7 @@ export default function ModelEditor({
                         <div className="binding-row">
                           <span className="binding-type-label">
                             {b.object_type}
-                            {isResource && <span className="binding-resource-badge" title="Permanent object type — fixed pool, never deactivated. Pool size is set in the Permanent Objects tab.">P</span>}
+                            {isResource && <span className="binding-resource-badge" title="Immutable object type — fixed pool, never deactivated.">I</span>}
                           </span>
                           <input
                             className="binding-num"
@@ -956,7 +974,7 @@ export default function ModelEditor({
                               e.target.value === '' ? null : parseInt(e.target.value) || 0)}
                           />
                           <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
-                            title={isResource ? 'Permanent objects come from the pre-populated pool — they cannot be created by activities and are never deactivated.' : ''}>
+                            title={isResource ? 'Immutable objects come from the pre-populated pool — they cannot be created by activities and are never deactivated.' : ''}>
                             <input type="checkbox" checked={isResource ? false : !!b.creates}
                               disabled={isResource}
                               onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
@@ -1180,7 +1198,7 @@ export default function ModelEditor({
                 {showConSummary.has(act.name) && (() => {
                   const actName = act.name;
                   const cons = constraints || [];
-                  const scopePart = c => c.scope?.object_type ? ` per ${c.scope.object_type}` : '';
+                  const scopePart = c => c.scope ? ` per ${(c.scope.bindings||[]).length > 1 ? c.scope.bindings.map(([t])=>t).join(', ') : c.scope.object_type}` : '';
                   const times = n => n == null ? '' : n === 1 ? 'once' : `${n} times`;
                   const nminPart = c => (c.nmin ?? 0) > 1 ? ` at least ${times(c.nmin)}` : '';
                   const nmaxPart = c => (c.nmax ?? null) !== null ? `, at most ${times(c.nmax)}` : '';
@@ -1464,7 +1482,7 @@ export default function ModelEditor({
                       {!isEditing ? (
                         <>
                           <span className="constraint-scope">
-                            [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
+                            [{formatScope(c.scope)}]
                           </span>
                           {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
                             ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
@@ -1510,9 +1528,9 @@ export default function ModelEditor({
                               onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
                             />
                           </label>
-                          <label className="constraint-edit-label">
+                          {false && <label className="constraint-edit-label">
                             <HelpTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint. Same attribute/op/value format as binding guards.">guard:</HelpTip>
-                            {c.guard ? (
+                            {false && c.guard ? (
                               <span style={{display:'flex',gap:'0.25rem',alignItems:'center'}}>
                                 <input className="constraint-edit-num" style={{width:'5rem'}} placeholder="attribute"
                                   value={c.guard.attribute||''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, attribute: e.target.value} })} />
@@ -1524,9 +1542,9 @@ export default function ModelEditor({
                                 <button className="row-delete-btn" title="Remove guard" onClick={() => updateConstraint(realIdx, { guard: null })}>✕</button>
                               </span>
                             ) : (
-                              <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
+                              false && <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
                             )}
-                          </label>
+                          </label>}
                           <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
                         </div>
                       )}
@@ -1637,7 +1655,7 @@ export default function ModelEditor({
                   />
                 </span>
               )}
-              {newCon.guard ? (
+              {false && newCon.guard ? (
                 <span style={{display:'flex',gap:'0.25rem',alignItems:'center',flexWrap:'wrap'}}>
                   <span style={{fontSize:'0.72rem',color:'#64748b'}}>guard: if</span>
                   <input className="card-input" style={{width:'5rem'}} placeholder="attribute"
@@ -1650,7 +1668,7 @@ export default function ModelEditor({
                   <button className="row-delete-btn" title="Remove guard" onClick={() => setNewCon(p => ({ ...p, guard: null }))}>✕</button>
                 </span>
               ) : (
-                <button className="con-filter-btn" onClick={() => setNewCon(p => ({ ...p, guard: {attribute:'', op:'==', value:''} }))}>+ guard</button>
+                false && <button className="con-filter-btn" onClick={() => setNewCon(p => ({ ...p, guard: {attribute:'', op:'==', value:''} }))}>+ guard</button>
               )}
               <button className="add-form-btn" onClick={addConstraint}>+ Add</button>
             </div>
@@ -1670,7 +1688,7 @@ export default function ModelEditor({
                   </span>
                   <span className="o2o-tgt">{r.target_type}</span>
                   <span className="o2o-cardinality">
-                    min={r.min_links} max={r.max_links === null ? '∞' : r.max_links}
+                    max: {r.max_links === null ? '∞' : r.max_links}
                   </span>
                   <label className="binding-toggle">
                     <input type="checkbox" checked={!!r.bidirectional}
@@ -1702,12 +1720,9 @@ export default function ModelEditor({
                   onChange={e => setNewO2O(p => ({ ...p, bidirectional: e.target.checked }))} />
                 bidirectional
               </label>
-              <input className="binding-num" type="number" min={0} value={newO2O.min_links}
-                placeholder="min"
-                onChange={e => setNewO2O(p => ({ ...p, min_links: parseInt(e.target.value) || 0 }))} />
               <input className="binding-num" type="number" min={0}
                 value={newO2O.max_links === null ? '' : newO2O.max_links}
-                placeholder="max (∞)"
+                placeholder="max links (∞)"
                 onChange={e => setNewO2O(p => ({
                   ...p, max_links: e.target.value === '' ? null : parseInt(e.target.value) || 0
                 }))} />
@@ -1731,7 +1746,7 @@ export default function ModelEditor({
               });
               const involved = new Set(o2oRules.flatMap(r => [r.source_type, r.target_type]));
               const cols = otNames.filter(t => involved.has(t));
-              const fmtCell = ({min, max}) => `${min}..${max == null ? '∞' : max}`;
+              const fmtCell = ({min, max}) => { const s = max == null ? '∞' : max; return (max !== null && min === max) ? String(min) : `${min}-${s}`; };
               return (
                 <div style={{overflowX:'auto',marginTop:'1rem'}}>
                   <table className="o2o-preview-table">
@@ -1836,7 +1851,7 @@ export default function ModelEditor({
 
 
         {/* ━━ ATTRIBUTES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
-        {activeTab === 'attributes' && (
+        {false && activeTab === 'attributes' && (
           <div>
             <p className="prob-hint">
               Attribute definitions and default values per object type. Definitions come from the
@@ -1927,7 +1942,7 @@ export default function ModelEditor({
         )}
 
         {/* ━━ RESOURCES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
-        {activeTab === 'resources' && (
+        {false && activeTab === 'resources' && (
           <div>
             <p className="prob-hint">
               Permanent object types are <strong>permanently active</strong> and never deactivated — they
@@ -2180,7 +2195,7 @@ export default function ModelEditor({
                     <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',marginRight:'0.25rem'}}>Object:</span>
                     <span className="object-flow-type-name">{otype}</span>
                     {resourceTypes.includes(otype) && (
-                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Permanent</span>
+                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Immutable</span>
                     )}
                     <span className="object-flow-act-count">{sortedInvolved.length} activities</span>
                   </div>

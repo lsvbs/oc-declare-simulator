@@ -20,3 +20,4 @@ metrics/*.json
 
 # Frontend build output
 Frontend/dist/
+src/Simulation/IO/input/eventlog/

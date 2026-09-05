@@ -78,6 +78,85 @@ def _scope_ids(candidate: Any, state: SimulationState, scope_type: str,
     return _get_scope_object_ids_from_candidate(candidate, state, scope_type)
 
 
+def _joint_scope_event_ids(
+    candidate: Any,
+    state: SimulationState,
+    scope: Any,
+    source_activity: str,
+) -> frozenset:
+    """Return event IDs of source_activity events jointly satisfying all multi-type bindings.
+
+    For each binding (obj_type, involvement):
+      'any' → any candidate object of that type must appear in the source event
+      'all' → all candidate objects of that type must appear in the source event
+      'each' (single obj) → that object must appear in the source event
+      'each' (multi obj) → Cartesian product: every combination of one object per
+                            multi-each type must have a qualifying joint source event
+
+    Returns empty frozenset if no qualifying event exists (constraint not satisfied).
+    """
+    from itertools import product as _iproduct
+
+    bindings = scope.bindings
+    if not bindings:
+        return frozenset()
+
+    cand_by_type: dict = {}
+    for oid in (getattr(candidate, 'participating_object_ids', []) or []):
+        rt = state.objects.get(oid)
+        if rt:
+            cand_by_type.setdefault(rt.object_type, []).append(oid)
+
+    def _src_eids_for_obj(oid: str) -> frozenset:
+        return frozenset(e.event_id for e in
+                         _events_for_activity_and_object(state, source_activity, oid))
+
+    single_sets: list = []
+    multi_sets: list = []
+
+    for obj_type, inv in bindings:
+        A_objs = cand_by_type.get(obj_type, [])
+        if not A_objs:
+            return frozenset()
+        if inv == 'any':
+            s: set = set()
+            for oid in A_objs:
+                s.update(e.event_id for e in
+                         _events_for_activity_and_object(state, source_activity, oid))
+            single_sets.append(frozenset(s))
+        elif inv == 'all':
+            combined = None
+            for oid in A_objs:
+                es = _src_eids_for_obj(oid)
+                combined = es if combined is None else combined & es
+            single_sets.append(combined if combined is not None else frozenset())
+        else:  # each
+            if len(A_objs) <= 1:
+                single_sets.append(_src_eids_for_obj(A_objs[0]))
+            else:
+                multi_sets.append([_src_eids_for_obj(oid) for oid in A_objs])
+
+    joint_base = single_sets[0] if single_sets else frozenset(
+        e.event_id for e in _events_for_activity(state, source_activity)
+    )
+    for s in single_sets[1:]:
+        joint_base = joint_base & s
+
+    if not multi_sets:
+        return joint_base
+
+    qualifying: set = set()
+    for assignment in _iproduct(*multi_sets):
+        j = joint_base
+        for obj_set in assignment:
+            j = j & obj_set
+        if not j:
+            return frozenset()  # This assignment has no qualifying event → fails
+        qualifying.update(j)
+
+    return frozenset(qualifying)
+
+
 def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
     if candidate.activity_name == constraint.source_activity:
         forbidden = constraint.target_activity
@@ -147,6 +226,16 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
 
     if candidate.activity_name != target:
         return True
+
+    # Multi-type binding: joint check across all object types in the binding
+    if constraint.scope.bindings:
+        qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source)
+        count = len(qualifying)
+        if nmin > 0 and count < nmin:
+            return False
+        if nmax is not None and count > nmax:
+            return False
+        return count >= 1 if nmin > 0 else True
 
     if constraint.scope.kind == "each":
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)

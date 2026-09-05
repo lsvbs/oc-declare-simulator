@@ -89,8 +89,8 @@ def _parse_activity_durations(raw: Dict[str, Any]) -> Dict[str, Any]:
             continue
         out[str(act_name)] = ActivityDuration(
             dist_type=str(d.get("dist_type", "lognormal")),
-            mean_seconds=float(d.get("mean_seconds", 3600.0)),
-            std_seconds=float(d.get("std_seconds", 600.0)),
+            mean_seconds=float(d.get("mean_seconds", 0.0)),
+            std_seconds=float(d.get("std_seconds", 0.0)),
             min_seconds=float(d.get("min_seconds", 0.0)),
             max_seconds=_opt_float(d.get("max_seconds")),
             sojourn_mean=_opt_float(d.get("sojourn_mean")),
@@ -181,8 +181,15 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         source = c.get("source") or c.get("source_activity") or c.get("a")
         target = c.get("target") or c.get("target_activity") or c.get("b")
         scope = c.get("scope") or {}
-        scope_kind = scope.get("kind", "each")
-        scope_object_type = scope.get("object_type")
+        ipl = scope.get("involvement_per_label") or c.get("involvement_per_label") or {}
+        if ipl:
+            bindings = tuple((str(t), str(v)) for t, v in ipl.items())
+            primary_type = next(iter(ipl))
+            primary_kind = ipl[primary_type]
+        else:
+            bindings = ()
+            primary_type = scope.get("object_type")
+            primary_kind = scope.get("kind", "each")
         if not ctype or not source or not target:
             continue
         # Cardinality bounds (OC-DECLARE). For precedence/chain_precedence/
@@ -207,7 +214,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                 constraint_type=str(ctype),
                 source_activity=str(source),
                 target_activity=str(target),
-                scope=Scope(kind=str(scope_kind), object_type=str(scope_object_type) if scope_object_type is not None else ""),
+                scope=Scope(
+                    kind=str(primary_kind),
+                    object_type=str(primary_type) if primary_type is not None else "",
+                    bindings=bindings,
+                ),
                 nmin=nmin,
                 nmax=nmax,
                 guard=c.get("guard") or None,
@@ -272,10 +283,6 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             str(k): dict(v)
             for k, v in (data.get("attribute_schema") or {}).items()
             if isinstance(v, dict)
-        },
-        concurrency_probs={
-            str(k): float(v)
-            for k, v in (data.get("concurrency_probs") or {}).items()
         },
         _constraints_by_activity=_constraints_idx,
     )

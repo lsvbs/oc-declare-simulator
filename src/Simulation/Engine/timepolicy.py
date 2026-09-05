@@ -18,17 +18,11 @@ class DefaultTimePolicy:
 
 	def next_timestamp(self, state: Any, candidate: Any, config: Any, rng: Any | None = None) -> datetime:
 		if getattr(state, "last_generated_timestamp", None) is not None:
-			try:
-				return state.last_generated_timestamp + config.default_time_delta
-			except OverflowError:
-				return state.last_generated_timestamp
+			return state.last_generated_timestamp
 
 		timestamps = [e.timestamp for e in getattr(state, "executed_events", []) if getattr(e, "timestamp", None) is not None]
 		if timestamps:
-			try:
-				return max(timestamps) + config.default_time_delta
-			except OverflowError:
-				return max(timestamps)
+			return max(timestamps)
 
 		return config.start_timestamp
 
@@ -116,7 +110,6 @@ class DistributionTimePolicy:
     """Time policy that samples realistic durations from per-activity distributions."""
 
     durations: Dict[str, Any]  # activity_name -> ActivityDuration
-    _fallback_delta: timedelta = timedelta(hours=1)
 
     def __post_init__(self):
         # #18: pre-compute lognormal log-space parameters for each activity
@@ -157,7 +150,7 @@ class DistributionTimePolicy:
 
         dur = self.durations.get(act)
         if dur is None:
-            return base + (getattr(config, "default_time_delta", self._fallback_delta))
+            return base
 
         # #20: pass cached numpy_api flag to avoid hasattr on every sample
         numpy_api = self._get_numpy_api(rng) if rng is not None else None
