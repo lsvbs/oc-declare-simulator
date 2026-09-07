@@ -3364,8 +3364,8 @@ def further_eval_cardinality_fidelity():
 
         with open(log_path,  'r', encoding='utf-8') as f:
             sim_ocel  = json.load(f)
-        with open(real_path, 'r', encoding='utf-8') as f:
-            real_ocel = json.load(f)
+        # Use load_ocel2 to normalise OCEL 1.0 (.jsonocel) as well as OCEL 2.0
+        real_ocel = load_ocel2(str(real_path))
 
         def _objects_per_event(ocel):
             evs = ocel.get('events', [])

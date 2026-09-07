@@ -90,13 +90,11 @@ def _joint_scope_event_ids(
       'any' → any candidate object of that type must appear in the source event
       'all' → all candidate objects of that type must appear in the source event
       'each' (single obj) → that object must appear in the source event
-      'each' (multi obj) → Cartesian product: every combination of one object per
-                            multi-each type must have a qualifying joint source event
+      'each' (multi obj) → each object individually must have a qualifying source
+                            event (per-object existential check against joint_base)
 
     Returns empty frozenset if no qualifying event exists (constraint not satisfied).
     """
-    from itertools import product as _iproduct
-
     bindings = scope.bindings
     if not bindings:
         return frozenset()
@@ -112,7 +110,7 @@ def _joint_scope_event_ids(
                          _events_for_activity_and_object(state, source_activity, oid))
 
     single_sets: list = []
-    multi_sets: list = []
+    each_multi_groups: list = []  # list of [frozenset, ...] per "each" group with multiple objects
 
     for obj_type, inv in bindings:
         A_objs = cand_by_type.get(obj_type, [])
@@ -134,7 +132,7 @@ def _joint_scope_event_ids(
             if len(A_objs) <= 1:
                 single_sets.append(_src_eids_for_obj(A_objs[0]))
             else:
-                multi_sets.append([_src_eids_for_obj(oid) for oid in A_objs])
+                each_multi_groups.append([_src_eids_for_obj(oid) for oid in A_objs])
 
     joint_base = single_sets[0] if single_sets else frozenset(
         e.event_id for e in _events_for_activity(state, source_activity)
@@ -142,17 +140,19 @@ def _joint_scope_event_ids(
     for s in single_sets[1:]:
         joint_base = joint_base & s
 
-    if not multi_sets:
+    if not each_multi_groups:
         return joint_base
 
+    # Per-object existential check: each individual object in an "each" group must
+    # have at least one qualifying source event within joint_base.  Collect all such
+    # events into the return set so the caller can count them.
     qualifying: set = set()
-    for assignment in _iproduct(*multi_sets):
-        j = joint_base
-        for obj_set in assignment:
-            j = j & obj_set
-        if not j:
-            return frozenset()  # This assignment has no qualifying event → fails
-        qualifying.update(j)
+    for group_event_sets in each_multi_groups:
+        for obj_events in group_event_sets:
+            local = joint_base & obj_events
+            if not local:
+                return frozenset()  # this object has no qualifying source event
+            qualifying.update(local)
 
     return frozenset(qualifying)
 
@@ -233,8 +233,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
         count = len(qualifying)
         if nmin > 0 and count < nmin:
             return False
-        if nmax is not None and count > nmax:
-            return False
         return count >= 1 if nmin > 0 else True
 
     if constraint.scope.kind == "each":
@@ -264,8 +262,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             a_count = _count_activity_for_object(state, source, oid)
             if nmin > 0 and a_count < nmin:
                 return False
-            if nmax is not None and a_count > nmax:
-                return False
             if nmax is not None:
                 t_count = _count_activity_for_object(state, target, oid)
                 if t_count >= nmax:
@@ -285,8 +281,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             a_count = _count_activity_for_object(state, source, oid)
             ok = True
             if nmin > 0 and a_count < nmin:
-                ok = False
-            if nmax is not None and a_count > nmax:
                 ok = False
             if nmax is not None and ok:
                 t_count = _count_activity_for_object(state, target, oid)
@@ -758,7 +752,7 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
                 if existing + new_from_created + new_from_participants > rule.max_links:
                     return False
 
-            if otype == rule.target_type:
+            if rule.bidirectional and otype == rule.target_type:
                 existing = _count_links_for_object(state, oid, rule.source_type)
                 new_from_created = created_counts.get(rule.source_type, 0)
                 new_from_participants = sum(

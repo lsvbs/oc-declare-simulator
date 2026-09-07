@@ -4001,7 +4001,7 @@ function SummaryMetricCard({ m }) {
 }
 
 // ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
-function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount }) {
+function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount, onEventLogFileChange }) {
   const hasBoth = !!(resultsAsIs && resultsToBe);
   const rAsis = resultsAsIs ?? results;
   const rTobe = resultsToBe;
@@ -4160,6 +4160,10 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   const [ngdLoading, setNgdLoading] = React.useState(false);
   const [ngdError,   setNgdError]   = React.useState(null);
 
+  const [cardFidAsis,    setCardFidAsis]    = React.useState(null);
+  const [cardFidLoading, setCardFidLoading] = React.useState(false);
+  const [cardFidError,   setCardFidError]   = React.useState(null);
+
   // Input log coverage reference — synthetic results-like object for CoverageRadarMini
   const [inputLogCovResults, setInputLogCovResults] = React.useState(null);
   React.useEffect(() => {
@@ -4188,6 +4192,18 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
       setXlogData(r.data);
     } catch (e) { setXlogError(e.response?.data?.error || e.message); }
     finally { setXlogLoading(false); }
+  };
+
+  const runCardFidelity = async () => {
+    if (!rAsis?.output_file || !inputEventLogFile) return;
+    setCardFidLoading(true); setCardFidError(null); setCardFidAsis(null);
+    try {
+      const r = await axios.post('/api/further-eval/cardinality-fidelity', {
+        outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
+      });
+      setCardFidAsis(r.data);
+    } catch (e) { setCardFidError(e.response?.data?.error || e.message); }
+    finally { setCardFidLoading(false); }
   };
 
   const ocdeclareFile = activeModel?._source_file || null;
@@ -4246,6 +4262,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
     if (inputEventLogFile) {
       runDistFidelity();
       runXlogFidelity();
+      runCardFidelity();
 
       // NGD — load real log traces and compute n-gram distance (n=2)
       if (rAsis?.object_traces) {
@@ -4302,6 +4319,22 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
           <span style={{fontWeight:600}}>Evaluating:</span>
           <span>{(activeModel?.activities||[]).length > 0 ? `${(activeModel.activities||[]).length} activities · ${(activeModel.constraints||[]).length} constraints` : 'Current model'}</span>
           {inputEventLogFile && <><span style={{color:'#cbd5e1'}}>·</span><span style={{color:'#64748b'}}>compared against <strong style={{color:'#475569'}}>{inputEventLogFile.split('/').pop()}</strong></span></>}
+        </div>
+      )}
+
+      {/* Log file picker — shown when no event log is linked (e.g. parameters loaded directly) */}
+      {!inputEventLogFile && onEventLogFileChange && (eventLogFiles||[]).length > 0 && (
+        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.75rem',padding:'0.4rem 0.75rem',background:'#fffbeb',border:'1px solid #fde68a',borderRadius:'6px',fontSize:'0.78rem',color:'#92400e'}}>
+          <span style={{fontWeight:600}}>⚠ No event log linked.</span>
+          <span style={{color:'#78350f'}}>Select a log to enable log-comparison measures:</span>
+          <select
+            defaultValue=""
+            style={{fontSize:'0.78rem',padding:'0.2rem 0.4rem',borderRadius:'4px',border:'1px solid #fcd34d',background:'#fff',color:'#334155'}}
+            onChange={e => { if (e.target.value) onEventLogFileChange(e.target.value); }}
+          >
+            <option value="">— select event log —</option>
+            {(eventLogFiles||[]).map(f => <option key={f} value={f}>{f}</option>)}
+          </select>
         </div>
       )}
 
@@ -4948,7 +4981,53 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         );
       })()}
 
-          {/* ── Object Cardinality Fidelity moved to Further Measures strip ── */}
+          {/* ── Object Cardinality Fidelity ── */}
+          {inputEventLogFile && (
+            <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
+              <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap'}}>
+                <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
+                  Object Cardinality Fidelity
+                </span>
+                <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
+                  objects per event — sim vs real log
+                </span>
+                {cardFidLoading && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
+              </div>
+              {cardFidError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{cardFidError}</p>}
+              {cardFidAsis?.table && (
+                <table style={{width:'100%', borderCollapse:'collapse', fontSize:'0.71rem', color:'#334155'}}>
+                  <thead>
+                    <tr style={{background:'#f1f5f9', borderBottom:'1px solid #e2e8f0'}}>
+                      <th style={{textAlign:'left', padding:'0.2rem 0.4rem', fontWeight:600}}>Activity</th>
+                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Real mean</th>
+                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Sim mean</th>
+                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Δ mean</th>
+                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Real n</th>
+                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Sim n</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cardFidAsis.table.map((row, i) => {
+                      const absDiff = row.mean_diff != null ? Math.abs(row.mean_diff) : null;
+                      const diffColor = absDiff == null ? '#64748b' : absDiff < 0.5 ? '#16a34a' : absDiff < 1.5 ? '#d97706' : '#dc2626';
+                      return (
+                        <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                          <td style={{padding:'0.2rem 0.4rem'}}>{row.activity}</td>
+                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem'}}>{row.real?.mean?.toFixed(2) ?? '—'}</td>
+                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem'}}>{row.sim?.mean?.toFixed(2) ?? '—'}</td>
+                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:diffColor, fontWeight:600}}>
+                            {row.mean_diff != null ? (row.mean_diff >= 0 ? '+' : '') + row.mean_diff.toFixed(2) : '—'}
+                          </td>
+                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:'#64748b'}}>{row.real?.count ?? '—'}</td>
+                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:'#64748b'}}>{row.sim?.count ?? '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
         </>
       )}
 
@@ -11609,6 +11688,7 @@ function App() {
                   inputEventLogFile={discoveryConfig.eventLogFile}
                   evalRunCount={evalRunCount}
                   onRerunEvaluation={() => { setEvaluationReady(true); setEvalRunCount(c => c + 1); }}
+                  onEventLogFileChange={(f) => setDiscoveryConfig(prev => ({ ...prev, eventLogFile: f }))}
                 />
               )}
             </div>{/* end evaluation tab */}

@@ -404,15 +404,10 @@ class Simulator:
                     if blocked:
                         continue
 
-                # Early exit: check precedence nmax and target count cap
+                # Early exit: check precedence nmax (target count cap only)
                 if prec_gates_nmax:
                     blocked = False
                     for con in prec_gates_nmax:
-                        src_count = len(state._events_by_act_obj.get(
-                            (con.source_activity, oid), []))
-                        if src_count > con.nmax:
-                            blocked = True
-                            break
                         t_count = len(state._events_by_act_obj.get(
                             (activity.name, oid), []))
                         if t_count >= con.nmax:
@@ -582,9 +577,12 @@ class Simulator:
                             if nmin > 0 and src_count == 0:
                                 blocked = True
                                 break
-                            if nmax is not None and src_count > nmax:
-                                blocked = True
-                                break
+                            if nmax is not None:
+                                t_count = len(state._events_by_act_obj.get(
+                                    (target_act, scope_oid), []))
+                                if t_count >= nmax:
+                                    blocked = True
+                                    break
                 if blocked:
                     continue
 
@@ -656,9 +654,6 @@ class Simulator:
                         src_count = len(state._events_by_act_obj.get((act, oid), []))
                         if src_count >= nmin:
                             eligible[tgt].add(oid)
-                        # If nmax exceeded (source count), remove target eligibility
-                        if nmax is not None and src_count > nmax:
-                            eligible[tgt].discard(oid)
 
             # A fired as target of precedence(X → A): A itself may now be eligible
             # (handled by prec_satisfied cache — no action needed here)

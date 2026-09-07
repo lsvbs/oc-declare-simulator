@@ -1670,31 +1670,64 @@ def discover_o2o_rules(ocel_log: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # Record link
                 o2o_links[(obj1_type, obj2_type)][obj1_id].add(obj2_id)
     
-    # Calculate cardinality
+    # Calculate cardinality for each directed pair, then decide bidirectionality
     o2o_rules = []
     processed_pairs = set()
-    
+
     for (type1, type2), links in o2o_links.items():
         if (type1, type2) in processed_pairs or (type2, type1) in processed_pairs:
             continue
-        
-        # Count how many type2 objects each type1 object links to
-        cardinalities = [len(linked_objs) for linked_objs in links.values()]
-        
-        if cardinalities:
-            min_links = min(cardinalities)
-            max_links = max(cardinalities)
-            
+        processed_pairs.add((type1, type2))
+
+        fwd_cards = [len(linked_objs) for linked_objs in links.values()]
+        if not fwd_cards:
+            continue
+
+        fwd_min = min(fwd_cards)
+        fwd_max = max(fwd_cards)
+
+        rev_links = o2o_links.get((type2, type1), {})
+        rev_cards = [len(linked_objs) for linked_objs in rev_links.values()]
+
+        if rev_cards:
+            rev_min = min(rev_cards)
+            rev_max = max(rev_cards)
+
+            if fwd_max == rev_max and fwd_min == rev_min:
+                # Symmetric: one bidirectional rule with the shared cardinality
+                o2o_rules.append({
+                    'source_type': type1,
+                    'target_type': type2,
+                    'min_links': fwd_min,
+                    'max_links': fwd_max if fwd_max < 100 else None,
+                    'bidirectional': True,
+                })
+            else:
+                # Asymmetric: two separate unidirectional rules
+                o2o_rules.append({
+                    'source_type': type1,
+                    'target_type': type2,
+                    'min_links': fwd_min,
+                    'max_links': fwd_max if fwd_max < 100 else None,
+                    'bidirectional': False,
+                })
+                o2o_rules.append({
+                    'source_type': type2,
+                    'target_type': type1,
+                    'min_links': rev_min,
+                    'max_links': rev_max if rev_max < 100 else None,
+                    'bidirectional': False,
+                })
+        else:
+            # No reverse links observed — unidirectional rule
             o2o_rules.append({
                 'source_type': type1,
                 'target_type': type2,
-                'min_links': min_links,
-                'max_links': max_links if max_links < 100 else None,
-                'bidirectional': True  # Assume bidirectional by default
+                'min_links': fwd_min,
+                'max_links': fwd_max if fwd_max < 100 else None,
+                'bidirectional': False,
             })
-            
-            processed_pairs.add((type1, type2))
-    
+
     return o2o_rules
 
 
