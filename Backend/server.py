@@ -3017,6 +3017,14 @@ def further_eval_conformance_check():
                     checked += 1
                     if has_src and has_tgt:
                         violated += 1
+                elif ctype in ('not_succession', 'not_precedence'):
+                    # Violated if source has fired and target follows it (not_succession)
+                    # or if target fires and source has preceded it (not_precedence) —
+                    # both reduce to: source and target both appear in the trace.
+                    if has_src:
+                        checked += 1
+                        if has_tgt:
+                            violated += 1
                 elif ctype == 'coexistence':
                     if has_src or has_tgt:
                         checked += 1

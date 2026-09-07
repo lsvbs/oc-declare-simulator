@@ -209,6 +209,19 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             nmax = int(nmax_raw) if nmax_raw is not None else None
         except (TypeError, ValueError):
             nmax = None
+        # OC-Declare paper: nmin=0, nmax=0 is the negated existence form.
+        # Remap to the corresponding not_* type so the simulator uses the correct checker.
+        _NEGATION_MAP = {
+            'response': 'not_succession',
+            'precedence': 'not_precedence',
+            'chain_response': 'not_chain_succession',
+            'chain_precedence': 'not_chain_succession',
+            'responded_existence': 'not_coexistence',
+            'coexistence': 'not_coexistence',
+        }
+        if nmin == 0 and nmax == 0 and ctype in _NEGATION_MAP:
+            ctype = _NEGATION_MAP[ctype]
+            nmax = None
         constraints.append(
             Constraint(
                 constraint_type=str(ctype),
@@ -567,13 +580,28 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
                 # `from` is the constrained later activity in the engine.
                 src, tgt = tgt, src
 
+            # OC-Declare paper: nmin=0, nmax=0 is the negated existence form.
+            _nmin = int(nmin) if nmin is not None else 0
+            _nmax = None if nmax is None else int(nmax)
+            _NEGATION_MAP_LIST = {
+                'response': 'not_succession',
+                'precedence': 'not_precedence',
+                'chain_response': 'not_chain_succession',
+                'chain_precedence': 'not_chain_succession',
+                'responded_existence': 'not_coexistence',
+                'coexistence': 'not_coexistence',
+            }
+            if _nmin == 0 and _nmax == 0 and constraint_type in _NEGATION_MAP_LIST:
+                constraint_type = _NEGATION_MAP_LIST[constraint_type]
+                _nmax = None
+
             constraints.append(Constraint(
                 constraint_type=constraint_type,
                 source_activity=src,
                 target_activity=tgt,
                 scope=scope,
-                nmin=int(nmin) if nmin is not None else 0,
-                nmax=None if nmax is None else int(nmax),
+                nmin=_nmin,
+                nmax=_nmax,
             ))
 
     # Build activities with bindings (flatten per-activity dicts to lists)

@@ -249,11 +249,23 @@ class SimulationState:
                 self._inactive_scope_types.add(obj.object_type)
 
         # Clear all pending obligations scoped to this object.
-        keys_to_remove = [
-            k for k in self._obligations_count
-            if (isinstance(k[1], str) and k[1] == object_id) or
-               (isinstance(k[1], frozenset) and object_id in k[1])
-        ]
+        keys_to_remove = []
+        for k in self._obligations_count:
+            if isinstance(k[1], str) and k[1] == object_id:
+                keys_to_remove.append(k)
+            elif isinstance(k[1], frozenset) and object_id in k[1]:
+                c_key_ob = self._obligation_to_constraint.get(k)
+                if c_key_ob and len(c_key_ob) > 3 and c_key_ob[3] == 'any':
+                    # any-mode: cancel only when no other active members remain
+                    remaining_active = any(
+                        oid != object_id and self.objects.get(oid) and self.objects[oid].active
+                        for oid in k[1]
+                    )
+                    if not remaining_active:
+                        keys_to_remove.append(k)
+                else:
+                    # all-mode: cancel immediately — full set can never fire
+                    keys_to_remove.append(k)
         for k in keys_to_remove:
             del self._obligations_count[k]
             self._obligations_ready.pop(k, None)

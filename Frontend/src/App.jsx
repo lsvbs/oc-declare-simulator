@@ -4124,6 +4124,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   const [distFidLoading, setDistFidLoading] = React.useState(false);
   const [distFidError,   setDistFidError]   = React.useState(null);
   const [distFidOpen,    setDistFidOpen]    = React.useState(true);
+  const [evalAllLoading, setEvalAllLoading] = React.useState(false);
 
   const runDistFidelity = async () => {
     if (!rAsis?.output_file || !inputEventLogFile) return;
@@ -4234,6 +4235,9 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
   React.useEffect(() => {
     if (!rAsis?.output_file) return;
 
+    setEvalAllLoading(true);
+    const _promises = [];
+
     // Fitness / Precision / OC-Declare Confidence — synchronous from object_traces
     const computeAndSetConf = (r, setter) => {
       if (!r?.object_traces) return;
@@ -4252,36 +4256,40 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         setter({ reach: _mean(all,'reach'), exclusivity: _mean(all,'exclusivity') });
       } catch(e) {}
     };
-    fetchOcpq(rAsis.output_file, setOcpqTotals);
-    if (rTobe?.output_file) fetchOcpq(rTobe.output_file, setOcpqTotalsTobe);
+    _promises.push(fetchOcpq(rAsis.output_file, setOcpqTotals));
+    if (rTobe?.output_file) _promises.push(fetchOcpq(rTobe.output_file, setOcpqTotalsTobe));
 
     // Post-hoc Fitness — async conformance check
-    runConformanceCheck();
+    _promises.push(runConformanceCheck());
 
     // Distribution + cross-log fidelity — require event log
     if (inputEventLogFile) {
-      runDistFidelity();
-      runXlogFidelity();
-      runCardFidelity();
+      _promises.push(runDistFidelity());
+      _promises.push(runXlogFidelity());
+      _promises.push(runCardFidelity());
 
       // NGD — load real log traces and compute n-gram distance (n=2)
       if (rAsis?.object_traces) {
         setNgdData(null); setNgdError(null); setNgdLoading(true);
-        axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
-          .then(resp => {
-            const evts = resp.data.events || [];
-            const realTraces = {};
-            evts.forEach(e => {
-              (e.object_ids || []).forEach(oid => {
-                (realTraces[oid] = realTraces[oid] || []).push(e.activity);
+        _promises.push(
+          axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
+            .then(resp => {
+              const evts = resp.data.events || [];
+              const realTraces = {};
+              evts.forEach(e => {
+                (e.object_ids || []).forEach(oid => {
+                  (realTraces[oid] = realTraces[oid] || []).push(e.activity);
+                });
               });
-            });
-            setNgdData(computeNGD(rAsis.object_traces, realTraces, 2));
-          })
-          .catch(e => setNgdError(e.response?.data?.error || e.message))
-          .finally(() => setNgdLoading(false));
+              setNgdData(computeNGD(rAsis.object_traces, realTraces, 2));
+            })
+            .catch(e => setNgdError(e.response?.data?.error || e.message))
+            .finally(() => setNgdLoading(false))
+        );
       }
     }
+
+    Promise.allSettled(_promises).finally(() => setEvalAllLoading(false));
   }, [evalRunCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const [multiSeeds,   setMultiSeeds]   = React.useState('42,99,123,456,789');
@@ -4313,6 +4321,13 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
 
   return (
     <div>
+      {evalAllLoading ? (
+        <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'4rem 2rem',gap:'1rem'}}>
+          <div className="spinner" />
+          <div style={{fontSize:'0.9rem',color:'#64748b',fontWeight:500}}>Computing evaluation metrics…</div>
+        </div>
+      ) : (
+        <>
       {/* Model / run header */}
       {rAsis && (
         <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.75rem',padding:'0.4rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',fontSize:'0.78rem',color:'#475569'}}>
@@ -5036,6 +5051,8 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
         <OCCoveragePanel results={rAsis} model={activeModel || modelBase} discoveryResults={discoveryResults} logResults={inputLogCovResults} />
       )}
 
+        </>
+      )}
     </div>
   );
 }
@@ -7537,6 +7554,23 @@ function App() {
     : [];
   const hasModelWarnings = bindingWarnings.length > 0;
 
+  // ── Lifecycle warnings (non-resource types with no deactivates=True binding) ──
+  const lifecycleWarnings = React.useMemo(() => {
+    const activities = activeModel?.activities || [];
+    const resourceTypes = new Set(discoveryResults?.resource_types || []);
+    const deactivatingTypes = new Set();
+    const allBoundTypes = new Set();
+    activities.forEach(act => {
+      (act.bindings || []).forEach(b => {
+        if (b.object_type && !resourceTypes.has(b.object_type)) {
+          allBoundTypes.add(b.object_type);
+          if (b.deactivates) deactivatingTypes.add(b.object_type);
+        }
+      });
+    });
+    return [...allBoundTypes].filter(t => !deactivatingTypes.has(t));
+  }, [activeModel, discoveryResults]);
+
   // ── Step 2.5: Timing discovery state ─────────────────────────────────────
   const [timingAnchors,       setTimingAnchors]       = useState({});
   const [timingMode,          setTimingMode]          = useState('single');
@@ -7581,6 +7615,24 @@ function App() {
   });
   const [activeDiscoveryTab, setActiveDiscoveryTab] = useState('lifecycle');
   const [isRunningDiscoveries, setIsRunningDiscoveries] = useState(false);
+
+  // Recovery: if discovery finished and modelAsIs is null due to the stale-ref race condition,
+  // auto-initialize it from activeModel. isRunningDiscoveries guards against firing mid-discovery;
+  // modelEdited guards against firing at startup before any discovery has run.
+  const prevIsRunningDiscoveriesRef = React.useRef(false);
+  React.useEffect(() => {
+    const wasRunning = prevIsRunningDiscoveriesRef.current;
+    prevIsRunningDiscoveriesRef.current = isRunningDiscoveries;
+    const justFinished = wasRunning && !isRunningDiscoveries;
+    const alreadyBroken = !wasRunning && !isRunningDiscoveries;
+    if ((justFinished || alreadyBroken) && !modelAsIs && activeModel && modelEdited) {
+      const snap = JSON.parse(JSON.stringify(activeModel));
+      snap.start_activities = config.startActivities || [];
+      setModelAsIs(snap);
+      setModelToBe(JSON.parse(JSON.stringify(snap)));
+      setModelBase(JSON.parse(JSON.stringify(snap)));
+    }
+  }, [isRunningDiscoveries, activeModel, modelEdited]); // eslint-disable-line react-hooks/exhaustive-deps
   const [discoveryElapsed, setDiscoveryElapsed] = useState(null);
   const discStartRef = useRef(null);
   const discTimerRef = useRef(null);
@@ -8541,6 +8593,12 @@ function App() {
 
   const runAllDiscoveries = useCallback(async () => {
     if (!discoveryConfig.eventLogFile) return;
+    // Guard: loadModelState (triggered by useEffect on ocdeclareFile change) is async.
+    // If the user clicks "Discover" before it resolves, activeModel is null and
+    // runLifecycleDerivation produces an incomplete model. Await it here if needed.
+    if (!activeModelRef.current && config.ocdeclareFile) {
+      await loadModelState(config.ocdeclareFile, discoveryConfig.eventLogFile);
+    }
     setIsRunningDiscoveries(true);
     // Start discovery elapsed timer
     discStartRef.current = Date.now();
@@ -8599,13 +8657,23 @@ function App() {
           if (r.observedNmin != null) nmaxByLabel[`__nmin__${r.label}`] = r.observedNmin;
         });
         if (applyNminNmaxFromModelCheck && modelAfterNmax && !Array.isArray(modelAfterNmax)) {
+          // OC-Declare paper: nmin=0,nmax=0 = negated existence constraint; nmin=1,nmax=∞ = standard existence form.
+          const NEGATION_MAP = {
+            response: 'not_succession', precedence: 'not_precedence',
+            chain_response: 'not_chain_succession', chain_precedence: 'not_chain_succession',
+            responded_existence: 'not_coexistence', coexistence: 'not_coexistence',
+          };
           // Apply synchronously so the snapshot below captures the updated model
           const updatedConstraints = (modelAfterNmax.constraints || []).map(c => {
             const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
             const result = modelCheckResult.constraintResults.find(r => r.label === label);
             if (!result || result.total === 0) return c;
-            const newNmin = (c.nmin == null && result.observedNmin != null) ? result.observedNmin : c.nmin;
-            const newNmax = (c.nmax == null && result.observedNmax != null) ? result.observedNmax : c.nmax;
+            const newNmin = result.observedNmin != null ? result.observedNmin : c.nmin;
+            const newNmax = result.observedNmax != null ? result.observedNmax : c.nmax;
+            // Negated existence (0,0): remap constraint type to its not_* equivalent
+            if (newNmin === 0 && newNmax === 0 && NEGATION_MAP[c.constraint_type]) {
+              return { ...c, constraint_type: NEGATION_MAP[c.constraint_type], nmin: 0, nmax: null };
+            }
             if (newNmin === c.nmin && newNmax === c.nmax) return c;
             return { ...c, nmin: newNmin, nmax: newNmax };
           });
@@ -8638,7 +8706,7 @@ function App() {
   }, [discoveryChecks, discoveryConfig.eventLogFile, dropZeroConfConstraints, logConfResults,
       applyNminNmaxFromModelCheck, runLogModelCheck,
       runLifecycleDerivation, runPermanentObjectDiscovery, runTimingDiscovery, runO2ODiscovery,
-      applyStartProbability, runHealthCheck]);
+      applyStartProbability, runHealthCheck, config.ocdeclareFile, loadModelState]);
 
   const restoreFromHistory = useCallback((entry) => {
     if (entry.model)      setActiveModel(entry.model);
@@ -9935,12 +10003,13 @@ function App() {
                         {config.ocdeclareFile && (
                           <div className="landing-option-group" style={{borderTop:'1px solid #e2e8f0',paddingTop:'0.75rem',marginTop:'0.25rem'}}>
                             <label className="landing-option-label">OC-Declare Model Check</label>
-                            <label style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.78rem',cursor:'pointer',marginTop:'0.25rem'}}>
+                            <label style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.78rem',cursor:'pointer',marginTop:'0.25rem'}}
+                              title="Applies observed nmin/nmax bounds from the log to each constraint. Existence constraints (nmin=1, nmax=∞) get nmin=1 applied explicitly. Constraints never observed after their source (nmin=0, nmax=0) are remapped to their negated form (e.g. response → not_succession). Other bounds are applied as counting constraints.">
                               <input type="checkbox" checked={applyNminNmaxFromModelCheck}
                                 onChange={e => setApplyNminNmaxFromModelCheck(e.target.checked)} />
                               Apply nmin/nmax from log to constraints
                             </label>
-                            <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>Sets bounds per constraint based on how often they fire in the log</div>
+                            <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>Sets bounds from log counts; (0,0) → negated form, (1,∞) → existence form, others → counting</div>
                           </div>
                         )}
                       </div>
@@ -12913,6 +12982,14 @@ function App() {
                 ⚠ Simulation blocked — {bindingWarnings.length} activit{bindingWarnings.length === 1 ? 'y has' : 'ies have'} no object bindings:{' '}
                 <strong>{bindingWarnings.map(a => a.name).join(', ')}</strong>.
                 Open the Model Editor → Activities tab to fix.
+              </div>
+            )}
+            {lifecycleWarnings.length > 0 && (
+              <div className="model-warnings-notice" style={{background:'#fffbeb',border:'1px solid #fde68a',color:'#92400e'}}>
+                ⚠ No terminal activity found for {lifecycleWarnings.length} object type{lifecycleWarnings.length === 1 ? '' : 's'}:{' '}
+                <strong>{lifecycleWarnings.join(', ')}</strong>.
+                Objects of these types will never be deactivated and will accumulate throughout the run.
+                Add <code>deactivates: true</code> to the terminal binding in the model to fix.
               </div>
             )}
           </div>

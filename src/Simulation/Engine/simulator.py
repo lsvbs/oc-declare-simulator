@@ -490,28 +490,44 @@ class Simulator:
                     continue
                 seen_obligation_keys.add(dedup_key)
 
-                # Handle all-mode frozenset obligations separately
+                # Handle frozenset obligations (any-mode and all-mode) separately
                 is_frozenset = isinstance(scope_oid, frozenset)
 
                 if is_frozenset:
-                    # All-mode: target must fire involving all objects in the frozenset
                     frozen_oids = scope_oid
-                    # Skip if any object in the set is inactive
-                    if any(not (state.objects.get(o) and state.objects[o].active) for o in frozen_oids):
-                        continue
-                    # Skip if already in pool or in-progress
-                    if any((target_act, o) in pool_index for o in frozen_oids):
-                        continue
-                    if any((target_act, o) in in_progress_index for o in frozen_oids):
-                        continue
-                    # Build candidate with all frozenset objects forced
+                    c_key_ob = state._obligation_to_constraint.get((target_act, scope_oid))
+                    scope_kind_of_ob = c_key_ob[3] if c_key_ob else 'all'
                     activity = act_by_name.get(target_act)
                     if activity is None:
                         continue
-                    candidate = build_candidate_for_activity(
-                        activity, state, resource_types=resource_types,
-                        force_object_ids=list(frozen_oids)
-                    )
+
+                    if scope_kind_of_ob == 'any':
+                        # Any-mode: force one active member — non-empty intersection discharges
+                        active_members = [o for o in frozen_oids
+                                          if state.objects.get(o) and state.objects[o].active]
+                        if not active_members:
+                            continue
+                        if any((target_act, o) in pool_index for o in active_members):
+                            continue
+                        if any((target_act, o) in in_progress_index for o in active_members):
+                            continue
+                        candidate = build_candidate_for_activity(
+                            activity, state, resource_types=resource_types,
+                            force_object_ids=[active_members[0]]
+                        )
+                    else:
+                        # All-mode: target must fire involving all objects in the frozenset
+                        if any(not (state.objects.get(o) and state.objects[o].active) for o in frozen_oids):
+                            continue
+                        if any((target_act, o) in pool_index for o in frozen_oids):
+                            continue
+                        if any((target_act, o) in in_progress_index for o in frozen_oids):
+                            continue
+                        candidate = build_candidate_for_activity(
+                            activity, state, resource_types=resource_types,
+                            force_object_ids=list(frozen_oids)
+                        )
+
                     if candidate is None:
                         continue
                     if not is_candidate_semantically_allowed(self.static_model, candidate, state):
@@ -738,10 +754,16 @@ class Simulator:
             if state._obligations_count.pop((act, oid), None) is not None:
                 state._obligations_ready.pop((act, oid), None)
                 _record_fulfillment((act, oid))
-        # Discharge all-mode frozenset obligations (single-type all AND multi-type each-combos)
+        # Discharge frozenset obligations (any-mode: non-empty intersection; all-mode: full subset)
         all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
         for k in all_keys:
-            if k[1].issubset(fired_oids) and self._check_obligation_binding_satisfied(k, fired_oids, state):
+            c_key_ob = state._obligation_to_constraint.get(k)
+            scope_kind_of_ob = c_key_ob[3] if c_key_ob else 'all'
+            if scope_kind_of_ob == 'any':
+                satisfied = bool(k[1].intersection(fired_oids))
+            else:
+                satisfied = k[1].issubset(fired_oids)
+            if satisfied and self._check_obligation_binding_satisfied(k, fired_oids, state):
                 state._obligations_count.pop(k, None)
                 state._obligations_ready.pop(k, None)
                 state._obligation_bindings.pop(k, None)
@@ -829,21 +851,12 @@ class Simulator:
                     executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
-                for scope_object_id in scope_object_ids:
-                    key = (constraint.target_activity, scope_object_id)
+                if scope_object_ids:
+                    key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
                         state._obligation_to_constraint[key] = c_key
-                        if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
-                            state._obligations_ready[key] = 1
-                        else:
-                            prereqs = self._obligation_prerequisites.get(constraint.target_activity, {})
-                            scope_type = state._type_of_object.get(scope_object_id)
-                            for req_source in prereqs.get(scope_type, []):
-                                if not state._events_by_act_obj.get((req_source, scope_object_id)):
-                                    state._obligations_blocked.setdefault(
-                                        (req_source, scope_object_id), set()).add(key)
-                                    break
+                        state._obligations_ready[key] = 1  # any-mode: one member suffices
             elif constraint.scope.kind == "all":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event, state=state,

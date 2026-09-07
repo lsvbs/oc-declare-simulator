@@ -78,8 +78,21 @@ class Constraint:
         "response",
         "not_coexistence",
         "not_precedence",
+        "not_succession",
+        "not_chain_succession",
         "chain_precedence",
         "chain_response",
+        "responded_existence",
+        "coexistence",
+        "absence",
+        "exactly",
+        "init",
+        "exclusive_choice",
+        "alternate_response",
+        "alternate_precedence",
+        "succession",
+        "chain_succession",
+        "alternate_succession",
     ]
     source_activity: str
     target_activity: str
