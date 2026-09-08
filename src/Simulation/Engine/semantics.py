@@ -5,6 +5,7 @@ from typing import Any, Optional
 from src.Simulation.Domain.ir import StaticModel
 from src.Simulation.Domain.state import SimulationState
 from src.Simulation.Domain.ir import O2ORule
+from src.Simulation.Engine.attrutils import apply_guard_filter
 _EMPTY_SET: frozenset = frozenset()  # #14: reusable empty set to avoid alloc in O2O checks
 
 
@@ -77,6 +78,85 @@ def _scope_ids(candidate: Any, state: SimulationState, scope_type: str,
     return _get_scope_object_ids_from_candidate(candidate, state, scope_type)
 
 
+def _joint_scope_event_ids(
+    candidate: Any,
+    state: SimulationState,
+    scope: Any,
+    source_activity: str,
+) -> frozenset:
+    """Return event IDs of source_activity events jointly satisfying all multi-type bindings.
+
+    For each binding (obj_type, involvement):
+      'any' → any candidate object of that type must appear in the source event
+      'all' → all candidate objects of that type must appear in the source event
+      'each' (single obj) → that object must appear in the source event
+      'each' (multi obj) → each object individually must have a qualifying source
+                            event (per-object existential check against joint_base)
+
+    Returns empty frozenset if no qualifying event exists (constraint not satisfied).
+    """
+    bindings = scope.bindings
+    if not bindings:
+        return frozenset()
+
+    cand_by_type: dict = {}
+    for oid in (getattr(candidate, 'participating_object_ids', []) or []):
+        rt = state.objects.get(oid)
+        if rt:
+            cand_by_type.setdefault(rt.object_type, []).append(oid)
+
+    def _src_eids_for_obj(oid: str) -> frozenset:
+        return frozenset(e.event_id for e in
+                         _events_for_activity_and_object(state, source_activity, oid))
+
+    single_sets: list = []
+    each_multi_groups: list = []  # list of [frozenset, ...] per "each" group with multiple objects
+
+    for obj_type, inv in bindings:
+        A_objs = cand_by_type.get(obj_type, [])
+        if not A_objs:
+            return frozenset()
+        if inv == 'any':
+            s: set = set()
+            for oid in A_objs:
+                s.update(e.event_id for e in
+                         _events_for_activity_and_object(state, source_activity, oid))
+            single_sets.append(frozenset(s))
+        elif inv == 'all':
+            combined = None
+            for oid in A_objs:
+                es = _src_eids_for_obj(oid)
+                combined = es if combined is None else combined & es
+            single_sets.append(combined if combined is not None else frozenset())
+        else:  # each
+            if len(A_objs) <= 1:
+                single_sets.append(_src_eids_for_obj(A_objs[0]))
+            else:
+                each_multi_groups.append([_src_eids_for_obj(oid) for oid in A_objs])
+
+    joint_base = single_sets[0] if single_sets else frozenset(
+        e.event_id for e in _events_for_activity(state, source_activity)
+    )
+    for s in single_sets[1:]:
+        joint_base = joint_base & s
+
+    if not each_multi_groups:
+        return joint_base
+
+    # Per-object existential check: each individual object in an "each" group must
+    # have at least one qualifying source event within joint_base.  Collect all such
+    # events into the return set so the caller can count them.
+    qualifying: set = set()
+    for group_event_sets in each_multi_groups:
+        for obj_events in group_event_sets:
+            local = joint_base & obj_events
+            if not local:
+                return frozenset()  # this object has no qualifying source event
+            qualifying.update(local)
+
+    return frozenset(qualifying)
+
+
 def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
     if candidate.activity_name == constraint.source_activity:
         forbidden = constraint.target_activity
@@ -147,6 +227,14 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
     if candidate.activity_name != target:
         return True
 
+    # Multi-type binding: joint check across all object types in the binding
+    if constraint.scope.bindings:
+        qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source)
+        count = len(qualifying)
+        if nmin > 0 and count < nmin:
+            return False
+        return count >= 1 if nmin > 0 else True
+
     if constraint.scope.kind == "each":
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
 
@@ -174,8 +262,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             a_count = _count_activity_for_object(state, source, oid)
             if nmin > 0 and a_count < nmin:
                 return False
-            if nmax is not None and a_count > nmax:
-                return False
             if nmax is not None:
                 t_count = _count_activity_for_object(state, target, oid)
                 if t_count >= nmax:
@@ -195,8 +281,6 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             a_count = _count_activity_for_object(state, source, oid)
             ok = True
             if nmin > 0 and a_count < nmin:
-                ok = False
-            if nmax is not None and a_count > nmax:
                 ok = False
             if nmax is not None and ok:
                 t_count = _count_activity_for_object(state, target, oid)
@@ -578,6 +662,23 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
             scope_type = getattr(constraint.scope, 'object_type', None)
             if scope_type and scope_type in inactive_types and scope_type not in creates_set:
                 continue
+
+        # Phase 2: apply constraint-level object-filter guard.
+        # Scope objects not satisfying the guard are exempt — filter them out
+        # before passing to the checker. If no objects remain, skip (trivially passes).
+        c_guard = getattr(constraint, 'guard', None)
+        if c_guard:
+            scope_type = getattr(constraint.scope, 'object_type', None)
+            if scope_type:
+                original_ids = scope_ids_cache.get(scope_type, [])
+                guarded_ids = apply_guard_filter(original_ids, c_guard, state)
+                if not guarded_ids:
+                    continue  # no objects subject to this constraint — passes trivially
+                local_cache = {**scope_ids_cache, scope_type: guarded_ids}
+                if not check_constraint(constraint, candidate, state, local_cache):
+                    return False
+                continue
+
         if not check_constraint(constraint, candidate, state, scope_ids_cache):
             return False
     return True
@@ -651,7 +752,7 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
                 if existing + new_from_created + new_from_participants > rule.max_links:
                     return False
 
-            if otype == rule.target_type:
+            if rule.bidirectional and otype == rule.target_type:
                 existing = _count_links_for_object(state, oid, rule.source_type)
                 new_from_created = created_counts.get(rule.source_type, 0)
                 new_from_participants = sum(

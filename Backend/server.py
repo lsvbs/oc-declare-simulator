@@ -9,6 +9,7 @@ from flask_cors import CORS
 import os
 import sys
 import json
+import statistics as _statistics
 from pathlib import Path
 from collections import Counter
 import pickle
@@ -26,7 +27,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_concurrency_probs, discover_o2o_rules, discover_resource_types
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -53,6 +54,7 @@ discovery_cache = {}
 # Active simulation runs: run_id -> {state, stop_event, thread, done}
 import threading
 _active_runs: dict = {}
+_discovery_runs: dict = {}  # run_id -> {done, phase, pct, result, error}
 
 
 def _compute_avg_connected_trace_duration(state, resource_types) -> float | None:
@@ -117,7 +119,108 @@ def _compute_avg_connected_trace_duration(state, resource_types) -> float | None
     return round(sum(durations) / len(durations), 1)
 
 
-def _compute_ocel_time_span(ocel_source) -> float | None:
+def _compute_case_tracker(state, start_activity_names: set, resource_types: set) -> dict:
+    """Compute per-start-activity case statistics.
+
+    A case is defined as one firing of a start activity plus all non-resource
+    objects whose first event is that start event.  A case is complete when
+    every one of those objects is inactive (deactivated).
+    """
+    resource_types = set(resource_types or [])
+
+    # Index: oid -> event_id of the first event the object participates in
+    obj_first_event: dict[str, str] = {}
+    # Index: oid -> timestamp of the last event the object participates in
+    obj_last_ts: dict[str, object] = {}
+    # Index: oid -> list of (timestamp, activity, object_ids) in order
+    obj_events: dict[str, list] = {}
+
+    for event in state.executed_events:
+        for oid in event.object_ids:
+            if oid not in obj_first_event:
+                obj_first_event[oid] = event.event_id
+            obj_last_ts[oid] = event.timestamp
+            obj_events.setdefault(oid, []).append(event)
+
+    _CASE_DETAIL_CAP = 500  # max individual cases stored per start activity
+
+    case_pools: dict[str, list] = {}
+
+    for event in state.executed_events:
+        if event.activity_name not in start_activity_names:
+            continue
+
+        # Objects created at this event: their first event is this event, non-resource
+        created = [
+            oid for oid in event.object_ids
+            if obj_first_event.get(oid) == event.event_id
+            and state.objects.get(oid) is not None
+            and state.objects[oid].object_type not in resource_types
+        ]
+
+        completed = bool(created) and all(
+            not state.objects[oid].active for oid in created
+        )
+
+        case_end_ts = None
+        if created:
+            lasts = [obj_last_ts[oid] for oid in created if obj_last_ts.get(oid) is not None]
+            if lasts:
+                case_end_ts = max(lasts)
+
+        duration_s = None
+        if event.timestamp is not None and case_end_ts is not None:
+            duration_s = (case_end_ts - event.timestamp).total_seconds()
+            if duration_s < 0:
+                duration_s = None
+
+        # Build ordered event sequence for this case (union of all spawned-object timelines)
+        seen_eids: set = set()
+        case_events: list = []
+        for oid in created:
+            for ev in obj_events.get(oid, []):
+                if ev.event_id not in seen_eids:
+                    seen_eids.add(ev.event_id)
+                    case_events.append(ev)
+        case_events.sort(key=lambda e: (e.timestamp is None, e.timestamp))
+
+        def _iso(ts):
+            return ts.isoformat() if ts is not None else None
+
+        case_pools.setdefault(event.activity_name, []).append({
+            'completed': completed,
+            'duration_s': duration_s,
+            'created_count': len(created),
+            'start_ts': _iso(event.timestamp),
+            'end_ts': _iso(case_end_ts),
+            'events': [
+                {
+                    'activity': e.activity_name,
+                    'timestamp': _iso(e.timestamp),
+                    'object_ids': list(e.object_ids),
+                }
+                for e in case_events
+            ],
+        })
+
+    result: dict[str, dict] = {}
+    for act, cases in case_pools.items():
+        total = len(cases)
+        done = sum(1 for c in cases if c['completed'])
+        durations = [c['duration_s'] for c in cases if c['duration_s'] is not None]
+        result[act] = {
+            'case_count': total,
+            'completed': done,
+            'completion_rate': round(done / total, 3) if total else 0,
+            'mean_duration_s': round(_statistics.mean(durations), 1) if durations else None,
+            'min_duration_s': round(min(durations), 1) if durations else None,
+            'max_duration_s': round(max(durations), 1) if durations else None,
+            'median_duration_s': round(_statistics.median(durations), 1) if durations else None,
+            'cases': cases[:_CASE_DETAIL_CAP],
+            'cases_capped': len(cases) > _CASE_DETAIL_CAP,
+        }
+
+    return result
     """Return the total time span of an OCEL log in seconds (last − first timestamp)."""
     if not ocel_source or not isinstance(ocel_source, dict):
         return None
@@ -214,7 +317,7 @@ def get_available_files():
         
         event_log_files = [
             f for f in os.listdir(EVENTLOG_DIR)
-            if (f.endswith('.json') or f.endswith('.xml')) and not f.endswith('_matrix.json')
+            if (f.endswith('.json') or f.endswith('.xml') or f.endswith('.csv') or f.endswith('.jsonocel')) and not f.endswith('_matrix.json')
         ] if EVENTLOG_DIR.exists() else []
         
         parameter_files = [
@@ -482,34 +585,6 @@ def run_discovery():
                             sum(max_reuse_list) / len(max_reuse_list), 2
                         )
 
-        # Global consecutive-repeat stats: across the full sorted event timeline,
-        # find every run of consecutive same-activity firings and record its length.
-        # min/mean/max of those run lengths tells you how the activity clusters in
-        # the real log — directly calibrates the max_consecutive setting.
-        activity_consec_stats: dict = {}
-        if ocel_source:
-            sorted_acts = [
-                _norm_act(edata)
-                for edata in sorted(events_list_raw, key=_norm_ts)
-                if _norm_act(edata)
-            ]
-            # Scan runs
-            act_runs: dict = {}  # activity -> list of run lengths
-            i = 0
-            while i < len(sorted_acts):
-                act = sorted_acts[i]
-                run = 1
-                while i + run < len(sorted_acts) and sorted_acts[i + run] == act:
-                    run += 1
-                act_runs.setdefault(act, []).append(run)
-                i += run
-            for act, runs in act_runs.items():
-                activity_consec_stats[act] = {
-                    'min':  min(runs),
-                    'max':  max(runs),
-                    'mean': round(sum(runs) / len(runs), 2),
-                }
-
         # Calculate transition statistics
         transition_count = sum(len(targets) for targets in prob_matrix.values())
 
@@ -520,8 +595,6 @@ def run_discovery():
             'activities': activities,
             'activity_counts': activity_counts,
             'activity_repeat_stats': activity_repeat_stats,
-            'activity_consec_stats': activity_consec_stats,
-            # (activity_nmax_suggestions removed)
             'start_counts': start_counts,
             'event_log': event_log,
             'event_log_ocel': event_log_ocel,  # OCEL dict for lifecycle derivation
@@ -533,7 +606,6 @@ def run_discovery():
                 'activities': activities,
                 'activity_counts': activity_counts,
                 'activity_repeat_stats': activity_repeat_stats,
-                'activity_consec_stats': activity_consec_stats,
                 # (activity_nmax_suggestions removed)
                 'activity_count': len(activities),
                 'total_events': total_events,
@@ -643,7 +715,11 @@ def get_model_state():
                         'constraint_type': c.constraint_type,
                         'source_activity': c.source_activity,
                         'target_activity': c.target_activity,
-                        'scope': {'kind': c.scope.kind, 'object_type': c.scope.object_type},
+                        'scope': {
+                            'kind': c.scope.kind,
+                            'object_type': c.scope.object_type,
+                            'bindings': list(c.scope.bindings) if c.scope.bindings else [],
+                        },
                         'nmin': c.nmin,
                         'nmax': c.nmax,
                     }
@@ -792,6 +868,7 @@ def simulation_status(run_id):
         'total_oblig_fulfilled':    total_oblig_fulfilled,
         'total_oblig_cancelled':    total_oblig_cancelled,
         'completed_traces':         completed_traces,
+        'completed_cases':          getattr(state, '_start_event_count', 0) if state else 0,
         'last_timestamp':           last_ts,
         'start_timestamp':          start_ts,
         'done':                     run['done'],
@@ -832,12 +909,25 @@ def run_simulation():
                 max_traces = int(max_traces)
             except (TypeError, ValueError):
                 max_traces = None
+        max_cases = data.get('maxCases')
+        if max_cases is not None:
+            try:
+                max_cases = int(max_cases)
+            except (TypeError, ValueError):
+                max_cases = None
         seed = int(data.get('seed', 42))
         # Accept either startActivities (list, new) or startActivity (string, legacy)
         start_activities = data.get('startActivities')
         if not start_activities:
             sa = data.get('startActivity')
             start_activities = [sa] if sa else []
+        # Per-activity start caps: {activity_name: max_fires} — optional
+        start_activity_caps = data.get('startActivityCaps') or {}
+        if isinstance(start_activity_caps, dict):
+            # Coerce values to int, drop null/empty
+            start_activity_caps = {k: int(v) for k, v in start_activity_caps.items() if v not in (None, '', 0)}
+        else:
+            start_activity_caps = {}
         model_override = data.get('modelOverride')            # full edited model dict (optional)
         prob_matrix_override = data.get('probMatrixOverride') # normalised prob matrix (optional)
 
@@ -893,13 +983,15 @@ def run_simulation():
         # Build simulation config
         start_policy = StartPolicy(
             start_activity_names=start_activities,
-            max_case_starts=None
+            max_case_starts=None,
+            start_activity_caps=start_activity_caps,
         )
         
         config = SimulationConfig(
             max_steps=max_steps,
             max_sim_time_s=max_sim_time_s,
             max_traces=max_traces,
+            max_cases=max_cases,
             seed=seed,
             start_policy=start_policy,
             anchor_object_types=[ot.name for ot in static_model.object_types]
@@ -985,6 +1077,7 @@ def run_simulation():
                     "target_activity": getattr(c, "target_activity", None),
                     "scope_kind": getattr(c.scope, "kind", None) if hasattr(c, "scope") and c.scope else None,
                     "scope_object_type": getattr(c.scope, "object_type", None) if hasattr(c, "scope") and c.scope else None,
+                    "scope_bindings": list(getattr(c.scope, "bindings", ())) if hasattr(c, "scope") and c.scope else [],
                     "nmin": getattr(c, "nmin", None),
                     "nmax": getattr(c, "nmax", None),
                 }
@@ -1212,18 +1305,7 @@ def run_simulation():
         history.append(run_entry)
         _save_history(history)
 
-        # Build concurrency summary from the cached discovered probs
-        # Only include unique pairs (A <= B) above threshold 0.3, sorted by probability
-        cached_conc = discovery_cache.get(event_log_file, {}).get('concurrency_probs', {})
-        concurrency_pairs = sorted(
-            [
-                {'a': k.split('|||')[0], 'b': k.split('|||')[1], 'p': round(v, 3)}
-                for k, v in cached_conc.items()
-                if '|||' in k and k.split('|||')[0] <= k.split('|||')[1] and v >= 0.3
-            ],
-            key=lambda x: -x['p'],
-        )
-        
+
         return jsonify({
             'success': True,
             'results': {
@@ -1245,19 +1327,20 @@ def run_simulation():
                 'iteration_log_file': iteration_log_filename,
                 # metrics intentionally omitted from inline response — can be very large
                 # (hundreds of MB for big runs). Use GET /api/run-history/{id}/metrics
-                # or the Download Metrics button to access the full data.
+                # to access the full data.
                 'metrics': {
                     'activity_metrics': metrics.get('activity_metrics', {}),
                     'activity_service_by_type': metrics.get('activity_service_by_type', {}),
                     # object_metrics omitted — too large; available via metrics file download
                 },
                 'audit': audit,
-                'concurrency_pairs': concurrency_pairs,
                 'resource_types': list(static_model.resource_types or []),
                 'completed_traces': getattr(final_state, 'completed_trace_count', 0),
                 'obligations_fulfilled': getattr(final_state, 'total_obligations_fulfilled', 0),
                 'obligations_cancelled': getattr(final_state, 'total_obligations_cancelled', 0),
                 'obligations_violated': getattr(final_state, 'total_obligations_violated', 0),
+                'guard_checks_total': getattr(final_state, 'guard_checks_total', 0),
+                'guard_checks_passed': getattr(final_state, 'guard_checks_passed', 0),
                 # Per-constraint obligation stats (E3/S8): fulfillment rate per response constraint
                 'constraint_obligation_stats': {
                     f"{k[0]}|{k[1]}→{k[2]}|{k[3]}": v
@@ -1289,6 +1372,12 @@ def run_simulation():
                 'avg_parallelism': (lambda s: (
                     round(sum(s) / len(s), 2) if s else None
                 ))(getattr(final_state, 'parallelism_samples', [])),
+                # Case tracker: per start-activity case counts, completion rates and durations
+                'case_tracker': _compute_case_tracker(
+                    final_state,
+                    start_activity_names=set(start_activities or []),
+                    resource_types=static_model.resource_types or set(),
+                ),
             },
             'logs': [
                 f"Loaded model: {ocdeclare_file}",
@@ -1322,16 +1411,19 @@ def download_file(filename):
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/api/download-metrics/<filename>', methods=['GET'])
-def download_metrics(filename):
-    """Download generated metrics file."""
+@app.route('/api/download-ocdeclare/<filename>', methods=['GET'])
+def download_ocdeclare_file(filename):
+    """Download a saved OC-Declare model file from OCDECLARE_DIR."""
     try:
-        file_path = METRICS_DIR / filename
+        safe = Path(filename).name  # prevent directory traversal
+        file_path = OCDECLARE_DIR / safe
         if not file_path.exists():
             return jsonify({'error': 'File not found'}), 404
-        return send_file(file_path, mimetype='application/json', as_attachment=True, download_name=filename)
+        return send_file(file_path, mimetype='application/json', as_attachment=True, download_name=safe)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
 
 
 @app.route('/api/run-history', methods=['GET'])
@@ -1586,42 +1678,21 @@ def get_eventlog_events():
         if not log_path.exists():
             return jsonify({'error': f'Event log not found: {filename}'}), 404
 
-        # Support both JSON and XML OCEL formats
-        suffix = log_path.suffix.lower()
-        if suffix == '.xml':
-            from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2_xml
-            ocel = load_ocel2_xml(str(log_path))
-            # XML loader returns objects as dict {id: {type, attributes}}
-            objects_raw_dict = ocel.get('objects', {})
-            obj_type_map = {oid: info.get('type','') for oid, info in objects_raw_dict.items()}
-            events_dict = ocel.get('events', {})
-            result = []
-            for eid, ev in events_dict.items():
-                result.append({
-                    'id': eid,
-                    'activity': ev.get('activity', ''),
-                    'timestamp': ev.get('timestamp', ''),
-                    'object_ids': ev.get('omap', []),
-                })
-        else:
-            # JSON OCEL
-            content = log_path.read_text(encoding='utf-8').strip()
-            if not content:
-                return jsonify({'error': f'Event log file is empty: {filename}'}), 400
-            ocel = json.loads(content)
-            objects_raw = ocel.get('objects', [])
-            if isinstance(objects_raw, dict):
-                objects_raw = list(objects_raw.values())
-            obj_type_map = {obj.get('id', ''): obj.get('type', '') for obj in objects_raw}
-            events_raw = ocel.get('events', [])
-            if isinstance(events_raw, dict):
-                events_raw = list(events_raw.values())
-            result = []
-            for ev in events_raw:
-                rels = ev.get('relationships', []) or []
-                oids = [r['objectId'] for r in rels if r.get('objectId')]
-                result.append({'id': ev.get('id', ''), 'activity': ev.get('type', ''),
-                               'timestamp': ev.get('time', ''), 'object_ids': oids})
+        # load_ocel2 handles OCEL 1.0 (.jsonocel), OCEL 2.0 JSON, XML, and CSV
+        ocel = load_ocel2(str(log_path))
+        # After normalisation objects is always {oid: {type, attributes}}
+        objects_dict = ocel.get('objects', {})
+        obj_type_map = {oid: info.get('type', '') for oid, info in objects_dict.items()}
+        # After normalisation events is always {eid: {activity, timestamp, omap}}
+        events_dict = ocel.get('events', {})
+        result = []
+        for eid, ev in events_dict.items():
+            result.append({
+                'id': eid,
+                'activity': ev.get('activity', ev.get('type', '')),
+                'timestamp': ev.get('timestamp', ev.get('time', '')),
+                'object_ids': ev.get('omap', []),
+            })
 
         result.sort(key=lambda e: e.get('timestamp', ''))
         return jsonify({'events': result, 'count': len(result), 'object_types_map': obj_type_map})
@@ -1655,82 +1726,109 @@ def get_iteration_log(run_id):
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])
 def run_ocdeclare_discovery():
-    """Discover OC-Declare model from OCEL 2.0 event log."""
+    """Discover OC-Declare model asynchronously.
+
+    Returns immediately with {run_id}.  Poll
+    GET /api/discover-ocdeclare/status/<run_id> for {phase, pct, done, …}.
+    """
     try:
         data = request.json
-        event_log_file = data.get('eventLogFile')
-        min_support = data.get('minSupport', 0.7)
-        min_confidence = data.get('minConfidence', 0.85)
-        noise_threshold = data.get('noiseThreshold', 0.15)
-        lifecycle_threshold = data.get('lifecycleThreshold', 0.5)
-        resource_threshold = data.get('resourceThreshold', 50.0)
-        constraint_types = data.get('constraintTypes', {
-            'precedence': True,
-            'response': True,
-            'not_coexistence': False,
-            'chain_precedence': False,
-            'chain_response': False,
-            'coexistence': False,
-            'absence': False
-        })
-        # Per-constraint-type thresholds (optional). Each key maps to a dict
-        # with optional 'minSupport', 'minConfidence', 'noiseThreshold'.
-        # Falls back to the global values above for any missing key or field.
-        constraint_params = data.get('constraintParams', {})
-        
+        event_log_file      = data.get('eventLogFile')
+        noise_threshold     = float(data.get('noiseThreshold', 0.2))
+        arc_types           = data.get('arcTypes', ['EF', 'EP', 'AS'])
+        reduction           = data.get('reduction', 'Lossless')
+        lifecycle_threshold = float(data.get('lifecycleThreshold', 0.5))
+        permanent_threshold = float(data.get('resourceThreshold', 50.0))
+        run_id              = data.get('runId') or str(__import__('uuid').uuid4())
+
         if not event_log_file:
             return jsonify({'error': 'Missing event log file'}), 400
-        
-        # Validate parameters
-        if not (0 <= min_support <= 1):
-            return jsonify({'error': 'min_support must be between 0 and 1'}), 400
-        if not (0 <= min_confidence <= 1):
-            return jsonify({'error': 'min_confidence must be between 0 and 1'}), 400
         if not (0 <= noise_threshold <= 1):
-            return jsonify({'error': 'noise_threshold must be between 0 and 1'}), 400
+            return jsonify({'error': 'noiseThreshold must be between 0 and 1'}), 400
         if not (0 <= lifecycle_threshold <= 1):
-            return jsonify({'error': 'lifecycle_threshold must be between 0 and 1'}), 400
-        if resource_threshold < 1:
-            return jsonify({'error': 'resource_threshold must be >= 1'}), 400
+            return jsonify({'error': 'lifecycleThreshold must be between 0 and 1'}), 400
+        if permanent_threshold < 1:
+            return jsonify({'error': 'resourceThreshold must be >= 1'}), 400
 
         log_path = EVENTLOG_DIR / event_log_file
         if not log_path.exists():
             return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
-        
-        # Generate output filename with timestamp
-        from datetime import datetime
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_basename = Path(event_log_file).stem
+
+        from datetime import datetime as _dt
+        timestamp       = _dt.now().strftime('%Y%m%d_%H%M%S')
+        log_basename    = Path(event_log_file).stem
         output_filename = f'discovered_{log_basename}_{timestamp}.json'
-        
-        # Run discovery
-        result = discover_ocdeclare_model(
-            event_log_path=str(log_path),
-            min_support=min_support,
-            min_confidence=min_confidence,
-            noise_threshold=noise_threshold,
-            lifecycle_threshold=lifecycle_threshold,
-            resource_threshold=resource_threshold,
-            constraint_types=constraint_types,
-            constraint_params=constraint_params,
-            output_filename=output_filename,
-            output_dir=str(OCDECLARE_DIR)
-        )
-        
-        # Return results
-        return jsonify({
-            'success': True,
-            'filename': output_filename,
-            'model': result['model'],
-            'stats': result['stats'],
-            'parameters': result['parameters'],
-            'start_activities_ranked': result.get('start_activities_ranked', [])
-        })
-        
+
+        entry = {'done': False, 'phase': 'Starting', 'pct': 0, 'result': None, 'error': None, 'logs': []}
+        _discovery_runs[run_id] = entry
+
+        def _run():
+            from datetime import datetime as _dt2
+
+            def _progress(phase, pct):
+                entry['phase'] = phase
+                entry['pct']   = pct
+
+            def _log(msg):
+                entry['logs'].append({'t': _dt2.now().strftime('%H:%M:%S'), 'msg': msg})
+
+            try:
+                result = discover_ocdeclare_model(
+                    event_log_path=str(log_path),
+                    noise_threshold=noise_threshold,
+                    arc_types=arc_types,
+                    reduction=reduction,
+                    lifecycle_threshold=lifecycle_threshold,
+                    permanent_threshold=permanent_threshold,
+                    output_filename=output_filename,
+                    output_dir=str(OCDECLARE_DIR),
+                    progress_callback=_progress,
+                    log_callback=_log,
+                )
+                entry['result'] = {
+                    'success':  True,
+                    'filename': output_filename,
+                    'model':    result['model'],
+                    'stats':    result['stats'],
+                    'parameters': result['parameters'],
+                    'start_activities_ranked': result.get('start_activities_ranked', []),
+                }
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                entry['error'] = str(exc)
+            finally:
+                entry['done'] = True
+
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({'run_id': run_id})
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/discover-ocdeclare/status/<run_id>', methods=['GET'])
+def ocdeclare_discovery_status(run_id):
+    """Poll progress of an async OC-Declare discovery run."""
+    entry = _discovery_runs.get(run_id)
+    if not entry:
+        return jsonify({'error': 'unknown run_id'}), 404
+    resp = {
+        'done':  entry['done'],
+        'phase': entry['phase'],
+        'pct':   entry['pct'],
+        'logs':  list(entry.get('logs', [])),
+    }
+    if entry['done']:
+        if entry['error']:
+            resp['error'] = entry['error']
+        else:
+            resp.update(entry['result'] or {})
+        # Clean up after delivering the result
+        _discovery_runs.pop(run_id, None)
+    return jsonify(resp)
 
 
 @app.route('/api/constraint-health', methods=['POST'])
@@ -1817,6 +1915,93 @@ def constraint_health():
         except Exception:
             pass  # annotation is best-effort — never break the health check
 
+        return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/pinpoint-blocking', methods=['POST'])
+def pinpoint_blocking():
+    """Iteratively identify which constraints are blocking activities by removing
+    the top blocker each round and re-running the simulation."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from constraint_health_report import pinpoint_blocking_constraints
+
+        data = request.json or {}
+        model_override   = data.get('modelOverride')
+        ocdeclare_file   = data.get('ocdeclareFile')
+        start_activities = data.get('startActivities') or (
+            [data['startActivity']] if data.get('startActivity') else []
+        )
+        steps     = int(data.get('steps', 200))
+        max_rounds = int(data.get('maxRounds', 12))
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not model_override and not ocdeclare_file:
+            return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
+
+        if model_override:
+            model_dict = model_override
+        else:
+            model_path = OCDECLARE_DIR / ocdeclare_file
+            if not model_path.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(model_path) as f:
+                model_dict = json.load(f)
+
+        result = pinpoint_blocking_constraints(
+            model_dict=model_dict,
+            start_activities=start_activities,
+            steps=steps,
+            max_rounds=max_rounds,
+        )
+        return jsonify({'success': True, **result})
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/dry-run-stats', methods=['POST'])
+def dry_run_stats_endpoint():
+    """Run a 500-step dry simulation and return pool/blocking statistics."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from constraint_health_report import dry_run_stats
+
+        data = request.json or {}
+        model_override   = data.get('modelOverride')
+        ocdeclare_file   = data.get('ocdeclareFile')
+        start_activities = data.get('startActivities') or (
+            [data['startActivity']] if data.get('startActivity') else []
+        )
+        steps = int(data.get('steps', 500))
+
+        if not start_activities:
+            return jsonify({'error': 'Missing startActivities'}), 400
+        if not model_override and not ocdeclare_file:
+            return jsonify({'error': 'Either ocdeclareFile or modelOverride is required'}), 400
+
+        if model_override:
+            model_dict = model_override
+        else:
+            model_path = OCDECLARE_DIR / ocdeclare_file
+            if not model_path.exists():
+                return jsonify({'error': f'Model file not found: {ocdeclare_file}'}), 404
+            with open(model_path) as f:
+                model_dict = json.load(f)
+
+        result = dry_run_stats(
+            model_dict=model_dict,
+            start_activities=start_activities,
+            steps=steps,
+        )
         return jsonify({'success': True, **result})
 
     except Exception as e:
@@ -2303,21 +2488,14 @@ def discover_timing():
         event_log = load_ocel2(str(log_path))
         metrics = compute_ocpa_metrics(event_log, anchor_activities, service_time_mode=service_time_mode)
 
-        # Discover concurrency probabilities using the timing distributions as
-        # the window reference (max of each pair's mean_seconds).
-        concurrency = discover_concurrency_probs(event_log, activity_durations=metrics)
-
-        # Store both in the discovery cache so the simulator can use them
         if event_log_file in discovery_cache:
             discovery_cache[event_log_file]['time_distributions'] = metrics
-            discovery_cache[event_log_file]['concurrency_probs'] = concurrency
 
         return jsonify({
             'success': True,
             'metrics': metrics,
             'activity_count': len(metrics),
             'empty': len(metrics) == 0,
-            'concurrency_probs': {k: v for k, v in concurrency.items() if '|||' in k and k.split('|||')[0] <= k.split('|||')[1]},
         })
 
     except Exception as e:
@@ -2555,7 +2733,7 @@ def discover_resources():
     try:
         data = request.json or {}
         event_log_file = data.get('eventLogFile')
-        resource_threshold = float(data.get('resourceThreshold', 50.0))
+        permanent_threshold = float(data.get('resourceThreshold', 50.0))
 
         if not event_log_file:
             return jsonify({'error': 'Missing eventLogFile parameter'}), 400
@@ -2565,7 +2743,7 @@ def discover_resources():
             return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
 
         event_log = load_ocel2(str(log_path))
-        resource_type_names = discover_resource_types(event_log, resource_threshold)
+        resource_type_names = discover_permanent_object_types(event_log, permanent_threshold)
 
         # Count individual object instances per resource type
         objects_raw = event_log.get('objects', {})
@@ -2585,6 +2763,33 @@ def discover_resources():
             'resource_types': resource_type_names,
             'resource_info': resource_info,
         })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/suggest-permanent-threshold', methods=['POST'])
+def suggest_permanent_threshold():
+    """Suggest a permanent-object threshold via gap detection on the OCEL.
+
+    Body JSON:
+      eventLogFile – filename in EVENTLOG_DIR (required)
+
+    Returns:
+      { suggested_threshold: float | null }
+      null means the log's reuse distribution has no clear bimodal gap.
+    """
+    try:
+        data = request.json or {}
+        event_log_file = data.get('eventLogFile')
+        if not event_log_file:
+            return jsonify({'error': 'Missing eventLogFile parameter'}), 400
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
+        event_log = load_ocel2(str(log_path))
+        threshold = suggest_permanent_object_threshold(event_log)
+        return jsonify({'suggested_threshold': threshold})
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
@@ -2672,10 +2877,6 @@ def _build_static_model_from_request(data):
         merged = {act: m for act, m in time_distributions.items() if act not in existing}
         merged.update(existing)
         model_data = {**model_data, 'activity_durations': merged}
-    concurrency_probs = cached.get('concurrency_probs', {})
-    if concurrency_probs and isinstance(model_data, dict):
-        if not model_data.get('concurrency_probs'):
-            model_data = {**model_data, 'concurrency_probs': concurrency_probs}
 
     if isinstance(model_data, list):
         static_model = parse_ocdeclare_list(model_data)
@@ -2816,6 +3017,14 @@ def further_eval_conformance_check():
                     checked += 1
                     if has_src and has_tgt:
                         violated += 1
+                elif ctype in ('not_succession', 'not_precedence'):
+                    # Violated if source has fired and target follows it (not_succession)
+                    # or if target fires and source has preceded it (not_precedence) —
+                    # both reduce to: source and target both appear in the trace.
+                    if has_src:
+                        checked += 1
+                        if has_tgt:
+                            violated += 1
                 elif ctype == 'coexistence':
                     if has_src or has_tgt:
                         checked += 1
@@ -2900,8 +3109,8 @@ def further_eval_log_fidelity():
 
         with open(log_path, 'r', encoding='utf-8') as f:
             sim_ocel = json.load(f)
-        with open(real_path, 'r', encoding='utf-8') as f:
-            real_ocel = json.load(f)
+        # Use load_ocel2 to normalise OCEL 1.0 (.jsonocel) as well as OCEL 2.0
+        real_ocel = load_ocel2(str(real_path))
 
         def _extract_activities(ocel):
             evs = ocel.get('events', [])
@@ -2925,12 +3134,12 @@ def further_eval_log_fidelity():
             evs = ocel.get('events', [])
             if isinstance(evs, dict):
                 evs = list(evs.values())
-            evs = sorted(evs, key=lambda e: e.get('time', ''))
+            evs = sorted(evs, key=lambda e: e.get('time', '') or e.get('timestamp', ''))
             from datetime import datetime
             gaps = []
             prev_ts = None
             for e in evs:
-                ts_str = e.get('time', '')
+                ts_str = e.get('time', '') or e.get('timestamp', '')
                 if not ts_str:
                     continue
                 try:
@@ -3163,8 +3372,8 @@ def further_eval_cardinality_fidelity():
 
         with open(log_path,  'r', encoding='utf-8') as f:
             sim_ocel  = json.load(f)
-        with open(real_path, 'r', encoding='utf-8') as f:
-            real_ocel = json.load(f)
+        # Use load_ocel2 to normalise OCEL 1.0 (.jsonocel) as well as OCEL 2.0
+        real_ocel = load_ocel2(str(real_path))
 
         def _objects_per_event(ocel):
             evs = ocel.get('events', [])
@@ -3299,6 +3508,176 @@ def further_eval_ocpa_ocpq_comparison():
             'real_metrics': real_metrics,
             'sim_metrics':  sim_metrics,
             'global_wmape': global_wmape,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/further-eval/distribution-fidelity', methods=['POST'])
+def further_eval_distribution_fidelity():
+    """Distribution fidelity: Wasserstein-1 on per-activity sojourn times + KS on activity frequencies.
+
+    Following López-Pintado et al. 2024 "Discovery and Simulation of Data-Aware Business Processes".
+    Body: { outputFile: str, eventLogFile: str }
+    """
+    try:
+        data = request.json or {}
+        output_file    = data.get('outputFile')
+        event_log_file = data.get('eventLogFile')
+        if not output_file:
+            return jsonify({'error': 'outputFile is required'}), 400
+        if not event_log_file:
+            return jsonify({'error': 'eventLogFile (real log) is required'}), 400
+
+        log_path  = OUTPUT_DIR / output_file
+        real_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return jsonify({'error': f'Output log not found: {output_file}'}), 404
+        if not real_path.exists():
+            return jsonify({'error': f'Event log not found: {event_log_file}'}), 404
+
+        with open(log_path,  'r', encoding='utf-8') as f:
+            sim_ocel  = json.load(f)
+        # Use load_ocel2 to normalise OCEL 1.0 (.jsonocel) as well as OCEL 2.0
+        real_ocel = load_ocel2(str(real_path))
+
+        # ── Helpers ────────────────────────────────────────────────────────────
+
+        def _parse_ts(raw):
+            if not raw:
+                return None
+            from datetime import datetime
+            try:
+                return datetime.fromisoformat(
+                    str(raw).replace('Z', '+00:00').replace('+00:00', '')
+                )
+            except Exception:
+                return None
+
+        def _get_oids(ev):
+            # OCEL 2.0: omap is a list of plain object ID strings
+            omap = ev.get('omap')
+            if omap and isinstance(omap, list):
+                return [o for o in omap if o]
+            # JSON-OCEL: relationships is a list of dicts with objectId
+            rels = ev.get('relationships') or []
+            return [r.get('objectId', '') for r in rels if isinstance(r, dict) and r.get('objectId')]
+
+        def _extract_sojourn(ocel):
+            """Return dict of activity -> [sojourn_seconds] via backward-gap method."""
+            evs = ocel.get('events', [])
+            if isinstance(evs, dict):
+                evs = list(evs.values())
+            parsed = []
+            for ev in evs:
+                ts  = _parse_ts(ev.get('time') or ev.get('ocel:timestamp') or ev.get('timestamp'))
+                act = ev.get('type', ev.get('activity', ev.get('ocel:activity', '')))
+                oids = set(o for o in _get_oids(ev) if o)
+                if ts and act:
+                    parsed.append((ts, act, oids))
+            parsed.sort(key=lambda t: t[0])
+            obj_last: dict = {}
+            samples: dict  = {}
+            for ts, act, oids in parsed:
+                preceding = [obj_last[o] for o in oids if o in obj_last]
+                if preceding:
+                    s = (ts - max(preceding)).total_seconds()
+                    if 0 <= s < 365 * 86400:
+                        samples.setdefault(act, []).append(s)
+                for o in oids:
+                    obj_last[o] = ts
+            return samples
+
+        def _extract_act_counts(ocel):
+            evs = ocel.get('events', [])
+            if isinstance(evs, dict):
+                evs = list(evs.values())
+            counts: dict = {}
+            for ev in evs:
+                act = ev.get('type', ev.get('activity', ev.get('ocel:activity', '')))
+                if act:
+                    counts[act] = counts.get(act, 0) + 1
+            return counts
+
+        def _w1(a_vals, b_vals):
+            """Wasserstein-1 between two sample lists (O(n log n) two-pointer)."""
+            if not a_vals or not b_vals:
+                return None
+            a_s = sorted(a_vals)
+            b_s = sorted(b_vals)
+            na, nb = len(a_s), len(b_s)
+            all_x = sorted(set(a_s + b_s))
+            if len(all_x) < 2:
+                return 0.0
+            ia = ib = 0
+            w1 = 0.0
+            for i in range(len(all_x) - 1):
+                x, xn = all_x[i], all_x[i + 1]
+                while ia < na and a_s[ia] <= x:
+                    ia += 1
+                while ib < nb and b_s[ib] <= x:
+                    ib += 1
+                w1 += abs(ia / na - ib / nb) * (xn - x)
+            return round(w1, 2)
+
+        def _ks_samples(a_vals, b_vals):
+            """KS statistic between two sojourn-time sample lists (max |F_a(x) - F_b(x)|)."""
+            if not a_vals or not b_vals:
+                return None
+            a_s = sorted(a_vals)
+            b_s = sorted(b_vals)
+            na, nb = len(a_s), len(b_s)
+            all_x = sorted(set(a_s + b_s))
+            ia = ib = 0
+            ks = 0.0
+            for x in all_x:
+                while ia < na and a_s[ia] <= x:
+                    ia += 1
+                while ib < nb and b_s[ib] <= x:
+                    ib += 1
+                ks = max(ks, abs(ia / na - ib / nb))
+            return round(ks, 4)
+
+        # ── Compute ────────────────────────────────────────────────────────────
+
+        real_sojourn = _extract_sojourn(real_ocel)
+        sim_sojourn  = _extract_sojourn(sim_ocel)
+        real_counts  = _extract_act_counts(real_ocel)
+        sim_counts   = _extract_act_counts(sim_ocel)
+
+        all_acts = sorted(set(list(real_sojourn.keys()) + list(sim_sojourn.keys())))
+        act_rows = []
+        for act in all_acts:
+            rs = real_sojourn.get(act, [])
+            ss = sim_sojourn.get(act, [])
+            act_rows.append({
+                'activity': act,
+                'real_n':   len(rs),
+                'sim_n':    len(ss),
+                'w1_s':     _w1(rs, ss),
+                'ks_s':     _ks_samples(rs, ss),
+            })
+        act_rows.sort(key=lambda r: -r['real_n'])
+
+        total_real_n = sum(r['real_n'] for r in act_rows if r['w1_s'] is not None)
+        overall_w1 = round(
+            sum(r['w1_s'] * r['real_n'] for r in act_rows if r['w1_s'] is not None) / total_real_n,
+            2
+        ) if total_real_n > 0 else None
+
+        total_real_n_ks = sum(r['real_n'] for r in act_rows if r['ks_s'] is not None)
+        overall_ks = round(
+            sum(r['ks_s'] * r['real_n'] for r in act_rows if r['ks_s'] is not None) / total_real_n_ks,
+            4
+        ) if total_real_n_ks > 0 else None
+
+        return jsonify({
+            'activity_rows':    act_rows,
+            'overall_w1_s':     overall_w1,
+            'overall_ks_s':     overall_ks,
+            'real_event_count': sum(real_counts.values()),
+            'sim_event_count':  sum(sim_counts.values()),
         })
     except Exception as e:
         import traceback

@@ -89,8 +89,8 @@ def _parse_activity_durations(raw: Dict[str, Any]) -> Dict[str, Any]:
             continue
         out[str(act_name)] = ActivityDuration(
             dist_type=str(d.get("dist_type", "lognormal")),
-            mean_seconds=float(d.get("mean_seconds", 3600.0)),
-            std_seconds=float(d.get("std_seconds", 600.0)),
+            mean_seconds=float(d.get("mean_seconds", 0.0)),
+            std_seconds=float(d.get("std_seconds", 0.0)),
             min_seconds=float(d.get("min_seconds", 0.0)),
             max_seconds=_opt_float(d.get("max_seconds")),
             sojourn_mean=_opt_float(d.get("sojourn_mean")),
@@ -166,8 +166,11 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                     attribute_updates=tuple(b.get("attribute_updates") or ()),
                 )
             )
-        activities.append(Activity(name=name, bindings=bindings))
-
+        activities.append(Activity(
+            name=name,
+            bindings=bindings,
+            event_attributes=tuple(a.get("event_attributes") or ()),
+        ))
     # Constraints
     constraints = []
     for c in data.get("constraints", []) or []:
@@ -178,8 +181,15 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         source = c.get("source") or c.get("source_activity") or c.get("a")
         target = c.get("target") or c.get("target_activity") or c.get("b")
         scope = c.get("scope") or {}
-        scope_kind = scope.get("kind", "each")
-        scope_object_type = scope.get("object_type")
+        ipl = scope.get("involvement_per_label") or c.get("involvement_per_label") or {}
+        if ipl:
+            bindings = tuple((str(t), str(v)) for t, v in ipl.items())
+            primary_type = next(iter(ipl))
+            primary_kind = ipl[primary_type]
+        else:
+            bindings = ()
+            primary_type = scope.get("object_type")
+            primary_kind = scope.get("kind", "each")
         if not ctype or not source or not target:
             continue
         # Cardinality bounds (OC-DECLARE). For precedence/chain_precedence/
@@ -199,14 +209,32 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             nmax = int(nmax_raw) if nmax_raw is not None else None
         except (TypeError, ValueError):
             nmax = None
+        # OC-Declare paper: nmin=0, nmax=0 is the negated existence form.
+        # Remap to the corresponding not_* type so the simulator uses the correct checker.
+        _NEGATION_MAP = {
+            'response': 'not_succession',
+            'precedence': 'not_precedence',
+            'chain_response': 'not_chain_succession',
+            'chain_precedence': 'not_chain_succession',
+            'responded_existence': 'not_coexistence',
+            'coexistence': 'not_coexistence',
+        }
+        if nmin == 0 and nmax == 0 and ctype in _NEGATION_MAP:
+            ctype = _NEGATION_MAP[ctype]
+            nmax = None
         constraints.append(
             Constraint(
                 constraint_type=str(ctype),
                 source_activity=str(source),
                 target_activity=str(target),
-                scope=Scope(kind=str(scope_kind), object_type=str(scope_object_type) if scope_object_type is not None else ""),
+                scope=Scope(
+                    kind=str(primary_kind),
+                    object_type=str(primary_type) if primary_type is not None else "",
+                    bindings=bindings,
+                ),
                 nmin=nmin,
                 nmax=nmax,
+                guard=c.get("guard") or None,
             )
         )
 
@@ -268,10 +296,6 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             str(k): dict(v)
             for k, v in (data.get("attribute_schema") or {}).items()
             if isinstance(v, dict)
-        },
-        concurrency_probs={
-            str(k): float(v)
-            for k, v in (data.get("concurrency_probs") or {}).items()
         },
         _constraints_by_activity=_constraints_idx,
     )
@@ -556,13 +580,28 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
                 # `from` is the constrained later activity in the engine.
                 src, tgt = tgt, src
 
+            # OC-Declare paper: nmin=0, nmax=0 is the negated existence form.
+            _nmin = int(nmin) if nmin is not None else 0
+            _nmax = None if nmax is None else int(nmax)
+            _NEGATION_MAP_LIST = {
+                'response': 'not_succession',
+                'precedence': 'not_precedence',
+                'chain_response': 'not_chain_succession',
+                'chain_precedence': 'not_chain_succession',
+                'responded_existence': 'not_coexistence',
+                'coexistence': 'not_coexistence',
+            }
+            if _nmin == 0 and _nmax == 0 and constraint_type in _NEGATION_MAP_LIST:
+                constraint_type = _NEGATION_MAP_LIST[constraint_type]
+                _nmax = None
+
             constraints.append(Constraint(
                 constraint_type=constraint_type,
                 source_activity=src,
                 target_activity=tgt,
                 scope=scope,
-                nmin=int(nmin) if nmin is not None else 0,
-                nmax=None if nmax is None else int(nmax),
+                nmin=_nmin,
+                nmax=_nmax,
             ))
 
     # Build activities with bindings (flatten per-activity dicts to lists)
@@ -570,6 +609,8 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
     for n in sorted(activity_names):
         per_act = activity_bindings.get(n, {})
         bindings = list(per_act.values())
+        # Arc-list format cannot express event_attributes or constraint guards;
+        # those fields default to empty/None on the constructed dataclasses.
         activities.append(Activity(name=n, bindings=bindings))
     object_types_list = [ObjectType(name=n) for n in sorted(object_types)]
 

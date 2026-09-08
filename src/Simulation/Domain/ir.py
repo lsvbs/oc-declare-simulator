@@ -13,6 +13,10 @@ from typing import Literal, Optional, Any
 class Scope:
     kind: Literal["each", "any", "all"]
     object_type: str
+    # Multi-type bindings: tuple of (object_type, involvement) pairs.
+    # Empty means single-type; all existing single-type code ignores this field.
+    # When non-empty, kind/object_type hold the primary binding for legacy readers.
+    bindings: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,12 @@ class ObjectBinding:
 class Activity:
     name: str
     bindings: list[ObjectBinding] = field(default_factory=list)
+    # Phase 3: event-level attribute captures evaluated at activity completion.
+    # Each entry is one of:
+    #   {"name": "channel",      "source": "static", "value": "web"}
+    #   {"name": "order_status", "source": "object",
+    #    "object_type": "order", "attribute": "status"}
+    event_attributes: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -68,14 +78,32 @@ class Constraint:
         "response",
         "not_coexistence",
         "not_precedence",
+        "not_succession",
+        "not_chain_succession",
         "chain_precedence",
         "chain_response",
+        "responded_existence",
+        "coexistence",
+        "absence",
+        "exactly",
+        "init",
+        "exclusive_choice",
+        "alternate_response",
+        "alternate_precedence",
+        "succession",
+        "chain_succession",
+        "alternate_succession",
     ]
     source_activity: str
     target_activity: str
     scope: Scope
     nmin: int = 0
     nmax: int | None = None
+    # Phase 2: OC-Declare object-filter guard.
+    # {"attribute": "priority", "op": "==", "value": "high"}
+    # Scope objects NOT satisfying the guard are exempt from this constraint
+    # (they are simply skipped — not blocked). Same op set as ObjectBinding.guard.
+    guard: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -108,8 +136,8 @@ class ActivityDuration:
     """
 
     dist_type: str = "lognormal"
-    mean_seconds: float = 3600.0
-    std_seconds: float = 600.0
+    mean_seconds: float = 0.0
+    std_seconds: float = 0.0
     min_seconds: float = 0.0
     max_seconds: float | None = None
     # OCPA reference metrics
@@ -142,10 +170,6 @@ class StaticModel:
     max_consecutive_per_object: dict[str, int] = field(default_factory=dict)
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
     attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Concurrency probabilities: stored for future use / analytics only.
-    # NOT used by the simulation engine — DES handles concurrency naturally
-    # via object availability and service time sampling.
-    concurrency_probs: dict[str, float] = field(default_factory=dict)
     # Per-activity constraint index: activity_name -> constraints where that
     # activity is source_activity or target_activity. Built once after parse.
     # Reduces check_all_constraints from O(all_constraints) to O(relevant).

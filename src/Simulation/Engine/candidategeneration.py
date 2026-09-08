@@ -8,47 +8,12 @@ from src.Simulation.Domain.ir import Activity, ObjectBinding, StaticModel
 from src.Simulation.Domain.state import SimulationState
 from src.Simulation.Engine.o2o import neighbors_by_type
 from src.Simulation.Engine.semantics import check_all_constraints, check_o2o_rules
+from src.Simulation.Engine.attrutils import apply_guard_filter
 
 
 def _apply_guard_filter(ids: list, guard: dict, state: SimulationState) -> list:
-    """Filter object ids by a binding attribute guard.
-
-    Objects that do not have the named attribute are excluded (fail-absent).
-    Both sides are cast to numeric types when possible for numeric comparisons.
-    """
-    attr_name = guard.get('attribute', '')
-    op        = guard.get('op', '==')
-    raw_val   = guard.get('value')
-
-    def _coerce(a, b):
-        try:
-            return float(a), float(b)
-        except (TypeError, ValueError):
-            return str(a), str(b)
-
-    result = []
-    for oid in ids:
-        obj = state.objects.get(oid)
-        if obj is None:
-            continue
-        attrs = obj.attributes or {}
-        if attr_name not in attrs:
-            continue  # fail-absent
-        obj_val = attrs[attr_name]
-        a, b = _coerce(obj_val, raw_val)
-        try:
-            if   op == '==': match = a == b
-            elif op == '!=': match = a != b
-            elif op == '>' : match = a >  b
-            elif op == '<' : match = a <  b
-            elif op == '>=': match = a >= b
-            elif op == '<=': match = a <= b
-            else:            match = False
-        except TypeError:
-            match = False
-        if match:
-            result.append(oid)
-    return result
+    """Thin wrapper kept for backward compatibility — delegates to attrutils."""
+    return apply_guard_filter(ids, guard, state)
 
 
 @dataclass
@@ -173,7 +138,10 @@ def build_candidate_for_activity(
         # Apply attribute guard: filter out objects that don't satisfy the guard.
         guard = getattr(binding, 'guard', None)
         if guard:
+            before = len(existing_ids)
             existing_ids = _apply_guard_filter(existing_ids, guard, state)
+            state.guard_checks_total += before
+            state.guard_checks_passed += len(existing_ids)
 
         # Basic validation: if max_count provided but less than min_count, impossible
         if binding.max_count is not None and binding.max_count < binding.min_count:
@@ -186,13 +154,8 @@ def build_candidate_for_activity(
         # input requirements.
 
         if not binding.creates:
-            # For simulation eligibility, require at least 1 object regardless of
-            # binding.min_count.  Log-derived min_counts are batch-size statistics
-            # (e.g. Depart: min=2 because ships always left with ≥2 containers),
-            # NOT logical preconditions.  We still try to select min_count objects
-            # when they are available, but we never block the activity if only 1 exists.
-            eligibility_count = 1
-            target_count = max(binding.min_count, eligibility_count)
+            eligibility_count = binding.min_count
+            target_count = binding.min_count
 
             # Use already existing active objects first (but do not exceed max_count)
             if binding.max_count is None:
@@ -215,23 +178,16 @@ def build_candidate_for_activity(
 
             participating_object_ids.extend(selected_ids)
         else:
-            # Output binding: this activity instantiates a new object of this type.
+            # Output binding: this activity instantiates new objects of this type.
             #
-            # Creation count is always exactly 1 per firing — regardless of
-            # min_count. min_count comes from log-discovery and represents the
-            # average NUMBER OF OBJECTS THAT PARTICIPATED in events of this
-            # activity (including existing ones), not how many new ones to
-            # create on each firing. Using it directly causes an explosion
-            # (e.g. min_count=50 containers → 50 new objects every step).
-            #
-            # Reuse: if max_count is set, fill up to (max_count - 1) slots
+            # Reuse: if max_count is set, fill up to (max_count - create_count) slots
             # with existing linked objects. If max_count is None, no reuse —
-            # the newly created object is the sole participant of this type.
+            # the newly created objects are the sole participants of this type.
             #
             # Resource types come from the pre-populated pool only.
             if binding.object_type in _resource_types:
-                eligibility_count = 1
-                target_count = max(binding.min_count, eligibility_count)
+                eligibility_count = binding.min_count
+                target_count = binding.min_count
                 selected_from_existing = min(len(existing_ids), target_count,
                                              binding.max_count if binding.max_count is not None else len(existing_ids))
                 selected_ids = existing_ids[:selected_from_existing]
@@ -240,12 +196,12 @@ def build_candidate_for_activity(
                 participating_object_ids.extend(selected_ids)
                 continue
 
-            create_count = 1  # always create exactly one new instance
+            create_count = max(1, binding.min_count)
 
             if binding.max_count is not None:
                 reuse_limit = min(len(existing_ids), max(0, binding.max_count - create_count))
             else:
-                reuse_limit = 0  # no reuse when unbounded — created object is the sole participant
+                reuse_limit = 0  # no reuse when unbounded — created objects are the sole participants
 
             selected_ids = _find_objects_preferring_linked(
                 state, existing_ids, participating_object_ids, reuse_limit
@@ -291,6 +247,14 @@ def build_candidate_for_object_and_activity(
 
     for binding in activity.bindings:
         existing_ids = available_for_type.get(binding.object_type, [])
+
+        # Apply attribute guard (mirrors build_candidate_for_activity)
+        guard = getattr(binding, 'guard', None)
+        if guard:
+            before = len(existing_ids)
+            existing_ids = apply_guard_filter(existing_ids, guard, state)
+            state.guard_checks_total += before
+            state.guard_checks_passed += len(existing_ids)
 
         # Basic validation: impossible multiplicity
         if binding.max_count is not None and binding.max_count < binding.min_count:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, field
+from itertools import product as _iproduct
 from typing import Optional
 
 from src.Simulation.Domain.ir import StaticModel, Activity
@@ -18,7 +19,7 @@ from src.Simulation.Engine.candidategeneration import (
 from src.Simulation.Engine.semantics import _count_activity_for_object
 
 
-def _apply_attribute_update(obj, upd: dict) -> None:
+def _apply_attribute_update(obj, upd: dict, timestamp=None) -> None:
     """Apply a single attribute update dict to a RuntimeObject in-place."""
     attr = upd.get('attribute', '')
     op   = upd.get('op', 'set')
@@ -30,6 +31,8 @@ def _apply_attribute_update(obj, upd: dict) -> None:
         obj.attributes[attr] = obj.attributes.get(attr, 0) + upd.get('by', 1)
     elif op == 'decrement':
         obj.attributes[attr] = obj.attributes.get(attr, 0) - upd.get('by', 1)
+    # Phase 4: record timestamped change in attribute history
+    obj.attribute_history.append((timestamp, attr, obj.attributes[attr]))
 
 
 def apply_conservative_link_policy(static_model, participating_ids, created_object_ids, state):
@@ -242,14 +245,22 @@ class Simulator:
         return self.run_des(state)
 
     def _is_start_activity_blocked(self, candidate, state: SimulationState) -> bool:
-        """Return True if this start activity has hit its max_case_starts cap."""
+        """Return True if this start activity has hit its cap (global or per-activity)."""
         start_names = set(self.config.start_policy.start_activity_names)
-        if candidate.activity_name not in start_names:
+        act = candidate.activity_name
+        if act not in start_names:
             return False
+        # Global cap
         max_starts = self.config.start_policy.max_case_starts
-        if max_starts is None:
-            return False
-        return self._count_started_cases(state) >= max_starts
+        if max_starts is not None and state._start_event_count >= max_starts:
+            return True
+        # Per-activity cap
+        caps = self.config.start_policy.start_activity_caps or {}
+        if act in caps and caps[act] is not None:
+            fired = state._start_event_count_by_activity.get(act, 0)
+            if fired >= caps[act]:
+                return True
+        return False
 
     def _should_stop(self, state: SimulationState) -> bool:
         # Time-based limit (primary)
@@ -262,6 +273,11 @@ class Simulator:
         max_tr = getattr(self.config, 'max_traces', None)
         if max_tr is not None:
             if state.completed_trace_count >= max_tr:
+                return True
+        # Case-based limit: stop when start-activity firings reach the target
+        max_ca = getattr(self.config, 'max_cases', None)
+        if max_ca is not None:
+            if state._start_event_count >= max_ca:
                 return True
         # Event/step cap (safety backstop — always applies)
         if state.step_count >= self.config.max_steps:
@@ -349,9 +365,8 @@ class Simulator:
                 continue
 
             # Expand: one candidate per active object of the primary binding type.
-            # Cap at 32 to avoid O(n_objects) work when many objects accumulate.
             primary_type = primary_bindings[0].object_type
-            active_ids = list(state._active_by_type.get(primary_type, set()))[:32]
+            active_ids = list(state._active_by_type.get(primary_type, set()))
 
             # Pre-compute cheap precedence gates for this activity (nmin and nmax)
             # using only the primary object id — avoids building the full candidate.
@@ -389,15 +404,10 @@ class Simulator:
                     if blocked:
                         continue
 
-                # Early exit: check precedence nmax and target count cap
+                # Early exit: check precedence nmax (target count cap only)
                 if prec_gates_nmax:
                     blocked = False
                     for con in prec_gates_nmax:
-                        src_count = len(state._events_by_act_obj.get(
-                            (con.source_activity, oid), []))
-                        if src_count > con.nmax:
-                            blocked = True
-                            break
                         t_count = len(state._events_by_act_obj.get(
                             (activity.name, oid), []))
                         if t_count >= con.nmax:
@@ -480,28 +490,44 @@ class Simulator:
                     continue
                 seen_obligation_keys.add(dedup_key)
 
-                # Handle all-mode frozenset obligations separately
+                # Handle frozenset obligations (any-mode and all-mode) separately
                 is_frozenset = isinstance(scope_oid, frozenset)
 
                 if is_frozenset:
-                    # All-mode: target must fire involving all objects in the frozenset
                     frozen_oids = scope_oid
-                    # Skip if any object in the set is inactive
-                    if any(not (state.objects.get(o) and state.objects[o].active) for o in frozen_oids):
-                        continue
-                    # Skip if already in pool or in-progress
-                    if any((target_act, o) in pool_index for o in frozen_oids):
-                        continue
-                    if any((target_act, o) in in_progress_index for o in frozen_oids):
-                        continue
-                    # Build candidate with all frozenset objects forced
+                    c_key_ob = state._obligation_to_constraint.get((target_act, scope_oid))
+                    scope_kind_of_ob = c_key_ob[3] if c_key_ob else 'all'
                     activity = act_by_name.get(target_act)
                     if activity is None:
                         continue
-                    candidate = build_candidate_for_activity(
-                        activity, state, resource_types=resource_types,
-                        force_object_ids=list(frozen_oids)
-                    )
+
+                    if scope_kind_of_ob == 'any':
+                        # Any-mode: force one active member — non-empty intersection discharges
+                        active_members = [o for o in frozen_oids
+                                          if state.objects.get(o) and state.objects[o].active]
+                        if not active_members:
+                            continue
+                        if any((target_act, o) in pool_index for o in active_members):
+                            continue
+                        if any((target_act, o) in in_progress_index for o in active_members):
+                            continue
+                        candidate = build_candidate_for_activity(
+                            activity, state, resource_types=resource_types,
+                            force_object_ids=[active_members[0]]
+                        )
+                    else:
+                        # All-mode: target must fire involving all objects in the frozenset
+                        if any(not (state.objects.get(o) and state.objects[o].active) for o in frozen_oids):
+                            continue
+                        if any((target_act, o) in pool_index for o in frozen_oids):
+                            continue
+                        if any((target_act, o) in in_progress_index for o in frozen_oids):
+                            continue
+                        candidate = build_candidate_for_activity(
+                            activity, state, resource_types=resource_types,
+                            force_object_ids=list(frozen_oids)
+                        )
+
                     if candidate is None:
                         continue
                     if not is_candidate_semantically_allowed(self.static_model, candidate, state):
@@ -567,9 +593,12 @@ class Simulator:
                             if nmin > 0 and src_count == 0:
                                 blocked = True
                                 break
-                            if nmax is not None and src_count > nmax:
-                                blocked = True
-                                break
+                            if nmax is not None:
+                                t_count = len(state._events_by_act_obj.get(
+                                    (target_act, scope_oid), []))
+                                if t_count >= nmax:
+                                    blocked = True
+                                    break
                 if blocked:
                     continue
 
@@ -641,9 +670,6 @@ class Simulator:
                         src_count = len(state._events_by_act_obj.get((act, oid), []))
                         if src_count >= nmin:
                             eligible[tgt].add(oid)
-                        # If nmax exceeded (source count), remove target eligibility
-                        if nmax is not None and src_count > nmax:
-                            eligible[tgt].discard(oid)
 
             # A fired as target of precedence(X → A): A itself may now be eligible
             # (handled by prec_satisfied cache — no action needed here)
@@ -728,12 +754,19 @@ class Simulator:
             if state._obligations_count.pop((act, oid), None) is not None:
                 state._obligations_ready.pop((act, oid), None)
                 _record_fulfillment((act, oid))
-        # Discharge all-mode frozenset obligations
+        # Discharge frozenset obligations (any-mode: non-empty intersection; all-mode: full subset)
         all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
         for k in all_keys:
-            if k[1].issubset(fired_oids):
+            c_key_ob = state._obligation_to_constraint.get(k)
+            scope_kind_of_ob = c_key_ob[3] if c_key_ob else 'all'
+            if scope_kind_of_ob == 'any':
+                satisfied = bool(k[1].intersection(fired_oids))
+            else:
+                satisfied = k[1].issubset(fired_oids)
+            if satisfied and self._check_obligation_binding_satisfied(k, fired_oids, state):
                 state._obligations_count.pop(k, None)
                 state._obligations_ready.pop(k, None)
+                state._obligation_bindings.pop(k, None)
                 _record_fulfillment(k)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
@@ -745,7 +778,54 @@ class Simulator:
                 constraint.target_activity,
                 getattr(constraint.scope, 'kind', 'each'),
             )
-            if constraint.scope.kind == "each":
+            if constraint.scope.bindings and len(constraint.scope.bindings) > 1:
+                # Multi-type: build one obligation per Cartesian combination of each-type objects.
+                # Secondary any/all bindings are stored and verified at fulfillment time.
+                event_oids_by_type: dict = {}
+                for oid in executed_event.object_ids:
+                    rt = state.objects.get(oid)
+                    if rt:
+                        event_oids_by_type.setdefault(rt.object_type, []).append(oid)
+
+                each_types = [t for t, inv in constraint.scope.bindings if inv == 'each']
+                other_bindings = [(t, inv) for t, inv in constraint.scope.bindings if inv != 'each']
+                each_oid_lists = [event_oids_by_type.get(t, []) for t in each_types]
+
+                if each_types and any(not lst for lst in each_oid_lists):
+                    pass  # Required each-type missing from source event — no obligation
+                else:
+                    secondary_info = [
+                        (t, inv, frozenset(event_oids_by_type.get(t, [])))
+                        for t, inv in other_bindings
+                        if event_oids_by_type.get(t)
+                    ]
+                    if each_types:
+                        for combo in _iproduct(*each_oid_lists):
+                            key = (constraint.target_activity, frozenset(combo))
+                            if key not in state._obligations_count:
+                                state._obligations_count[key] = 1
+                                state._obligation_to_constraint[key] = c_key
+                                if secondary_info:
+                                    state._obligation_bindings[key] = secondary_info
+                                state._obligations_ready[key] = 1
+                    else:
+                        # Only any/all bindings — key on primary type's object set
+                        primary_type, _ = constraint.scope.bindings[0]
+                        primary_oids = frozenset(event_oids_by_type.get(primary_type, []))
+                        if primary_oids:
+                            key = (constraint.target_activity, primary_oids)
+                            if key not in state._obligations_count:
+                                state._obligations_count[key] = 1
+                                state._obligation_to_constraint[key] = c_key
+                                remaining = [
+                                    (t, inv, frozenset(event_oids_by_type.get(t, [])))
+                                    for t, inv in constraint.scope.bindings[1:]
+                                    if event_oids_by_type.get(t)
+                                ]
+                                if remaining:
+                                    state._obligation_bindings[key] = remaining
+                                state._obligations_ready[key] = 1
+            elif constraint.scope.kind == "each":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
@@ -771,21 +851,12 @@ class Simulator:
                     executed_event=executed_event, state=state,
                     scope_object_type=constraint.scope.object_type,
                 )
-                for scope_object_id in scope_object_ids:
-                    key = (constraint.target_activity, scope_object_id)
+                if scope_object_ids:
+                    key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
                         state._obligation_to_constraint[key] = c_key
-                        if self._is_obligation_ready(constraint.target_activity, scope_object_id, state):
-                            state._obligations_ready[key] = 1
-                        else:
-                            prereqs = self._obligation_prerequisites.get(constraint.target_activity, {})
-                            scope_type = state._type_of_object.get(scope_object_id)
-                            for req_source in prereqs.get(scope_type, []):
-                                if not state._events_by_act_obj.get((req_source, scope_object_id)):
-                                    state._obligations_blocked.setdefault(
-                                        (req_source, scope_object_id), set()).add(key)
-                                    break
+                        state._obligations_ready[key] = 1  # any-mode: one member suffices
             elif constraint.scope.kind == "all":
                 scope_object_ids = self._get_event_scope_object_ids(
                     executed_event=executed_event, state=state,
@@ -823,7 +894,28 @@ class Simulator:
 
         return scope_ids
 
-        return scope_ids
+    def _check_obligation_binding_satisfied(self, key, fired_oids: set, state: SimulationState) -> bool:
+        """Check secondary any/all bindings for a multi-type obligation against the fired event."""
+        binding_info = state._obligation_bindings.get(key)
+        if not binding_info:
+            return True
+        fired_by_type: dict = {}
+        for oid in fired_oids:
+            obj = state.objects.get(oid)
+            if obj:
+                fired_by_type.setdefault(obj.object_type, set()).add(oid)
+        for obj_type, inv, required_oids in binding_info:
+            present = fired_by_type.get(obj_type, set())
+            if not present:
+                return False
+            if inv == 'any':
+                if not (required_oids & present):
+                    return False
+            else:  # 'all'
+                if not required_oids.issubset(present):
+                    return False
+        return True
+
 
     def _get_activity_by_name(self, activity_name: str) -> Optional[Activity]:
         # #1: O(1) dict lookup using cached _act_by_name built in __init__
@@ -903,6 +995,10 @@ class Simulator:
             defaults = attribute_defaults.get(object_type, {})
             obj = state.add_object(object_type=object_type, attributes=defaults)
             created_object_ids.append(obj.object_id)
+            # Phase 4: record initial attribute values in history
+            if defaults:
+                for attr_name, attr_val in defaults.items():
+                    obj.attribute_history.append((state.current_time, attr_name, attr_val))
             # Phase 3: add newly created object to eligibility for start activities only.
             # Non-start activities are updated via _update_eligibility when prerequisites fire.
             for act_name in self._start_names_set:
@@ -1010,12 +1106,31 @@ class Simulator:
                     obj = state.objects.get(oid)
                     if obj and obj.object_type == binding.object_type:
                         for upd in updates:
-                            _apply_attribute_update(obj, upd)
+                            _apply_attribute_update(obj, upd, timestamp=in_prog.complete_at)
+
+            # Phase 3: capture event-level attributes
+            evt_attrs: dict = {}
+            for cap in getattr(activity, 'event_attributes', ()) or ():
+                source = cap.get('source')
+                name   = cap.get('name', '')
+                if not name:
+                    continue
+                if source == 'static':
+                    evt_attrs[name] = cap.get('value')
+                elif source == 'object':
+                    cap_type = cap.get('object_type', '')
+                    cap_attr = cap.get('attribute', '')
+                    for oid in in_prog.participating_object_ids:
+                        obj = state.objects.get(oid)
+                        if obj and obj.object_type == cap_type:
+                            evt_attrs[name] = obj.attributes.get(cap_attr)
+                            break
 
         executed_event = state.record_event(
             activity_name=in_prog.candidate_activity_name,
             participating_object_ids=in_prog.participating_object_ids,
             timestamp=in_prog.complete_at,
+            attributes=evt_attrs if activity else {},
         )
         state.current_time = in_prog.complete_at
 

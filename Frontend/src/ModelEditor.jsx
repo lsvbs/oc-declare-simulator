@@ -1,6 +1,23 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import './ModelEditor.css';
 
+// ── Scope formatter ───────────────────────────────────────────────────────────
+function formatScope(scope) {
+  if (!scope) return '';
+  const bindings = scope.bindings || [];
+  if (bindings.length <= 1) {
+    if (scope.kind && scope.object_type) return `${scope.kind} ${scope.object_type}`;
+    return scope.object_type || scope.kind || '';
+  }
+  const groups = {};
+  for (const [t, inv] of bindings) {
+    (groups[inv] = groups[inv] || []).push(t);
+  }
+  return Object.entries(groups)
+    .map(([inv, types]) => `${inv.charAt(0).toUpperCase() + inv.slice(1)}(${types.join(',')})`)
+    .join(', ');
+}
+
 // ── O2O UML Diagram ───────────────────────────────────────────────────────────
 const NODE_R   = 34;
 const O2O_PALETTE = ['#667eea','#10b981','#f59e0b','#ef4444','#8b5cf6',
@@ -180,13 +197,70 @@ export function O2ODiagram({ rules, otNames }) {
 }
 
 // ── HelpTip ──────────────────────────────────────────────────────────────────
-function HelpTip({ text }) {
+function HelpTip({ text, children }) {
   const [visible, setVisible] = useState(false);
   return (
-    <span className="help-tip" onMouseEnter={() => setVisible(true)} onMouseLeave={() => setVisible(false)}>
+    <span className="help-tip" onMouseEnter={() => setVisible(true)} onMouseLeave={() => setVisible(false)}
+      style={children ? {display:'inline-flex',alignItems:'center',gap:'2px'} : undefined}>
+      {children}
       <span className="help-tip-icon">?</span>
       {visible && <span className="help-tip-popup">{text}</span>}
     </span>
+  );
+}
+
+// ── Sort helpers ──────────────────────────────────────────────────────────────
+function useSortState() {
+  const [s, setSt] = useState({col:null,dir:null});
+  const cycle = col => setSt(p => p.col!==col ? {col,dir:'asc'} : p.dir==='asc' ? {col,dir:'desc'} : {col:null,dir:null});
+  const set = (col, dir) => setSt(col ? {col, dir} : {col:null, dir:null});
+  return [s, cycle, set];
+}
+function sortedBy(arr, s, val) {
+  if (!s.col) return arr;
+  return [...arr].sort((a,b) => {
+    const va=val(a,s.col), vb=val(b,s.col);
+    const isNum = v => v!==''&&v!=null&&!isNaN(+v);
+    const cmp = isNum(va)&&isNum(vb) ? +va - +vb : String(va??'').localeCompare(String(vb??''));
+    return s.dir==='asc' ? cmp : -cmp;
+  });
+}
+function SortHdr({col, s, cycle, children, style={}}) {
+  const active = s.col===col;
+  const icon = active&&s.dir==='asc' ? '▲' : active&&s.dir==='desc' ? '▼' : '⇅';
+  return (
+    <span onClick={()=>cycle(col)} title="Click to sort" style={{cursor:'pointer',userSelect:'none',display:'inline-flex',alignItems:'center',gap:'2px',...style}}>
+      {children}<span style={{fontSize:'0.6em',opacity:active?1:0.4,color:active?'#6366f1':'#94a3b8'}}>{icon}</span>
+    </span>
+  );
+}
+function SortSelect({s, set, columns, tips}) {
+  const val = s.col ? `${s.col}:${s.dir}` : 'log';
+  const active = !!s.col;
+  const tipContent = tips ? (
+    <span>{columns.map((c, i) => (
+      <span key={c.col}>{i > 0 && <><br/><br/></>}<strong>{c.label}:</strong> {tips[c.col]}</span>
+    ))}</span>
+  ) : null;
+  return (
+    <div style={{display:'inline-flex',alignItems:'center',gap:'0.3rem',padding:'0.3rem 0.5rem',
+      background:'#f8fafc',border:'1px solid',borderColor:active?'#6366f1':'#e2e8f0',
+      borderRadius:'6px',fontSize:'0.75rem',flexShrink:0}}>
+      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Sort:</span>
+      <select value={val}
+        onChange={e => { const v=e.target.value; if(v==='log') set(null); else { const [col,dir]=v.split(':'); set(col,dir); } }}
+        style={{fontSize:'0.73rem',border:'1px solid',borderRadius:'3px',padding:'1px 3px',
+          background:active?'#eff6ff':'white',borderColor:active?'#6366f1':'#cbd5e1'}}>
+        <option value="log">Event Log order</option>
+        <optgroup label="Sort by column">
+          {columns.flatMap(({col,label}) => [
+            <option key={col+':asc'} value={col+':asc'}>{label} ↑ (A–Z / Low–High)</option>,
+            <option key={col+':desc'} value={col+':desc'}>{label} ↓ (Z–A / High–Low)</option>,
+          ])}
+        </optgroup>
+      </select>
+      {tipContent && <HelpTip text={tipContent}/>}
+    </div>
   );
 }
 
@@ -200,7 +274,7 @@ const CONSTRAINT_TYPES = [
   'alternate_response', 'alternate_precedence', 'alternate_succession',
 ];
 
-const CONSTRAINT_HELP = {
+export const CONSTRAINT_HELP = {
   precedence:           'B is blocked until A has fired on the same scope object. nmin ≥ 1 (default) enforces this; nmax caps how many A-occurrences may precede B.',
   not_precedence:       'Once A fires on a scope object, B is permanently blocked for that object. B can still fire freely before A occurs.',
   response:             'If A fires on an object, B must eventually follow. Use n≤ to cap how many times B may fire per scope object.',
@@ -220,12 +294,12 @@ const CONSTRAINT_HELP = {
   alternate_precedence: 'Each B must be preceded by A, with no other B in between. B is blocked when it would exceed the count of A firings.',
   alternate_succession: 'Alternating A then B with no repetitions (Alternate Response ∧ Alternate Precedence).',
 };
-const SCOPE_KINDS      = ['each', 'global', 'any', 'all'];
+const SCOPE_KINDS      = ['each', 'any', 'all'];
 
 // nmin defaults to 1 so a manually added precedence constraint actually enforces
 // "source before target" during simulation. nmin is only meaningful for
 // precedence; the other constraint checks ignore it, so the default is harmless.
-const EMPTY_CONSTRAINT = { constraint_type: 'precedence', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null };
+const EMPTY_CONSTRAINT = { constraint_type: '', source_activity: '', target_activity: '', scope: { kind: 'each', object_type: '' }, nmin: 1, nmax: null, guard: null };
 const EMPTY_O2O        = { source_type: '', target_type: '', min_links: 0, max_links: null, bidirectional: true };
 
 function ObjectLifecycleSummary({ otNames, activities, resourceTypes }) {
@@ -296,12 +370,14 @@ export default function ModelEditor({
   startActivities = [],
   onStartActivitiesChange = null,
   onUseParameters = null,
+  tracePosition = {},
 }) {
   const [activeTab,      setActiveTab]      = useState('activities');
   const [collapsed,      setCollapsed]      = useState(true);
   const [expandedActs,   setExpandedActs]   = useState(new Set());
   const [expandedGuards, setExpandedGuards] = useState(new Set()); // `${ai}-${bi}`
   const [expandedEffects,setExpandedEffects]= useState(new Set()); // `${ai}-${bi}`
+  const [expandedEventCaps,setExpandedEventCaps]= useState(new Set()); // ai
   const [selectedParamFile, setSelectedParamFile] = useState('');
   const [expandedProbs,  setExpandedProbs]  = useState(new Set());
   const [conFilter,      setConFilter]      = useState('');
@@ -311,6 +387,10 @@ export default function ModelEditor({
   const [showConSummary, setShowConSummary] = useState(new Set()); // activity names with popup visible
   // Per-activity "add binding" selected type: { [actName]: objectType }
   const [newBindingTypes, setNewBindingTypes] = useState({});
+  const [sortAct,  cycleAct,  setSortAct]  = useSortState();
+  const [sortCon,  cycleCon,  setSortCon]  = useSortState();
+  const [sortProb, cycleProb, setSortProb] = useSortState();
+  const [sortTime, cycleTime, setSortTime] = useSortState();
 
   if (!model || Array.isArray(model)) return null;
 
@@ -332,6 +412,11 @@ export default function ModelEditor({
       ...a,
       bindings: (a.bindings || []).map((b, bidx) => bidx !== bi ? b : { ...b, [field]: value }),
     });
+    onModelChange({ ...model, activities: newActs });
+  };
+
+  const updateActivityEventCaps = (actName, caps) => {
+    const newActs = activities.map(a => a.name !== actName ? a : { ...a, event_attributes: caps });
     onModelChange({ ...model, activities: newActs });
   };
 
@@ -387,6 +472,7 @@ export default function ModelEditor({
   };
 
   const addConstraint = () => {
+    if (!newCon.constraint_type) return;
     const isUnary = ['absence', 'exactly', 'init'].includes(newCon.constraint_type);
     if (isUnary) {
       if (!newCon.source_activity) return;
@@ -484,12 +570,12 @@ export default function ModelEditor({
   const TABS = [
     { id: 'activities',   label: 'Activities',   count: activities.length },
     { id: 'constraints',  label: 'Constraints',  count: constraints.length },
-    { id: 'o2o',          label: 'O2O Rules',    count: o2oRules.length },
-    { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
-    { id: 'resources',    label: 'Permanent Objects', count: resourceTypes.length || null },
+    { id: 'o2o',          label: 'Obj-to-Obj', count: o2oRules.length },
+    // { id: 'attributes',   label: 'Attributes',   count: objectTypes.length },
+    // { id: 'resources',    label: 'Permanent Objects', count: resourceTypes.length || null },
     { id: 'probabilities',label: 'Probabilities',count: null },
     { id: 'timing',       label: 'Timing',       count: null },
-    { id: 'flow',         label: 'Object Flow',  count: null },
+    { id: 'flow',         label: 'Object Involvement',  count: null },
   ];
 
   // Pre-compute special filter sets
@@ -515,6 +601,7 @@ export default function ModelEditor({
   }, [constraints]);
 
   const [conSpecialFilter, setConSpecialFilter] = useState(''); // '' | 'selfloop' | 'multi_response'
+  const [groupByObjType, setGroupByObjType] = useState(false);
 
   const filteredConstraints = constraints.filter(c => {
     const textMatch = !conFilter ||
@@ -532,6 +619,59 @@ export default function ModelEditor({
     }
     return true;
   });
+  const sortedConstraints = (() => {
+    // Topological BFS layers for Activity Order sort
+    const inDeg = {}, outEdges = {}, allActs = new Set();
+    constraints.forEach(c => {
+      const src = c.source_activity, tgt = c.target_activity;
+      if (!src || !tgt || src === tgt) return;
+      allActs.add(src); allActs.add(tgt);
+      outEdges[src] = outEdges[src] || [];
+      outEdges[src].push(tgt);
+      inDeg[tgt] = (inDeg[tgt] || 0) + 1;
+      if (inDeg[src] === undefined) inDeg[src] = 0;
+    });
+    const actLayer = {};
+    const bfsQ = [];
+    for (const act of allActs) {
+      if ((inDeg[act] || 0) === 0) { actLayer[act] = 0; bfsQ.push(act); }
+    }
+    for (let i = 0; i < bfsQ.length; i++) {
+      const act = bfsQ[i];
+      for (const tgt of (outEdges[act] || [])) {
+        if (actLayer[tgt] === undefined || actLayer[tgt] < actLayer[act] + 1) {
+          actLayer[tgt] = actLayer[act] + 1;
+          bfsQ.push(tgt);
+        }
+      }
+    }
+    const conKey = (c, col) => {
+      if (col === 'type') return c.constraint_type || '';
+      if (col === 'source') return c.source_activity || '';
+      if (col === 'target') return c.target_activity || '';
+      if (col === 'scope') return c.scope?.object_type || '';
+      if (col === 'activity_order') {
+        const sl = String(actLayer[c.source_activity] ?? 999).padStart(4, '0');
+        const tl = String(actLayer[c.target_activity] ?? 999).padStart(4, '0');
+        return `${sl}.${tl}.${c.source_activity||''}.${c.target_activity||''}`;
+      }
+      return '';
+    };
+    const cmpFn = (a, b) => {
+      if (!sortCon.col) return 0;
+      const va = conKey(a, sortCon.col), vb = conKey(b, sortCon.col);
+      const isNum = v => v !== '' && v != null && !isNaN(+v);
+      const cmp = isNum(va) && isNum(vb) ? +va - +vb : String(va ?? '').localeCompare(String(vb ?? ''));
+      return sortCon.dir === 'asc' ? cmp : -cmp;
+    };
+    if (groupByObjType) {
+      return [...filteredConstraints].sort((a, b) => {
+        const objCmp = (a.scope?.object_type || '').localeCompare(b.scope?.object_type || '');
+        return objCmp !== 0 ? objCmp : cmpFn(a, b);
+      });
+    }
+    return sortedBy(filteredConstraints, sortCon, conKey);
+  })();
 
   // ── Timing helpers ────────────────────────────────────────────────────────
   const DIST_TYPES = ['lognormal', 'normal', 'exponential', 'fixed'];
@@ -656,15 +796,15 @@ export default function ModelEditor({
                 disabled={!selectedParamFile}
                 title="Load the selected parameter file into the editor"
               >
-                ⬆ Load
+                Load
               </button>
             </div>
             <button
               className="model-download-btn"
               onClick={downloadModel}
-              title="Download the current parameters (activities, bindings, constraints, O2O rules, timing, max-consecutive and edited probabilities) as a JSON file. A copy is also saved to IO/input/parameters so you can reload it later."
+              title="Download the current parameters (activities, bindings, constraints, object-to-object relationships, timing, max-consecutive and edited probabilities) as a JSON file. A copy is also saved to IO/input/parameters so you can reload it later."
             >
-              ⬇ Download JSON
+              Download JSON
             </button>
           </div>
         </div>
@@ -689,7 +829,7 @@ export default function ModelEditor({
           <div className="activities-list">
             {/* ── Toolbar: global constraint toggle + parameter buttons ── */}
             <div className="activities-toolbar">
-              <label className="act-con-summary-toggle" title="Show/hide constraint summary for each activity">
+              <label className="act-con-summary-toggle" title="Show/hide constraint summary for all activities">
                 <input
                   type="checkbox"
                   checked={showConSummary.size === activities.length && activities.length > 0}
@@ -699,7 +839,7 @@ export default function ModelEditor({
                     else setShowConSummary(new Set());
                   }}
                 />
-                Show constraints
+                Show all constraint summaries
               </label>
               <div className="activities-toolbar-right">
                 {!hideParameterButtons && (
@@ -719,8 +859,30 @@ export default function ModelEditor({
                 )}
               </div>
             </div>
+            <p style={{fontSize:'0.78rem',color:'#64748b',margin:'0.25rem 0 0.5rem 0'}}>
+              All activities in the model. Expand an activity to configure its object bindings.
+            </p>
+            <div style={{display:'flex',flexWrap:'wrap',gap:'0.5rem 1rem',fontSize:'0.72rem',color:'#64748b',
+              background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',
+              padding:'0.35rem 0.65rem',marginBottom:'0.5rem',alignItems:'center'}}>
+              <span style={{fontWeight:700,color:'#94a3b8',fontSize:'0.65rem',textTransform:'uppercase',letterSpacing:'0.05em',marginRight:'0.25rem'}}>Legend:</span>
+              <span><span style={{fontWeight:700,color:'#16a34a',marginRight:'3px'}}>+</span>Creates new objects of that type</span>
+              <span><span style={{fontWeight:700,color:'#dc2626',marginRight:'3px'}}>−</span>Deactivates (ends lifecycle of) objects of that type</span>
+              <span><span style={{fontWeight:700,color:'#f59e0b',marginRight:'3px'}}>★</span>Start activity — simulation begins here</span>
+              <span><span style={{fontWeight:700,color:'#64748b',marginRight:'3px'}}>●</span>Activity involves this type (binding, no create/deactivate)</span>
+            </div>
+            {onStartActivitiesChange && activities.length > 0 && (
+              <div style={{display:'flex',justifyContent:'flex-end',paddingRight:'0.5rem',marginBottom:'0.15rem'}}>
+                <span style={{fontSize:'0.68rem',fontWeight:600,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.05em'}}>Start activity</span>
+              </div>
+            )}
             {activities.length === 0 && <p className="empty-notice">No activities defined.</p>}
-            {activities.map((act, ai) => (
+            {activities.length > 0 && (
+              <div style={{marginBottom:'0.4rem'}}>
+                <SortSelect s={sortAct} set={setSortAct} columns={[{col:'name',label:'Activity name'}]}/>
+              </div>
+            )}
+            {sortedBy(activities, sortAct, a => a.name).map((act, ai) => (
               <div key={act.name} id={`activity-row-${act.name}`} className={`activity-row ${expandedActs.has(act.name) ? 'open' : ''}`}>
                 <div className="activity-header" onClick={() => toggleAct(act.name)}>
                   <span className={`activity-expand ${expandedActs.has(act.name) ? 'open' : ''}`}>▶</span>
@@ -749,6 +911,29 @@ export default function ModelEditor({
                   <span className="activity-binding-count">
                     {(act.bindings || []).length} binding{(act.bindings || []).length !== 1 ? 's' : ''}
                   </span>
+                  <button
+                    className={`binding-guard-btn${(act.event_attributes?.length) ? ' active' : ''}`}
+                    title="Event captures: attribute values recorded into the event log when this activity fires"
+                    onClick={e => {
+                      e.stopPropagation();
+                      if (!expandedActs.has(act.name)) toggleAct(act.name);
+                      setExpandedEventCaps(prev => {
+                        const n = new Set(prev); n.has(act.name) ? n.delete(act.name) : n.add(act.name); return n;
+                      });
+                    }}>
+                    {(act.event_attributes?.length) ? '[event caps ✓]' : '[event caps]'}
+                  </button>
+                  <button
+                    className={`binding-guard-btn${showConSummary.has(act.name) ? ' active' : ''}`}
+                    title="Show constraint summary for this activity"
+                    onClick={e => {
+                      e.stopPropagation();
+                      setShowConSummary(prev => {
+                        const n = new Set(prev); n.has(act.name) ? n.delete(act.name) : n.add(act.name); return n;
+                      });
+                    }}>
+                    {showConSummary.has(act.name) ? '[constraints ✓]' : '[constraints]'}
+                  </button>
                 </div>
                 {expandedActs.has(act.name) && (
                   <div className="activity-bindings">
@@ -772,7 +957,7 @@ export default function ModelEditor({
                         <div className="binding-row">
                           <span className="binding-type-label">
                             {b.object_type}
-                            {isResource && <span className="binding-resource-badge" title="Permanent object type — fixed pool, never deactivated. Pool size is set in the Permanent Objects tab.">P</span>}
+                            {isResource && <span className="binding-resource-badge" title="Immutable object type — fixed pool, never deactivated.">I</span>}
                           </span>
                           <input
                             className="binding-num"
@@ -789,7 +974,7 @@ export default function ModelEditor({
                               e.target.value === '' ? null : parseInt(e.target.value) || 0)}
                           />
                           <label className={`binding-toggle${isResource ? ' binding-toggle-disabled' : ''}`}
-                            title={isResource ? 'Permanent objects come from the pre-populated pool — they cannot be created by activities and are never deactivated.' : ''}>
+                            title={isResource ? 'Immutable objects come from the pre-populated pool — they cannot be created by activities and are never deactivated.' : ''}>
                             <input type="checkbox" checked={isResource ? false : !!b.creates}
                               disabled={isResource}
                               onChange={e => !isResource && updateBinding(ai, bi, 'creates', e.target.checked)} />
@@ -872,7 +1057,12 @@ export default function ModelEditor({
                                   className="guard-op-select"
                                   value={upd.op || 'set'}
                                   onChange={e => {
-                                    const updated = (b.attribute_updates || []).map((u, i) => i === ui ? { ...u, op: e.target.value } : u);
+                                    const newOp = e.target.value;
+                                    const updated = (b.attribute_updates || []).map((u, i) => {
+                                      if (i !== ui) return u;
+                                      const { value: _v, by: _b, ...rest } = u;
+                                      return newOp === 'set' ? { ...rest, op: newOp, value: '' } : { ...rest, op: newOp, by: '' };
+                                    });
                                     updateBinding(ai, bi, 'attribute_updates', updated);
                                   }}>
                                   <option value="set">set</option>
@@ -924,13 +1114,91 @@ export default function ModelEditor({
                         + Add binding
                       </button>
                     </div>
+
+                    {/* ── Event captures section ── */}
+                    {expandedEventCaps.has(act.name) && (
+                      <div className="binding-effects-section" style={{marginTop:'0.5rem'}}>
+                        <span className="binding-guard-label" style={{marginBottom:'0.25rem',display:'block'}}>Event captures:</span>
+                        {(act.event_attributes || []).map((cap, ci) => (
+                          <div key={ci} className="binding-effects-row" style={{alignItems:'center',flexWrap:'wrap',gap:'0.35rem'}}>
+                            <input
+                              className="guard-attr-input"
+                              placeholder="attr name"
+                              value={cap.name || ''}
+                              onChange={e => {
+                                const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, name: e.target.value } : c);
+                                updateActivityEventCaps(act.name, caps);
+                              }}
+                            />
+                            <select
+                              className="guard-op-select"
+                              value={cap.source || 'static'}
+                              onChange={e => {
+                                const src = e.target.value;
+                                const base = { name: cap.name || '', source: src };
+                                const updated = src === 'static'
+                                  ? { ...base, value: '' }
+                                  : { ...base, object_type: '', attribute: '' };
+                                const caps = (act.event_attributes || []).map((c, i) => i === ci ? updated : c);
+                                updateActivityEventCaps(act.name, caps);
+                              }}>
+                              <option value="static">static</option>
+                              <option value="object">object</option>
+                            </select>
+                            {(cap.source || 'static') === 'static' ? (
+                              <input
+                                className="guard-value-input"
+                                placeholder="value"
+                                value={cap.value ?? ''}
+                                onChange={e => {
+                                  const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, value: e.target.value } : c);
+                                  updateActivityEventCaps(act.name, caps);
+                                }}
+                              />
+                            ) : (
+                              <>
+                                <select
+                                  className="guard-op-select"
+                                  value={cap.object_type || ''}
+                                  onChange={e => {
+                                    const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, object_type: e.target.value } : c);
+                                    updateActivityEventCaps(act.name, caps);
+                                  }}>
+                                  <option value="">type…</option>
+                                  {otNames.map(t => <option key={t} value={t}>{t}</option>)}
+                                </select>
+                                <input
+                                  className="guard-attr-input"
+                                  placeholder="attribute"
+                                  value={cap.attribute || ''}
+                                  onChange={e => {
+                                    const caps = (act.event_attributes || []).map((c, i) => i === ci ? { ...c, attribute: e.target.value } : c);
+                                    updateActivityEventCaps(act.name, caps);
+                                  }}
+                                />
+                              </>
+                            )}
+                            <button className="row-delete-btn" title="Remove capture"
+                              onClick={() => {
+                                const caps = (act.event_attributes || []).filter((_, i) => i !== ci);
+                                updateActivityEventCaps(act.name, caps);
+                              }}>✕</button>
+                          </div>
+                        ))}
+                        <button className="add-binding-btn" style={{marginTop:'0.25rem'}}
+                          onClick={() => {
+                            const caps = [...(act.event_attributes || []), { name: '', source: 'static', value: '' }];
+                            updateActivityEventCaps(act.name, caps);
+                          }}>+ Add capture</button>
+                      </div>
+                    )}
                   </div>
                 )}
                 {/* ── Constraint summary popup ── */}
                 {showConSummary.has(act.name) && (() => {
                   const actName = act.name;
                   const cons = constraints || [];
-                  const scopePart = c => c.scope?.object_type ? ` per ${c.scope.object_type}` : '';
+                  const scopePart = c => c.scope ? ` per ${(c.scope.bindings||[]).length > 1 ? c.scope.bindings.map(([t])=>t).join(', ') : c.scope.object_type}` : '';
                   const times = n => n == null ? '' : n === 1 ? 'once' : `${n} times`;
                   const nminPart = c => (c.nmin ?? 0) > 1 ? ` at least ${times(c.nmin)}` : '';
                   const nmaxPart = c => (c.nmax ?? null) !== null ? `, at most ${times(c.nmax)}` : '';
@@ -1072,7 +1340,11 @@ export default function ModelEditor({
 
                   const ConstraintBadge = ({ c }) => (
                     <div className="con-hint-badge-wrap">
-                      <span className={`constraint-type-badge ${c.constraint_type}`} style={{fontSize:'0.6rem'}}>
+                      <span
+                        className={`constraint-type-badge ${c.constraint_type}`}
+                        style={{fontSize:'0.6rem'}}
+                        title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g,' ')}
+                      >
                         {c.constraint_type.replace(/_/g,' ')}
                       </span>
                       {cardLabel(c) && <span className="con-hint-card">{cardLabel(c)}</span>}
@@ -1133,14 +1405,26 @@ export default function ModelEditor({
         {/* ━━ CONSTRAINTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
         {activeTab === 'constraints' && (
           <div>
-            <div className="toolbar-row">
-              <input
-                className="filter-input"
-                placeholder="Filter by activity name…"
-                value={conFilter}
-                onChange={e => setConFilter(e.target.value)}
-              />
-              <span className="filter-count">{filteredConstraints.length} / {constraints.length}</span>
+            <div style={{fontSize:'0.95rem',fontWeight:600,marginBottom:'0.5rem'}}>{constraints.length} Constraints</div>
+            <div style={{display:'flex',gap:'0.4rem',alignItems:'center',marginBottom:'0.4rem',flexWrap:'wrap'}}>
+              <SortSelect s={sortCon} set={setSortCon} columns={[
+                {col:'type',label:'Type'},{col:'source',label:'Source'},
+                {col:'target',label:'Target'},{col:'activity_order',label:'Activity Order'},
+              ]} tips={{
+                type: 'Groups all constraints of the same type together (response, precedence, not_coexistence, etc.).',
+                source: 'Alphabetical by source activity name.',
+                target: 'Alphabetical by target activity name.',
+                activity_order: 'Process-flow order: constraints from "entry" activities (no predecessors in the constraint graph) appear first, then activities reachable from them layer by layer, ending with activities that are only ever targets.',
+              }}/>
+              <div className="toolbar-row" style={{flex:1,marginBottom:0}}>
+                <input
+                  className="filter-input"
+                  placeholder="Filter by activity name…"
+                  value={conFilter}
+                  onChange={e => setConFilter(e.target.value)}
+                />
+                <span className="filter-count">{filteredConstraints.length} / {constraints.length}</span>
+              </div>
             </div>
             <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'0.5rem'}}>
               <button
@@ -1163,82 +1447,130 @@ export default function ModelEditor({
                 Multiple responses before
                 {activitiesWithMultipleResponsesBefore.size > 0 && <span className="con-filter-badge">{activitiesWithMultipleResponsesBefore.size}</span>}
               </button>
+              <label title="When checked, constraints are grouped by their scope object type, shown in bordered boxes with the type name as a title. The selected sort applies within each group."
+                className={`con-filter-btn${groupByObjType ? ' active' : ''}`}
+                style={{display:'inline-flex',alignItems:'center',gap:'0.3rem',cursor:'pointer',userSelect:'none'}}>
+                <input type="checkbox" checked={groupByObjType} onChange={e => setGroupByObjType(e.target.checked)}
+                  style={{margin:0,accentColor:'#6366f1'}}/>
+                Group by object type
+              </label>
             </div>
 
             <div className="constraints-list">
               {filteredConstraints.length === 0 && (
                 <p className="empty-notice">No constraints match the filter.</p>
               )}
-              {filteredConstraints.map((c, idx) => {
-                const realIdx = constraints.indexOf(c);
-                const isEditing = editingConIdx === realIdx;
-                return (
-                  <div key={idx} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}>
-                    <span className={`constraint-type-badge ${c.constraint_type}`}>
-                      {c.constraint_type.replace(/_/g, ' ')}
-                    </span>
-                    <span className="constraint-src">{c.source_activity}</span>
-                    <span className="constraint-arrow">→</span>
-                    <span className="constraint-tgt">{c.target_activity}</span>
-                    {!isEditing ? (
-                      <>
-                        <span className="constraint-scope">
-                          [{c.scope?.kind}{c.scope?.object_type ? ` ${c.scope.object_type}` : ''}]
-                        </span>
-                        {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
-                          ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
-                          <span className="constraint-card">
-                            {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
+              {(() => {
+                const renderRow = (c, key) => {
+                  const realIdx = constraints.indexOf(c);
+                  const isEditing = editingConIdx === realIdx;
+                  const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                    : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                    : undefined;
+                  return (
+                    <div key={key} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}
+                      style={rowBg ? {background:rowBg} : undefined}>
+                      <span
+                        className={`constraint-type-badge ${c.constraint_type}`}
+                        title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g, ' ')}
+                      >
+                        {c.constraint_type.replace(/_/g, ' ')}
+                      </span>
+                      <span className="constraint-src">{c.source_activity}</span>
+                      <span className="constraint-arrow">→</span>
+                      <span className="constraint-tgt">{c.target_activity}</span>
+                      {!isEditing ? (
+                        <>
+                          <span className="constraint-scope">
+                            [{formatScope(c.scope)}]
                           </span>
-                        )}
-                        <button className="row-edit-btn" onClick={() => setEditingConIdx(realIdx)} title="Edit constraint">✏</button>
-                      </>
-                    ) : (
-                      <div className="constraint-edit-inline">
-                        <label className="constraint-edit-label">scope kind:
-                          <select
-                            className="constraint-edit-select"
-                            value={c.scope?.kind || 'each'}
-                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, kind: e.target.value } })}
-                          >
-                            <option value="each">Each (∀)</option>
-                            <option value="any">Any</option>
-                            <option value="all">All</option>
-                            <option value="global">Global</option>
-                          </select>
-                        </label>
-                        <label className="constraint-edit-label">scope type:
-                          <select
-                            className="constraint-edit-select"
-                            value={c.scope?.object_type || ''}
-                            onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, object_type: e.target.value } })}
-                          >
-                            <option value="">—</option>
-                            {otNames.map(t => <option key={t} value={t}>{t}</option>)}
-                          </select>
-                        </label>
-                        <label className="constraint-edit-label">n≥:
-                          <input type="number" min={0} className="constraint-edit-num"
-                            value={c.nmin ?? 0}
-                            onChange={e => updateConstraint(realIdx, { nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) })}
-                          />
-                        </label>
-                        <label className="constraint-edit-label">n≤:
-                          <input type="number" min={0} className="constraint-edit-num"
-                            placeholder="∞"
-                            value={c.nmax ?? ''}
-                            onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
-                          />
-                        </label>
-                        <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
-                      </div>
-                    )}
-                    <button className="row-delete-btn" onClick={() => { deleteConstraint(realIdx); setEditingConIdx(null); }} title="Remove">✕</button>
-                  </div>
-                );
-              })}
+                          {(c.constraint_type === 'precedence' || c.constraint_type === 'response') &&
+                            ((c.nmin ?? 0) > 0 || (c.nmax ?? null) !== null) && (
+                            <span className="constraint-card">
+                              {(c.nmin ?? 0) > 0 ? `n≥${c.nmin}` : ''}{(c.nmax ?? null) !== null ? ` n≤${c.nmax}` : ''}
+                            </span>
+                          )}
+                          <button className="row-edit-btn" onClick={() => setEditingConIdx(realIdx)} title="Edit constraint">✏</button>
+                        </>
+                      ) : (
+                        <div className="constraint-edit-inline">
+                          <label className="constraint-edit-label"><HelpTip text="each = constraint applies per individual object instance; any = at least one instance satisfies it; all = every instance must satisfy it.">scope kind:</HelpTip>
+                            <select
+                              className="constraint-edit-select"
+                              value={c.scope?.kind || 'each'}
+                              onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, kind: e.target.value } })}
+                            >
+                              <option value="each">each — per individual object</option>
+                              <option value="any">any — at least one object</option>
+                              <option value="all">all — every object</option>
+                            </select>
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="The object type whose instances the constraint is evaluated against.">scope type:</HelpTip>
+                            <select
+                              className="constraint-edit-select"
+                              value={c.scope?.object_type || ''}
+                              onChange={e => updateConstraint(realIdx, { scope: { ...c.scope, object_type: e.target.value } })}
+                            >
+                              <option value="">—</option>
+                              {otNames.map(t => <option key={t} value={t}>{t}</option>)}
+                            </select>
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="Minimum Source firings required before Target may fire (nmin). Default 0 = no minimum.">n≥:</HelpTip>
+                            <input type="number" min={0} className="constraint-edit-num"
+                              value={c.nmin ?? 0}
+                              onChange={e => updateConstraint(realIdx, { nmin: e.target.value === '' ? 0 : parseInt(e.target.value, 10) })}
+                            />
+                          </label>
+                          <label className="constraint-edit-label"><HelpTip text="Maximum Source firings before Target must have fired (nmax). Leave blank for no upper bound.">n≤:</HelpTip>
+                            <input type="number" min={0} className="constraint-edit-num"
+                              placeholder="∞"
+                              value={c.nmax ?? ''}
+                              onChange={e => updateConstraint(realIdx, { nmax: e.target.value === '' ? null : parseInt(e.target.value, 10) })}
+                            />
+                          </label>
+                          {false && <label className="constraint-edit-label">
+                            <HelpTip text="Optional attribute guard (OC-Declare): scope objects not satisfying this predicate are exempt from this constraint. Same attribute/op/value format as binding guards.">guard:</HelpTip>
+                            {false && c.guard ? (
+                              <span style={{display:'flex',gap:'0.25rem',alignItems:'center'}}>
+                                <input className="constraint-edit-num" style={{width:'5rem'}} placeholder="attribute"
+                                  value={c.guard.attribute||''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, attribute: e.target.value} })} />
+                                <select className="constraint-edit-select" style={{width:'3.5rem'}} value={c.guard.op||'=='} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, op: e.target.value} })}>
+                                  {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
+                                </select>
+                                <input className="constraint-edit-num" style={{width:'4rem'}} placeholder="value"
+                                  value={c.guard.value??''} onChange={e => updateConstraint(realIdx, { guard: {...c.guard, value: e.target.value} })} />
+                                <button className="row-delete-btn" title="Remove guard" onClick={() => updateConstraint(realIdx, { guard: null })}>✕</button>
+                              </span>
+                            ) : (
+                              false && <button className="con-filter-btn" onClick={() => updateConstraint(realIdx, { guard: {attribute:'', op:'==', value:''} })}>+ add guard</button>
+                            )}
+                          </label>}
+                          <button className="row-edit-btn" onClick={() => setEditingConIdx(null)} title="Done">✓</button>
+                        </div>
+                      )}
+                      <button className="row-delete-btn" onClick={() => { deleteConstraint(realIdx); setEditingConIdx(null); }} title="Remove">✕</button>
+                    </div>
+                  );
+                };
+                if (groupByObjType) {
+                  const groups = [];
+                  sortedConstraints.forEach(c => {
+                    const ot = c.scope?.object_type || '';
+                    if (!groups.length || groups[groups.length - 1].ot !== ot) groups.push({ ot, items: [] });
+                    groups[groups.length - 1].items.push(c);
+                  });
+                  return groups.map((g, gi) => (
+                    <div key={gi} className="constraint-obj-group">
+                      <span className="constraint-obj-group-label">{g.ot || '(no object type)'}</span>
+                      {g.items.map((c, li) => renderRow(c, `g${gi}-${li}`))}
+                    </div>
+                  ));
+                }
+                return sortedConstraints.map((c, idx) => renderRow(c, idx));
+              })()}
             </div>
 
+            <div className="add-form-header">+ Add Constraint</div>
             <div className="add-form">
               <select value={newCon.constraint_type}
                 onChange={e => setNewCon(p => ({
@@ -1247,6 +1579,7 @@ export default function ModelEditor({
                   nmin: e.target.value === 'precedence' ? 1 : e.target.value === 'exactly' ? 1 : 0,
                   nmax: e.target.value === 'absence' ? 0 : null,
                 }))}>
+                <option value="">constraint…</option>
                 {CONSTRAINT_TYPES.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
               </select>
               {CONSTRAINT_HELP[newCon.constraint_type] && (
@@ -1276,7 +1609,11 @@ export default function ModelEditor({
               )}
               <select value={newCon.scope.kind}
                 onChange={e => setNewCon(p => ({ ...p, scope: { ...p.scope, kind: e.target.value, object_type: e.target.value === 'global' ? '' : p.scope.object_type } }))}>
-                {SCOPE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+                {SCOPE_KINDS.map(k => <option key={k} value={k}>{
+                  k === 'each' ? 'each — per individual object' :
+                  k === 'any'  ? 'any — at least one object' :
+                  'all — every object'
+                }</option>)}
               </select>
               {newCon.scope.kind !== 'global' && (
                 <select value={newCon.scope.object_type}
@@ -1318,6 +1655,21 @@ export default function ModelEditor({
                   />
                 </span>
               )}
+              {false && newCon.guard ? (
+                <span style={{display:'flex',gap:'0.25rem',alignItems:'center',flexWrap:'wrap'}}>
+                  <span style={{fontSize:'0.72rem',color:'#64748b'}}>guard: if</span>
+                  <input className="card-input" style={{width:'5rem'}} placeholder="attribute"
+                    value={newCon.guard.attribute||''} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, attribute: e.target.value} }))} />
+                  <select className="constraint-edit-select" style={{width:'3.5rem'}} value={newCon.guard.op||'=='} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, op: e.target.value} }))}>
+                    {['==','!=','>','<','>=','<='].map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                  <input className="card-input" style={{width:'4rem'}} placeholder="value"
+                    value={newCon.guard.value??''} onChange={e => setNewCon(p => ({ ...p, guard: {...p.guard, value: e.target.value} }))} />
+                  <button className="row-delete-btn" title="Remove guard" onClick={() => setNewCon(p => ({ ...p, guard: null }))}>✕</button>
+                </span>
+              ) : (
+                false && <button className="con-filter-btn" onClick={() => setNewCon(p => ({ ...p, guard: {attribute:'', op:'==', value:''} }))}>+ guard</button>
+              )}
               <button className="add-form-btn" onClick={addConstraint}>+ Add</button>
             </div>
           </div>
@@ -1327,7 +1679,7 @@ export default function ModelEditor({
         {activeTab === 'o2o' && (
           <div>
             <div className="o2o-list">
-              {o2oRules.length === 0 && <p className="empty-notice">No O2O rules defined.</p>}
+              {o2oRules.length === 0 && <p className="empty-notice">No object-to-object relationships defined.</p>}
               {o2oRules.map((r, idx) => (
                 <div key={idx} className="o2o-row">
                   <span className="o2o-src">{r.source_type}</span>
@@ -1336,7 +1688,7 @@ export default function ModelEditor({
                   </span>
                   <span className="o2o-tgt">{r.target_type}</span>
                   <span className="o2o-cardinality">
-                    min={r.min_links} max={r.max_links === null ? '∞' : r.max_links}
+                    max: {r.max_links === null ? '∞' : r.max_links}
                   </span>
                   <label className="binding-toggle">
                     <input type="checkbox" checked={!!r.bidirectional}
@@ -1368,12 +1720,9 @@ export default function ModelEditor({
                   onChange={e => setNewO2O(p => ({ ...p, bidirectional: e.target.checked }))} />
                 bidirectional
               </label>
-              <input className="binding-num" type="number" min={0} value={newO2O.min_links}
-                placeholder="min"
-                onChange={e => setNewO2O(p => ({ ...p, min_links: parseInt(e.target.value) || 0 }))} />
               <input className="binding-num" type="number" min={0}
                 value={newO2O.max_links === null ? '' : newO2O.max_links}
-                placeholder="max (∞)"
+                placeholder="max links (∞)"
                 onChange={e => setNewO2O(p => ({
                   ...p, max_links: e.target.value === '' ? null : parseInt(e.target.value) || 0
                 }))} />
@@ -1397,7 +1746,7 @@ export default function ModelEditor({
               });
               const involved = new Set(o2oRules.flatMap(r => [r.source_type, r.target_type]));
               const cols = otNames.filter(t => involved.has(t));
-              const fmtCell = ({min, max}) => `${min}..${max == null ? '∞' : max}`;
+              const fmtCell = ({min, max}) => { const s = max == null ? '∞' : max; return (max !== null && min === max) ? String(min) : `${min}-${s}`; };
               return (
                 <div style={{overflowX:'auto',marginTop:'1rem'}}>
                   <table className="o2o-preview-table">
@@ -1440,7 +1789,12 @@ export default function ModelEditor({
               completely blocked — set them very low rather than exactly 0 to reduce their frequency.
             </p>
             {actNames.length === 0 && <p className="empty-notice">No activities defined.</p>}
-            {actNames.map(src => {
+            {actNames.length > 0 && (
+              <div style={{marginBottom:'0.4rem'}}>
+                <SortSelect s={sortProb} set={setSortProb} columns={[{col:'from',label:'From activity'}]}/>
+              </div>
+            )}
+            {sortedBy(actNames, sortProb, n => n).map(src => {
               const row      = probMatrix[src] || {};
               const rowTotal = actNames.reduce((s, a) => s + (row[a] || 0), 0);
               const isOpen   = expandedProbs.has(src);
@@ -1497,7 +1851,7 @@ export default function ModelEditor({
 
 
         {/* ━━ ATTRIBUTES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
-        {activeTab === 'attributes' && (
+        {false && activeTab === 'attributes' && (
           <div>
             <p className="prob-hint">
               Attribute definitions and default values per object type. Definitions come from the
@@ -1509,6 +1863,19 @@ export default function ModelEditor({
               const otName = typeof ot === 'string' ? ot : ot.name;
               const attrDefs = (typeof ot === 'object' ? ot.attributes : null) || [];
               const schema = (model.attribute_schema || {})[otName] || {};
+
+              // Also show attrs discovered only in attribute_schema (no explicit type def)
+              const defNames = new Set(attrDefs.map(a => a.name));
+              const mergedAttrDefs = [
+                ...attrDefs,
+                ...Object.keys(schema)
+                  .filter(n => !defNames.has(n))
+                  .map(n => {
+                    const v = schema[n];
+                    const type = typeof v === 'boolean' ? 'boolean' : typeof v === 'number' ? 'float' : 'string';
+                    return { name: n, type, _discovered: true };
+                  }),
+              ];
 
               const updateDefault = (attrName, value) => {
                 const newSchema = {
@@ -1550,13 +1917,13 @@ export default function ModelEditor({
               return (
                 <div key={otName} className="timing-row">
                   <div className="timing-act-name">{otName}</div>
-                  {attrDefs.length === 0 && (
+                  {mergedAttrDefs.length === 0 && (
                     <span className="timing-no-data">no attributes defined</span>
                   )}
-                  {attrDefs.map(ad => (
+                  {mergedAttrDefs.map(ad => (
                     <div key={ad.name} className="attr-row">
                       <span className="attr-name">{ad.name}</span>
-                      <span className="attr-type">({ad.type})</span>
+                      <span className="attr-type" title={ad._discovered ? 'type inferred from discovered values' : undefined}>({ad.type}{ad._discovered ? ', discovered' : ''})</span>
                       <input
                         className="attr-default-input"
                         title={`Default value for ${ad.name}`}
@@ -1575,7 +1942,7 @@ export default function ModelEditor({
         )}
 
         {/* ━━ RESOURCES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
-        {activeTab === 'resources' && (
+        {false && activeTab === 'resources' && (
           <div>
             <p className="prob-hint">
               Permanent object types are <strong>permanently active</strong> and never deactivated — they
@@ -1646,7 +2013,22 @@ export default function ModelEditor({
               </div>
             </details>
             {actNames.length === 0 && <p className="empty-notice">No activities defined.</p>}
-            {actNames.map(act => {
+            {actNames.length > 0 && (
+              <div style={{marginBottom:'0.4rem'}}>
+                <SortSelect s={sortTime} set={setSortTime} columns={[
+                  {col:'name',label:'Activity'},{col:'mean',label:'Mean (s)'},
+                  {col:'std',label:'Std (s)'},{col:'logmean',label:'Log Mean'},
+                ]}/>
+              </div>
+            )}
+            {sortedBy(actNames, sortTime, (act, col) => {
+              const td = timingData[act] || {};
+              if (col==='name') return act;
+              if (col==='mean') return td.mean_seconds??'';
+              if (col==='std') return td.std_seconds??'';
+              if (col==='logmean') return td.log_mean_seconds??'';
+              return act;
+            }).map(act => {
               const td = timingData[act] || {};
               const hasData = !!td.mean_seconds;
               return (
@@ -1733,14 +2115,61 @@ export default function ModelEditor({
               const creatingActs    = involvedActs.filter(a => (a.bindings || []).some(b => b.object_type === otype && b.creates));
               const deactivatingActs = involvedActs.filter(a => (a.bindings || []).some(b => b.object_type === otype && (b.deactivates || b.consumes)));
 
-              // Build a set of activity names in order they appear in the model
-              const actOrder = activities.map(a => a.name);
-              const sortedInvolved = involvedActs
-                .slice()
-                .sort((a, b) => actOrder.indexOf(a.name) - actOrder.indexOf(b.name));
+              // Topological sort: OCEL trace_position primary, constraint edges as structure, model order as tiebreaker
+              const involvedNames = new Set(involvedActs.map(a => a.name));
+              const modelOrder = activities.map(a => a.name);
 
-              // Derive edges: from probMatrix, only between activities involved with this type
-              const involvedNames = new Set(sortedInvolved.map(a => a.name));
+              // Rank by OCEL trace position (avg position in log); fall back to model order index
+              const ocelRank = (name) => {
+                if (name in tracePosition) return tracePosition[name];
+                return 1000 + modelOrder.indexOf(name);
+              };
+
+              const adj = {};
+              const indegree = {};
+              involvedActs.forEach(a => { adj[a.name] = []; indegree[a.name] = 0; });
+              constraints.forEach(c => {
+                if (!['precedence','chain_precedence'].includes(c.constraint_type)) return;
+                if (!involvedNames.has(c.source_activity) || !involvedNames.has(c.target_activity)) return;
+                if (!adj[c.source_activity].includes(c.target_activity)) {
+                  adj[c.source_activity].push(c.target_activity);
+                  indegree[c.target_activity]++;
+                }
+              });
+
+              // Kahn's algorithm — ties broken by OCEL rank
+              const byRank = (a, b) => ocelRank(a) - ocelRank(b);
+              const queue = Object.keys(indegree).filter(n => indegree[n] === 0).sort(byRank);
+              const sorted = [];
+              while (queue.length > 0) {
+                const node = queue.shift();
+                sorted.push(node);
+                adj[node].slice().sort(byRank).forEach(tgt => {
+                  indegree[tgt]--;
+                  if (indegree[tgt] === 0) {
+                    const pos = queue.findIndex(n => byRank(n, tgt) > 0);
+                    pos === -1 ? queue.push(tgt) : queue.splice(pos, 0, tgt);
+                  }
+                });
+              }
+              // Append any remaining (cycles) sorted by OCEL rank
+              involvedActs
+                .filter(a => !sorted.includes(a.name))
+                .sort((a, b) => byRank(a.name, b.name))
+                .forEach(a => sorted.push(a.name));
+
+              // Pin creators first, deactivators last — preserve topo order within each group
+              const creatorNames   = new Set(creatingActs.map(a => a.name));
+              const deactivatorNames = new Set(deactivatingActs.map(a => a.name));
+              const creators   = sorted.filter(n => creatorNames.has(n) && !deactivatorNames.has(n));
+              const deactivators = sorted.filter(n => deactivatorNames.has(n) && !creatorNames.has(n));
+              const middle     = sorted.filter(n => !creatorNames.has(n) && !deactivatorNames.has(n));
+              const bothRoles  = sorted.filter(n => creatorNames.has(n) && deactivatorNames.has(n));
+              const finalOrder = [...creators, ...bothRoles, ...middle, ...deactivators];
+
+              const sortedInvolved = finalOrder.map(n => involvedActs.find(a => a.name === n)).filter(Boolean);
+
+              // Derive edges from probMatrix
               const edges = [];
               sortedInvolved.forEach(a => {
                 const row = probMatrix[a.name] || {};
@@ -1751,7 +2180,7 @@ export default function ModelEditor({
                 });
               });
 
-              // Detect back-edges: if target appears earlier in model order than source
+              // Detect back-edges
               const nameIndex = {};
               sortedInvolved.forEach((a, i) => { nameIndex[a.name] = i; });
               const backEdges = new Set(
@@ -1763,61 +2192,63 @@ export default function ModelEditor({
               return (
                 <div key={otype} className="object-flow-type">
                   <div className="object-flow-type-header">
+                    <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',marginRight:'0.25rem'}}>Object:</span>
                     <span className="object-flow-type-name">{otype}</span>
                     {resourceTypes.includes(otype) && (
-                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Permanent</span>
+                      <span className="binding-resource-badge" style={{marginLeft:'0.4rem'}}>Immutable</span>
                     )}
                     <span className="object-flow-act-count">{sortedInvolved.length} activities</span>
                   </div>
 
-                  <div className="object-flow-track">
-                    {sortedInvolved.map((act, i) => {
-                      const isCreating    = creatingActs.some(a => a.name === act.name);
-                      const isDeactivating = deactivatingActs.some(a => a.name === act.name);
-                      const outgoing = edges.filter(e => e.from === act.name);
-                      const isLast = i === sortedInvolved.length - 1;
+                  <div style={{display:'flex',alignItems:'flex-start',gap:'0.5rem'}}>
+                    <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8',paddingTop:'0.55rem',whiteSpace:'nowrap',flexShrink:0}}>Object flow:</span>
+                    <div className="object-flow-track">
+                      {sortedInvolved.map((act, i) => {
+                        const isCreating    = creatingActs.some(a => a.name === act.name);
+                        const isDeactivating = deactivatingActs.some(a => a.name === act.name);
+                        const outgoing = edges.filter(e => e.from === act.name);
 
-                      return (
-                        <div key={act.name} className="object-flow-node-wrap">
-                          <div className={`object-flow-node${isCreating ? ' flow-creates' : ''}${isDeactivating ? ' flow-deactivates' : ''}`}>
-                            {isCreating && <span className="flow-node-badge flow-badge-create" title="Creates this object type">+</span>}
-                            {isDeactivating && <span className="flow-node-badge flow-badge-deact" title="Deactivates this object type">✕</span>}
-                            <button
-                              className="flow-node-name"
-                              onClick={() => {
-                                setActiveTab('activities');
-                                setExpandedActs(prev => { const n = new Set(prev); n.add(act.name); return n; });
-                                setTimeout(() => {
-                                  document.getElementById(`activity-row-${act.name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                }, 50);
-                              }}
-                              title="Jump to this activity in the Activities tab"
-                            >
-                              {act.name}
-                            </button>
-                          </div>
-
-                          {/* Outgoing transitions */}
-                          {outgoing.length > 0 && (
-                            <div className="object-flow-edges">
-                              {outgoing.map(e => {
-                                const isBack = backEdges.has(`${e.from}→${e.to}`);
-                                return (
-                                  <span
-                                    key={e.to}
-                                    className={`object-flow-edge${isBack ? ' flow-edge-back' : ''}`}
-                                    title={`${e.from} → ${e.to}: ${(e.prob * 100).toFixed(1)}%${isBack ? ' (back-edge)' : ''}`}
-                                  >
-                                    {isBack ? '↩ ' : '→ '}{e.to}
-                                    <span className="flow-edge-prob">{(e.prob * 100).toFixed(0)}%</span>
-                                  </span>
-                                );
-                              })}
+                        return (
+                          <div key={act.name} className="object-flow-node-wrap">
+                            <div className={`object-flow-node${isCreating ? ' flow-creates' : ''}${isDeactivating ? ' flow-deactivates' : ''}`}>
+                              {isCreating && <span className="flow-node-badge flow-badge-create" title="Creates this object type">+</span>}
+                              {isDeactivating && <span className="flow-node-badge flow-badge-deact" title="Deactivates this object type">✕</span>}
+                              <button
+                                className="flow-node-name"
+                                onClick={() => {
+                                  setActiveTab('activities');
+                                  setExpandedActs(prev => { const n = new Set(prev); n.add(act.name); return n; });
+                                  setTimeout(() => {
+                                    document.getElementById(`activity-row-${act.name}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                  }, 50);
+                                }}
+                                title="Jump to this activity in the Activities tab"
+                              >
+                                {act.name}
+                              </button>
                             </div>
-                          )}
-                        </div>
-                      );
-                    })}
+
+                            {outgoing.length > 0 && (
+                              <div className="object-flow-edges">
+                                {outgoing.map(e => {
+                                  const isBack = backEdges.has(`${e.from}→${e.to}`);
+                                  return (
+                                    <span
+                                      key={e.to}
+                                      className={`object-flow-edge${isBack ? ' flow-edge-back' : ''}`}
+                                      title={`${e.from} → ${e.to}: ${(e.prob * 100).toFixed(1)}%${isBack ? ' (back-edge)' : ''}`}
+                                    >
+                                      {isBack ? '↩ ' : '→ '}{e.to}
+                                      <span className="flow-edge-prob">{(e.prob * 100).toFixed(0)}%</span>
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
 
                   {backEdges.size > 0 && (

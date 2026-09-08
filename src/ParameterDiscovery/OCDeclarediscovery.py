@@ -5,11 +5,12 @@ This module discovers OC-Declare declarative constraints from object-centric eve
 It mines constraints like precedence and response rules with support/confidence metrics.
 """
 
+import csv
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 
 
@@ -62,11 +63,95 @@ def load_ocel2_xml(filename: str) -> Dict[str, Any]:
     }
 
 
+def load_ocel2_csv(filename: str) -> Dict[str, Any]:
+    """Convert a BPIC-style flat CSV event log into the internal OCEL 2.0 dict.
+
+    Expected columns (at minimum):
+        concept:name          – activity label
+        time:timestamp        – ISO timestamp
+        case:concept:name     – application/case object ID
+        EventOrigin           – object type context: Application | Workflow | Offer
+        EventID               – event-scoped object ID (workitem, state, or offer ID)
+        OfferID               – explicit offer object ID for offer state-change rows
+
+    Sparse offer-attribute columns (FirstWithdrawalAmount, NumberOfTerms, Accepted,
+    MonthlyCost, Selected, CreditScore, OfferedAmount) are captured on the Offer
+    object from the first row where they are non-empty.
+    """
+    objects: Dict[str, Any] = {}
+    events: Dict[str, Any] = {}
+
+    with open(filename, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            activity  = (row.get('concept:name') or '').strip()
+            timestamp = (row.get('time:timestamp') or '').strip()
+            case_id   = (row.get('case:concept:name') or '').strip()
+            origin    = (row.get('EventOrigin') or '').strip()
+            event_id_raw = (row.get('EventID') or '').strip()
+            offer_id  = (row.get('OfferID') or '').strip()
+
+            if not activity or not timestamp or not case_id:
+                continue
+
+            # ── Application object ─────────────────────────────────────────
+            if case_id not in objects:
+                objects[case_id] = {
+                    'type': 'Application',
+                    'attributes': {
+                        k: row.get(k, '') for k in
+                        ('case:LoanGoal', 'case:ApplicationType', 'case:RequestedAmount')
+                    },
+                }
+
+            omap = [case_id]
+
+            # ── Workflow workitem object ───────────────────────────────────
+            if origin == 'Workflow' and event_id_raw:
+                if event_id_raw not in objects:
+                    objects[event_id_raw] = {'type': 'Workflow', 'attributes': {}}
+                omap.append(event_id_raw)
+
+            # ── Offer object ───────────────────────────────────────────────
+            elif origin == 'Offer':
+                # Prefer explicit OfferID; fall back to EventID when it names the offer
+                resolved = offer_id or (event_id_raw if event_id_raw.startswith('Offer_') else None)
+                if resolved:
+                    if resolved not in objects:
+                        offer_attrs = {
+                            k: row.get(k, '') for k in
+                            ('FirstWithdrawalAmount', 'NumberOfTerms', 'Accepted',
+                             'MonthlyCost', 'Selected', 'CreditScore', 'OfferedAmount')
+                        }
+                        objects[resolved] = {'type': 'Offer', 'attributes': offer_attrs}
+                    else:
+                        # Back-fill sparse attributes from later rows if still empty
+                        existing = objects[resolved]['attributes']
+                        for k in ('FirstWithdrawalAmount', 'NumberOfTerms', 'Accepted',
+                                  'MonthlyCost', 'Selected', 'CreditScore', 'OfferedAmount'):
+                            if not existing.get(k) and row.get(k, '').strip():
+                                existing[k] = row[k].strip()
+                    omap.append(resolved)
+
+            events[f'evt_{i}'] = {
+                'activity':  activity,
+                'timestamp': timestamp,
+                'omap':      omap,
+            }
+
+    object_types = sorted({v['type'] for v in objects.values()})
+    return {
+        'events':      events,
+        'objects':     objects,
+        'objectTypes': [{'name': t} for t in object_types],
+    }
+
+
 def load_ocel2(filename: str) -> Dict[str, Any]:
-    """Load an OCEL 2.0 event log from a JSON or XML file.
+    """Load an OCEL 2.0 event log from a JSON, JSONOCEL, XML, or CSV file.
 
     Args:
-        filename: Path to OCEL 2.0 file (.json or .xml)
+        filename: Path to OCEL file (.json, .jsonocel, .xml, or .csv)
 
     Returns:
         Dictionary with 'events' and 'objects' keys
@@ -77,16 +162,38 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
 
     if filepath.suffix.lower() == '.xml':
         return load_ocel2_xml(filename)
-    
+
+    if filepath.suffix.lower() == '.csv':
+        return load_ocel2_csv(filename)
+
     with open(filepath, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+
     # Support both OCEL 2.0 format (dict) and simple list format
     if isinstance(data, dict):
-        # Handle case where objects/events might be arrays instead of dicts
-        # Some OCEL tools export objects/events as arrays
+        # ── OCEL 1.0 normalisation (.jsonocel / ocel:-prefixed keys) ─────────
+        if 'ocel:events' in data and 'ocel:objects' in data:
+            events_dict: Dict[str, Any] = {}
+            for eid, ev in data['ocel:events'].items():
+                events_dict[eid] = {
+                    'activity':  ev.get('ocel:activity', ''),
+                    'timestamp': ev.get('ocel:timestamp', ''),
+                    'omap':      ev.get('ocel:omap', []),
+                }
+            objects_dict: Dict[str, Any] = {}
+            for oid, obj in data['ocel:objects'].items():
+                objects_dict[oid] = {
+                    'type':       obj.get('ocel:type', ''),
+                    'attributes': obj.get('ocel:ovmap', {}),
+                }
+            global_log = data.get('ocel:global-log', {})
+            raw_types   = global_log.get('ocel:object-types', [])
+            object_types = [{'name': t} for t in raw_types] if raw_types else \
+                           [{'name': t} for t in sorted({v['type'] for v in objects_dict.values()})]
+            return {'events': events_dict, 'objects': objects_dict, 'objectTypes': object_types}
+
+        # ── OCEL 2.0 — objects/events may be arrays instead of dicts ─────────
         if 'objects' in data and isinstance(data['objects'], list):
-            # Convert objects array to dict
             objects_dict = {}
             for obj in data['objects']:
                 obj_id = obj.get('id') or obj.get('ocel:oid')
@@ -96,7 +203,7 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
                         'attributes': obj.get('attributes', {})
                     }
             data['objects'] = objects_dict
-        
+
         if 'events' in data and isinstance(data['events'], list):
             # Convert events array to dict
             events_dict = {}
@@ -105,10 +212,10 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
                 if evt_id:
                     # Extract activity name
                     activity = evt.get('activity') or evt.get('ocel:activity') or evt.get('type')
-                    
+
                     # Extract timestamp
                     timestamp = evt.get('timestamp') or evt.get('ocel:timestamp') or evt.get('time')
-                    
+
                     # Extract object relationships
                     # Handle both simple list of IDs and list of relationship objects
                     relationships = evt.get('omap') or evt.get('ocel:omap') or evt.get('relationships', [])
@@ -118,7 +225,7 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
                     else:
                         # Relationships is already a simple list of IDs
                         omap = relationships
-                    
+
                     events_dict[evt_id] = {
                         'activity': activity,
                         'timestamp': timestamp,
@@ -280,522 +387,845 @@ def discover_activities(ocel_log: Dict[str, Any]) -> List[str]:
     return sorted(list(activities))
 
 
-def calculate_precedence_support_confidence(
-    traces: Dict[str, List[str]], 
-    source: str, 
-    target: str
-) -> Tuple[float, float]:
-    """Calculate support and confidence for precedence constraint (source before target).
-    
-    Args:
-        traces: Dictionary of object_id -> activity sequence
-        source: Source activity
-        target: Target activity
-        
-    Returns:
-        Tuple of (support, confidence)
-        - support: % of traces where source precedes target
-        - confidence: % of traces with source where target follows
+# ──────────────────────────────────────────────────────────────────────────────
+# Küsters & van der Aalst (2025) OC-Declare Discovery
+# Reference: https://github.com/aarkue/OCPQ (rust4pm dependency)
+# "OC-DECLARE: Discovering Object-Centric Declarative Patterns with Synchronization"
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_discovery_indices(ocel_log: Dict[str, Any]) -> Dict[str, Any]:
+    """Build lookup tables for efficient arc checking."""
+    events  = ocel_log.get('events', {})
+    objects = ocel_log.get('objects', {})
+
+    events_by_activity: Dict[str, List[str]]            = defaultdict(list)
+    events_by_object:   Dict[str, List[Tuple]]           = defaultdict(list)  # oid→[(ts,eid)]
+    event_objs_by_type: Dict[str, Dict[str, List[str]]] = {}
+    event_time:         Dict[str, str]                   = {}
+    event_activity_map: Dict[str, str]                   = {}
+
+    ev_items = events.items() if isinstance(events, dict) else []
+    for eid, edata in ev_items:
+        if not isinstance(edata, dict):
+            continue
+        activity  = edata.get('activity') or edata.get('type', '')
+        timestamp = edata.get('timestamp', '')
+        omap      = edata.get('omap', []) or edata.get('relationships', [])
+        if not activity:
+            continue
+        events_by_activity[activity].append(eid)
+        event_time[eid] = timestamp
+        event_activity_map[eid] = activity
+        by_type: Dict[str, List[str]] = defaultdict(list)
+        for oid in omap:
+            obj   = (objects.get(oid) if isinstance(objects, dict) else None) or {}
+            otype = obj.get('type', '')
+            if otype:
+                by_type[otype].append(oid)
+                events_by_object[oid].append((timestamp, eid))
+        event_objs_by_type[eid] = dict(by_type)
+
+    for oid in events_by_object:
+        events_by_object[oid].sort(key=lambda x: x[0])
+
+    return {
+        'events_by_activity': dict(events_by_activity),
+        'events_by_object':   dict(events_by_object),
+        'event_objs_by_type': event_objs_by_type,
+        'event_time':         event_time,
+        'event_activity':     event_activity_map,
+    }
+
+
+def _get_max_objects_per_event(
+    ocel_log: Dict[str, Any],
+    activities: List[str],
+    object_types: List[str],
+) -> Dict[str, Dict[str, int]]:
+    """Return {activity: {obj_type: max_objects_in_any_single_event}}."""
+    events  = ocel_log.get('events', {})
+    objects = ocel_log.get('objects', {})
+    act_set = set(activities)
+    ot_set  = set(object_types)
+    result: Dict[str, Dict[str, int]] = {a: {} for a in activities}
+
+    ev_items = events.items() if isinstance(events, dict) else []
+    for eid, edata in ev_items:
+        if not isinstance(edata, dict):
+            continue
+        activity = edata.get('activity') or edata.get('type', '')
+        if activity not in act_set:
+            continue
+        omap = edata.get('omap', []) or edata.get('relationships', [])
+        counts: Dict[str, int] = {}
+        for oid in omap:
+            obj = (objects.get(oid) if isinstance(objects, dict) else None) or {}
+            otype = obj.get('type', '')
+            if otype in ot_set:
+                counts[otype] = counts.get(otype, 0) + 1
+        for otype, cnt in counts.items():
+            if cnt > result[activity].get(otype, 0):
+                result[activity][otype] = cnt
+    return result
+
+
+def _count_qualifying_events(
+    oid: str,
+    t_A: str,
+    arc_type: str,
+    obj_B_events: Dict[str, List[Tuple]],
+) -> int:
+    """Count qualifying B-events for one object binding (AS / EF / EP)."""
+    b_events = obj_B_events.get(oid, [])
+    if arc_type == 'EF':
+        return sum(1 for ts, _ in b_events if ts > t_A)
+    if arc_type == 'EP':
+        return sum(1 for ts, _ in b_events if ts < t_A)
+    return len(b_events)  # AS
+
+
+def _count_df_dp(
+    oid: str,
+    t_A: str,
+    act_B: str,
+    arc_type: str,
+    events_by_object: Dict[str, List[Tuple]],
+    event_activity: Dict[str, str],
+) -> int:
+    """Return 1 if the directly adjacent event (DF: after, DP: before) is act_B, else 0."""
+    obj_events = events_by_object.get(oid, [])  # sorted (ts, eid)
+    if arc_type == 'DF':
+        for ts, eid in obj_events:
+            if ts > t_A:
+                return 1 if event_activity.get(eid) == act_B else 0
+    else:  # DP
+        for ts, eid in reversed(obj_events):
+            if ts < t_A:
+                return 1 if event_activity.get(eid) == act_B else 0
+    return 0
+
+
+def _check_arc(
+    idx: Dict[str, Any],
+    act_A: str,
+    act_B: str,
+    arc_type: str,
+    obj_type: str,
+    involvement: str,
+    noise_threshold: float,
+    counts_min: int = 1,
+    counts_max: Optional[int] = 20,
+) -> Optional[Dict[str, Any]]:
     """
-    total_traces = len(traces)
-    if total_traces == 0:
-        return 0.0, 0.0
-    
-    traces_with_precedence = 0
-    traces_with_source = 0
-    
-    for trace in traces.values():
-        has_source = source in trace
-        if not has_source:
+    Check one OC-Declare arc (act_A → act_B, arc_type, obj_type, involvement).
+
+    involvement semantics mirror OCPQ/rust4pm OCDeclareArcLabel.get_bindings():
+      'each' — one binding per T-object in source event; event violated if ANY fails.
+      'any'  — one binding (union of all T-objects); event violated if NONE qualifies.
+      'all'  — one binding requiring ALL T-objects in the same target event.
+
+    support = satisfied_events / total_events_with_T-object.
+    Returns arc dict if support >= 1 − noise_threshold, else None.
+    """
+    eids_A     = idx['events_by_activity'].get(act_A, [])
+    eids_B_set = set(idx['events_by_activity'].get(act_B, []))
+    if not eids_A or not eids_B_set:
+        return None
+
+    event_time         = idx['event_time']
+    event_objs_by_type = idx['event_objs_by_type']
+    events_by_object   = idx['events_by_object']
+    event_activity     = idx['event_activity']
+
+    # Build per-object B-event index: oid → [(ts, eid)]
+    obj_B_events: Dict[str, List[Tuple]] = {}
+    for eid in eids_B_set:
+        for oid in event_objs_by_type.get(eid, {}).get(obj_type, []):
+            obj_B_events.setdefault(oid, []).append((event_time.get(eid, ''), eid))
+    for oid in obj_B_events:
+        obj_B_events[oid].sort()
+
+    total = satisfied = 0
+
+    for eid_A in eids_A:
+        A_objs = event_objs_by_type.get(eid_A, {}).get(obj_type, [])
+        if not A_objs:
+            continue
+        t_A = event_time.get(eid_A, '')
+        total += 1
+        event_ok = False
+
+        if involvement == 'each':
+            event_ok = True
+            for oid in A_objs:
+                if arc_type in ('DF', 'DP'):
+                    cnt = _count_df_dp(oid, t_A, act_B, arc_type, events_by_object, event_activity)
+                else:
+                    cnt = _count_qualifying_events(oid, t_A, arc_type, obj_B_events)
+                if cnt < counts_min or (counts_max is not None and cnt > counts_max):
+                    event_ok = False
+                    break
+
+        elif involvement == 'any':
+            if arc_type in ('DF', 'DP'):
+                event_ok = any(
+                    _count_df_dp(oid, t_A, act_B, arc_type, events_by_object, event_activity) >= counts_min
+                    for oid in A_objs
+                )
+            else:
+                qualifying_eids: Set[str] = set()
+                for oid in A_objs:
+                    for ts, eid in obj_B_events.get(oid, []):
+                        if arc_type == 'EF' and ts > t_A:
+                            qualifying_eids.add(eid)
+                        elif arc_type == 'EP' and ts < t_A:
+                            qualifying_eids.add(eid)
+                        elif arc_type == 'AS':
+                            qualifying_eids.add(eid)
+                cnt = len(qualifying_eids)
+                event_ok = cnt >= counts_min and (counts_max is None or cnt <= counts_max)
+
+        elif involvement == 'all':
+            if len(A_objs) == 1:
+                oid = A_objs[0]
+                cnt = (_count_df_dp(oid, t_A, act_B, arc_type, events_by_object, event_activity)
+                       if arc_type in ('DF', 'DP')
+                       else _count_qualifying_events(oid, t_A, arc_type, obj_B_events))
+                event_ok = cnt >= counts_min and (counts_max is None or cnt <= counts_max)
+            else:
+                A_objs_set = set(A_objs)
+                first_oid  = A_objs[0]
+                qualifying_all: Set[str] = set()
+                for ts, eid in obj_B_events.get(first_oid, []):
+                    if arc_type == 'EF' and ts <= t_A:
+                        continue
+                    if arc_type == 'EP' and ts >= t_A:
+                        continue
+                    b_objs = set(event_objs_by_type.get(eid, {}).get(obj_type, []))
+                    if A_objs_set.issubset(b_objs):
+                        qualifying_all.add(eid)
+                cnt = len(qualifying_all)
+                event_ok = cnt >= counts_min and (counts_max is None or cnt <= counts_max)
+
+        if event_ok:
+            satisfied += 1
+
+    if total == 0:
+        return None
+    support = satisfied / total
+    if support < 1.0 - noise_threshold:
+        return None
+
+    return {
+        'from':                  act_A,
+        'to':                    act_B,
+        'arc_type':              arc_type,
+        'label':                 [obj_type],
+        'involvement':           involvement,
+        'involvement_per_label': {obj_type: involvement},
+        'counts':                [counts_min, None],
+        'support':               round(support, 4),
+    }
+
+
+def _get_stricter_arc_type(
+    idx: Dict[str, Any],
+    act_A: str,
+    act_B: str,
+    obj_type: str,
+    involvement: str,
+    arc_types: List[str],
+    noise_threshold: float,
+    counts_min: int,
+    counts_max: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    Given a viable AS-candidate, find the strictest arc type(s).
+    Mirrors OCPQ's get_stricter_arrows_for_as:
+      EF → try DF; EP → try DP; fall back to AS only if nothing else qualifies and A≠B.
+    """
+    ret: List[Dict[str, Any]] = []
+
+    def _try(atype: str) -> Optional[Dict[str, Any]]:
+        return _check_arc(idx, act_A, act_B, atype, obj_type, involvement,
+                          noise_threshold, counts_min, counts_max)
+
+    if 'EF' in arc_types or 'DF' in arc_types:
+        if 'EF' in arc_types:
+            ef = _try('EF')
+            if ef is not None:
+                df = _try('DF') if 'DF' in arc_types else None
+                ret.append(df if df is not None else ef)
+        elif 'DF' in arc_types:
+            df = _try('DF')
+            if df is not None:
+                ret.append(df)
+
+    if 'EP' in arc_types or 'DP' in arc_types:
+        if 'EP' in arc_types:
+            ep = _try('EP')
+            if ep is not None:
+                dp = _try('DP') if 'DP' in arc_types else None
+                ret.append(dp if dp is not None else ep)
+        elif 'DP' in arc_types:
+            dp = _try('DP')
+            if dp is not None:
+                ret.append(dp)
+
+    # AS only as fallback for non-self-loop pairs
+    if not ret and 'AS' in arc_types and act_A != act_B:
+        a_arc = _try('AS')
+        if a_arc is not None:
+            ret.append(a_arc)
+
+    return ret
+
+
+def _arc_type_dominated_by_or_eq(arc_type: str, other: str) -> bool:
+    """True when `arc_type` is implied by (dominated by) `other`."""
+    if arc_type == other:
+        return True
+    if arc_type == 'AS':
+        return True
+    if other == 'AS':
+        return False
+    return (arc_type == 'EF' and other == 'DF') or (arc_type == 'EP' and other == 'DP')
+
+
+def _involvement_strength(inv: str) -> int:
+    return {'any': 0, 'each': 1, 'all': 2}.get(inv, 1)
+
+
+def _get_df_dp_eid(
+    oid: str,
+    t_A: str,
+    arc_type: str,
+    act_B: str,
+    events_by_object: Dict[str, List[Tuple]],
+    event_activity: Dict[str, str],
+) -> Optional[str]:
+    """Return the ID of the directly adjacent act_B event (DF: after, DP: before), or None."""
+    obj_events = events_by_object.get(oid, [])
+    if arc_type == 'DF':
+        for ts, eid in obj_events:
+            if ts > t_A:
+                return eid if event_activity.get(eid) == act_B else None
+    else:  # DP
+        for ts, eid in reversed(obj_events):
+            if ts < t_A:
+                return eid if event_activity.get(eid) == act_B else None
+    return None
+
+
+def _check_arc_multi_type(
+    idx: Dict[str, Any],
+    act_A: str,
+    act_B: str,
+    arc_type: str,
+    bindings: List[Tuple[str, str]],
+    noise_threshold: float,
+    counts_min: int = 1,
+    counts_max: Optional[int] = 20,
+) -> Optional[Dict[str, Any]]:
+    """Check a multi-type OC-Declare arc (len(bindings) >= 2).
+
+    For each source event that has objects of every type in bindings, the event
+    is satisfied when there exists a single target event satisfying all type
+    conditions simultaneously.
+
+    For 'any'/'all' bindings and single-object 'each': one qualifying frozenset.
+    For multi-object 'each': Cartesian product — every combination of one object
+    per multi-object-each type must find a qualifying B-event containing all
+    assigned objects at once.
+    """
+    if len(bindings) < 2:
+        return None
+
+    obj_types = [t for t, _ in bindings]
+    eids_A = idx['events_by_activity'].get(act_A, [])
+    eids_B: Set[str] = set(idx['events_by_activity'].get(act_B, []))
+    if not eids_A or not eids_B:
+        return None
+
+    event_time         = idx['event_time']
+    event_objs_by_type = idx['event_objs_by_type']
+    events_by_object   = idx['events_by_object']
+    event_activity     = idx['event_activity']
+
+    # Build per-type B-events index: {obj_type: {oid: [(ts, eid)]}}
+    b_evt: Dict[str, Dict[str, List[Tuple]]] = {ot: {} for ot in obj_types}
+    for eid in eids_B:
+        eot = event_objs_by_type.get(eid, {})
+        for ot in obj_types:
+            for oid in eot.get(ot, []):
+                b_evt[ot].setdefault(oid, []).append((event_time.get(eid, ''), eid))
+    for ot in b_evt:
+        for oid in b_evt[ot]:
+            b_evt[ot][oid].sort()
+
+    total = satisfied = 0
+
+    for eid_A in eids_A:
+        eot_A = event_objs_by_type.get(eid_A, {})
+        if any(not eot_A.get(ot) for ot in obj_types):
+            continue
+        t_A = event_time.get(eid_A, '')
+        total += 1
+
+        # Compute qualifying B-event sets per binding.
+        # Most bindings produce a single frozenset; multi-object 'each' produces
+        # a list of per-object frozensets that are checked separately.
+        single_sets: List = []
+        multi_sets: List = []
+
+        for ot, inv in bindings:
+            A_objs = eot_A.get(ot, [])
+
+            if arc_type in ('DF', 'DP'):
+                if inv == 'any':
+                    q: Set[str] = set()
+                    for oid in A_objs:
+                        e = _get_df_dp_eid(oid, t_A, arc_type, act_B,
+                                           events_by_object, event_activity)
+                        if e:
+                            q.add(e)
+                    single_sets.append(frozenset(q))
+                elif len(A_objs) <= 1:
+                    oid = A_objs[0] if A_objs else None
+                    e = (_get_df_dp_eid(oid, t_A, arc_type, act_B,
+                                        events_by_object, event_activity)
+                         if oid else None)
+                    single_sets.append(frozenset([e]) if e else frozenset())
+                else:
+                    per_obj = []
+                    for oid in A_objs:
+                        e = _get_df_dp_eid(oid, t_A, arc_type, act_B,
+                                           events_by_object, event_activity)
+                        per_obj.append(frozenset([e]) if e else frozenset())
+                    multi_sets.append(per_obj)
+
+            else:  # EF / EP / AS
+                def _eid_set(oid: str, _ot: str = ot) -> frozenset:
+                    return frozenset(
+                        eid for ts, eid in b_evt[_ot].get(oid, [])
+                        if (arc_type == 'EF' and ts > t_A)
+                        or (arc_type == 'EP' and ts < t_A)
+                        or arc_type == 'AS'
+                    )
+
+                if inv == 'any':
+                    s: Set[str] = set()
+                    for oid in A_objs:
+                        s.update(_eid_set(oid))
+                    single_sets.append(frozenset(s))
+                elif inv == 'all':
+                    combined = None
+                    for oid in A_objs:
+                        combined = _eid_set(oid) if combined is None else combined & _eid_set(oid)
+                    single_sets.append(combined if combined is not None else frozenset())
+                else:  # each
+                    if len(A_objs) <= 1:
+                        oid = A_objs[0] if A_objs else None
+                        single_sets.append(_eid_set(oid) if oid else frozenset())
+                    else:
+                        # Multi-object each: Cartesian product across types
+                        multi_sets.append([_eid_set(oid) for oid in A_objs])
+
+        # Base qualifying set from all single-set bindings
+        joint_base = single_sets[0] if single_sets else frozenset(eids_B)
+        for s in single_sets[1:]:
+            joint_base = joint_base & s
+
+        if not multi_sets:
+            cnt = len(joint_base)
+            if cnt >= counts_min and (counts_max is None or cnt <= counts_max):
+                satisfied += 1
+        else:
+            # Every combination of one object per multi-object-each type must find
+            # a qualifying B-event containing all assigned objects simultaneously.
+            from itertools import product as _iproduct
+            ok = True
+            for assignment in _iproduct(*multi_sets):
+                joint = joint_base
+                for obj_set in assignment:
+                    joint = joint & obj_set
+                if not joint:
+                    ok = False
+                    break
+            if ok:
+                satisfied += 1
+
+    if total == 0:
+        return None
+    support = satisfied / total
+    if support < 1.0 - noise_threshold:
+        return None
+
+    ipl = {t: inv for t, inv in bindings}
+    min_inv = min(bindings, key=lambda x: _involvement_strength(x[1]))[1]
+    return {
+        'from':                  act_A,
+        'to':                    act_B,
+        'arc_type':              arc_type,
+        'label':                 list(obj_types),
+        'involvement':           min_inv,
+        'involvement_per_label': ipl,
+        'counts':                [counts_min, None],
+        'support':               round(support, 4),
+    }
+
+
+def _combine_to_multitype_arcs(
+    single_arcs: List[Dict[str, Any]],
+    idx: Dict[str, Any],
+    noise_threshold: float,
+    counts_min: int,
+    counts_max: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Group single-type arcs by (from, to, arc_type) and merge into multi-type arcs.
+
+    For each group of size ≥ 2, deduplicate by object type (keeping the strongest
+    involvement per type), then try the largest subset that forms a valid multi-type
+    arc. Single-type arcs whose type is covered by the multi-type arc are removed;
+    remaining ones are kept.
+    """
+    from itertools import combinations as _combinations
+
+    groups: Dict[Tuple, List[Dict]] = {}
+    for arc in single_arcs:
+        key = (arc['from'], arc['to'], arc['arc_type'])
+        groups.setdefault(key, []).append(arc)
+
+    result: List[Dict[str, Any]] = []
+    for key, group in groups.items():
+        if len(group) < 2:
+            result.extend(group)
             continue
 
-        traces_with_source += 1
+        act_A, act_B, arc_type = key
 
-        # Check if ANY occurrence of source precedes ANY occurrence of target.
-        # list.index() only finds the first occurrence, which gives wrong results
-        # when either activity repeats.  We scan for the earliest source position
-        # and then check whether target appears anywhere after it.
-        if source in trace:
-            first_source_idx = next(i for i, a in enumerate(trace) if a == source)
-            # target must appear at some position strictly after first_source_idx
-            if any(a == target for a in trace[first_source_idx + 1:]):
-                traces_with_precedence += 1
-    
-    support = traces_with_precedence / total_traces if total_traces > 0 else 0.0
-    confidence = traces_with_precedence / traces_with_source if traces_with_source > 0 else 0.0
-    
-    return support, confidence
+        # Deduplicate by obj_type, keeping the arc with the strongest involvement.
+        # This prevents duplicate-type entries (e.g. any(review) + each(review))
+        # from corrupting the multi-type binding check.
+        best_per_type: Dict[str, Dict] = {}
+        for arc in group:
+            t   = arc['label'][0]
+            inv = _involvement_strength(arc.get('involvement', 'each'))
+            if t not in best_per_type or inv > _involvement_strength(
+                    best_per_type[t].get('involvement', 'each')):
+                best_per_type[t] = arc
+        unique_group = list(best_per_type.values())
+
+        best_multi: Optional[Dict[str, Any]] = None
+        best_covered_types: Set[str] = set()
+
+        if len(unique_group) >= 2:
+            for size in range(len(unique_group), 1, -1):
+                found = False
+                for subset_indices in _combinations(range(len(unique_group)), size):
+                    sub_arcs = [unique_group[i] for i in subset_indices]
+                    bindings = [(a['label'][0], a.get('involvement', 'each'))
+                                for a in sub_arcs]
+                    multi = _check_arc_multi_type(
+                        idx, act_A, act_B, arc_type, bindings,
+                        noise_threshold, counts_min, counts_max)
+                    if multi is not None:
+                        best_multi = multi
+                        best_covered_types = {a['label'][0] for a in sub_arcs}
+                        found = True
+                        break
+                if found:
+                    break
+
+        if best_multi is not None:
+            result.append(best_multi)
+            # Keep any arc from the original group whose type is NOT covered
+            for arc in group:
+                if arc['label'][0] not in best_covered_types:
+                    result.append(arc)
+        else:
+            result.extend(group)
+
+    return result
 
 
-def calculate_response_support_confidence(
-    traces: Dict[str, List[str]], 
-    source: str, 
-    target: str
-) -> Tuple[float, float]:
-    """Calculate support and confidence for response constraint (source triggers target).
-    
-    Args:
-        traces: Dictionary of object_id -> activity sequence
-        source: Source activity (trigger)
-        target: Target activity (response)
-        
-    Returns:
-        Tuple of (support, confidence)
-        - support: % of traces where source is followed by target
-        - confidence: % of traces with source where target eventually follows
+def _has_dominating_path(
+    candidate_idx: int,
+    arcs: List[Dict[str, Any]],
+    adj: Dict[str, List[int]],
+    active: List[bool],
+) -> bool:
+    """BFS: return True if there is a path through active arcs from c.from to c.to
+    where each traversed edge's (arc_type, involvement, label) dominates candidate's."""
+    c      = arcs[candidate_idx]
+    c_type = c['arc_type']
+    c_lbl  = set(c['label'])
+
+    queue: deque = deque([(c['from'], 0)])
+    visited: Set[str] = {c['from']}
+
+    while queue:
+        curr, depth = queue.popleft()
+        if curr == c['to']:
+            return True
+        for ei in adj.get(curr, []):
+            if not active[ei] or ei == candidate_idx:
+                continue
+            e      = arcs[ei]
+            e_type = e['arc_type']
+            e_lbl  = set(e['label'])
+            if not _arc_type_dominated_by_or_eq(c_type, e_type):
+                continue
+            if not c_lbl.issubset(e_lbl):
+                continue
+            e_ipl = e.get('involvement_per_label',
+                           {t: e.get('involvement', 'each') for t in e_lbl})
+            c_ipl = c.get('involvement_per_label',
+                           {t: c.get('involvement', 'each') for t in c_lbl})
+            if any(_involvement_strength(e_ipl.get(t, 'each')) <
+                   _involvement_strength(c_ipl.get(t, 'each'))
+                   for t in c_lbl):
+                continue
+            # Lossless guard: skip if 'any' labels overlap at depth >= 1
+            if (depth >= 1
+                    and c.get('involvement') == 'any'
+                    and e.get('involvement') == 'any'
+                    and c_lbl & e_lbl):
+                continue
+            if e['to'] not in visited:
+                visited.add(e['to'])
+                queue.append((e['to'], depth + 1))
+
+    return False
+
+
+def _lossless_reduction(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """BFS-based transitive lossless reduction, matching OCPQ's reduce_oc_arcs(lossless=true)."""
+    if not arcs:
+        return arcs
+    arcs = sorted(arcs, key=lambda a: (a['from'], a['to'], a['arc_type'],
+                                        a.get('involvement', 'each')))
+    adj: Dict[str, List[int]] = {}
+    for i, arc in enumerate(arcs):
+        adj.setdefault(arc['from'], []).append(i)
+
+    active = [True] * len(arcs)
+    for i in range(len(arcs)):
+        if active[i] and _has_dominating_path(i, arcs, adj, active):
+            active[i] = False
+
+    return [arc for i, arc in enumerate(arcs) if active[i]]
+
+
+def _refine_arcs(
+    arcs: List[Dict[str, Any]],
+    idx: Dict[str, Any],
+    noise_threshold: float,
+    counts_min: int,
+    counts_max: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Refinement pass: tighten involvement per arc.
+
+    Single-type: any→each (stops at each to match OCPQ single-type output).
+    Multi-type: any→each then each→all applied per type within the binding.
     """
-    total_traces = len(traces)
-    if total_traces == 0:
-        return 0.0, 0.0
-    
-    traces_with_response = 0
-    traces_with_source = 0
-    
-    for trace in traces.values():
-        if source not in trace:
+    refined: List[Dict[str, Any]] = []
+    for arc in arcs:
+        ipl      = arc.get('involvement_per_label', {})
+        arc_type = arc['arc_type']
+        act1, act2 = arc['from'], arc['to']
+
+        if len(ipl) <= 1:
+            # Single-type arc: cap escalation at 'each'
+            obj_type    = arc['label'][0] if arc['label'] else ''
+            involvement = arc.get('involvement', 'each')
+            next_inv    = {'any': 'each'}.get(involvement)
+            if next_inv is not None:
+                stricter = _check_arc(idx, act1, act2, arc_type, obj_type, next_inv,
+                                      noise_threshold, counts_min, counts_max)
+                if stricter is not None:
+                    refined.append(stricter)
+                    continue
+            refined.append(arc)
+        else:
+            # Multi-type arc: try any→each, then each→all, per type
+            new_ipl = dict(ipl)
+            for escalation in ({'any': 'each'}, {'each': 'all'}):
+                for t, inv in list(new_ipl.items()):
+                    nxt = escalation.get(inv)
+                    if nxt is None:
+                        continue
+                    test_ipl = {**new_ipl, t: nxt}
+                    result = _check_arc_multi_type(
+                        idx, act1, act2, arc_type,
+                        list(test_ipl.items()),
+                        noise_threshold, counts_min, counts_max,
+                    )
+                    if result is not None:
+                        new_ipl[t] = nxt
+            if new_ipl != ipl:
+                final = _check_arc_multi_type(
+                    idx, act1, act2, arc_type,
+                    list(new_ipl.items()),
+                    noise_threshold, counts_min, counts_max,
+                )
+                if final is not None:
+                    refined.append(final)
+                    continue
+            refined.append(arc)
+    return refined
+
+
+def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Map OC-Declare arcs to the DeCo simulator constraint format.
+
+    EF/DF(A→B, T): response(source=A, target=B)
+    EP/DP(A→B, T): precedence(source=B, target=A)
+    AS(A→B, T):    coexistence(source=A, target=B)
+    """
+    ARC_TO_CTYPE = {
+        'EF': 'response',  'DF': 'response',
+        'EP': 'precedence', 'DP': 'precedence',
+        'AS': 'coexistence',
+    }
+    constraints = []
+    for arc in arcs:
+        A, B      = arc['from'], arc['to']
+        atype     = arc['arc_type']
+        obj_type  = arc['label'][0] if arc.get('label') else ''
+        nmin, nmax = arc.get('counts', [1, None])
+        support   = arc.get('support', 0.0)
+        ctype     = ARC_TO_CTYPE.get(atype)
+        if not ctype:
             continue
-
-        traces_with_source += 1
-
-        # Use the earliest occurrence of source; check if target follows any of them.
-        # list.index() only finds the first — this is correct for response (we want
-        # "does target eventually follow the first source occurrence"), but we make
-        # the intent explicit for repeated-activity traces.
-        first_source_idx = next(i for i, a in enumerate(trace) if a == source)
-        if any(a == target for a in trace[first_source_idx + 1:]):
-            traces_with_response += 1
-    
-    support = traces_with_response / total_traces if total_traces > 0 else 0.0
-    confidence = traces_with_response / traces_with_source if traces_with_source > 0 else 0.0
-    
-    return support, confidence
-
-
-def discover_precedence_constraints(
-    traces: Dict[str, List[str]],
-    activities: List[str],
-    object_type: str,
-    min_support: float = 0.7,
-    min_confidence: float = 0.85
-) -> List[Dict[str, Any]]:
-    """Discover precedence constraints (A must happen before B).
-    
-    Args:
-        traces: Object traces for specific object type
-        activities: List of all activities
-        object_type: Object type these constraints apply to
-        min_support: Minimum support threshold
-        min_confidence: Minimum confidence threshold
-        
-    Returns:
-        List of discovered precedence constraints
-    """
-    constraints = []
-    
-    for source in activities:
-        for target in activities:
-            if source == target:
-                continue
-            
-            support, confidence = calculate_precedence_support_confidence(traces, source, target)
-            
-            if support >= min_support and confidence >= min_confidence:
-                constraints.append({
-                    'type': 'precedence',
-                    'constraint_type': 'precedence',
-                    'source': source,
-                    'target': target,
-                    'source_activity': source,
-                    'target_activity': target,
-                    'nmin': 1,
-                    'scope': {
-                        'kind': 'each',
-                        'object_type': object_type
-                    },
-                    'support': round(support, 3),
-                    'confidence': round(confidence, 3)
-                })
-    
+        src, tgt = (B, A) if atype in ('EP', 'DP') else (A, B)
+        inv = arc.get('involvement', 'each')
+        ipl = arc.get('involvement_per_label', {obj_type: inv})
+        constraints.append({
+            'type':                  ctype,
+            'constraint_type':       ctype,
+            'source':                src,
+            'target':                tgt,
+            'source_activity':       src,
+            'target_activity':       tgt,
+            'source_type':           obj_type,
+            'target_type':           obj_type,
+            'nmin':                  nmin,
+            'nmax':                  nmax,
+            'support':               support,
+            'confidence':            support,
+            'arc_type':              atype,
+            'involvement':           inv,
+            'involvement_per_label': ipl,
+            'label':                 arc.get('label', []),
+            'scope':                 {
+                'kind':                   inv,
+                'object_type':            obj_type,
+                'involvement_per_label':  ipl,
+            },
+        })
     return constraints
 
 
-def discover_response_constraints(
-    traces: Dict[str, List[str]],
+def _discover_kvaanda_arcs(
+    ocel_log: Dict[str, Any],
     activities: List[str],
-    object_type: str,
-    min_support: float = 0.7,
-    min_confidence: float = 0.85
+    object_types: List[str],
+    noise_threshold: float = 0.2,
+    arc_types: Optional[List[str]] = None,
+    counts_min: int = 1,
+    counts_max: Optional[int] = 20,
+    reduction: str = 'Lossless',
+    refinement: bool = True,
+    progress_callback=None,
+    log_callback=None,
 ) -> List[Dict[str, Any]]:
-    """Discover response constraints (if A happens, B must eventually follow).
-    
-    Args:
-        traces: Object traces for specific object type
-        activities: List of all activities
-        object_type: Object type these constraints apply to
-        min_support: Minimum support threshold
-        min_confidence: Minimum confidence threshold
-        
-    Returns:
-        List of discovered response constraints
     """
-    constraints = []
-    
-    for source in activities:
-        for target in activities:
-            if source == target:
-                continue
-            
-            support, confidence = calculate_response_support_confidence(traces, source, target)
-            
-            if support >= min_support and confidence >= min_confidence:
-                constraints.append({
-                    'type': 'response',
-                    'constraint_type': 'response',
-                    'source': source,
-                    'target': target,
-                    'source_activity': source,
-                    'target_activity': target,
-                    'scope': {
-                        'kind': 'each',
-                        'object_type': object_type
-                    },
-                    'support': round(support, 3),
-                    'confidence': round(confidence, 3)
-                })
-    
-    return constraints
+    Discover OC-Declare arcs per OCPQ / rust4pm (Küsters & van der Aalst 2025).
 
-
-def calculate_not_coexistence_support_confidence(
-    traces: Dict[str, List[str]],
-    source: str,
-    target: str
-) -> Tuple[float, float]:
-    """Calculate support/confidence for a not-coexistence (mutual exclusion) rule.
-
-    ``not_coexistence(A, B)`` states that A and B never both occur within the
-    same scope (object trace). The rule is *activated* whenever at least one of
-    A or B occurs and *satisfied* whenever they do not both occur. It is a
-    symmetric relation (``not_coexistence(A, B) == not_coexistence(B, A)``).
-
-    Args:
-        traces: Dictionary of object_id -> activity sequence
-        source: First activity (A)
-        target: Second activity (B)
-
-    Returns:
-        Tuple of (support, confidence)
-        - support: fraction of all traces in which at least one of A or B occurs
-          (i.e. how often the rule is relevant / activated). This filters out
-          activity pairs that are simply too rare to be meaningful.
-        - confidence: among those activated traces, the fraction in which A and B
-          do NOT coexist. 1.0 means perfect mutual exclusion.
+    For each (act_A, act_B) pair sharing object type T:
+      1. Generate viable label type(s) — 'any' and/or 'each' — via AS threshold check.
+      2. For each viable label, escalate to the strictest arc type (EF→DF, EP→DP, AS fallback).
+      3. Apply lossless BFS reduction.
+      4. Apply refinement pass (any→each→all), then reduce again.
     """
-    total_traces = len(traces)
-    if total_traces == 0:
-        return 0.0, 0.0
+    if arc_types is None:
+        arc_types = ['EF', 'EP', 'AS']
 
-    traces_with_a = 0
-    traces_with_b = 0
-    traces_with_both = 0
-    traces_with_either = 0
+    def _log(msg):
+        if log_callback is not None:
+            log_callback(msg)
 
-    for trace in traces.values():
-        has_a = source in trace
-        has_b = target in trace
+    idx      = _build_discovery_indices(ocel_log)
+    max_objs = _get_max_objects_per_event(ocel_log, activities, object_types)
+    arcs: List[Dict[str, Any]] = []
 
-        if has_a:
-            traces_with_a += 1
-        if has_b:
-            traces_with_b += 1
-        if has_a and has_b:
-            traces_with_both += 1
-        if has_a or has_b:
-            traces_with_either += 1
+    # Pre-compute which object types each activity's B-side has events for
+    act_B_otypes: Dict[str, Set[str]] = {}
+    for act in activities:
+        s: Set[str] = set()
+        for eid in idx['events_by_activity'].get(act, []):
+            s.update(idx['event_objs_by_type'].get(eid, {}).keys())
+        act_B_otypes[act] = s
 
-    # Mutual exclusion is only meaningful when BOTH activities are individually
-    # possible for this object type. If one of them never occurs, the apparent
-    # "non-coexistence" is just absence of that activity, not a real exclusion.
-    if traces_with_a == 0 or traces_with_b == 0:
-        return 0.0, 0.0
+    _log(f"Arc mining: {len(activities)} activities × {len(object_types)} object types, noise threshold {noise_threshold}")
 
-    support = traces_with_either / total_traces
-    confidence = (
-        (traces_with_either - traces_with_both) / traces_with_either
-        if traces_with_either > 0 else 0.0
-    )
+    n_acts = len(activities)
+    for i, act_A in enumerate(activities):
+        if progress_callback is not None:
+            progress_callback('Mining arcs', round(100 * i / n_acts) if n_acts else 100)
+        _log(f"[{i+1}/{n_acts}] Checking act_A: {act_A}")
+        for act_B in activities:
+            for obj_type in object_types:
+                if max_objs.get(act_A, {}).get(obj_type, 0) == 0:
+                    continue
+                if obj_type not in act_B_otypes.get(act_B, set()):
+                    continue
 
-    return support, confidence
+                is_multiple = max_objs[act_A][obj_type] > 1
 
+                # Step 1: check 'any' with AS to see if this pair is viable at all
+                any_as = _check_arc(idx, act_A, act_B, 'AS', obj_type, 'any',
+                                    noise_threshold, counts_min, counts_max)
+                if any_as is None:
+                    continue
 
-def discover_not_coexistence_constraints(
-    traces: Dict[str, List[str]],
-    activities: List[str],
-    object_type: str,
-    min_support: float = 0.7,
-    min_confidence: float = 0.85
-) -> List[Dict[str, Any]]:
-    """Discover not-coexistence (mutually exclusive) constraints.
+                if is_multiple:
+                    involvements = ['any']
+                    each_as = _check_arc(idx, act_A, act_B, 'AS', obj_type, 'each',
+                                         noise_threshold, counts_min, counts_max)
+                    if each_as is not None:
+                        involvements.append('each')
+                else:
+                    # When max objects per event == 1, 'any' and 'each' are equivalent;
+                    # OCPQ returns 'each' in this case.
+                    involvements = ['each']
 
-    A ``not_coexistence(A, B)`` constraint means activities A and B never occur
-    together within the same scope object's history. Because the relation is
-    symmetric, each unordered activity pair is reported at most once.
+                # Step 2: escalate arc type for each viable involvement
+                for inv in involvements:
+                    arcs.extend(_get_stricter_arc_type(
+                        idx, act_A, act_B, obj_type, inv, arc_types,
+                        noise_threshold, counts_min, counts_max,
+                    ))
 
-    Args:
-        traces: Object traces for specific object type
-        activities: List of all activities
-        object_type: Object type these constraints apply to
-        min_support: Minimum support threshold
-        min_confidence: Minimum confidence threshold
+    # Step 3: combine single-type arcs into multi-type arcs where possible
+    _log(f"Arc scan done — {len(arcs)} raw arcs found; merging multi-type arcs…")
+    arcs = _combine_to_multitype_arcs(arcs, idx, noise_threshold, counts_min, counts_max)
+    _log(f"After multi-type merge: {len(arcs)} arcs")
 
-    Returns:
-        List of discovered not-coexistence constraints
-    """
-    constraints = []
+    # Step 4: lossless reduction
+    if reduction == 'Lossless':
+        arcs = _lossless_reduction(arcs)
+        _log(f"After lossless reduction: {len(arcs)} arcs remain")
 
-    # Iterate over unordered pairs only (i < j) to avoid duplicate symmetric
-    # constraints. The engine's not_coexistence check is direction-agnostic.
-    for i, source in enumerate(activities):
-        for target in activities[i + 1:]:
-            if source == target:
-                continue
+    # Step 5: refinement then re-reduce
+    if refinement:
+        arcs = _refine_arcs(arcs, idx, noise_threshold, counts_min, counts_max)
+        if reduction == 'Lossless':
+            arcs = _lossless_reduction(arcs)
+        _log(f"After refinement + re-reduction: {len(arcs)} final arcs")
 
-            support, confidence = calculate_not_coexistence_support_confidence(
-                traces, source, target
-            )
-
-            if support >= min_support and confidence >= min_confidence:
-                constraints.append({
-                    'type': 'not_coexistence',
-                    'constraint_type': 'not_coexistence',
-                    'source': source,
-                    'target': target,
-                    'source_activity': source,
-                    'target_activity': target,
-                    'scope': {
-                        'kind': 'each',
-                        'object_type': object_type
-                    },
-                    'support': round(support, 3),
-                    'confidence': round(confidence, 3)
-                })
-
-    return constraints
-
-
-def calculate_chain_precedence_support_confidence(
-    traces: Dict[str, List[str]],
-    source: str,
-    target: str
-) -> Tuple[float, float]:
-    """Calculate support/confidence for a chain-precedence rule.
-
-    ``chain_precedence(A, B)`` states that every B is *immediately* preceded by
-    A within the same scope (object trace).  Unlike plain ``precedence`` (A
-    somewhere before B), this is the directly-follows variant: the event right
-    before B must be A.
-
-    The rule is *activated* by every occurrence of B that has a predecessor
-    (i.e. B is not the first event of the trace) and *satisfied* when that
-    immediate predecessor is A.  We use the strict trace-level interpretation:
-    a trace satisfies the rule only when *all* of its activating B's are
-    immediately preceded by A.
-
-    Args:
-        traces: Dictionary of object_id -> activity sequence
-        source: Activity that must directly precede the target (A)
-        target: Activity whose immediate predecessor is constrained (B)
-
-    Returns:
-        Tuple of (support, confidence)
-        - support: fraction of all traces that activate AND satisfy the rule
-        - confidence: among activating traces, the fraction that satisfy it
-    """
-    total_traces = len(traces)
-    if total_traces == 0:
-        return 0.0, 0.0
-
-    activated_traces = 0
-    satisfied_traces = 0
-
-    for trace in traces.values():
-        has_activation = False
-        all_ok = True
-        for i, activity in enumerate(trace):
-            # B is activating only when it has a predecessor (not first event).
-            if activity == target and i > 0:
-                has_activation = True
-                if trace[i - 1] != source:
-                    all_ok = False
-        if has_activation:
-            activated_traces += 1
-            if all_ok:
-                satisfied_traces += 1
-
-    if activated_traces == 0:
-        return 0.0, 0.0
-
-    support = satisfied_traces / total_traces
-    confidence = satisfied_traces / activated_traces
-    return support, confidence
-
-
-def calculate_chain_response_support_confidence(
-    traces: Dict[str, List[str]],
-    source: str,
-    target: str
-) -> Tuple[float, float]:
-    """Calculate support/confidence for a chain-response rule.
-
-    ``chain_response(A, B)`` states that every A is *immediately* followed by B
-    within the same scope (object trace).  Unlike plain ``response`` (B
-    eventually follows A), this is the directly-follows variant: the event right
-    after A must be B.
-
-    The rule is *activated* by every occurrence of A that has a successor (i.e.
-    A is not the last event of the trace) and *satisfied* when that immediate
-    successor is B.  We use the strict trace-level interpretation: a trace
-    satisfies the rule only when *all* of its activating A's are immediately
-    followed by B.
-
-    Args:
-        traces: Dictionary of object_id -> activity sequence
-        source: Activity whose immediate successor is constrained (A)
-        target: Activity that must directly follow the source (B)
-
-    Returns:
-        Tuple of (support, confidence)
-        - support: fraction of all traces that activate AND satisfy the rule
-        - confidence: among activating traces, the fraction that satisfy it
-    """
-    total_traces = len(traces)
-    if total_traces == 0:
-        return 0.0, 0.0
-
-    activated_traces = 0
-    satisfied_traces = 0
-
-    for trace in traces.values():
-        has_activation = False
-        all_ok = True
-        last_idx = len(trace) - 1
-        for i, activity in enumerate(trace):
-            # A is activating only when it has a successor (not last event).
-            if activity == source and i < last_idx:
-                has_activation = True
-                if trace[i + 1] != target:
-                    all_ok = False
-        if has_activation:
-            activated_traces += 1
-            if all_ok:
-                satisfied_traces += 1
-
-    if activated_traces == 0:
-        return 0.0, 0.0
-
-    support = satisfied_traces / total_traces
-    confidence = satisfied_traces / activated_traces
-    return support, confidence
-
-
-def discover_chain_precedence_constraints(
-    traces: Dict[str, List[str]],
-    activities: List[str],
-    object_type: str,
-    min_support: float = 0.7,
-    min_confidence: float = 0.85
-) -> List[Dict[str, Any]]:
-    """Discover chain-precedence constraints (B is immediately preceded by A).
-
-    Args:
-        traces: Object traces for specific object type
-        activities: List of all activities
-        object_type: Object type these constraints apply to
-        min_support: Minimum support threshold
-        min_confidence: Minimum confidence threshold
-
-    Returns:
-        List of discovered chain-precedence constraints
-    """
-    constraints = []
-
-    for source in activities:
-        for target in activities:
-            if source == target:
-                continue
-
-            support, confidence = calculate_chain_precedence_support_confidence(
-                traces, source, target
-            )
-
-            if support >= min_support and confidence >= min_confidence:
-                constraints.append({
-                    'type': 'chain_precedence',
-                    'constraint_type': 'chain_precedence',
-                    'source': source,
-                    'target': target,
-                    'source_activity': source,
-                    'target_activity': target,
-                    'nmin': 1,
-                    'scope': {
-                        'kind': 'each',
-                        'object_type': object_type
-                    },
-                    'support': round(support, 3),
-                    'confidence': round(confidence, 3)
-                })
-
-    return constraints
-
-
-def discover_chain_response_constraints(
-    traces: Dict[str, List[str]],
-    activities: List[str],
-    object_type: str,
-    min_support: float = 0.7,
-    min_confidence: float = 0.85
-) -> List[Dict[str, Any]]:
-    """Discover chain-response constraints (A is immediately followed by B).
-
-    Args:
-        traces: Object traces for specific object type
-        activities: List of all activities
-        object_type: Object type these constraints apply to
-        min_support: Minimum support threshold
-        min_confidence: Minimum confidence threshold
-
-    Returns:
-        List of discovered chain-response constraints
-    """
-    constraints = []
-
-    for source in activities:
-        for target in activities:
-            if source == target:
-                continue
-
-            support, confidence = calculate_chain_response_support_confidence(
-                traces, source, target
-            )
-
-            if support >= min_support and confidence >= min_confidence:
-                constraints.append({
-                    'type': 'chain_response',
-                    'constraint_type': 'chain_response',
-                    'source': source,
-                    'target': target,
-                    'source_activity': source,
-                    'target_activity': target,
-                    'nmin': 1,
-                    'scope': {
-                        'kind': 'each',
-                        'object_type': object_type
-                    },
-                    'support': round(support, 3),
-                    'confidence': round(confidence, 3)
-                })
-
-    return constraints
+    return arcs
 
 
 def discover_lifecycle(
@@ -843,30 +1273,37 @@ def discover_lifecycle(
     
     objects = ocel_log.get('objects', {})
     events = ocel_log.get('events', {})
-    
-    # Track first and last activities per object
-    object_first_activity = {}
-    object_last_activity = {}
-    
-    for obj_id, obj_data in objects.items():
-        if obj_data.get('type') != object_type:
+
+    # Build object-type filter set for this type — O(N_objects)
+    obj_ids_of_type = {
+        oid for oid, od in objects.items()
+        if isinstance(od, dict) and od.get('type') == object_type
+    }
+    if not obj_ids_of_type:
+        return set(), set()
+
+    # Single pass over events: collect (timestamp, activity) per relevant object — O(N_events)
+    obj_timeline: Dict[str, list] = defaultdict(list)
+    ev_iter = events.items() if isinstance(events, dict) else []
+    for eid, edata in ev_iter:
+        if not isinstance(edata, dict):
             continue
-        
-        # Find all events for this object
-        obj_events = []
-        for event_id, event_data in events.items():
-            object_ids = event_data.get('omap', []) or event_data.get('relationships', [])
-            if obj_id in object_ids:
-                obj_events.append({
-                    'activity': event_data.get('activity'),
-                    'timestamp': event_data.get('timestamp', '')
-                })
-        
-        if obj_events:
-            # Sort by timestamp
-            obj_events.sort(key=lambda x: x['timestamp'])
-            object_first_activity[obj_id] = obj_events[0]['activity']
-            object_last_activity[obj_id] = obj_events[-1]['activity']
+        activity  = edata.get('activity') or edata.get('type', '')
+        timestamp = edata.get('timestamp', '')
+        if not activity:
+            continue
+        omap = edata.get('omap') or edata.get('relationships') or []
+        for oid in omap:
+            if oid in obj_ids_of_type:
+                obj_timeline[oid].append((timestamp, activity))
+
+    # Extract first/last activity per object
+    object_first_activity = {}
+    object_last_activity  = {}
+    for oid, timeline in obj_timeline.items():
+        timeline.sort(key=lambda x: x[0])
+        object_first_activity[oid] = timeline[0][1]
+        object_last_activity[oid]  = timeline[-1][1]
     
     # Aggregate: only keep activities that appear as first/last for enough instances
     n = len(object_first_activity)
@@ -890,18 +1327,18 @@ def discover_lifecycle(
     return creating_activities, terminating_activities
 
 
-def discover_resource_types(
+def discover_permanent_object_types(
     ocel_log: Dict[str, Any],
-    resource_threshold: float = 2.0
+    permanent_threshold: float = 2.0
 ) -> List[str]:
-    """Classify object types as reusable resources.
+    """Classify object types as permanent (reusable) objects.
 
-    A type is classified as a resource if the average maximum per-activity
-    reuse count per object instance exceeds ``resource_threshold``.
+    A type is classified as permanent if the average maximum per-activity
+    reuse count per object instance exceeds ``permanent_threshold``.
 
     "Per-activity reuse" = how many times a single object instance appears in
     the SAME activity. A Forklift firing Weigh 200 times scores 200.
-    An applicant firing Interview Held exactly once scores 1 — not a resource.
+    An applicant firing Interview Held exactly once scores 1 — not permanent.
 
     This correctly distinguishes shared infrastructure (Forklifts, Trucks) from
     case objects (applicants, orders) that each go through activities at most
@@ -909,12 +1346,12 @@ def discover_resource_types(
 
     Args:
         ocel_log: OCEL 2.0 log dictionary
-        resource_threshold: Minimum average max-per-activity repetitions per
+        permanent_threshold: Minimum average max-per-activity repetitions per
             instance. Default 2.0 — an object must repeat the same activity
-            more than twice on average to be classified as a resource.
+            more than twice on average to be classified as permanent.
 
     Returns:
-        List of resource object type names.
+        List of permanent object type names.
     """
     if isinstance(ocel_log, list):
         return []
@@ -957,12 +1394,115 @@ def discover_resource_types(
         if ot and obj_id not in obj_act_counts:
             type_max_reuse[ot].append(0)
 
-    resource_types = []
+    permanent_types = []
     for ot, scores in type_max_reuse.items():
-        if scores and sum(scores) / len(scores) >= resource_threshold:
-            resource_types.append(ot)
+        if scores and sum(scores) / len(scores) >= permanent_threshold:
+            permanent_types.append(ot)
 
-    return sorted(resource_types)
+    return sorted(permanent_types)
+
+
+def suggest_permanent_object_threshold(ocel_log: Dict[str, Any]) -> Optional[float]:
+    """Suggest a threshold for permanent object classification via gap detection.
+
+    Computes the average max-per-activity reuse score per object type, sorts
+    them ascending, and finds the pair of adjacent scores with the largest
+    relative gap (multiplicative jump).  Returns the geometric mean of those
+    two scores as the suggested threshold, or None when the distribution is
+    too flat (max gap ratio < 3) or fewer than 2 object types have data.
+    """
+    import math
+
+    if not isinstance(ocel_log, dict):
+        return None
+
+    objects_raw = ocel_log.get('objects') or {}
+    events_raw  = ocel_log.get('events')  or {}
+
+    # Support both dict-keyed {id: {type, ...}} and list-based [{id, type, ...}] formats
+    if isinstance(events_raw, dict):
+        events_iter = events_raw.values()
+    elif isinstance(events_raw, list):
+        events_iter = events_raw
+    else:
+        events_iter = []
+
+    obj_act_counts: Dict = defaultdict(lambda: defaultdict(int))
+    for event_data in events_iter:
+        if not isinstance(event_data, dict):
+            continue
+        activity = (event_data.get('activity') or event_data.get('type') or
+                    event_data.get('ocel:activity', ''))
+        omap = event_data.get('omap') or []
+        if not omap:
+            rels = event_data.get('relationships') or []
+            omap = [r.get('objectId', r) if isinstance(r, dict) else r for r in rels]
+        for obj_id in omap:
+            if activity:
+                obj_act_counts[obj_id][activity] += 1
+
+    # Build obj_id → type map; handles both dict-keyed and list formats
+    obj_type_map: Dict[str, str] = {}
+    if isinstance(objects_raw, dict):
+        for obj_id, obj_data in objects_raw.items():
+            if isinstance(obj_data, dict):
+                ot = obj_data.get('type')
+                if ot:
+                    obj_type_map[obj_id] = ot
+        objects_items = objects_raw.items()
+    elif isinstance(objects_raw, list):
+        for obj_data in objects_raw:
+            if isinstance(obj_data, dict):
+                obj_id = obj_data.get('id', '')
+                ot = obj_data.get('type')
+                if ot and obj_id:
+                    obj_type_map[obj_id] = ot
+        objects_items = ((o.get('id', ''), o) for o in objects_raw if isinstance(o, dict))
+    else:
+        objects_items = iter([])
+
+    type_max_reuse: Dict = defaultdict(list)
+    for obj_id, act_counts in obj_act_counts.items():
+        ot = obj_type_map.get(obj_id)
+        if ot:
+            type_max_reuse[ot].append(max(act_counts.values()) if act_counts else 0)
+    for obj_id, obj_data in objects_items:
+        if not isinstance(obj_data, dict):
+            continue
+        ot = obj_data.get('type')
+        if ot and obj_id not in obj_act_counts:
+            type_max_reuse[ot].append(0)
+
+    type_scores = {
+        ot: sum(scores) / len(scores)
+        for ot, scores in type_max_reuse.items()
+        if scores
+    }
+
+    if len(type_scores) < 2:
+        return None
+
+    sorted_scores = sorted(type_scores.values())
+
+    best_ratio = 1.0
+    best_i = None
+    for i in range(len(sorted_scores) - 1):
+        lo = sorted_scores[i]
+        hi = sorted_scores[i + 1]
+        ratio = (hi / lo) if lo > 0 else (float('inf') if hi > 0 else 1.0)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_i = i
+
+    if best_i is None or best_ratio < 3.0:
+        return None
+
+    lo = sorted_scores[best_i]
+    hi = sorted_scores[best_i + 1]
+    threshold = math.sqrt(lo * hi) if lo > 0 else hi
+    return round(threshold, 2)
+
+
 def discover_start_activities(
     ocel_log: Dict[str, Any],
     min_pct: float = 1.0
@@ -993,18 +1533,24 @@ def discover_start_activities(
     objects = ocel_log.get('objects', {})
     events  = ocel_log.get('events', {})
 
-    first_activities: List[str] = []
-    for obj_id in objects:
-        obj_events = [
-            ed for ed in events.values()
-            if obj_id in (ed.get('omap') or [])
-        ]
-        if not obj_events:
+    # Single pass over events: track earliest (timestamp, activity) per object — O(N_events)
+    obj_first: Dict[str, tuple] = {}  # oid -> (timestamp, activity)
+    ev_iter = events.items() if isinstance(events, dict) else []
+    for eid, edata in ev_iter:
+        if not isinstance(edata, dict):
             continue
-        obj_events.sort(key=lambda e: e.get('timestamp', ''))
-        first_act = obj_events[0].get('activity')
-        if first_act:
-            first_activities.append(first_act)
+        activity  = edata.get('activity') or edata.get('type', '')
+        timestamp = edata.get('timestamp', '')
+        if not activity:
+            continue
+        omap = edata.get('omap') or edata.get('relationships') or []
+        for oid in omap:
+            if oid not in objects:
+                continue
+            if oid not in obj_first or timestamp < obj_first[oid][0]:
+                obj_first[oid] = (timestamp, activity)
+
+    first_activities: List[str] = [act for (_, act) in obj_first.values() if act]
 
     total = len(first_activities)
     if total == 0:
@@ -1124,45 +1670,83 @@ def discover_o2o_rules(ocel_log: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # Record link
                 o2o_links[(obj1_type, obj2_type)][obj1_id].add(obj2_id)
     
-    # Calculate cardinality
+    # Calculate cardinality for each directed pair, then decide bidirectionality
     o2o_rules = []
     processed_pairs = set()
-    
+
     for (type1, type2), links in o2o_links.items():
         if (type1, type2) in processed_pairs or (type2, type1) in processed_pairs:
             continue
-        
-        # Count how many type2 objects each type1 object links to
-        cardinalities = [len(linked_objs) for linked_objs in links.values()]
-        
-        if cardinalities:
-            min_links = min(cardinalities)
-            max_links = max(cardinalities)
-            
+        processed_pairs.add((type1, type2))
+
+        fwd_cards = [len(linked_objs) for linked_objs in links.values()]
+        if not fwd_cards:
+            continue
+
+        fwd_min = min(fwd_cards)
+        fwd_max = max(fwd_cards)
+
+        rev_links = o2o_links.get((type2, type1), {})
+        rev_cards = [len(linked_objs) for linked_objs in rev_links.values()]
+
+        if rev_cards:
+            rev_min = min(rev_cards)
+            rev_max = max(rev_cards)
+
+            if fwd_max == rev_max and fwd_min == rev_min:
+                # Symmetric: one bidirectional rule with the shared cardinality
+                o2o_rules.append({
+                    'source_type': type1,
+                    'target_type': type2,
+                    'min_links': fwd_min,
+                    'max_links': fwd_max if fwd_max < 100 else None,
+                    'bidirectional': True,
+                })
+            else:
+                # Asymmetric: two separate unidirectional rules
+                o2o_rules.append({
+                    'source_type': type1,
+                    'target_type': type2,
+                    'min_links': fwd_min,
+                    'max_links': fwd_max if fwd_max < 100 else None,
+                    'bidirectional': False,
+                })
+                o2o_rules.append({
+                    'source_type': type2,
+                    'target_type': type1,
+                    'min_links': rev_min,
+                    'max_links': rev_max if rev_max < 100 else None,
+                    'bidirectional': False,
+                })
+        else:
+            # No reverse links observed — unidirectional rule
             o2o_rules.append({
                 'source_type': type1,
                 'target_type': type2,
-                'min_links': min_links,
-                'max_links': max_links if max_links < 100 else None,
-                'bidirectional': True  # Assume bidirectional by default
+                'min_links': fwd_min,
+                'max_links': fwd_max if fwd_max < 100 else None,
+                'bidirectional': False,
             })
-            
-            processed_pairs.add((type1, type2))
-    
+
     return o2o_rules
 
 
 def discover_ocdeclare_model(
     event_log_path: str,
+    noise_threshold: float = 0.2,
+    arc_types: Optional[List[str]] = None,
+    reduction: str = 'Lossless',
+    lifecycle_threshold: float = 0.5,
+    permanent_threshold: float = 50.0,
+    # Legacy parameters kept for backward compatibility (ignored by new algorithm)
     min_support: float = 0.7,
     min_confidence: float = 0.85,
-    noise_threshold: float = 0.15,
-    lifecycle_threshold: float = 0.5,
-    resource_threshold: float = 50.0,
     constraint_types: Optional[Dict[str, bool]] = None,
     constraint_params: Optional[Dict[str, Dict[str, float]]] = None,
     output_filename: Optional[str] = None,
-    output_dir: Optional[str] = None
+    output_dir: Optional[str] = None,
+    progress_callback=None,
+    log_callback=None,
 ) -> Dict[str, Any]:
     """Main function to discover OC-Declare model from OCEL 2.0 event log.
     
@@ -1175,8 +1759,8 @@ def discover_ocdeclare_model(
         lifecycle_threshold: Minimum fraction of object instances for which an
             activity must be the chronological first/last event to be labelled
             creates/consumes.  Default 0.5 (majority vote).
-        resource_threshold: Average events-per-instance above which an object
-            type is classified as a reusable resource (e.g. Forklift, Truck).
+        permanent_threshold: Average events-per-instance above which an object
+            type is classified as a permanent object (e.g. Forklift, Truck).
             Default 50.
         constraint_types: Dict of constraint types to discover (bool flags).
         constraint_params: Optional per-constraint-type thresholds. Keys are
@@ -1197,110 +1781,95 @@ def discover_ocdeclare_model(
     """
     # Default constraint types
     if constraint_types is None:
-        constraint_types = {
-            'precedence': True,
-            'response': True,
-            'not_coexistence': False,
-            'chain_precedence': False,
-            'chain_response': False,
-            'coexistence': False,
-            'absence': False
-        }
+        constraint_types = {}
     if constraint_params is None:
         constraint_params = {}
+    if arc_types is None:
+        arc_types = ['EF', 'EP', 'AS']
 
-    def _thresholds(ctype: str):
-        """Return (support, adjusted_confidence) for a specific constraint type,
-        falling back to global parameters when per-type values are absent."""
-        p = constraint_params.get(ctype, {})
-        sup  = p.get('minSupport',      min_support)
-        conf = p.get('minConfidence',   min_confidence)
-        noise = p.get('noiseThreshold', noise_threshold)
-        return sup, max(conf - noise, 0.5)
+    def _cb(phase: str, pct: int) -> None:
+        if progress_callback is not None:
+            progress_callback(phase, pct)
+
+    def _log(msg: str) -> None:
+        if log_callback is not None:
+            log_callback(msg)
 
     # Load event log
+    _cb('Loading log', 0)
+    _log(f"Loading event log: {Path(event_log_path).name}")
     ocel_log = load_ocel2(event_log_path)
-    
+
     # Discover basic elements
+    _cb('Discovering structure', 5)
     object_types = discover_object_types(ocel_log)
-    activities = discover_activities(ocel_log)
-    
+    activities   = discover_activities(ocel_log)
+    n_events = len(ocel_log.get('events', {}))
+    n_objects = len(ocel_log.get('objects', {}))
+    _log(f"Loaded {n_events:,} events, {n_objects:,} objects — {len(object_types)} object types, {len(activities)} activities")
+    _log(f"Object types: {', '.join(object_types)}")
+
     # Discover object bindings
+    _cb('Building bindings', 8)
+    _log("Discovering object bindings (cardinality per activity)…")
     bindings_data = discover_object_bindings(ocel_log)
-    
-    # Discover constraints per object type
-    all_constraints = []
-    
-    for obj_type in object_types:
-        # Extract traces for this object type
-        traces = extract_object_traces(ocel_log, obj_type)
-        
-        if not traces:
-            continue
-        
-        # Discover lifecycle
-        creating_acts, terminating_acts = discover_lifecycle(ocel_log, obj_type, lifecycle_threshold)
-        
-        # Update bindings with lifecycle info
+    _log(f"Bindings done for {len(bindings_data)} activities")
+
+    # Update bindings with lifecycle info (creates/deactivates flags)
+    n_types = len(object_types)
+    for ti, obj_type in enumerate(object_types):
+        pct = 8 + int(2 * (ti + 1) / max(n_types, 1))  # 8→10 across all types
+        _cb('Lifecycle discovery', pct)
+        _log(f"Lifecycle [{ti+1}/{n_types}]: scanning events for '{obj_type}'…")
+        creating_acts, terminating_acts = discover_lifecycle(
+            ocel_log, obj_type, lifecycle_threshold
+        )
+        _log(f"  → creates: {sorted(creating_acts) or 'none'}  |  deactivates: {sorted(terminating_acts) or 'none'}")
         for activity in creating_acts:
             if activity in bindings_data and obj_type in bindings_data[activity]:
                 bindings_data[activity][obj_type]['creates'] = True
-        
         for activity in terminating_acts:
             if activity in bindings_data and obj_type in bindings_data[activity]:
                 bindings_data[activity][obj_type]['deactivates'] = True
-        
-        # Discover precedence constraints
-        if constraint_types.get('precedence', False):
-            _sup, _conf = _thresholds('precedence')
-            precedence = discover_precedence_constraints(
-                traces, activities, obj_type, _sup, _conf
-            )
-            all_constraints.extend(precedence)
-        
-        # Discover response constraints
-        if constraint_types.get('response', False):
-            _sup, _conf = _thresholds('response')
-            response = discover_response_constraints(
-                traces, activities, obj_type, _sup, _conf
-            )
-            all_constraints.extend(response)
 
-        # Discover not-coexistence (mutually exclusive) constraints
-        if constraint_types.get('not_coexistence', False):
-            _sup, _conf = _thresholds('not_coexistence')
-            not_coexistence = discover_not_coexistence_constraints(
-                traces, activities, obj_type, _sup, _conf
-            )
-            all_constraints.extend(not_coexistence)
+    # Discover OC-Declare constraints using Küsters & van der Aalst (2025) algorithm
+    _cb('Mining arcs', 10)
+    all_constraints = _arcs_to_deco_constraints(
+        _discover_kvaanda_arcs(
+            ocel_log=ocel_log,
+            activities=activities,
+            object_types=object_types,
+            noise_threshold=noise_threshold,
+            arc_types=arc_types,
+            counts_min=1,
+            counts_max=20,
+            reduction=reduction,
+            refinement=True,
+            progress_callback=lambda phase, pct: _cb(phase, 10 + int(pct * 0.8)),
+            log_callback=log_callback,
+        )
+    )
+    _log(f"Constraint translation done — {len(all_constraints)} constraints discovered")
 
-        # Discover chain-precedence constraints (B immediately preceded by A)
-        if constraint_types.get('chain_precedence', False):
-            _sup, _conf = _thresholds('chain_precedence')
-            chain_precedence = discover_chain_precedence_constraints(
-                traces, activities, obj_type, _sup, _conf
-            )
-            all_constraints.extend(chain_precedence)
-
-        # Discover chain-response constraints (A immediately followed by B)
-        if constraint_types.get('chain_response', False):
-            _sup, _conf = _thresholds('chain_response')
-            chain_response = discover_chain_response_constraints(
-                traces, activities, obj_type, _sup, _conf
-            )
-            all_constraints.extend(chain_response)
-    
     # Discover O2O rules
+    _cb('Discovering O2O rules', 92)
+    _log("Discovering object-to-object (O2O) relationship rules…")
     o2o_rules = discover_o2o_rules(ocel_log)
+    _log(f"Found {len(o2o_rules)} O2O rules")
 
     # Classify resource object types (high events-per-instance ratio)
-    resource_types = discover_resource_types(ocel_log, resource_threshold)
+    _cb('Classifying object types', 94)
+    _log("Classifying permanent (resource) object types…")
+    resource_types = discover_permanent_object_types(ocel_log, permanent_threshold)
+    _log(f"Permanent/resource types: {', '.join(resource_types) if resource_types else 'none detected'}")
 
     # Discover ranked start activity candidates
     start_activities_ranked = discover_start_activities(ocel_log)
 
     # Collect attribute schema and default values from the log.
-    # attribute_schema: { object_type: { attr_name: most_common_value } }
+    # attribute_schema: { object_type: { attr_name: initial_value } }
+    # Phase 4d: when attribute entries carry timestamps, use the earliest-observed
+    # value per attribute (object's initial state) instead of most-common.
     # object_type_attr_defs: { object_type: [ {name, type} ] }
     attribute_schema: Dict[str, Any] = {}
     object_type_attr_defs: Dict[str, list] = {}
@@ -1320,6 +1889,7 @@ def discover_ocdeclare_model(
             for a in attr_defs if isinstance(a, dict) and a.get("name")
         ]
 
+    # Buckets: (object_type, attr_name) -> list of (timestamp_str_or_None, value)
     attr_value_buckets: Dict[str, Dict[str, list]] = {}
     obj_iter = raw_objects.values() if isinstance(raw_objects, dict) else (raw_objects if isinstance(raw_objects, list) else [])
     for obj_entry in obj_iter:
@@ -1333,21 +1903,51 @@ def discover_ocdeclare_model(
                     continue
                 name = a.get("name")
                 value = a.get("value")
+                ts = a.get("time")  # may be None for unversioned entries
                 if name is not None and value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((ts, value))
         elif isinstance(attrs, dict):
             for name, value in attrs.items():
                 if value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append(value)
+                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((None, value))
 
     for ot, attr_map in attr_value_buckets.items():
         defaults = {}
-        for attr_name, values in attr_map.items():
-            counter = Counter(str(v) for v in values)
-            most_common_str, _ = counter.most_common(1)[0]
-            original = next((v for v in values if str(v) == most_common_str), most_common_str)
-            defaults[attr_name] = original
+        for attr_name, ts_value_pairs in attr_map.items():
+            # Use earliest timestamped value when available; fall back to most-common
+            timestamped = [(ts, v) for ts, v in ts_value_pairs if ts is not None]
+            if timestamped:
+                timestamped.sort(key=lambda x: x[0])
+                defaults[attr_name] = timestamped[0][1]
+            else:
+                values = [v for _, v in ts_value_pairs]
+                counter = Counter(str(v) for v in values)
+                most_common_str, _ = counter.most_common(1)[0]
+                defaults[attr_name] = next((v for v in values if str(v) == most_common_str), most_common_str)
         attribute_schema[ot] = defaults
+
+    # Phase 3e: discover event-level attribute names per activity type
+    # Collect attribute names observed on events in the log — user still decides
+    # capture source; this pre-populates the known attribute names.
+    event_attr_names: Dict[str, list] = {}  # activity_name -> [attr_name, ...]
+    raw_events = ocel_log.get("events", []) or []
+    ev_iter = raw_events.values() if isinstance(raw_events, dict) else raw_events
+    for ev_entry in ev_iter:
+        if not isinstance(ev_entry, dict):
+            continue
+        act_name = ev_entry.get("type") or ev_entry.get("activity") or ""
+        ev_attrs = ev_entry.get("attributes", []) or []
+        seen = event_attr_names.setdefault(act_name, [])
+        if isinstance(ev_attrs, list):
+            for ea in ev_attrs:
+                if isinstance(ea, dict):
+                    n = ea.get("name")
+                    if n and n not in seen:
+                        seen.append(n)
+        elif isinstance(ev_attrs, dict):
+            for n in ev_attrs:
+                if n not in seen:
+                    seen.append(n)
 
     # Build object_types list: strings for backward compat, but enrich with attr defs
     object_types_with_attrs = []
@@ -1371,10 +1971,15 @@ def discover_ocdeclare_model(
                     'deactivates': binding_info['deactivates']
                 })
 
-        activity_structures.append({
+        act_entry: Dict[str, Any] = {
             'name': activity,
-            'bindings': bindings_list
-        })
+            'bindings': bindings_list,
+        }
+        # Phase 3e: attach discovered event attribute names so the UI can
+        # pre-populate the event_attributes capture list
+        if activity in event_attr_names and event_attr_names[activity]:
+            act_entry['discovered_event_attr_names'] = event_attr_names[activity]
+        activity_structures.append(act_entry)
 
     # Build discovered model
     discovered_model = {
@@ -1384,6 +1989,7 @@ def discover_ocdeclare_model(
         'o2o_rules': o2o_rules,
         'resource_types': resource_types,
         'attribute_schema': attribute_schema,
+        'event_attribute_names': event_attr_names,  # Phase 3e
     }
     
     # Save to file if requested
@@ -1415,7 +2021,7 @@ def discover_ocdeclare_model(
         'avg_confidence': round(sum(c['confidence'] for c in all_constraints) / len(all_constraints), 3) if all_constraints else 0
     }
     
-    return {
+    result = {
         'model': discovered_model,
         'stats': stats,
         'output_file': output_filename,
@@ -1425,11 +2031,14 @@ def discover_ocdeclare_model(
             'min_confidence': min_confidence,
             'noise_threshold': noise_threshold,
             'lifecycle_threshold': lifecycle_threshold,
-            'resource_threshold': resource_threshold,
+            'permanent_threshold': permanent_threshold,
             'resource_types': resource_types,
             'constraint_types': constraint_types
         }
     }
+    _cb('Done', 100)
+    _log(f"Discovery complete — model saved to {output_filename or '(not saved)'}")
+    return result
 
 
 
@@ -1729,141 +2338,3 @@ def compute_ocpa_metrics(
         }
 
     return result
-
-
-
-
-def discover_concurrency_probs(
-    ocel_log: Dict[str, Any],
-    activity_durations: Optional[Dict[str, Any]] = None,
-    window_seconds: Optional[float] = None,
-    min_occurrences: int = 2,
-) -> Dict[str, float]:
-    """Discover pairwise concurrency probabilities from an OCEL 2.0 log.
-
-    Two events are considered concurrent when they share at least one object
-    and their timestamps are within ``window_seconds`` of each other.  If no
-    explicit window is given, the window for a pair (A, B) is
-    ``max(mean_A, mean_B)`` from the provided activity_durations, falling
-    back to 3600 s (1 h) when durations are unavailable.
-
-    Returns a flat dict keyed ``"A|||B"`` (always A < B lexicographically so
-    each unordered pair appears once) with the probability value in [0, 1].
-    The probability is:
-        p(A ∥ B) = (times A and B fired concurrently) / (total firings of A)
-    Both ``"A|||B"`` and ``"B|||A"`` are stored for fast lookup.
-
-    Parameters
-    ----------
-    ocel_log         : OCEL 2.0 dict (from load_ocel2).
-    activity_durations : dict activity_name -> ActivityDuration or plain dict
-                       with a ``mean_seconds`` key.  Used to set the window.
-    window_seconds   : fixed override for the concurrency window (seconds).
-                       When set, activity_durations is ignored for windowing.
-    min_occurrences  : minimum number of concurrent co-occurrences required
-                       before a probability is recorded.  Filters noise pairs.
-    """
-    if isinstance(ocel_log, list):
-        return {}
-
-    events  = ocel_log.get("events",  {})
-    objects = ocel_log.get("objects", {})
-
-    # ── Parse timestamps ──────────────────────────────────────────────────────
-    def _ts(raw) -> Optional[datetime]:
-        if raw is None:
-            return None
-        if isinstance(raw, datetime):
-            return raw
-        try:
-            s = str(raw).replace("Z", "+00:00")
-            return datetime.fromisoformat(s)
-        except Exception:
-            return None
-
-    # Build a list of (timestamp, activity, event_id, {object_ids}) records
-    ev_records = []
-    for eid, edata in events.items():
-        ts  = _ts(edata.get("timestamp") or edata.get("ocel:timestamp") or edata.get("time"))
-        act = edata.get("activity") or edata.get("ocel:activity")
-        omap = set(edata.get("omap") or edata.get("relationships") or [])
-        if ts and act:
-            ev_records.append((ts, act, eid, omap))
-
-    if not ev_records:
-        return {}
-
-    ev_records.sort(key=lambda x: x[0])
-
-    # ── Default window lookup ─────────────────────────────────────────────────
-    def _mean_s(act: str) -> float:
-        if activity_durations is None:
-            return 3600.0
-        entry = activity_durations.get(act)
-        if entry is None:
-            return 3600.0
-        if isinstance(entry, dict):
-            return float(entry.get("mean_seconds", 3600.0))
-        return float(getattr(entry, "mean_seconds", 3600.0))
-
-    # ── Count co-occurrences ──────────────────────────────────────────────────
-    # For every event E_A, scan forward/backward within the window and find
-    # events E_B that share at least one object with E_A.
-    from datetime import timedelta
-
-    act_total: Dict[str, int] = Counter(r[1] for r in ev_records)
-    pair_count: Dict[str, int] = {}   # "A|||B" -> co-occurrence count (A <= B)
-
-    n = len(ev_records)
-    for i, (ts_a, act_a, _, omap_a) in enumerate(ev_records):
-        win = timedelta(seconds=window_seconds if window_seconds is not None else 3600.0)
-        # scan forward only — symmetric pairs counted once then doubled
-        for j in range(i + 1, n):
-            ts_b, act_b, _, omap_b = ev_records[j]
-            if (ts_b - ts_a) > win:
-                break
-            if act_a == act_b:
-                continue
-            if not omap_a.intersection(omap_b):
-                continue
-            # use max window of the two activities when no fixed override
-            if window_seconds is None:
-                effective_win = timedelta(seconds=max(_mean_s(act_a), _mean_s(act_b)))
-                if (ts_b - ts_a) > effective_win:
-                    continue
-            key = "|||".join(sorted([act_a, act_b]))
-            pair_count[key] = pair_count.get(key, 0) + 1
-
-    # ── Build probability dict ────────────────────────────────────────────────
-    result: Dict[str, float] = {}
-    for key, cnt in pair_count.items():
-        if cnt < min_occurrences:
-            continue
-        a, b = key.split("|||")
-        total_a = act_total.get(a, 0)
-        total_b = act_total.get(b, 0)
-        if total_a == 0 or total_b == 0:
-            continue
-        # p = symmetric: fraction of A-firings with a concurrent B,
-        # averaged with fraction of B-firings with a concurrent A
-        p = 0.5 * (cnt / total_a + cnt / total_b)
-        p = min(1.0, round(p, 4))
-        result[f"{a}|||{b}"] = p
-        result[f"{b}|||{a}"] = p  # both orderings for fast lookup
-
-    return result
-
-
-if __name__ == '__main__':
-    # Example usage
-    result = discover_ocdeclare_model(
-        event_log_path='src/Simulation/IO/input/eventlog/example_log.json',
-        min_support=0.7,
-        min_confidence=0.85,
-        noise_threshold=0.15,
-        constraint_types={'precedence': True, 'response': True},
-        output_filename='discovered_model.json'
-    )
-    
-    print(f"Discovered model saved to: {result['output_file']}")
-    print(f"Statistics: {result['stats']}")

@@ -13,6 +13,9 @@ class RuntimeObject:
     # DES occupancy: set while this resource is held by an in-progress activity
     busy_until: Optional[datetime] = None
     busy_by: Optional[str] = None   # activity_name holding this resource
+    # Phase 4: full attribute change history for OCEL 2.0 timestamped export
+    # Each entry: (timestamp: Optional[datetime], attr_name: str, new_value: Any)
+    attribute_history: list = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +56,8 @@ class ExecutedEvent:
     activity_name: str
     timestamp: Optional[datetime]
     object_ids: list[str] = field(default_factory=list)
+    # Phase 3: event-level attributes captured at activity completion
+    attributes: dict[str, Any] = field(default_factory=dict)
 
     @property
     def participating_object_ids(self) -> list[str]:
@@ -92,6 +97,8 @@ class SimulationState:
     _last_activity_per_object: dict[str, str] = field(default_factory=dict)
     # count of start-activity events (maintained via start_activity_names set in record_event)
     _start_event_count: int = 0
+    # per-activity start-event count: {activity_name: count}
+    _start_event_count_by_activity: dict = field(default_factory=dict)
     # set of start activity names — populated once by the simulator before running
     _start_activity_names: set = field(default_factory=set)
     # set of resource type names — populated once by the simulator before running
@@ -161,6 +168,9 @@ class SimulationState:
     # Maps each active obligation key → constraint identity tuple, so deactivate_object
     # can attribute cancellations to the right constraint without a full scan.
     _obligation_to_constraint: dict = field(default_factory=dict)
+    # Multi-type secondary binding info: obligation_key → [(obj_type, inv, frozenset(required_oids))]
+    # Only populated for multi-type response obligations; empty for single-type.
+    _obligation_bindings: dict = field(default_factory=dict)
     # Running count of deactivated non-resource objects (= completed traces)
     # Maintained in deactivate_object — avoids O(n) scan in _should_stop
     completed_trace_count: int = 0
@@ -173,6 +183,10 @@ class SimulationState:
     _inactive_scope_types: set = field(default_factory=set)
     # Performance: typed link index — _linked_by_type[oid][object_type] = set of linked oids of that type
     _linked_by_type: dict = field(default_factory=dict)
+
+    # Phase 1b: guard coverage counters — incremented by candidategeneration
+    guard_checks_total: int = 0
+    guard_checks_passed: int = 0
 
     # Phase 1 — Obligation stratification
     # Ready pool: (target_act, scope_oid) → 1 — prerequisites satisfied, inject immediately
@@ -235,13 +249,27 @@ class SimulationState:
                 self._inactive_scope_types.add(obj.object_type)
 
         # Clear all pending obligations scoped to this object.
-        keys_to_remove = [
-            k for k in self._obligations_count
-            if (isinstance(k[1], str) and k[1] == object_id) or
-               (isinstance(k[1], frozenset) and object_id in k[1])
-        ]
+        keys_to_remove = []
+        for k in self._obligations_count:
+            if isinstance(k[1], str) and k[1] == object_id:
+                keys_to_remove.append(k)
+            elif isinstance(k[1], frozenset) and object_id in k[1]:
+                c_key_ob = self._obligation_to_constraint.get(k)
+                if c_key_ob and len(c_key_ob) > 3 and c_key_ob[3] == 'any':
+                    # any-mode: cancel only when no other active members remain
+                    remaining_active = any(
+                        oid != object_id and self.objects.get(oid) and self.objects[oid].active
+                        for oid in k[1]
+                    )
+                    if not remaining_active:
+                        keys_to_remove.append(k)
+                else:
+                    # all-mode: cancel immediately — full set can never fire
+                    keys_to_remove.append(k)
         for k in keys_to_remove:
             del self._obligations_count[k]
+            self._obligations_ready.pop(k, None)
+            self._obligation_bindings.pop(k, None)
             # Each cancelled unfulfilled obligation is a constraint violation (S8).
             # Attribute it to the originating constraint via the reverse-lookup dict.
             c_key = self._obligation_to_constraint.pop(k, None)
@@ -254,9 +282,7 @@ class SimulationState:
                 self.total_obligations_violated += 1
         self.total_deactivations += 1
         self.total_obligations_cancelled += len(keys_to_remove)
-        # Clean up stratified obligation pools
-        for k in [k for k in self._obligations_ready if isinstance(k[1], str) and k[1] == object_id]:
-            del self._obligations_ready[k]
+        # Clean up stratified obligation pools (blocked only; ready handled above)
         for k in [k for k in self._obligations_blocked if isinstance(k[1], str) and k[1] == object_id]:
             self._obligations_blocked.pop(k, None)
         # Remove from eligibility index
@@ -320,12 +346,14 @@ class SimulationState:
         activity_name: str,
         participating_object_ids: list[str],
         timestamp: Optional[datetime] = None,
+        attributes: Optional[dict] = None,
     ) -> ExecutedEvent:
         event = ExecutedEvent(
             event_id=self.new_event_id(),
             activity_name=activity_name,
             timestamp=timestamp,
             object_ids=participating_object_ids,
+            attributes=dict(attributes) if attributes else {},
         )
         self.executed_events.append(event)
         self.step_count += 1
@@ -350,6 +378,9 @@ class SimulationState:
 
         if activity_name in self._start_activity_names:
             self._start_event_count += 1
+            self._start_event_count_by_activity[activity_name] = (
+                self._start_event_count_by_activity.get(activity_name, 0) + 1
+            )
 
         # ── Global consecutive-streak cache ───────────────────────────────────
         if self._last_global_activity != activity_name:

@@ -6,9 +6,11 @@ structure. It avoids mixing multiple JSON variants in one file.
 Notes for compatibility with OCPQ / OCEL 2.0 readers:
 - Top-level collections are emitted as lists, not dictionaries.
 - Events must carry a `time` field.
-- Object attributes are exported as time-stamped records using the simulation
-  start time as the timestamp (attributes are static — initialized once and
-  not modified during simulation).
+- Object attributes are exported as time-stamped records. When attribute
+  history is tracked (Phase 4), each change gets its own timestamped entry.
+  Otherwise a single snapshot with the simulation start time is used.
+- Event attributes are exported when populated by activity event_attributes
+  capture specs (Phase 3).
 """
 
 from __future__ import annotations
@@ -52,15 +54,23 @@ def _build_object_type_definitions(state: SimulationState, static_model: Any = N
     return result
 
 
-def _build_event_type_definitions(state: SimulationState) -> list[dict[str, Any]]:
+def _build_event_type_definitions(state: SimulationState, static_model: Any = None) -> list[dict[str, Any]]:
     event_type_names = sorted({ev.activity_name for ev in state.executed_events})
 
+    # Build attribute schema from static model's activity event_attributes specs
+    attr_schema: dict[str, list] = {}
+    if static_model is not None:
+        for act in getattr(static_model, 'activities', []) or []:
+            caps = getattr(act, 'event_attributes', ()) or ()
+            if caps:
+                attr_schema[act.name] = [
+                    {"name": cap.get('name', ''), "type": "string"}
+                    for cap in caps if cap.get('name')
+                ]
+
     return [
-        {
-            "name": event_type_name,
-            "attributes": [],
-        }
-        for event_type_name in event_type_names
+        {"name": name, "attributes": attr_schema.get(name, [])}
+        for name in event_type_names
     ]
 
 
@@ -71,11 +81,24 @@ def _build_objects(state: SimulationState, ref_timestamp: Optional[datetime] = N
     for obj_id in sorted(state.objects.keys()):
         obj = state.objects[obj_id]
         attrs = []
-        for attr_name, attr_value in (obj.attributes or {}).items():
-            entry: dict[str, Any] = {"name": attr_name, "value": attr_value}
-            if ts_str is not None:
-                entry["time"] = ts_str
-            attrs.append(entry)
+        history = getattr(obj, 'attribute_history', None)
+        if history:
+            # Phase 4: export full timestamped history
+            for (ts, attr_name, attr_value) in history:
+                entry: dict[str, Any] = {"name": attr_name, "value": attr_value}
+                ts_entry = _isoformat_or_none(ts)
+                if ts_entry is not None:
+                    entry["time"] = ts_entry
+                elif ts_str is not None:
+                    entry["time"] = ts_str
+                attrs.append(entry)
+        else:
+            # Fallback: single snapshot
+            for attr_name, attr_value in (obj.attributes or {}).items():
+                entry = {"name": attr_name, "value": attr_value}
+                if ts_str is not None:
+                    entry["time"] = ts_str
+                attrs.append(entry)
         objects.append({
             "id": obj_id,
             "type": obj.object_type,
@@ -119,7 +142,10 @@ def _build_events(
             "type": ev.activity_name,
             "time": ts if ts is not None else None,
             "relationships": relationships,
-            "attributes": [],
+            "attributes": [
+                {"name": k, "value": v}
+                for k, v in (getattr(ev, 'attributes', None) or {}).items()
+            ],
         }
 
         events.append(event_record)
@@ -165,7 +191,7 @@ def build_ocel2_dict(
         "version": "2.0",
         "ordering": "timestamp",
         "objectTypes": _build_object_type_definitions(state, static_model),
-        "eventTypes": _build_event_type_definitions(state),
+        "eventTypes": _build_event_type_definitions(state, static_model),
         "objects": _build_objects(state, ref_ts),
         "events": _build_events(
             state,
