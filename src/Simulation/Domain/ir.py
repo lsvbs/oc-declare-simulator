@@ -178,10 +178,15 @@ class StaticModel:
     def constraints_for_activity(self, activity_name: str) -> list:
         """Return only constraints relevant to this activity (O(1) lookup)."""
         idx = object.__getattribute__(self, '_constraints_by_activity')
-        if idx:
-            return idx.get(activity_name, [])
-        # Fallback: return all (index not built yet)
-        return object.__getattribute__(self, 'constraints')
+        if not idx:
+            # Build index lazily into the mutable dict (frozen dataclass allows mutating contents)
+            constraints = object.__getattribute__(self, 'constraints')
+            for c in constraints:
+                for act in (c.source_activity, c.target_activity):
+                    if act:
+                        idx.setdefault(act, []).append(c)
+            idx.setdefault('__built__', [])  # sentinel so empty-constraint models don't rebuild
+        return idx.get(activity_name, [])
 
 
 model = StaticModel(

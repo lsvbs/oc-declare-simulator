@@ -82,6 +82,8 @@ class SimulationState:
     # Fast index for obligation resolution: (target_activity, scope_object_id|None) -> count
     # None key is used for unscoped obligations. Kept in sync with pending_obligations.
     _obligations_count: dict[tuple, int] = field(default_factory=dict)
+    # activity_name → set of frozenset-keyed obligation tuples for fast O(1) lookup
+    _frozenset_obligation_acts: dict[str, set] = field(default_factory=dict)
     next_object_counter: dict[str, int] = field(default_factory=dict)
     next_event_counter: int = 1
     last_generated_timestamp: Optional[datetime] = None
@@ -91,7 +93,7 @@ class SimulationState:
     _events_by_activity: dict[str, list] = field(default_factory=dict)
     # object_id -> all events involving that object
     _events_by_object: dict[str, list] = field(default_factory=dict)
-    # (activity_name, object_id) -> all events with that activity involving that object
+    # (activity_name, object_id) -> list of event IDs (str) for that activity+object pair
     _events_by_act_obj: dict[tuple, list] = field(default_factory=dict)
     # object_id -> activity_name of the most recent event involving it
     _last_activity_per_object: dict[str, str] = field(default_factory=dict)
@@ -268,6 +270,10 @@ class SimulationState:
                     keys_to_remove.append(k)
         for k in keys_to_remove:
             del self._obligations_count[k]
+            if isinstance(k[1], frozenset):
+                fs_acts = self._frozenset_obligation_acts.get(k[0])
+                if fs_acts:
+                    fs_acts.discard(k)
             self._obligations_ready.pop(k, None)
             self._obligation_bindings.pop(k, None)
             # Each cancelled unfulfilled obligation is a constraint violation (S8).
@@ -365,7 +371,7 @@ class SimulationState:
             # Capture previous activity before updating — needed for streak reset below
             prev_act_for_oid = self._last_activity_per_object.get(oid)
             self._events_by_object.setdefault(oid, []).append(event)
-            self._events_by_act_obj.setdefault((activity_name, oid), []).append(event)
+            self._events_by_act_obj.setdefault((activity_name, oid), []).append(event.event_id)
             self._last_activity_per_object[oid] = activity_name
 
             # Per-object streak (#17: inlined, no dict allocation)

@@ -374,13 +374,13 @@ class Simulator:
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
-                and getattr(con, 'nmin', 0) > 0
+                and con.nmin > 0
             ]
             prec_gates_nmax = [
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
-                and getattr(con, 'nmax', None) is not None
+                and con.nmax is not None
             ]
 
             for oid in active_ids:
@@ -391,10 +391,10 @@ class Simulator:
                 # the expensive build_candidate_for_activity call
                 if prec_gates_nmin:
                     blocked = False
-                    prec_satisfied = getattr(state, '_prec_satisfied', None)
+                    prec_satisfied = state._prec_satisfied
                     for con in prec_gates_nmin:
                         cache_key = (con.source_activity, activity.name, 'each', oid)
-                        if prec_satisfied is not None and cache_key in prec_satisfied:
+                        if cache_key in prec_satisfied:
                             continue  # already permanently satisfied
                         src_count = len(state._events_by_act_obj.get(
                             (con.source_activity, oid), []))
@@ -755,7 +755,7 @@ class Simulator:
                 state._obligations_ready.pop((act, oid), None)
                 _record_fulfillment((act, oid))
         # Discharge frozenset obligations (any-mode: non-empty intersection; all-mode: full subset)
-        all_keys = [k for k in list(state._obligations_count) if k[0] == act and isinstance(k[1], frozenset)]
+        all_keys = list(state._frozenset_obligation_acts.get(act, ()))
         for k in all_keys:
             c_key_ob = state._obligation_to_constraint.get(k)
             scope_kind_of_ob = c_key_ob[3] if c_key_ob else 'all'
@@ -767,6 +767,9 @@ class Simulator:
                 state._obligations_count.pop(k, None)
                 state._obligations_ready.pop(k, None)
                 state._obligation_bindings.pop(k, None)
+                fs_acts = state._frozenset_obligation_acts.get(k[0])
+                if fs_acts:
+                    fs_acts.discard(k)
                 _record_fulfillment(k)
 
     def _create_response_obligations(self, executed_event, state: SimulationState) -> None:
@@ -776,7 +779,7 @@ class Simulator:
                 constraint.constraint_type,
                 constraint.source_activity,
                 constraint.target_activity,
-                getattr(constraint.scope, 'kind', 'each'),
+                constraint.scope.kind,
             )
             if constraint.scope.bindings and len(constraint.scope.bindings) > 1:
                 # Multi-type: build one obligation per Cartesian combination of each-type objects.
@@ -804,6 +807,7 @@ class Simulator:
                             key = (constraint.target_activity, frozenset(combo))
                             if key not in state._obligations_count:
                                 state._obligations_count[key] = 1
+                                state._frozenset_obligation_acts.setdefault(key[0], set()).add(key)
                                 state._obligation_to_constraint[key] = c_key
                                 if secondary_info:
                                     state._obligation_bindings[key] = secondary_info
@@ -816,6 +820,7 @@ class Simulator:
                             key = (constraint.target_activity, primary_oids)
                             if key not in state._obligations_count:
                                 state._obligations_count[key] = 1
+                                state._frozenset_obligation_acts.setdefault(key[0], set()).add(key)
                                 state._obligation_to_constraint[key] = c_key
                                 remaining = [
                                     (t, inv, frozenset(event_oids_by_type.get(t, [])))
@@ -855,6 +860,7 @@ class Simulator:
                     key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._frozenset_obligation_acts.setdefault(key[0], set()).add(key)
                         state._obligation_to_constraint[key] = c_key
                         state._obligations_ready[key] = 1  # any-mode: one member suffices
             elif constraint.scope.kind == "all":
@@ -866,6 +872,7 @@ class Simulator:
                     key = (constraint.target_activity, frozenset(scope_object_ids))
                     if key not in state._obligations_count:
                         state._obligations_count[key] = 1
+                        state._frozenset_obligation_acts.setdefault(key[0], set()).add(key)
                         state._obligation_to_constraint[key] = c_key
                         state._obligations_ready[key] = 1  # all-mode: always ready (frozenset handles sync)
             else:
@@ -1089,7 +1096,7 @@ class Simulator:
             deactivated_types = {
                 binding.object_type
                 for binding in activity.bindings
-                if getattr(binding, "deactivates", False)
+                if binding.deactivates
                 and binding.object_type not in resource_types
             }
             for oid in in_prog.participating_object_ids:
@@ -1099,7 +1106,7 @@ class Simulator:
 
             # Apply attribute updates (DES: fires on completion, not on start)
             for binding in activity.bindings:
-                updates = getattr(binding, 'attribute_updates', ()) or ()
+                updates = binding.attribute_updates
                 if not updates:
                     continue
                 for oid in in_prog.participating_object_ids:
@@ -1110,7 +1117,7 @@ class Simulator:
 
             # Phase 3: capture event-level attributes
             evt_attrs: dict = {}
-            for cap in getattr(activity, 'event_attributes', ()) or ():
+            for cap in activity.event_attributes:
                 source = cap.get('source')
                 name   = cap.get('name', '')
                 if not name:
@@ -1154,18 +1161,18 @@ class Simulator:
         # Populate precedence satisfied cache on firing: for every precedence
         # with this activity as target, mark it satisfied for each participating
         # object so future candidate checks skip the constraint for these objects.
-        prec_satisfied = getattr(state, '_prec_satisfied', None)
+        prec_satisfied = state._prec_satisfied
         if prec_satisfied is not None:
             fired_act = in_prog.candidate_activity_name
             resource_types = self._resource_types_set
             for con in self._prec_by_target.get(fired_act, []):
                 if con.scope.kind != 'each':
                     continue
-                nmax = getattr(con, 'nmax', None)
+                nmax = con.nmax
                 if nmax is not None:
                     continue  # nmax constraints can be re-violated; don't cache
                 source = con.source_activity
-                nmin = getattr(con, 'nmin', 0)
+                nmin = con.nmin
                 cache_key_base = (source, fired_act, 'each')
                 for oid in in_prog.participating_object_ids:
                     obj = state.objects.get(oid)

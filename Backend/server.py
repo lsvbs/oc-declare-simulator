@@ -1252,17 +1252,29 @@ def run_simulation():
             for link in final_state.links
         ]
         
-        # Save output
-        output_file = write_ocel2_json(final_state, static_model=static_model)
+        # Save output — include model name in filename for traceability
+        import re as _re
+        if ocdeclare_file:
+            _raw_slug = Path(ocdeclare_file).stem
+        elif isinstance(model_data, dict):
+            _raw_slug = model_data.get('name') or ''
+        else:
+            _raw_slug = ''
+        _log_slug = _re.sub(r'[^a-zA-Z0-9_-]', '_', _raw_slug).strip('_')[:40]
+        output_file = write_ocel2_json(
+            final_state,
+            static_model=static_model,
+            log_id=f"log_{_log_slug}" if _log_slug else "log",
+        )
         output_filename = os.path.basename(output_file)
 
         # Compute and save timing metrics
         metrics = compute_metrics(final_state)
-        metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
+        metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_', 1))
         metrics_filename = os.path.basename(metrics_file)
 
         # Close temp file and rename to final iteration log path
-        iteration_log_filename = output_filename.replace('log_', 'iteration_')
+        iteration_log_filename = output_filename.replace('log_', 'iteration_', 1)
         iteration_log_path = METRICS_DIR / iteration_log_filename
         try:
             _iter_tmp.close()
@@ -2254,21 +2266,20 @@ def analyze_pressure():
             total_steps_run[0] += 1
             last_sim_time[0] = state.current_time
 
-            waiting_acts = {wc.candidate_activity_name for wc in state.waiting_queue}
+            # waiting_acts = {wc.candidate_activity_name for wc in state.waiting_queue}
 
             for act in self_s.static_model.activities:
                 if act.name in pool_acts:
                     continue
 
-                # Resource busy — activity is in waiting queue (passed semantic checks, failed resource)
-                if act.name in waiting_acts:
-                    block_counts[act.name]['resource_busy'] += 1
-                    # Find which resource type is blocking
-                    for wc in state.waiting_queue:
-                        if wc.candidate_activity_name == act.name:
-                            blocking_constraint[act.name][f'resource:{wc.blocked_resource_type}'] += 1
-                            break
-                    continue
+                # Resource busy — activity is in waiting queue (resource concept removed)
+                # if act.name in waiting_acts:
+                #     block_counts[act.name]['resource_busy'] += 1
+                #     for wc in state.waiting_queue:
+                #         if wc.candidate_activity_name == act.name:
+                #             blocking_constraint[act.name][f'resource:{wc.blocked_resource_type}'] += 1
+                #             break
+                #     continue
 
                 pt = primary_type.get(act.name)
 
@@ -2411,7 +2422,7 @@ def analyze_pressure():
                 suggestion = f'No active objects of type "{pt}" — check that the activity creating "{pt}" fires early enough and that deactivation is not premature'
             else:
                 constraint_detail = {'constraint_type': 'other'}
-                suggestion = 'Activity is blocked by semantic constraints — check not_coexistence, nmax caps, or exclusive_choice constraints'
+                suggestion = 'Activity is blocked by semantic constraints — check not_coexistence or nmax caps'
 
             key = f'{act_name}:{top_ckey}'
             if key not in seen:
@@ -2996,7 +3007,7 @@ def further_eval_conformance_check():
                 has_src = src in trace
                 has_tgt = tgt in trace
 
-                if ctype in ('response', 'succession'):
+                if ctype == 'response':
                     if has_src:
                         checked += 1
                         first_src = next((i for i, a in enumerate(trace) if a == src), None)
@@ -3025,18 +3036,18 @@ def further_eval_conformance_check():
                         checked += 1
                         if has_tgt:
                             violated += 1
-                elif ctype == 'coexistence':
-                    if has_src or has_tgt:
-                        checked += 1
-                        if not (has_src and has_tgt):
-                            violated += 1
-                elif ctype == 'exclusive_choice':
-                    checked += 1
-                    if has_src and has_tgt:
-                        violated += 1
-                    elif not has_src and not has_tgt:
-                        violated += 1
-                elif ctype in ('existence', 'init', 'last'):
+                # elif ctype == 'coexistence':  # removed: coexistence not used
+                #     if has_src or has_tgt:
+                #         checked += 1
+                #         if not (has_src and has_tgt):
+                #             violated += 1
+                # elif ctype == 'exclusive_choice':  # removed: exclusive_choice not used
+                #     checked += 1
+                #     if has_src and has_tgt:
+                #         violated += 1
+                #     elif not has_src and not has_tgt:
+                #         violated += 1
+                elif ctype in ('existence', 'last'):
                     checked += 1
                     if not has_src:
                         violated += 1
@@ -3046,11 +3057,11 @@ def further_eval_conformance_check():
                     cap = nmax if nmax is not None else 0
                     if cnt > cap:
                         violated += 1
-                elif ctype == 'exactly':
-                    checked += 1
-                    cnt = trace.count(src)
-                    if cnt != nmin:
-                        violated += 1
+                # elif ctype == 'exactly':  # removed: exactly not used
+                #     checked += 1
+                #     cnt = trace.count(src)
+                #     if cnt != nmin:
+                #         violated += 1
                 else:
                     # Generic: count-based check where applicable
                     if has_src:

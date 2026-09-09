@@ -1086,7 +1086,7 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
     ARC_TO_CTYPE = {
         'EF': 'response',  'DF': 'response',
         'EP': 'precedence', 'DP': 'precedence',
-        'AS': 'coexistence',
+        # 'AS': 'coexistence',  # removed: coexistence not used
     }
     constraints = []
     for arc in arcs:
@@ -1858,10 +1858,11 @@ def discover_ocdeclare_model(
     _log(f"Found {len(o2o_rules)} O2O rules")
 
     # Classify resource object types (high events-per-instance ratio)
-    _cb('Classifying object types', 94)
-    _log("Classifying permanent (resource) object types…")
-    resource_types = discover_permanent_object_types(ocel_log, permanent_threshold)
-    _log(f"Permanent/resource types: {', '.join(resource_types) if resource_types else 'none detected'}")
+    # _cb('Classifying object types', 94)
+    # _log("Classifying permanent (resource) object types…")
+    # resource_types = discover_permanent_object_types(ocel_log, permanent_threshold)
+    resource_types: list = []
+    # _log(f"Permanent/resource types: {', '.join(resource_types) if resource_types else 'none detected'}")
 
     # Discover ranked start activity candidates
     start_activities_ranked = discover_start_activities(ocel_log)
@@ -1983,6 +1984,7 @@ def discover_ocdeclare_model(
 
     # Build discovered model
     discovered_model = {
+        'name': Path(event_log_path).stem if event_log_path else None,
         'object_types': object_types_with_attrs,
         'activities': activity_structures,
         'constraints': all_constraints,

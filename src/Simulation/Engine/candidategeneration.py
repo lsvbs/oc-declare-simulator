@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
@@ -28,11 +29,15 @@ def find_active_objects_of_type(state: SimulationState, object_type: str, limit:
     active_set = state._active_by_type.get(object_type)
     if not active_set:
         return []
-    current_time = getattr(state, 'current_time', None)
-    is_resource = object_type in getattr(state, '_resource_types', set())
+    is_resource = object_type in state._resource_types
+    if not is_resource:
+        if limit > 0:
+            return list(itertools.islice(active_set, limit))
+        return list(active_set)
+    current_time = state.current_time
     result = []
     for oid in active_set:
-        if is_resource and current_time is not None:
+        if current_time is not None:
             obj = state.objects.get(oid)
             if obj and obj.busy_until is not None and obj.busy_until > current_time:
                 continue  # resource occupied — skip
@@ -136,7 +141,7 @@ def build_candidate_for_activity(
             existing_ids = forced
 
         # Apply attribute guard: filter out objects that don't satisfy the guard.
-        guard = getattr(binding, 'guard', None)
+        guard = binding.guard
         if guard:
             before = len(existing_ids)
             existing_ids = _apply_guard_filter(existing_ids, guard, state)
@@ -249,7 +254,7 @@ def build_candidate_for_object_and_activity(
         existing_ids = available_for_type.get(binding.object_type, [])
 
         # Apply attribute guard (mirrors build_candidate_for_activity)
-        guard = getattr(binding, 'guard', None)
+        guard = binding.guard
         if guard:
             before = len(existing_ids)
             existing_ids = apply_guard_filter(existing_ids, guard, state)

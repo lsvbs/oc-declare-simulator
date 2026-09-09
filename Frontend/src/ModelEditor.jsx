@@ -268,10 +268,13 @@ const CONSTRAINT_TYPES = [
   'precedence', 'not_precedence', 'response', 'not_coexistence',
   'chain_precedence', 'chain_response',
   'responded_existence',
-  'absence', 'exactly', 'init',
-  'exclusive_choice',
-  'succession', 'chain_succession', 'not_succession', 'not_chain_succession',
-  'alternate_response', 'alternate_precedence', 'alternate_succession',
+  'absence',
+  // 'exactly',  // removed
+  // 'init',  // removed
+  // 'exclusive_choice',  // removed
+  // 'succession', 'chain_succession',  // removed
+  'not_succession', 'not_chain_succession',
+  // 'alternate_response', 'alternate_precedence', 'alternate_succession',  // removed
 ];
 
 export const CONSTRAINT_HELP = {
@@ -283,16 +286,16 @@ export const CONSTRAINT_HELP = {
   chain_response:       'Once A fires, every other activity is blocked for the scope object until B fires next.',
   responded_existence:  'If A occurs, B must also occur (before or after). Post-hoc obligation only — not enforced eagerly during simulation.',
   absence:              'Activity must never occur (n≤ = 0) or at most n≤ times per scope object.',
-  exactly:              'A must occur exactly n≥ times. Block further firings after n≥. Set source = target = the activity.',
-  init:                 'A must be the first activity to fire. All other activities are blocked until A has fired at least once.',
-  exclusive_choice:     'Exactly one of A or B may occur. Once one fires, the other is permanently blocked.',
-  succession:           'A must precede B (Precedence) AND after every A, B must eventually follow (Response). Composed constraint.',
-  chain_succession:     'A and B must occur consecutively (Chain Precedence ∧ Chain Response).',
+  // exactly:           removed
+  // init:              removed
+  // exclusive_choice:  removed
+  // succession:        removed
+  // chain_succession:  removed
   not_succession:       'After A fires, B must never follow.',
   not_chain_succession: 'B must not occur immediately after A.',
-  alternate_response:   'Between each A and its matching B response, no other A may occur. Source cannot re-fire while "armed".',
-  alternate_precedence: 'Each B must be preceded by A, with no other B in between. B is blocked when it would exceed the count of A firings.',
-  alternate_succession: 'Alternating A then B with no repetitions (Alternate Response ∧ Alternate Precedence).',
+  // alternate_response:   removed
+  // alternate_precedence: removed
+  // alternate_succession: removed
 };
 const SCOPE_KINDS      = ['each', 'any', 'all'];
 
@@ -473,7 +476,7 @@ export default function ModelEditor({
 
   const addConstraint = () => {
     if (!newCon.constraint_type) return;
-    const isUnary = ['absence', 'exactly', 'init'].includes(newCon.constraint_type);
+    const isUnary = ['absence'].includes(newCon.constraint_type);
     if (isUnary) {
       if (!newCon.source_activity) return;
     } else {
@@ -593,7 +596,7 @@ export default function ModelEditor({
     // Activities that appear as target in 2+ response/chain_response constraints
     const counts = {};
     constraints.forEach(c => {
-      if (['response','chain_response','alternate_response'].includes(c.constraint_type) && c.target_activity) {
+      if (['response','chain_response'].includes(c.constraint_type) && c.target_activity) {
         counts[c.target_activity] = (counts[c.target_activity] || 0) + 1;
       }
     });
@@ -1262,36 +1265,24 @@ export default function ModelEditor({
                       case 'responded_existence':
                         if (isSrc) return `If "${actName}" occurs, "${other}" must also occur${sp} (before or after)`;
                         else return `If "${other}" occurs, "${actName}" must also occur${sp} (before or after)`;
-                      case 'succession':
-                        if (isSrc) {
-                          let t = `"${actName}" must happen at least ${timesMin}${sp} before "${other}", and after "${actName}" fires "${other}" must eventually follow`;
-                          if (timesMax) t += ` (source capped at ${timesMax}${sp})`;
-                          return t;
-                        } else {
-                          let t = `"${other}" must happen at least ${timesMin}${sp} before "${actName}", and after "${other}" fires "${actName}" must eventually follow`;
-                          if (timesMax) t += ` (source capped at ${timesMax}${sp})`;
-                          return t;
-                        }
-                      case 'chain_succession':
-                        if (isSrc) return `"${actName}" and "${other}" must always occur consecutively${sp}`;
-                        else return `"${other}" and "${actName}" must always occur consecutively${sp}`;
-                      case 'alternate_response':
-                        if (isSrc) return `Between each "${actName}" and its matching "${other}", no other "${actName}" may occur${sp}`;
-                        else return `Between each "${other}" and its matching "${actName}", no other "${other}" may occur${sp}`;
-                      case 'alternate_precedence':
-                        if (isSrc) return `Each "${other}" must be preceded by "${actName}" with no other "${other}" in between${sp}`;
-                        else return `Each "${actName}" must be preceded by "${other}" with no other "${actName}" in between${sp}`;
-                      case 'alternate_succession':
-                        if (isSrc) return `"${actName}" and "${other}" must alternate without repetitions${sp}`;
-                        else return `"${other}" and "${actName}" must alternate without repetitions${sp}`;
-                      case 'exclusive_choice':
-                        return `Exactly one of "${actName}" or "${other}" may occur${sp} — once one fires the other is blocked`;
+                      // case 'succession':  // removed
+                      //   ...
+                      // case 'chain_succession':  // removed
+                      //   ...
+                      // case 'alternate_response':  // removed
+                      //   ...
+                      // case 'alternate_precedence':  // removed
+                      //   ...
+                      // case 'alternate_succession':  // removed
+                      //   ...
+                      // case 'exclusive_choice':  // removed
+                      //   ...
                       case 'absence':
                         return `"${actName}" must never occur${nmax != null ? ` more than ${timesMax}` : ''}${sp}`;
-                      case 'exactly':
-                        return `"${actName}" must occur exactly ${timesMin}${sp}`;
-                      case 'init':
-                        return `"${actName}" must be the first activity to fire`;
+                      // case 'exactly':  // removed
+                      //   ...
+                      // case 'init':  // removed
+                      //   ...
                       default:
                         return `${c.constraint_type.replace(/_/g,' ')}: "${src}" → "${tgt}"${sp}`;
                     }
@@ -1302,8 +1293,8 @@ export default function ModelEditor({
                   // "after"  = actName is source (actName → other)
                   // "mutual" = symmetric
                   const classifyDirection = (c) => {
-                    const mutual = ['not_coexistence', 'exclusive_choice', 'responded_existence',
-                                    'chain_succession', 'alternate_succession', 'succession'].includes(c.constraint_type);
+                    const mutual = ['not_coexistence', 'responded_existence'].includes(c.constraint_type);
+                    // 'exclusive_choice', 'chain_succession', 'alternate_succession', 'succession' removed
                     if (mutual) return 'mutual';
                     if (c.target_activity === actName) return 'before';
                     if (c.source_activity === actName) return 'after';
@@ -1464,8 +1455,8 @@ export default function ModelEditor({
                 const renderRow = (c, key) => {
                   const realIdx = constraints.indexOf(c);
                   const isEditing = editingConIdx === realIdx;
-                  const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
-                    : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                  const rowBg = /^(response|chain_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                    : /^(precedence|chain_precedence)$/.test(c.constraint_type) ? '#eff6ff'
                     : undefined;
                   return (
                     <div key={key} className={`constraint-row${isEditing ? ' constraint-row-editing' : ''}`}
@@ -1576,7 +1567,7 @@ export default function ModelEditor({
                 onChange={e => setNewCon(p => ({
                   ...p,
                   constraint_type: e.target.value,
-                  nmin: e.target.value === 'precedence' ? 1 : e.target.value === 'exactly' ? 1 : 0,
+                  nmin: e.target.value === 'precedence' ? 1 : 0,
                   nmax: e.target.value === 'absence' ? 0 : null,
                 }))}>
                 <option value="">constraint…</option>
@@ -1585,8 +1576,8 @@ export default function ModelEditor({
               {CONSTRAINT_HELP[newCon.constraint_type] && (
                 <HelpTip text={CONSTRAINT_HELP[newCon.constraint_type]} />
               )}
-              {/* For unary constraints (absence, exactly, init): single activity picker */}
-              {['absence', 'exactly', 'init'].includes(newCon.constraint_type) ? (
+              {/* For unary constraints (absence): single activity picker */}
+              {['absence'].includes(newCon.constraint_type) ? (
                 <select value={newCon.source_activity}
                   onChange={e => setNewCon(p => ({ ...p, source_activity: e.target.value, target_activity: e.target.value }))}>
                   <option value="">activity…</option>
@@ -1622,17 +1613,15 @@ export default function ModelEditor({
                   {otNames.map(t => <option key={t} value={t}>{t}</option>)}
                 </select>
               )}
-              {(['precedence', 'response', 'absence', 'exactly'].includes(newCon.constraint_type)) && (
+              {(['precedence', 'response', 'absence'].includes(newCon.constraint_type)) && (
                 <span className="card-inputs" title={
                   newCon.constraint_type === 'response'
                     ? 'n≤ caps how many times the target may fire per scope object (blank = no upper bound).'
                     : newCon.constraint_type === 'absence'
                     ? 'n≤ = 0 means never. Increase to allow at most n≤ occurrences.'
-                    : newCon.constraint_type === 'exactly'
-                    ? 'n≥ = exact required count. Activity is blocked after this many firings.'
                     : 'Cardinality bounds: nmin ≥ 1 enforces "source before target"; nmax optionally caps how many sources may precede the target (blank = no upper bound).'
                 }>
-                  {(newCon.constraint_type === 'precedence' || newCon.constraint_type === 'exactly') && (
+                  {(newCon.constraint_type === 'precedence') && (
                     <>
                       <label className="card-label">n≥</label>
                       <input

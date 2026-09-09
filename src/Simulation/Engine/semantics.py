@@ -54,9 +54,9 @@ def _last_activity_for_scope_object(state: SimulationState, scope_object_id: str
 # ---------------------------------------------------------------------------
 
 def _get_scope_object_ids_from_candidate(candidate: Any, state: SimulationState, scope_object_type: str) -> list[str]:
-    resource_types = getattr(state, '_resource_types', set()) or set()
+    resource_types = state._resource_types
     ids: list[str] = []
-    for oid in getattr(candidate, "participating_object_ids", []) or []:
+    for oid in candidate.participating_object_ids:
         runtime = state.objects.get(oid)
         if runtime is None:
             continue
@@ -100,14 +100,13 @@ def _joint_scope_event_ids(
         return frozenset()
 
     cand_by_type: dict = {}
-    for oid in (getattr(candidate, 'participating_object_ids', []) or []):
+    for oid in candidate.participating_object_ids:
         rt = state.objects.get(oid)
         if rt:
             cand_by_type.setdefault(rt.object_type, []).append(oid)
 
     def _src_eids_for_obj(oid: str) -> frozenset:
-        return frozenset(e.event_id for e in
-                         _events_for_activity_and_object(state, source_activity, oid))
+        return frozenset(state._events_by_act_obj.get((source_activity, oid), ()))
 
     single_sets: list = []
     each_multi_groups: list = []  # list of [frozenset, ...] per "each" group with multiple objects
@@ -119,8 +118,7 @@ def _joint_scope_event_ids(
         if inv == 'any':
             s: set = set()
             for oid in A_objs:
-                s.update(e.event_id for e in
-                         _events_for_activity_and_object(state, source_activity, oid))
+                s.update(state._events_by_act_obj.get((source_activity, oid), ()))
             single_sets.append(frozenset(s))
         elif inv == 'all':
             combined = None
@@ -139,6 +137,9 @@ def _joint_scope_event_ids(
     )
     for s in single_sets[1:]:
         joint_base = joint_base & s
+
+    if not joint_base:
+        return frozenset()
 
     if not each_multi_groups:
         return joint_base
@@ -190,7 +191,7 @@ def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationStat
 def check_response(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
     """Lazy response enforcement — only upper-bound (nmax) is enforced eagerly."""
     required_target = constraint.target_activity
-    nmax = getattr(constraint, "nmax", None)
+    nmax = constraint.nmax
 
     if candidate.activity_name == required_target:
         if nmax is not None:
@@ -221,8 +222,8 @@ def check_response(constraint: Any, candidate: Any, state: SimulationState, scop
 def check_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
     source = constraint.source_activity
     target = constraint.target_activity
-    nmin = getattr(constraint, "nmin", 0)
-    nmax = getattr(constraint, "nmax", None)
+    nmin = constraint.nmin
+    nmax = constraint.nmax
 
     if candidate.activity_name != target:
         return True
@@ -239,7 +240,7 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
 
         created_scope_count = sum(
-            1 for t in (getattr(candidate, "object_types_to_create", []) or [])
+            1 for t in candidate.object_types_to_create
             if t == constraint.scope.object_type
         )
 
@@ -249,15 +250,15 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
             return True
 
         if created_scope_count > 0:
-            if constraint.scope.object_type not in (candidate.object_types_to_create or []):
+            if constraint.scope.object_type not in candidate.object_types_to_create:
                 return False
 
-        prec_satisfied = getattr(state, '_prec_satisfied', None)
+        prec_satisfied = state._prec_satisfied
         cache_key_base = (source, target, 'each')
 
         for oid in scope_ids:
             # Fast path: already cached as permanently satisfied for this object
-            if prec_satisfied is not None and (cache_key_base + (oid,)) in prec_satisfied:
+            if (cache_key_base + (oid,)) in prec_satisfied:
                 continue
             a_count = _count_activity_for_object(state, source, oid)
             if nmin > 0 and a_count < nmin:
@@ -267,7 +268,7 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
                 if t_count >= nmax:
                     return False
             # Cache if permanently satisfied: nmin met and no nmax upper bound
-            if prec_satisfied is not None and a_count >= max(nmin, 1) and nmax is None:
+            if a_count >= max(nmin, 1) and nmax is None:
                 prec_satisfied.add(cache_key_base + (oid,))
 
         return True
@@ -327,7 +328,7 @@ def check_chain_precedence(constraint: Any, candidate: Any, state: SimulationSta
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
 
         created_scope_count = sum(
-            1 for t in (getattr(candidate, "object_types_to_create", []) or [])
+            1 for t in candidate.object_types_to_create
             if t == constraint.scope.object_type
         )
 
@@ -370,7 +371,7 @@ def check_chain_response(constraint: Any, candidate: Any, state: SimulationState
 
         if candidate.activity_name == source and candidate.activity_name != target:
             created_scope = sum(
-                1 for t in (getattr(candidate, "object_types_to_create", []) or [])
+                1 for t in candidate.object_types_to_create
                 if t == constraint.scope.object_type
             )
             if created_scope > 0:
@@ -413,7 +414,7 @@ def check_absence(constraint: Any, candidate: Any, state: SimulationState, scope
     target = constraint.target_activity or constraint.source_activity
     if candidate.activity_name != target:
         return True
-    nmax = getattr(constraint, "nmax", 0)
+    nmax = constraint.nmax
     if nmax is None:
         nmax = 0
     if constraint.scope.kind == "each":
@@ -587,55 +588,43 @@ def check_alternate_precedence(constraint: Any, candidate: Any, state: Simulatio
     return tgt_count < src_count
 
 
+def _check_succession(c, cand, st, sc=None):
+    return check_precedence(c, cand, st, sc) and check_response(c, cand, st, sc)
+
+
+def _check_chain_succession(c, cand, st, sc=None):
+    return check_chain_precedence(c, cand, st, sc) and check_chain_response(c, cand, st, sc)
+
+
+def _check_alternate_succession(c, cand, st, sc=None):
+    return check_alternate_response(c, cand, st, sc) and check_alternate_precedence(c, cand, st, sc)
+
+
+_CHECKERS: dict = {
+    'not_coexistence': check_not_coexistence,
+    'response': check_response,
+    'precedence': check_precedence,
+    'not_precedence': check_not_precedence,
+    'responded_existence': check_responded_existence,
+    'chain_response': check_chain_response,
+    'chain_precedence': check_chain_precedence,
+    'absence': check_absence,
+    'exactly': check_exactly,
+    'init': check_init,
+    'exclusive_choice': check_exclusive_choice,
+    'not_succession': check_not_succession,
+    'not_chain_succession': check_not_chain_succession,
+    'alternate_response': check_alternate_response,
+    'alternate_precedence': check_alternate_precedence,
+    'succession': _check_succession,
+    'chain_succession': _check_chain_succession,
+    'alternate_succession': _check_alternate_succession,
+}
+
+
 def check_constraint(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
-    kind = getattr(constraint, "constraint_type", None)
-    if kind == "not_coexistence":
-        return check_not_coexistence(constraint, candidate, state, scope_ids_cache)
-    if kind == "response":
-        return check_response(constraint, candidate, state, scope_ids_cache)
-    if kind == "precedence":
-        return check_precedence(constraint, candidate, state, scope_ids_cache)
-    if kind == "not_precedence":
-        return check_not_precedence(constraint, candidate, state, scope_ids_cache)
-    if kind == "responded_existence":
-        return check_responded_existence(constraint, candidate, state, scope_ids_cache)
-    if kind == "chain_response":
-        return check_chain_response(constraint, candidate, state, scope_ids_cache)
-    if kind == "chain_precedence":
-        return check_chain_precedence(constraint, candidate, state, scope_ids_cache)
-    # New constraint types
-    if kind == "absence":
-        return check_absence(constraint, candidate, state, scope_ids_cache)
-    if kind == "exactly":
-        return check_exactly(constraint, candidate, state, scope_ids_cache)
-    if kind == "init":
-        return check_init(constraint, candidate, state, scope_ids_cache)
-    if kind == "exclusive_choice":
-        return check_exclusive_choice(constraint, candidate, state, scope_ids_cache)
-    if kind == "not_succession":
-        return check_not_succession(constraint, candidate, state, scope_ids_cache)
-    if kind == "not_chain_succession":
-        return check_not_chain_succession(constraint, candidate, state, scope_ids_cache)
-    if kind == "alternate_response":
-        return check_alternate_response(constraint, candidate, state, scope_ids_cache)
-    if kind == "alternate_precedence":
-        return check_alternate_precedence(constraint, candidate, state, scope_ids_cache)
-    # Composite constraints decomposed into existing checks
-    if kind == "succession":
-        # Succession = Precedence ∧ Response (nmax enforcement)
-        return (check_precedence(constraint, candidate, state, scope_ids_cache) and
-                check_response(constraint, candidate, state, scope_ids_cache))
-    if kind == "chain_succession":
-        # Chain Succession = Chain Precedence ∧ Chain Response
-        return (check_chain_precedence(constraint, candidate, state, scope_ids_cache) and
-                check_chain_response(constraint, candidate, state, scope_ids_cache))
-    if kind == "alternate_succession":
-        # Alternate Succession = Alternate Response ∧ Alternate Precedence
-        return (check_alternate_response(constraint, candidate, state, scope_ids_cache) and
-                check_alternate_precedence(constraint, candidate, state, scope_ids_cache))
-    # participation and choice are post-hoc (end-of-trace) — not enforced eagerly
-    # coexistence is also post-hoc
-    return True
+    fn = _CHECKERS.get(constraint.constraint_type)
+    return fn(constraint, candidate, state, scope_ids_cache) if fn else True
 
 
 def check_all_constraints(static_model: StaticModel, candidate: Any, state: SimulationState) -> bool:
@@ -643,9 +632,9 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
     if not relevant:
         return True
     # #12: pre-compute scope object IDs once per scope type, reused by all checkers
-    resource_types = getattr(state, '_resource_types', set()) or set()
+    resource_types = state._resource_types
     scope_ids_cache: dict[str, list[str]] = {}
-    for oid in getattr(candidate, "participating_object_ids", []) or []:
+    for oid in candidate.participating_object_ids:
         runtime = state.objects.get(oid)
         if runtime is None or runtime.object_type in resource_types:
             continue
@@ -653,22 +642,21 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
 
     # Performance: set of object types with zero active instances — constraints
     # scoped to these types pass trivially (scope_ids would be empty → True)
-    inactive_types = getattr(state, '_inactive_scope_types', None)
-    creates_set = set(getattr(candidate, 'object_types_to_create', []) or [])
+    inactive_types = state._inactive_scope_types
+    creates_set = set(candidate.object_types_to_create)
 
     for constraint in relevant:
         # Skip constraint if its scope type is fully inactive and not being created now
-        if inactive_types is not None:
-            scope_type = getattr(constraint.scope, 'object_type', None)
-            if scope_type and scope_type in inactive_types and scope_type not in creates_set:
-                continue
+        scope_type = constraint.scope.object_type
+        if scope_type and scope_type in inactive_types and scope_type not in creates_set:
+            continue
 
         # Phase 2: apply constraint-level object-filter guard.
         # Scope objects not satisfying the guard are exempt — filter them out
         # before passing to the checker. If no objects remain, skip (trivially passes).
-        c_guard = getattr(constraint, 'guard', None)
+        c_guard = constraint.guard
         if c_guard:
-            scope_type = getattr(constraint.scope, 'object_type', None)
+            scope_type = constraint.scope.object_type
             if scope_type:
                 original_ids = scope_ids_cache.get(scope_type, [])
                 guarded_ids = apply_guard_filter(original_ids, c_guard, state)
@@ -690,29 +678,40 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
 
 def _count_links_for_object(state: SimulationState, object_id: str, other_type: str) -> int:
     """Count links from object_id to runtime objects of `other_type` — O(1) via typed index."""
-    linked_by_type = getattr(state, '_linked_by_type', None)
-    if linked_by_type is not None:
-        return len(linked_by_type.get(object_id, {}).get(other_type, _EMPTY_SET))
-    # Fallback: O(degree) scan if index not available
-    count = 0
-    for neighbor_id in state._links_by_object.get(object_id, ()):
-        obj = state.objects.get(neighbor_id)
-        if obj and obj.object_type == other_type:
-            count += 1
-    return count
+    return len(state._linked_by_type.get(object_id, {}).get(other_type, _EMPTY_SET))
+
+
+_o2o_activity_cache: dict = {}  # id(static_model) → frozenset[activity_name]
 
 
 def check_o2o_rules(static_model: StaticModel, candidate: Any, state: SimulationState) -> bool:
     if not static_model.o2o_rules:
         return True
 
-    resource_types: set = getattr(state, '_resource_types', set()) or set()
+    # Early-exit: skip entirely if this activity has no O2O-relevant bindings.
+    model_key = id(static_model)
+    applicable = _o2o_activity_cache.get(model_key)
+    if applicable is None:
+        o2o_types: set = set()
+        for rule in static_model.o2o_rules:
+            if rule.max_links is not None:
+                o2o_types.add(rule.source_type)
+                o2o_types.add(rule.target_type)
+        applicable = frozenset(
+            act.name for act in static_model.activities
+            if any(b.object_type in o2o_types for b in act.bindings)
+        )
+        _o2o_activity_cache[model_key] = applicable
+    if candidate.activity_name not in applicable:
+        return True
+
+    resource_types = state._resource_types
 
     created_counts: dict[str, int] = {}
-    for t in getattr(candidate, "object_types_to_create", []) or []:
+    for t in candidate.object_types_to_create:
         created_counts[t] = created_counts.get(t, 0) + 1
 
-    participating_ids = getattr(candidate, "participating_object_ids", []) or []
+    participating_ids = candidate.participating_object_ids
 
     # Pre-compute types of all participants
     participant_types: dict[str, str] = {}
@@ -727,40 +726,36 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
     for rule in static_model.o2o_rules:
         if rule.max_links is None:
             continue
-        # Skip rules where either type is absent from this candidate
         if rule.source_type not in all_types or rule.target_type not in all_types:
             continue
-        # Skip rules where either side is a resource type — resources are
-        # shared across cases and must not accumulate permanent link caps.
         if rule.source_type in resource_types or rule.target_type in resource_types:
             continue
-        for oid in participating_ids:
-            otype = participant_types.get(oid)
-            if otype is None:
-                continue
 
-            if otype == rule.source_type:
-                existing = _count_links_for_object(state, oid, rule.target_type)
-                # New links from created objects of target_type
-                new_from_created = created_counts.get(rule.target_type, 0)
-                # New links from other participating objects of target_type not yet linked
-                new_from_participants = sum(
-                    1 for other_id, other_type in participant_types.items()
-                    if other_id != oid and other_type == rule.target_type
-                    and other_id not in state._links_by_object.get(oid, _EMPTY_SET)
-                )
-                if existing + new_from_created + new_from_participants > rule.max_links:
-                    return False
+        # Hoist: compute sources/targets lists once per rule (avoids O(N²) type scan)
+        sources = [oid for oid, t in participant_types.items() if t == rule.source_type]
+        targets = [oid for oid, t in participant_types.items() if t == rule.target_type]
+        new_targets_created = created_counts.get(rule.target_type, 0)
 
-            if rule.bidirectional and otype == rule.target_type:
+        for oid in sources:
+            existing = _count_links_for_object(state, oid, rule.target_type)
+            oid_links = state._links_by_object.get(oid, _EMPTY_SET)
+            new_from_participants = sum(
+                1 for t_id in targets
+                if t_id != oid and t_id not in oid_links
+            )
+            if existing + new_targets_created + new_from_participants > rule.max_links:
+                return False
+
+        if rule.bidirectional:
+            new_sources_created = created_counts.get(rule.source_type, 0)
+            for oid in targets:
                 existing = _count_links_for_object(state, oid, rule.source_type)
-                new_from_created = created_counts.get(rule.source_type, 0)
+                oid_links = state._links_by_object.get(oid, _EMPTY_SET)
                 new_from_participants = sum(
-                    1 for other_id, other_type in participant_types.items()
-                    if other_id != oid and other_type == rule.source_type
-                    and other_id not in state._links_by_object.get(oid, _EMPTY_SET)
+                    1 for s_id in sources
+                    if s_id != oid and s_id not in oid_links
                 )
-                if existing + new_from_created + new_from_participants > rule.max_links:
+                if existing + new_sources_created + new_from_participants > rule.max_links:
                     return False
 
     return True

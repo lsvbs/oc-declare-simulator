@@ -95,9 +95,10 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       actDeactivates[name] = (a.bindings || []).filter(b => b.deactivates && b.object_type).map(b => b.object_type);
     });
 
-    // Ordering constraints: precedence(A→B) and response(A→B) and succession(A→B)
-    // mean A can precede B. chain variants too.
-    const ORDERING = new Set(['precedence', 'chain_precedence', 'response', 'chain_response', 'succession', 'chain_succession', 'alternate_response', 'alternate_precedence', 'alternate_succession', 'responded_existence']);
+    // Ordering constraints: precedence/response mean A can precede B. chain variants too.
+    const ORDERING = new Set(['precedence', 'chain_precedence', 'response', 'chain_response',
+      // 'succession', 'chain_succession', 'alternate_response', 'alternate_precedence', 'alternate_succession',  // removed
+      'responded_existence']);
     const NOT_AFTER = new Set(['not_coexistence', 'not_succession', 'not_precedence', 'not_chain_succession']);
 
     // Raw directed edges from ordering constraints: src can precede tgt
@@ -293,7 +294,7 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
 
   if (!nodes.length) return <div style={{color:'#94a3b8',fontSize:'0.82rem',padding:'1rem'}}>Add activities and constraints to see the constraint flow.</div>;
 
-  const ctypeColor = t => t?.startsWith('response') || t?.startsWith('chain_response') || t?.startsWith('alternate_response') ? '#7c3aed'
+  const ctypeColor = t => t?.startsWith('response') || t?.startsWith('chain_response') ? '#7c3aed'
     : t?.startsWith('chain') ? '#0369a1'
     : '#475569';
 
@@ -1335,8 +1336,9 @@ function computeOCDeclareConformance(events, objectTypesMap, constraints) {
     if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
 
     const tgtIndices = byActivity[tgtActivity] || [];
-    if (ctype === 'response' || ctype === 'chain_response' || ctype === 'succession' ||
-        ctype === 'alternate_response' || ctype === 'precedence' || ctype === 'alternate_precedence') {
+    if (ctype === 'response' || ctype === 'chain_response' ||
+        // 'succession', 'alternate_response', 'alternate_precedence' removed
+        ctype === 'precedence') {
       // Only events at or after srcTs — use binary search
       const start = firstIndexAtOrAfter(srcTs);
       return tgtIndices.filter(j => j >= start && j !== srcIdx);
@@ -2270,7 +2272,7 @@ function ConstraintAnalysis({ activeModel, results }) {
           msg: `${c.constraint_type}(${src}→${tgt}) scoped per ${stype}: source "${src}" has no binding for ${stype} — constraint is always vacuously satisfied (scope objects never present in source event)`,
         });
       }
-      if (!tgtHasScope && actNames.has(tgt) && !['not_coexistence','absence','exactly','init'].includes(c.constraint_type)) {
+      if (!tgtHasScope && actNames.has(tgt) && !['not_coexistence','absence'].includes(c.constraint_type)) {
         crossObjectIssues.push({
           severity: 'warn',
           msg: `${c.constraint_type}(${src}→${tgt}) scoped per ${stype}: target "${tgt}" has no binding for ${stype} — shared scope object can never appear in both events`,
@@ -4081,7 +4083,7 @@ function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults
       if (c.scope?.kind !== 'each' || !c.scope?.object_type) return;
       const stype = c.scope.object_type;
       if (actNames.has(c.source_activity) && !(actBindings[c.source_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
-      if (!['not_coexistence','absence','exactly','init'].includes(c.constraint_type) && actNames.has(c.target_activity) && !(actBindings[c.target_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
+      if (!['not_coexistence','absence'].includes(c.constraint_type) && actNames.has(c.target_activity) && !(actBindings[c.target_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
     });
     return { satisfOk, crossOk };
   }, [activeModel]);
@@ -5435,7 +5437,8 @@ function PerObjectBoundsChecker({ events, typesMap, constraints, onBoundsResults
                 scope, nmin = 1, nmax } = c;
         const label = `${ctype}(${src}→${tgt})`;
         const scopeObjs = objsByType[scope.object_type] || [];
-        const isBefore = ['precedence','chain_precedence','alternate_precedence'].includes(ctype);
+        const isBefore = ['precedence','chain_precedence'].includes(ctype);
+        // 'alternate_precedence' removed
         const isNot = ['not_coexistence','not_succession'].includes(ctype);
 
         let violated = 0, checked = 0, underMin = 0, overMax = 0, tgtCount = 0;
@@ -5653,8 +5656,9 @@ function LogModelConformance({ eventLogFile, activeModel, onResults, onBoundsRes
       if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
       if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
       const tgtIdxs = byAct[tgtAct] || [];
-      if (['response','chain_response','succession','alternate_response',
-           'precedence','alternate_precedence'].includes(ctype)) {
+      if (['response','chain_response',
+           // 'succession', 'alternate_response', 'alternate_precedence' removed
+           'precedence'].includes(ctype)) {
         const start = firstAtOrAfter(srcTs);
         return tgtIdxs.filter(j => j >= start && j !== srcIdx);
       }
@@ -6170,7 +6174,7 @@ function applyConstraintsToProbMatrix(matrix, constraints) {
   constraints.forEach(c => {
     const { constraint_type: ct, source_activity: src, target_activity: tgt } = c;
     if (!src || !tgt) return;
-    if (ct === 'chain_response' || ct === 'chain_succession') {
+    if (ct === 'chain_response' /* || ct === 'chain_succession' — removed */) {
       m[src] = {[tgt]: 1.0};
     } else if (ct === 'not_chain_succession') {
       if (m[src]) {
@@ -6199,7 +6203,7 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
   const forcedSrcs = React.useMemo(() => {
     const m = {};
     (constraints || []).forEach(c => {
-      if ((c.constraint_type === 'chain_response' || c.constraint_type === 'chain_succession') && c.source_activity && c.target_activity) {
+      if ((c.constraint_type === 'chain_response' /* || c.constraint_type === 'chain_succession' — removed */) && c.source_activity && c.target_activity) {
         if (!m[c.source_activity]) m[c.source_activity] = new Set();
         m[c.source_activity].add(c.target_activity);
       }
@@ -6277,7 +6281,7 @@ function BehaviorProbabilitiesPanel({ probMatrix, editMode, onUpdate, filters={}
                         {editMode && !isForced && <input type="range" min={0} max={100} step={0.5} value={parseFloat(pct)}
                           onChange={e=>updateProb(e.target.value)}
                           style={{flex:1,minWidth:'80px',maxWidth:'140px',accentColor:'#6366f1',cursor:'pointer'}}/>}
-                        {editMode && isForced && <span title="Forced by chain_response / chain_succession constraint" style={{fontSize:'0.65rem',color:'#7c3aed',background:'#f3f0ff',border:'1px solid #c4b5fd',borderRadius:'3px',padding:'1px 5px',whiteSpace:'nowrap'}}>forced</span>}
+                        {editMode && isForced && <span title="Forced by chain_response constraint" style={{fontSize:'0.65rem',color:'#7c3aed',background:'#f3f0ff',border:'1px solid #c4b5fd',borderRadius:'3px',padding:'1px 5px',whiteSpace:'nowrap'}}>forced</span>}
                         {!editMode && <div style={{flex:1,height:'6px',background:'#e2e8f0',borderRadius:'3px',overflow:'hidden',maxWidth:'140px'}}>
                           <div style={{height:'100%',width:pct+'%',background: isForced ? '#7c3aed' : '#6366f1',borderRadius:'3px'}}/>
                         </div>}
@@ -6582,8 +6586,11 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
 
 
 const BEHAVIOR_CTYPES = ['precedence','not_precedence','response','not_coexistence','chain_precedence','chain_response',
-  'responded_existence','absence','exactly','init','exclusive_choice','succession','chain_succession',
-  'not_succession','not_chain_succession','alternate_response','alternate_precedence','alternate_succession'];
+  'responded_existence','absence',
+  // 'exactly','init','exclusive_choice','succession','chain_succession',  // removed
+  'not_succession','not_chain_succession',
+  // 'alternate_response','alternate_precedence','alternate_succession',  // removed
+];
 const BEHAVIOR_SCOPE_KINDS = ['each','any','all'];
 const BEHAVIOR_SCOPE_KIND_OPTS = [
   {value:'each', label:'each — per individual object'},
@@ -6695,30 +6702,30 @@ function constraintDescription(con) {
       return `Every time **${A}** occurs, **${B}** must be the very next activity${scopeStr}. Nothing may come between them.`;
     case 'responded_existence':
       return `If **${A}** occurs, **${B}** must also occur at some point${nStr}${scopeStr} — before or after.`;
-    case 'exclusive_choice':
-      return `Either **${A}** or **${B}** must occur, but not both${scopeStr}. Exactly one of them may fire in a trace.`;
-    case 'succession':
-      return `**${A}** must precede **${B}**${scopeStr}, AND whenever **${A}** occurs **${B}** must eventually follow. Combines precedence and response.`;
-    case 'chain_succession':
-      return `**${A}** and **${B}** must always occur consecutively${scopeStr} — **${A}** immediately followed by **${B}**, with nothing in between.`;
+    // case 'exclusive_choice':  // removed
+    //   ...
+    // case 'succession':  // removed
+    //   ...
+    // case 'chain_succession':  // removed
+    //   ...
     case 'not_succession':
       return `Once **${A}** fires, **${B}** must not occur afterward${scopeStr}.`;
     case 'not_chain_succession':
       return `**${A}** cannot be immediately followed by **${B}**${scopeStr}. Another activity must come between them.`;
-    case 'alternate_response':
-      return `Each occurrence of **${A}** must be followed by **${B}** before **${A}** can occur again${scopeStr}. They must strictly alternate.`;
-    case 'alternate_precedence':
-      return `Each occurrence of **${B}** must be preceded by **${A}**, with no other **${B}** in between${scopeStr}.`;
-    case 'alternate_succession':
-      return `**${A}** and **${B}** must strictly alternate${scopeStr} — each **${A}** followed by **${B}** before the next **${A}**, and vice versa.`;
+    // case 'alternate_response':  // removed
+    //   ...
+    // case 'alternate_precedence':  // removed
+    //   ...
+    // case 'alternate_succession':  // removed
+    //   ...
     case 'absence':
       return nmax != null
         ? `**${A}** must occur at most **${nmax}** time${nmax !== 1 ? 's' : ''}${scopeStr}.`
         : `**${A}** must NOT occur at all${scopeStr}.`;
-    case 'exactly':
-      return `**${A}** must occur exactly **${nmin}** time${nmin !== 1 ? 's' : ''}${scopeStr} — no more, no less.`;
-    case 'init':
-      return `**${A}** must be the very first activity to fire${scopeStr}. No other activity may precede it.`;
+    // case 'exactly':  // removed
+    //   ...
+    // case 'init':  // removed
+    //   ...
     default:
       return `Constraint of type "${con.constraint_type}" on **${A}**${scopeStr}.`;
   }
@@ -6734,7 +6741,8 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
   const [newCon, setNewCon] = React.useState(BEHAVIOR_EMPTY_CON);
   const [conErrors, setConErrors] = React.useState({});
   const [sortCon, cycleCon, setSortCon] = useSortState();
-  const isUnary = t => ['absence','exactly','init'].includes(t);
+  const isUnary = t => ['absence'].includes(t);
+  // 'exactly', 'init' removed from isUnary
 
   const updateCon = (i, patch) => onUpdate(constraints.map((x,j) => j===i ? {...x,...patch} : x));
   const deleteCon = i => onUpdate(constraints.filter((_,j) => j!==i));
@@ -6844,8 +6852,8 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
               {sortedConstraints.map(({c, origIdx}) => {
                 const scopeOt = c.scope?.object_type || c.scope_object_type || '';
                 const scopeKind = c.scope?.kind || 'each';
-                const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
-                  : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
+                const rowBg = /^(response|chain_response)$/.test(c.constraint_type) ? '#f0fdf4'
+                  : /^(precedence|chain_precedence)$/.test(c.constraint_type) ? '#eff6ff'
                   : undefined;
                 return (
                   <tr key={origIdx} style={rowBg ? {background:rowBg} : undefined}>
@@ -7386,7 +7394,7 @@ function App() {
       not_coexistence: false,
       chain_precedence: false,
       chain_response: false,
-      coexistence: false,
+      // coexistence: false,  // removed
       absence: false
     },
     // Per-constraint-type thresholds. Chain types default to higher bars.
@@ -8484,8 +8492,9 @@ function App() {
         if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
         if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
         const tgtIs = byActIdx[tgtAct] || [];
-        if (['response','chain_response','succession','alternate_response',
-             'precedence','alternate_precedence'].includes(ctype)) {
+        if (['response','chain_response',
+             // 'succession', 'alternate_response', 'alternate_precedence' removed
+             'precedence'].includes(ctype)) {
           const start = firstGe(srcTs);
           return tgtIs.filter(j => j >= start && j !== srcIdx);
         }
@@ -8661,7 +8670,8 @@ function App() {
           const NEGATION_MAP = {
             response: 'not_succession', precedence: 'not_precedence',
             chain_response: 'not_chain_succession', chain_precedence: 'not_chain_succession',
-            responded_existence: 'not_coexistence', coexistence: 'not_coexistence',
+            responded_existence: 'not_coexistence',
+            // coexistence: 'not_coexistence',  // removed
           };
           // Apply synchronously so the snapshot below captures the updated model
           const updatedConstraints = (modelAfterNmax.constraints || []).map(c => {
