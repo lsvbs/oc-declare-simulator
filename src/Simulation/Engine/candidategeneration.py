@@ -23,11 +23,30 @@ class Candidate:
     object_types_to_create: list[str] = field(default_factory=list)
 
 
-def find_active_objects_of_type(state: SimulationState, object_type: str, limit: int = 0) -> list[str]:
-    """Return active, non-busy objects of `object_type`. If `limit` > 0, return at most `limit` items."""
+def find_active_objects_of_type(
+    state: SimulationState,
+    object_type: str,
+    limit: int = 0,
+    cache: dict[tuple, list[str]] | None = None,
+) -> list[str]:
+    """Return active, non-busy objects of `object_type`. If `limit` > 0, return at most `limit` items.
+
+    `cache` is an optional dict scoped to a single candidate-generation pass
+    (state is never mutated between calls during that pass — see
+    Simulator._generate_candidates_des). Reusing identical (object_type, limit)
+    lookups across the many candidates built per pass avoids rescanning the
+    same active-object pool over and over for non-primary bindings.
+    """
+    cache_key = (object_type, limit) if cache is not None else None
+    if cache_key is not None and cache_key in cache:
+        return cache[cache_key]
+
     active_set = state._active_by_type.get(object_type)
     if not active_set:
-        return []
+        result: list[str] = []
+        if cache_key is not None:
+            cache[cache_key] = result
+        return result
     current_time = getattr(state, 'current_time', None)
     is_resource = object_type in getattr(state, '_resource_types', set())
     result = []
@@ -39,6 +58,8 @@ def find_active_objects_of_type(state: SimulationState, object_type: str, limit:
         result.append(oid)
         if limit > 0 and len(result) >= limit:
             break
+    if cache_key is not None:
+        cache[cache_key] = result
     return result
 
 
@@ -77,6 +98,7 @@ def build_candidate_for_activity(
     resource_types: set[str] | None = None,
     force_object_id: str | None = None,
     force_object_ids: list[str] | None = None,
+    pool_cache: dict[tuple, list[str]] | None = None,
 ) -> Optional[Candidate]:
     """Build a candidate for ``activity`` from the global active-object pool.
 
@@ -86,6 +108,10 @@ def build_candidate_for_activity(
     mutation used in _generate_candidates_des (#6).
     ``force_object_ids`` pins a specific set of objects for all-mode obligations
     where all objects must participate together in the candidate event.
+    ``pool_cache`` memoizes find_active_objects_of_type(object_type, limit)
+    results across the many candidates built within one read-only
+    candidate-generation pass (state does not mutate mid-pass — see
+    Simulator._generate_candidates_des).
     """
     participating_object_ids: list[str] = []
     object_types_to_create: list[str] = []
@@ -104,29 +130,27 @@ def build_candidate_for_activity(
                 _forced_ids_by_type.setdefault(_fobj.object_type, []).append(_foid)
 
     for binding in activity.bindings:
-        # Determine how many objects to fetch for link-preference selection.
-        if binding.creates:
-            fetch_limit = binding.min_count
-        elif binding.max_count is not None:
-            fetch_limit = max(binding.max_count * 4, 8)
-        else:
-            fetch_limit = 8
-        existing_ids = find_active_objects_of_type(state, binding.object_type, limit=fetch_limit)
+        # #6: if force_object_id pins this binding's type, the pool is replaced
+        # outright below — skip the (potentially expensive) full-pool lookup.
+        is_forced_primary = (
+            force_object_id is not None
+            and not binding.creates
+            and binding.object_type == _forced_type
+            and len(participating_object_ids) == 0  # only for the first/primary binding
+        )
+        is_forced_set = (
+            not is_forced_primary
+            and force_object_ids is not None
+            and not binding.creates
+            and binding.object_type in _forced_ids_by_type
+        )
 
-        # #6: if force_object_id pins this binding's type, replace the pool
-        if (force_object_id is not None
-                and not binding.creates
-                and binding.object_type == _forced_type
-                and len(participating_object_ids) == 0):  # only for the first/primary binding
+        if is_forced_primary:
             obj = state.objects.get(force_object_id)
             if obj is None or not obj.active:
                 return None
             existing_ids = [force_object_id]
-
-        # force_object_ids: for all-mode, force specific objects into this binding
-        elif (force_object_ids is not None
-              and not binding.creates
-              and binding.object_type in _forced_ids_by_type):
+        elif is_forced_set:
             forced = _forced_ids_by_type[binding.object_type]
             # Verify all forced objects are active
             for _foid in forced:
@@ -134,6 +158,17 @@ def build_candidate_for_activity(
                 if _fobj is None or not _fobj.active:
                     return None
             existing_ids = forced
+        else:
+            # Determine how many objects to fetch for link-preference selection.
+            if binding.creates:
+                fetch_limit = binding.min_count
+            elif binding.max_count is not None:
+                fetch_limit = max(binding.max_count * 4, 8)
+            else:
+                fetch_limit = 8
+            existing_ids = find_active_objects_of_type(
+                state, binding.object_type, limit=fetch_limit, cache=pool_cache
+            )
 
         # Apply attribute guard: filter out objects that don't satisfy the guard.
         guard = getattr(binding, 'guard', None)

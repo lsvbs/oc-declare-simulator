@@ -298,6 +298,11 @@ class Simulator:
         start_activity_names = self._start_names_set
         candidates: list[Candidate] = []
         seen_keys: set[tuple] = set()
+        # Memoizes find_active_objects_of_type(object_type, limit) for the
+        # duration of this pass — state is read-only until candidates are
+        # chosen and started later, so identical lookups are safe to reuse
+        # across the many candidates built below (#20).
+        pool_cache: dict[tuple, list[str]] = {}
 
         max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
         max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
@@ -355,7 +360,7 @@ class Simulator:
                     if self.rng.random() > prob:
                         continue
 
-                candidate = build_candidate_for_activity(activity, state, resource_types=resource_types)
+                candidate = build_candidate_for_activity(activity, state, resource_types=resource_types, pool_cache=pool_cache)
                 if candidate and is_candidate_semantically_allowed(self.static_model, candidate, state):
                     key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
                            tuple(sorted(candidate.object_types_to_create)))
@@ -421,6 +426,7 @@ class Simulator:
                     activity, state,
                     resource_types=resource_types,
                     force_object_id=oid,
+                    pool_cache=pool_cache,
                 )
 
                 if candidate is None:
@@ -513,7 +519,8 @@ class Simulator:
                             continue
                         candidate = build_candidate_for_activity(
                             activity, state, resource_types=resource_types,
-                            force_object_ids=[active_members[0]]
+                            force_object_ids=[active_members[0]],
+                            pool_cache=pool_cache,
                         )
                     else:
                         # All-mode: target must fire involving all objects in the frozenset
@@ -525,7 +532,8 @@ class Simulator:
                             continue
                         candidate = build_candidate_for_activity(
                             activity, state, resource_types=resource_types,
-                            force_object_ids=list(frozen_oids)
+                            force_object_ids=list(frozen_oids),
+                            pool_cache=pool_cache,
                         )
 
                     if candidate is None:
@@ -608,11 +616,12 @@ class Simulator:
 
                 if scope_oid is not None:
                     candidate = build_candidate_for_activity(
-                        activity, state, resource_types=resource_types, force_object_id=scope_oid
+                        activity, state, resource_types=resource_types, force_object_id=scope_oid,
+                        pool_cache=pool_cache,
                     )
                 else:
                     candidate = build_candidate_for_activity(
-                        activity, state, resource_types=resource_types
+                        activity, state, resource_types=resource_types, pool_cache=pool_cache
                     )
 
                 if candidate is None:
@@ -693,9 +702,6 @@ class Simulator:
                             t_count = len(state._events_by_act_obj.get((act, oid), []))
                             if t_count >= nmax:
                                 eligible[act].discard(oid)
-        self._fulfill_response_obligations(executed_event, state)
-        self._create_response_obligations(executed_event, state)
-        self._promote_obligations(executed_event, state)
 
     def _is_obligation_ready(self, target_act: str, scope_oid: str, state: SimulationState) -> bool:
         """Check if all precedence prerequisites for target_act have fired for scope_oid."""
