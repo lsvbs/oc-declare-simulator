@@ -47,14 +47,15 @@ def find_active_objects_of_type(
         if cache_key is not None:
             cache[cache_key] = result
         return result
-    current_time = getattr(state, 'current_time', None)
-    is_resource = object_type in getattr(state, '_resource_types', set())
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # current_time = getattr(state, 'current_time', None)
+    # is_resource = object_type in getattr(state, '_resource_types', set())
     result = []
     for oid in active_set:
-        if is_resource and current_time is not None:
-            obj = state.objects.get(oid)
-            if obj and obj.busy_until is not None and obj.busy_until > current_time:
-                continue  # resource occupied — skip
+        # if is_resource and current_time is not None:
+        #     obj = state.objects.get(oid)
+        #     if obj and obj.busy_until is not None and obj.busy_until > current_time:
+        #         continue  # resource occupied — skip
         result.append(oid)
         if limit > 0 and len(result) >= limit:
             break
@@ -66,16 +67,19 @@ def find_active_objects_of_type(
 def _find_objects_preferring_linked(
     state: SimulationState,
     existing_ids: list[str],
-    participating_ids: list[str],
+    participating_set: set[str],
     count: int,
 ) -> list[str]:
     """Return up to `count` IDs from `existing_ids`, preferring those
-    already linked to any object in `participating_ids` — O(1) via index.
+    already linked to any object in `participating_set` — O(1) via index.
+
+    ``participating_set`` must already be a set (the caller maintains it
+    incrementally alongside its participating-ids list) — avoids rebuilding
+    a set from scratch on every one of the many calls made per candidate.
     """
-    if not participating_ids or not state._links_by_object:
+    if not participating_set or not state._links_by_object:
         return existing_ids[:count]
 
-    participating_set = set(participating_ids)
     linked_ids: list[str] = []
     unlinked_ids: list[str] = []
 
@@ -114,6 +118,9 @@ def build_candidate_for_activity(
     Simulator._generate_candidates_des).
     """
     participating_object_ids: list[str] = []
+    # Maintained alongside participating_object_ids so _find_objects_preferring_linked
+    # doesn't have to rebuild a set from the list on every call within this candidate.
+    participating_object_ids_set: set[str] = set()
     object_types_to_create: list[str] = []
     _resource_types = resource_types or set()
     _forced_type: str | None = None
@@ -173,10 +180,7 @@ def build_candidate_for_activity(
         # Apply attribute guard: filter out objects that don't satisfy the guard.
         guard = getattr(binding, 'guard', None)
         if guard:
-            before = len(existing_ids)
             existing_ids = _apply_guard_filter(existing_ids, guard, state)
-            state.guard_checks_total += before
-            state.guard_checks_passed += len(existing_ids)
 
         # Basic validation: if max_count provided but less than min_count, impossible
         if binding.max_count is not None and binding.max_count < binding.min_count:
@@ -205,13 +209,14 @@ def build_candidate_for_activity(
             # _find_objects_preferring_linked already implements this: it falls
             # back to unlinked only when no linked objects exist at all.
             selected_ids = _find_objects_preferring_linked(
-                state, existing_ids, participating_object_ids, selected_from_existing
+                state, existing_ids, participating_object_ids_set, selected_from_existing
             )
             if len(selected_ids) < eligibility_count:
                 # Not enough input objects to satisfy this binding
                 return None
 
             participating_object_ids.extend(selected_ids)
+            participating_object_ids_set.update(selected_ids)
         else:
             # Output binding: this activity instantiates new objects of this type.
             #
@@ -219,17 +224,19 @@ def build_candidate_for_activity(
             # with existing linked objects. If max_count is None, no reuse —
             # the newly created objects are the sole participants of this type.
             #
+            # [resource/permanent-object handling — disabled, kept for reference]
             # Resource types come from the pre-populated pool only.
-            if binding.object_type in _resource_types:
-                eligibility_count = binding.min_count
-                target_count = binding.min_count
-                selected_from_existing = min(len(existing_ids), target_count,
-                                             binding.max_count if binding.max_count is not None else len(existing_ids))
-                selected_ids = existing_ids[:selected_from_existing]
-                if len(selected_ids) < eligibility_count:
-                    return None
-                participating_object_ids.extend(selected_ids)
-                continue
+            # if binding.object_type in _resource_types:
+            #     eligibility_count = binding.min_count
+            #     target_count = binding.min_count
+            #     selected_from_existing = min(len(existing_ids), target_count,
+            #                                  binding.max_count if binding.max_count is not None else len(existing_ids))
+            #     selected_ids = existing_ids[:selected_from_existing]
+            #     if len(selected_ids) < eligibility_count:
+            #         return None
+            #     participating_object_ids.extend(selected_ids)
+            #     participating_object_ids_set.update(selected_ids)
+            #     continue
 
             create_count = max(1, binding.min_count)
 
@@ -239,9 +246,10 @@ def build_candidate_for_activity(
                 reuse_limit = 0  # no reuse when unbounded — created objects are the sole participants
 
             selected_ids = _find_objects_preferring_linked(
-                state, existing_ids, participating_object_ids, reuse_limit
+                state, existing_ids, participating_object_ids_set, reuse_limit
             )
             participating_object_ids.extend(selected_ids)
+            participating_object_ids_set.update(selected_ids)
 
             object_types_to_create.extend([binding.object_type] * create_count)
 
@@ -286,10 +294,7 @@ def build_candidate_for_object_and_activity(
         # Apply attribute guard (mirrors build_candidate_for_activity)
         guard = getattr(binding, 'guard', None)
         if guard:
-            before = len(existing_ids)
             existing_ids = apply_guard_filter(existing_ids, guard, state)
-            state.guard_checks_total += before
-            state.guard_checks_passed += len(existing_ids)
 
         # Basic validation: impossible multiplicity
         if binding.max_count is not None and binding.max_count < binding.min_count:

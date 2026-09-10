@@ -547,6 +547,14 @@ def _check_arc(
 
     total = satisfied = 0
 
+    # 'AS' + 'any' qualifying-event count doesn't depend on t_A — it's a pure
+    # function of the (frozen) set of A-side objects in the event. Without
+    # this cache it gets rebuilt by re-scanning every A-object's full B-event
+    # list on every single A-event, which is invisible for ordinary case
+    # objects but very expensive for high-frequency shared/resource objects
+    # (e.g. a handful of forklifts each touching thousands of events) (#22).
+    as_any_cache: Dict[frozenset, int] = {}
+
     for eid_A in eids_A:
         A_objs = event_objs_by_type.get(eid_A, {}).get(obj_type, [])
         if not A_objs:
@@ -572,6 +580,18 @@ def _check_arc(
                     _count_df_dp(oid, t_A, act_B, arc_type, events_by_object, event_activity) >= counts_min
                     for oid in A_objs
                 )
+            elif arc_type == 'AS':
+                # t_A-independent — cache per distinct A_objs set (#22).
+                cache_key = frozenset(A_objs)
+                cnt = as_any_cache.get(cache_key)
+                if cnt is None:
+                    qualifying_eids: Set[str] = set()
+                    for oid in A_objs:
+                        for ts, eid in obj_B_events.get(oid, []):
+                            qualifying_eids.add(eid)
+                    cnt = len(qualifying_eids)
+                    as_any_cache[cache_key] = cnt
+                event_ok = cnt >= counts_min and (counts_max is None or cnt <= counts_max)
             else:
                 qualifying_eids: Set[str] = set()
                 for oid in A_objs:
@@ -579,8 +599,6 @@ def _check_arc(
                         if arc_type == 'EF' and ts > t_A:
                             qualifying_eids.add(eid)
                         elif arc_type == 'EP' and ts < t_A:
-                            qualifying_eids.add(eid)
-                        elif arc_type == 'AS':
                             qualifying_eids.add(eid)
                 cnt = len(qualifying_eids)
                 event_ok = cnt >= counts_min and (counts_max is None or cnt <= counts_max)

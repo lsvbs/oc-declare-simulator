@@ -54,15 +54,16 @@ def _last_activity_for_scope_object(state: SimulationState, scope_object_id: str
 # ---------------------------------------------------------------------------
 
 def _get_scope_object_ids_from_candidate(candidate: Any, state: SimulationState, scope_object_type: str) -> list[str]:
-    resource_types = getattr(state, '_resource_types', set()) or set()
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # resource_types = getattr(state, '_resource_types', set()) or set()
     ids: list[str] = []
     for oid in getattr(candidate, "participating_object_ids", []) or []:
         runtime = state.objects.get(oid)
         if runtime is None:
             continue
         if runtime.object_type == scope_object_type:
-            if runtime.object_type not in resource_types:
-                ids.append(oid)
+            # if runtime.object_type not in resource_types:
+            ids.append(oid)
     return ids
 
 
@@ -83,6 +84,7 @@ def _joint_scope_event_ids(
     state: SimulationState,
     scope: Any,
     source_activity: str,
+    cand_by_type_cache: dict | None = None,
 ) -> frozenset:
     """Return event IDs of source_activity events jointly satisfying all multi-type bindings.
 
@@ -94,16 +96,24 @@ def _joint_scope_event_ids(
                             event (per-object existential check against joint_base)
 
     Returns empty frozenset if no qualifying event exists (constraint not satisfied).
+
+    ``cand_by_type_cache`` — when supplied (built once per candidate in
+    check_all_constraints, grouping ALL participants by type including
+    resource types), reuses it instead of rebuilding the same grouping from
+    scratch on every multi-type-binding precedence check for this candidate.
     """
     bindings = scope.bindings
     if not bindings:
         return frozenset()
 
-    cand_by_type: dict = {}
-    for oid in (getattr(candidate, 'participating_object_ids', []) or []):
-        rt = state.objects.get(oid)
-        if rt:
-            cand_by_type.setdefault(rt.object_type, []).append(oid)
+    if cand_by_type_cache is not None:
+        cand_by_type = cand_by_type_cache
+    else:
+        cand_by_type = {}
+        for oid in (getattr(candidate, 'participating_object_ids', []) or []):
+            rt = state.objects.get(oid)
+            if rt:
+                cand_by_type.setdefault(rt.object_type, []).append(oid)
 
     def _src_eids_for_obj(oid: str) -> frozenset:
         return frozenset(e.event_id for e in
@@ -218,7 +228,8 @@ def check_response(constraint: Any, candidate: Any, state: SimulationState, scop
     return True
 
 
-def check_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
+def check_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None,
+                      cand_by_type_cache: dict | None = None) -> bool:
     source = constraint.source_activity
     target = constraint.target_activity
     nmin = getattr(constraint, "nmin", 0)
@@ -229,7 +240,7 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
 
     # Multi-type binding: joint check across all object types in the binding
     if constraint.scope.bindings:
-        qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source)
+        qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source, cand_by_type_cache)
         count = len(qualifying)
         if nmin > 0 and count < nmin:
             return False
@@ -587,14 +598,15 @@ def check_alternate_precedence(constraint: Any, candidate: Any, state: Simulatio
     return tgt_count < src_count
 
 
-def check_constraint(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
+def check_constraint(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None,
+                      cand_by_type_cache: dict | None = None) -> bool:
     kind = getattr(constraint, "constraint_type", None)
     if kind == "not_coexistence":
         return check_not_coexistence(constraint, candidate, state, scope_ids_cache)
     if kind == "response":
         return check_response(constraint, candidate, state, scope_ids_cache)
     if kind == "precedence":
-        return check_precedence(constraint, candidate, state, scope_ids_cache)
+        return check_precedence(constraint, candidate, state, scope_ids_cache, cand_by_type_cache)
     if kind == "not_precedence":
         return check_not_precedence(constraint, candidate, state, scope_ids_cache)
     if kind == "responded_existence":
@@ -623,7 +635,7 @@ def check_constraint(constraint: Any, candidate: Any, state: SimulationState, sc
     # Composite constraints decomposed into existing checks
     if kind == "succession":
         # Succession = Precedence ∧ Response (nmax enforcement)
-        return (check_precedence(constraint, candidate, state, scope_ids_cache) and
+        return (check_precedence(constraint, candidate, state, scope_ids_cache, cand_by_type_cache) and
                 check_response(constraint, candidate, state, scope_ids_cache))
     if kind == "chain_succession":
         # Chain Succession = Chain Precedence ∧ Chain Response
@@ -643,12 +655,23 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
     if not relevant:
         return True
     # #12: pre-compute scope object IDs once per scope type, reused by all checkers
-    resource_types = getattr(state, '_resource_types', set()) or set()
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # resource_types = getattr(state, '_resource_types', set()) or set()
     scope_ids_cache: dict[str, list[str]] = {}
+    # Same pass also builds the resource-inclusive type grouping multi-type
+    # precedence bindings need (_joint_scope_event_ids) — avoids that function
+    # rebuilding an identical grouping from scratch on every such check (#21).
+    # (With resource handling disabled, scope_ids_cache and cand_by_type_cache
+    # always end up identical — no type is ever excluded as a resource — but
+    # both are kept so _joint_scope_event_ids's caller signature stays intact.)
+    cand_by_type_cache: dict[str, list[str]] = {}
     for oid in getattr(candidate, "participating_object_ids", []) or []:
         runtime = state.objects.get(oid)
-        if runtime is None or runtime.object_type in resource_types:
+        if runtime is None:
             continue
+        cand_by_type_cache.setdefault(runtime.object_type, []).append(oid)
+        # if runtime.object_type in resource_types:
+        #     continue
         scope_ids_cache.setdefault(runtime.object_type, []).append(oid)
 
     # Performance: set of object types with zero active instances — constraints
@@ -675,11 +698,11 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
                 if not guarded_ids:
                     continue  # no objects subject to this constraint — passes trivially
                 local_cache = {**scope_ids_cache, scope_type: guarded_ids}
-                if not check_constraint(constraint, candidate, state, local_cache):
+                if not check_constraint(constraint, candidate, state, local_cache, cand_by_type_cache):
                     return False
                 continue
 
-        if not check_constraint(constraint, candidate, state, scope_ids_cache):
+        if not check_constraint(constraint, candidate, state, scope_ids_cache, cand_by_type_cache):
             return False
     return True
 
@@ -706,7 +729,8 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
     if not static_model.o2o_rules:
         return True
 
-    resource_types: set = getattr(state, '_resource_types', set()) or set()
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # resource_types: set = getattr(state, '_resource_types', set()) or set()
 
     created_counts: dict[str, int] = {}
     for t in getattr(candidate, "object_types_to_create", []) or []:
@@ -730,10 +754,11 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
         # Skip rules where either type is absent from this candidate
         if rule.source_type not in all_types or rule.target_type not in all_types:
             continue
+        # [resource/permanent-object handling — disabled, kept for reference]
         # Skip rules where either side is a resource type — resources are
         # shared across cases and must not accumulate permanent link caps.
-        if rule.source_type in resource_types or rule.target_type in resource_types:
-            continue
+        # if rule.source_type in resource_types or rule.target_type in resource_types:
+        #     continue
         for oid in participating_ids:
             otype = participant_types.get(oid)
             if otype is None:

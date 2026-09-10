@@ -1,0 +1,100 @@
+{
+  "eventTypes": [
+    {
+      "name": "Submit Manuscript",
+      "attributes": []
+    },
+    {
+      "name": "Review Manuscript",
+      "attributes": []
+    }
+  ],
+  "objectTypes": [
+    {
+      "name": "manuscript",
+      "attributes": []
+    }
+  ],
+  "objects": [
+    {
+      "id": "m1",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m2",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m3",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    }
+  ],
+  "events": [
+    {
+      "id": "e1",
+      "type": "Submit Manuscript",
+      "time": "2026-01-01T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m1",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e2",
+      "type": "Review Manuscript",
+      "time": "2026-01-02T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m1",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e3",
+      "type": "Submit Manuscript",
+      "time": "2026-01-03T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m2",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e4",
+      "type": "Review Manuscript",
+      "time": "2026-01-04T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m2",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e5",
+      "type": "Submit Manuscript",
+      "time": "2026-01-05T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m3",
+          "qualifier": "manuscript"
+        }
+      ]
+    }
+  ]
+}

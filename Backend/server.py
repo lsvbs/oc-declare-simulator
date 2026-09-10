@@ -998,25 +998,7 @@ def run_simulation():
         )
         
         # Create selection wrapper with probability matrix
-        # Also captures per-candidate probabilities so the trace can report them.
-        _last_prob_map = {}  # activity_name -> normalised probability
-
         def select_with_matrix(candidates, state, static_model, config=None, rng=None, **kwargs):
-            # Mirror the probability calculation from selection.py so we can
-            # expose normalised weights in the iteration trace.
-            last_activity = (
-                state.executed_events[-1].activity_name
-                if state.executed_events
-                else "__START__"
-            )
-            transition_probs = prob_matrix.get(last_activity, {})
-            epsilon = 1e-6
-            raw_weights = [transition_probs.get(c.activity_name, 0.0) + epsilon for c in candidates]
-            total = sum(raw_weights)
-            _last_prob_map.clear()
-            for c, w in zip(candidates, raw_weights):
-                _last_prob_map[c.activity_name] = round(w / total, 4) if total > 0 else 0.0
-
             return select_candidate(
                 candidates=candidates,
                 state=state,
@@ -1025,7 +1007,7 @@ def run_simulation():
                 rng=rng,
                 transition_matrix=prob_matrix
             )
-        
+
         # Initialize state with initial objects (for Order Management)
         initial_state = SimulationState()
         
@@ -1054,144 +1036,12 @@ def run_simulation():
             initial_state.next_object_counter = {'products': 3, 'employees': 3}
         
         # Run simulation
-        import tempfile, os
-        _LOG_CAP = 500  # only keep last 500 steps in the response to avoid huge payloads
-        # Write full iteration trace directly to a temp file (JSONL) to avoid
-        # accumulating all entries in memory.
-        _iter_tmp = tempfile.NamedTemporaryFile(
-            mode='w', suffix='.jsonl', delete=False,
-            dir=str(METRICS_DIR), prefix='iteration_tmp_'
-        )
-        _iter_tmp_path = _iter_tmp.name
-
-        # Write model snapshot as the first record so the iteration log is self-contained
-        import json as _json2
-        _model_header = {
-            "event": "model_snapshot",
-            "ocdeclare_file": ocdeclare_file,
-            "start_activities": start_activities,
-            "constraints": [
-                {
-                    "constraint_type": getattr(c, "constraint_type", None),
-                    "source_activity": getattr(c, "source_activity", None),
-                    "target_activity": getattr(c, "target_activity", None),
-                    "scope_kind": getattr(c.scope, "kind", None) if hasattr(c, "scope") and c.scope else None,
-                    "scope_object_type": getattr(c.scope, "object_type", None) if hasattr(c, "scope") and c.scope else None,
-                    "scope_bindings": list(getattr(c.scope, "bindings", ())) if hasattr(c, "scope") and c.scope else [],
-                    "nmin": getattr(c, "nmin", None),
-                    "nmax": getattr(c, "nmax", None),
-                }
-                for c in static_model.constraints
-            ],
-            "activities": [
-                {
-                    "name": a.name,
-                    "bindings": [
-                        {
-                            "object_type": b.object_type,
-                            "creates": getattr(b, "creates", False),
-                            "deactivates": getattr(b, "deactivates", False),
-                            "min_count": getattr(b, "min_count", 1),
-                            "max_count": getattr(b, "max_count", None),
-                        }
-                        for b in (a.bindings or [])
-                    ],
-                }
-                for a in static_model.activities
-            ],
-            "o2o_rules": [
-                {
-                    "source_type": getattr(r, "source_type", None),
-                    "target_type": getattr(r, "target_type", None),
-                    "min_links": getattr(r, "min_links", None),
-                    "max_links": getattr(r, "max_links", None),
-                    "bidirectional": getattr(r, "bidirectional", False),
-                }
-                for r in (static_model.o2o_rules or [])
-            ],
-            "resource_types": list(static_model.resource_types or []),
-            "resource_pool_sizes": dict(static_model.resource_pool_sizes or {}),
-        }
-        _iter_tmp.write(_json2.dumps(_model_header) + '\n')
-        _iter_tmp.flush()
-
-        def trace_func(event: str, payload: dict):
-            if event == "iteration":
-                step = payload.get("step_count", "?")
-                candidates_detail = payload.get("candidates", [])
-                ts = payload.get("timestamp", None)
-                in_prog = payload.get("in_progress_count", 0)
-                waiting = payload.get("waiting_count", 0)
-                candidates_with_probs = [
-                    {
-                        "activity": c.get("activity_name", ""),
-                        "prob": _last_prob_map.get(c.get("activity_name", ""), None),
-                        "objects": c.get("participating_object_ids", []),
-                    }
-                    for c in candidates_detail
-                ]
-                entry = {
-                    "step": step,
-                    "event": "candidates",
-                    "num_candidates": payload.get("num_candidates", 0),
-                    "candidates_with_probs": candidates_with_probs,
-                    "in_progress": in_prog,
-                    "waiting": waiting,
-                    "sim_time": payload.get("sim_time", None),
-                    # Diagnostic fields for bottleneck analysis
-                    "active_objects":                 payload.get("active_objects", {}),
-                    "total_obligations":              payload.get("total_obligations", 0),
-                    "obligated_activities":           payload.get("obligated_activities", []),
-                    "deactivations_this_step":         payload.get("deactivations_this_step", 0),
-                    "obligations_fulfilled_this_step": payload.get("obligations_fulfilled_this_step", 0),
-                    "total_deactivations":             payload.get("total_deactivations", 0),
-                    "total_obligations_fulfilled":     payload.get("total_obligations_fulfilled", 0),
-                    "total_obligations_cancelled":     payload.get("total_obligations_cancelled", 0),
-                }
-                import json as _json
-                _iter_tmp.write(_json.dumps(entry) + '\n')
-            elif event == "chosen":
-                activity = payload.get("activity_name", "?")
-                entry = {
-                    "event": "chosen",
-                    "activity": activity,
-                    "prob": _last_prob_map.get(activity, None),
-                    "objects": payload.get("participating_object_ids", []),
-                    "creates": payload.get("object_types_to_create", []),
-                    "timestamp": payload.get("timestamp", None),
-                }
-                import json as _json
-                _iter_tmp.write(_json.dumps(entry) + '\n')
-            elif event == "applied":
-                entry = {
-                    "event":       "applied",
-                    "activity":    payload.get("activity_name", "?"),
-                    "timestamp":   payload.get("timestamp", None),
-                    "started_at":  payload.get("started_at", None),
-                    "duration_s":  payload.get("duration_s", None),
-                    "objects":     payload.get("object_ids", []),
-                    "step_count":  payload.get("step_count", None),
-                    "concurrent":  payload.get("concurrent", []),
-                }
-                import json as _json
-                _iter_tmp.write(_json.dumps(entry) + '\n')
-            elif event == "stop":
-                entry = {
-                    "step": payload.get("step_count", "?"),
-                    "event": "stop",
-                    "reason": payload.get("reason", "unknown"),
-                }
-                import json as _json
-                _iter_tmp.write(_json.dumps(entry) + '\n')
-                _iter_tmp.flush()
-
         stop_event = threading.Event()
         simulator = Simulator(
             static_model,
             config,
             rng=None,
             select_func=select_with_matrix,
-            trace_func=trace_func,
             stop_event=stop_event,
             transition_matrix=prob_matrix,
             start_counts=cached.get('start_counts', {}),
@@ -1261,20 +1111,6 @@ def run_simulation():
         metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
         metrics_filename = os.path.basename(metrics_file)
 
-        # Close temp file and rename to final iteration log path
-        iteration_log_filename = output_filename.replace('log_', 'iteration_')
-        iteration_log_path = METRICS_DIR / iteration_log_filename
-        try:
-            _iter_tmp.close()
-            import shutil
-            shutil.move(_iter_tmp_path, str(iteration_log_path))
-        except Exception:
-            try:
-                os.unlink(_iter_tmp_path)
-            except Exception:
-                pass
-            iteration_log_filename = None
-
         # Compute object lifecycle and activity participation audits
         from src.Simulation.IO.output.metrics import compute_audit
         audit = compute_audit(final_state, static_model=static_model, prob_matrix=prob_matrix)
@@ -1295,7 +1131,6 @@ def run_simulation():
             'objects_count':  len(final_state.objects),
             'output_file':    output_filename,
             'metrics_file':   metrics_filename,
-            'iteration_log_file': iteration_log_filename,
             'runtime_s':      _sim_runtime_s,
             # store config snapshot so re-run can replay it
             'model_override': model_override,
@@ -1324,7 +1159,6 @@ def run_simulation():
                 'object_links': object_links,
                 'output_file': output_filename,
                 'metrics_file': metrics_filename,
-                'iteration_log_file': iteration_log_filename,
                 # metrics intentionally omitted from inline response — can be very large
                 # (hundreds of MB for big runs). Use GET /api/run-history/{id}/metrics
                 # to access the full data.
@@ -1339,8 +1173,6 @@ def run_simulation():
                 'obligations_fulfilled': getattr(final_state, 'total_obligations_fulfilled', 0),
                 'obligations_cancelled': getattr(final_state, 'total_obligations_cancelled', 0),
                 'obligations_violated': getattr(final_state, 'total_obligations_violated', 0),
-                'guard_checks_total': getattr(final_state, 'guard_checks_total', 0),
-                'guard_checks_passed': getattr(final_state, 'guard_checks_passed', 0),
                 # Per-constraint obligation stats (E3/S8): fulfillment rate per response constraint
                 'constraint_obligation_stats': {
                     f"{k[0]}|{k[1]}→{k[2]}|{k[3]}": v
@@ -1699,29 +1531,6 @@ def get_eventlog_events():
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
-
-
-@app.route('/api/run-history/<run_id>/iteration-log', methods=['GET'])
-def get_iteration_log(run_id):
-    """Return the full iteration log for a specific run (JSONL format)."""
-    history = _load_history()
-    entry = next((e for e in history if e['id'] == run_id), None)
-    if not entry:
-        return jsonify({'error': 'Run not found'}), 404
-    ilf = entry.get('iteration_log_file')
-    if not ilf:
-        return jsonify({'error': 'No iteration log file for this run'}), 404
-    path = METRICS_DIR / ilf
-    if not path.exists():
-        return jsonify({'error': 'Iteration log file missing from disk'}), 404
-    # Support both legacy JSON array and new JSONL format
-    with open(path, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-    if content.startswith('['):
-        data = json.loads(content)
-    else:
-        data = [json.loads(line) for line in content.splitlines() if line.strip()]
-    return jsonify({'iteration_logs': data, 'count': len(data)})
 
 
 @app.route('/api/discover-ocdeclare', methods=['POST'])

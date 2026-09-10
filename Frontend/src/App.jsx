@@ -2398,249 +2398,6 @@ function ConstraintAnalysis({ activeModel, results }) {
   );
 }
 
-// ── TraceHealth ───────────────────────────────────────────────────────────────
-function TraceHealth({ results }) {
-  const [loaded,  setLoaded]  = React.useState(false);
-  const [loading, setLoading] = React.useState(false);
-  const [trace,   setTrace]   = React.useState(null);
-  const [error,   setError]   = React.useState(null);
-  const loadedFor = React.useRef(null);
-
-  const load = async () => {
-    const runId = results?.output_file;
-    if (!runId || loadedFor.current === runId) { setLoaded(true); return; }
-    setLoading(true); setError(null);
-    try {
-      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-      const entries = r.data.iteration_logs || [];
-      loadedFor.current = runId;
-      setTrace(analyseTrace(entries));
-      setLoaded(true);
-    } catch(e) { setError(e.response?.data?.error || e.message); }
-    finally { setLoading(false); }
-  };
-
-  const analyseTrace = (entries) => {
-    const applied   = entries.filter(e => e.event === 'applied');
-    const candSteps = entries.filter(e => e.event === 'candidates');
-    if (!applied.length) return null;
-
-    // Activity counts
-    const actCounts = {};
-    applied.forEach(e => { actCounts[e.activity] = (actCounts[e.activity] || 0) + 1; });
-
-    // Pool size over time (sample every 50 steps to keep chart manageable)
-    const SAMPLE = Math.max(1, Math.floor(candSteps.length / 200));
-    const poolSeries = candSteps
-      .filter((_, i) => i % SAMPLE === 0)
-      .map(s => ({ step: s.step, pool: s.num_candidates, inProg: s.in_progress || 0 }));
-
-    // Empty pool events
-    const emptyPools = candSteps.filter(s => s.num_candidates === 0);
-
-    // In-progress accumulation — max recorded
-    const maxInProg = Math.max(...candSteps.map(s => s.in_progress || 0));
-
-    // Bottleneck detection:
-    // For each step, track which activities are IN the pool (obligation pending)
-    // vs actually firing. High pool-presence but low firing rate = bottleneck.
-    const poolPresence = {}; // act → steps present in pool
-    const poolProbs    = {}; // act → [probs when in pool]
-    candSteps.forEach(s => {
-      (s.candidates_with_probs || []).forEach(c => {
-        poolPresence[c.activity] = (poolPresence[c.activity] || 0) + 1;
-        if (c.prob != null) {
-          (poolProbs[c.activity] = poolProbs[c.activity] || []).push(c.prob);
-        }
-      });
-    });
-
-    // Bottleneck score: activity that appears in pool many times but fires rarely
-    // relative to its pool presence
-    const bottlenecks = Object.entries(poolPresence)
-      .map(([act, presence]) => {
-        const fired = actCounts[act] || 0;
-        const avgProb = poolProbs[act]?.length
-          ? poolProbs[act].reduce((s,v)=>s+v,0) / poolProbs[act].length : null;
-        // fire rate = how often it fires when it's in the pool
-        const fireRate = presence > 0 ? fired / presence : 0;
-        return { act, presence, fired, avgProb, fireRate };
-      })
-      .filter(x => x.presence > 10) // ignore activities that barely appeared
-      .sort((a, b) => a.fireRate - b.fireRate); // worst fire rate first
-
-    // Activity trend: split into 5 windows, count per window
-    const windowSize = Math.ceil(applied.length / 5);
-    const actTrend = {};
-    applied.forEach((e, i) => {
-      const w = Math.min(4, Math.floor(i / windowSize));
-      if (!actTrend[e.activity]) actTrend[e.activity] = [0,0,0,0,0];
-      actTrend[e.activity][w]++;
-    });
-
-    // Late-stage dominant activities (last 20% of steps)
-    const lateStart = Math.floor(applied.length * 0.8);
-    const lateCounts = {};
-    applied.slice(lateStart).forEach(e => { lateCounts[e.activity] = (lateCounts[e.activity]||0)+1; });
-
-    return { actCounts, poolSeries, emptyPools, maxInProg, bottlenecks, actTrend, lateCounts,
-             totalSteps: candSteps.length, totalEvents: applied.length };
-  };
-
-  const fmtPct = v => v == null ? '—' : `${(v*100).toFixed(1)}%`;
-
-  return (
-    <Collapsible className="eval-section" title="Trace Health" defaultOpen={false}>
-      {!loaded && !loading && (
-        <div>
-          <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.5rem'}}>
-            Analyses the iteration trace to identify bottlenecks, pool collapses, and stuck activities.
-            Load on demand — large traces may take a moment.
-          </p>
-          <button className="discovery-button"
-            style={{fontSize:'0.82rem',padding:'0.4rem 1rem',display:'inline-flex',alignItems:'center',gap:'0.5rem'}}
-            onClick={load} disabled={loading}>
-            {loading && <div className="spinner spinner-sm"/>}
-            Analyse Trace
-          </button>
-        </div>
-      )}
-      {loading && <div style={{display:'flex',gap:'0.5rem',alignItems:'center',fontSize:'0.82rem',color:'#6366f1'}}><div className="spinner spinner-sm"/>Loading trace…</div>}
-      {error && <p style={{color:'#b91c1c',fontSize:'0.8rem'}}>⚠ {error}</p>}
-      {loaded && trace && (
-        <div>
-          {/* Summary row */}
-          <div className="trace-health-summary">
-            <div className="trace-health-stat">
-              <span className="trace-health-val">{trace.totalSteps.toLocaleString()}</span>
-              <span className="trace-health-lbl">Total steps</span>
-            </div>
-            <div className="trace-health-stat">
-              <span className="trace-health-val">{trace.emptyPools.length.toLocaleString()}</span>
-              <span className={`trace-health-lbl ${trace.emptyPools.length > trace.totalSteps * 0.1 ? 'trace-warn' : ''}`}>Empty pool steps</span>
-            </div>
-            <div className="trace-health-stat">
-              <span className="trace-health-val">{trace.maxInProg}</span>
-              <span className="trace-health-lbl">Peak in-progress</span>
-            </div>
-            <div className="trace-health-stat">
-              <span className={`trace-health-val ${trace.emptyPools.length / trace.totalSteps > 0.1 ? 'conf-bad' : 'conf-good'}`}>
-                {(trace.emptyPools.length / trace.totalSteps * 100).toFixed(1)}%
-              </span>
-              <span className="trace-health-lbl">Pool stall rate</span>
-            </div>
-          </div>
-
-          {/* Pool size + in-progress chart */}
-          <div style={{marginBottom:'1rem'}}>
-            <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
-              Candidate pool size over time
-            </div>
-            {(() => {
-              const W = 600, H = 80, n = trace.poolSeries.length;
-              if (n === 0) return null;
-              const maxPool = Math.max(...trace.poolSeries.map(s => s.pool), 1);
-              const maxIP   = Math.max(...trace.poolSeries.map(s => s.inProg), 1);
-              return (
-                <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:'block',overflow:'visible'}}>
-                  {/* In-progress background bars */}
-                  {trace.poolSeries.map((s, i) => {
-                    const x = (i / n) * W;
-                    const w = W / n;
-                    const h = (s.inProg / maxIP) * (H - 4);
-                    return <rect key={i} x={x} y={H - h} width={w - 0.5} height={h} fill="#e0e7ff" />;
-                  })}
-                  {/* Pool size line */}
-                  <polyline
-                    fill="none" stroke="#6366f1" strokeWidth="1.5"
-                    points={trace.poolSeries.map((s, i) => {
-                      const x = (i / n) * W;
-                      const y = H - (s.pool / maxPool) * (H - 4) - 2;
-                      return `${x},${y}`;
-                    }).join(' ')}
-                  />
-                  {/* Zero-pool markers */}
-                  {trace.poolSeries.filter(s => s.pool === 0).map((s, i) => {
-                    const idx = trace.poolSeries.indexOf(s);
-                    const x = (idx / n) * W;
-                    return <rect key={i} x={x} y={0} width={Math.max(1.5, W/n)} height={H} fill="rgba(239,68,68,0.15)" />;
-                  })}
-                  {/* Legend */}
-                  <rect x={W-120} y={4} width={10} height={6} fill="#e0e7ff"/>
-                  <text x={W-108} y={11} fontSize="9" fill="#64748b">In-progress</text>
-                  <line x1={W-120} y1={21} x2={W-110} y2={21} stroke="#6366f1" strokeWidth="1.5"/>
-                  <text x={W-108} y={24} fontSize="9" fill="#64748b">Pool size</text>
-                  <rect x={W-120} y={30} width={10} height={6} fill="rgba(239,68,68,0.3)"/>
-                  <text x={W-108} y={37} fontSize="9" fill="#64748b">Empty pool</text>
-                </svg>
-              );
-            })()}
-          </div>
-
-          {/* Bottleneck table */}
-          <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
-            Bottleneck activities — low fire rate despite pool presence
-          </div>
-          <p style={{fontSize:'0.73rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
-            Fire rate = firings ÷ steps the activity was in the pool. Low = activity is stuck in pool but rarely chosen or always blocked.
-          </p>
-          <table className="conf-detail-table" style={{marginBottom:'0.75rem'}}>
-            <thead>
-              <tr>
-                <th title="Activity name">Activity</th>
-                <th className="audit-num" title="Number of simulation steps this activity spent in the candidate pool (eligible to fire)">Pool steps</th>
-                <th className="audit-num" title="Number of times this activity actually fired during the simulation">Fired</th>
-                <th className="audit-num" title="Fraction of pool steps where the activity was actually chosen to fire (Fired ÷ Pool steps)">Fire rate</th>
-                <th className="audit-num" title="Average routing probability assigned to this activity when it was in the pool">Avg prob</th>
-                <th title="Bottleneck diagnosis based on fire rate and probability">Diagnosis</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trace.bottlenecks.map(b => {
-                const cls = b.fireRate < 0.05 ? 'conf-bad' : b.fireRate < 0.2 ? 'conf-mid' : 'conf-good';
-                let diag = '';
-                if (b.fired === 0) diag = 'Never fired — permanently blocked by constraint or missing objects';
-                else if (b.avgProb !== null && b.avgProb < 0.05) diag = 'Very low probability weight — outcompeted by other activities';
-                else if (b.fireRate < 0.05) diag = 'Rarely fires despite being in pool — likely blocked most steps by precedence/O2O';
-                else if (b.fireRate < 0.2) diag = 'Fires infrequently — constraint or probability limiting';
-                else diag = 'Moderate fire rate';
-                return (
-                  <tr key={b.act} className={b.fireRate < 0.05 ? 'audit-row-accumulating' : ''}>
-                    <td style={{fontSize:'0.78rem'}}>{b.act}</td>
-                    <td className="audit-num">{b.presence.toLocaleString()}</td>
-                    <td className="audit-num">{b.fired.toLocaleString()}</td>
-                    <td className="audit-num"><span className={cls}>{fmtPct(b.fireRate)}</span></td>
-                    <td className="audit-num">{b.avgProb != null ? fmtPct(b.avgProb) : '—'}</td>
-                    <td style={{fontSize:'0.72rem',color:'#64748b'}}>{diag}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-
-          {/* Late-stage activity distribution */}
-          <div style={{fontSize:'0.78rem',fontWeight:600,color:'#475569',marginBottom:'0.35rem'}}>
-            Activity distribution in last 20% of steps
-          </div>
-          <div style={{display:'flex',flexWrap:'wrap',gap:'0.3rem',marginBottom:'0.5rem'}}>
-            {Object.entries(trace.lateCounts)
-              .sort((a,b) => b[1]-a[1])
-              .map(([act, cnt]) => (
-                <span key={act} style={{
-                  fontSize:'0.72rem',padding:'0.15rem 0.5rem',
-                  borderRadius:'20px',background:'#f1f5f9',color:'#334155',
-                  border:'1px solid #e2e8f0',
-                }}>
-                  {act} <strong>{cnt}</strong>
-                </span>
-              ))}
-          </div>
-        </div>
-      )}
-    </Collapsible>
-  );
-}
-
 // ── ActivityTimeMatrix — activity × object-type timing matrix ─────────────────
 function ActivityTimeMatrix({ activityMetrics, activeModel, discoveryResults, objectTraces }) {
   const [mode, setMode] = React.useState('mean');
@@ -3176,11 +2933,6 @@ function computeOCCoverage(results, model, discoveryResults) {
   });
   const cov_arrow = weakArrow.length > 0 ? arrowDist / weakArrow.length : null;
 
-  // cov_guard: fraction of guard evaluations that passed (from simulation instrumentation)
-  const guardTotal  = results?.guard_checks_total  ?? 0;
-  const guardPassed = results?.guard_checks_passed ?? 0;
-  const cov_guard = guardTotal > 0 ? guardPassed / guardTotal : null;
-
   return {
     cov_act:        { value: cov_act,        fired: firedModelActs.length, total: modelActSet.size },
     cov_ot:         { value: cov_ot,         fired: firedOts.length,        total: modelOtSet.size },
@@ -3190,7 +2942,6 @@ function computeOCCoverage(results, model, discoveryResults) {
     cov_max:        { value: cov_max,         reached: maxReached, total: finiteMax.length },
     cov_neg:        { value: cov_neg,         nonTrivial: negNonTrivial, total: negConstraints.length },
     cov_arrow:      { value: cov_arrow,       dist: arrowDist, total: weakArrow.length },
-    cov_guard:      { value: cov_guard,       total: guardTotal, passed: guardPassed },
   };
 }
 
@@ -3229,7 +2980,6 @@ function OCCoveragePanel({ results, model, discoveryResults, logResults }) {
   };
 
   // ── Radar axes (5 dimensions — Jalali C.E/C.A/C.I/C.C/C.R) ─────────────────
-  // cov_guard excluded: it measures attribute selectivity, not log-derived coverage.
   // C.E = mean(cov_act, cov_ot)   — element coverage
   // C.C = mean(cov_min, cov_max, cov_neg) — count/cardinality coverage
   const ceVal = (() => {
@@ -3470,17 +3220,6 @@ function OCCoveragePanel({ results, model, discoveryResults, logResults }) {
             <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_arrow.value, logCov?.cov_arrow.value)}</td>
             <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of EF/EP constraints where target fired (EF vs DF / EP vs DP testable)</td>
             <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_arrow.dist}/{cov.cov_arrow.total} response/precedence constraints</td>
-          </tr>
-          {/* Guard — not on radar */}
-          <tr><td colSpan={5} style={{background:'#f1f5f9',fontWeight:700,fontSize:'0.7rem',color:'#475569',padding:'0.25rem 0.5rem',letterSpacing:'0.03em'}}>
-            Not on radar — requires generator instrumentation
-          </td></tr>
-          <tr>
-            <td style={{color:'#94a3b8',fontSize:'0.7rem',fontStyle:'italic'}}>—</td>
-            <td style={{fontWeight:600,whiteSpace:'nowrap'}}>Guard coverage</td>
-            <td style={{padding:'0.3rem 0.4rem'}}>{scoreBar(cov.cov_guard.value, logCov?.cov_guard.value)}</td>
-            <td style={{color:'#475569',fontSize:'0.72rem'}}>Fraction of binding/constraint guard evaluations where objects passed the attribute predicate (from simulation)</td>
-            <td style={{color:'#94a3b8',fontSize:'0.7rem'}}>{cov.cov_guard.total > 0 ? `${cov.cov_guard.passed}/${cov.cov_guard.total} evaluations passed` : 'No guards defined in model'}</td>
           </tr>
         </tbody>
       </table>
@@ -7465,8 +7204,6 @@ function App() {
   const [isPinpointing, setIsPinpointing] = useState(false);
   const [dryRunResult, setDryRunResult] = useState(null);
   const [isDryRunning, setIsDryRunning] = useState(false);
-  const [isLoadingFullIterationLog, setIsLoadingFullIterationLog] = useState(false);
-  const [fullIterationLogLoaded, setFullIterationLogLoaded] = useState(false);
   const [error, setError] = useState(null);
 
   // ── On-demand object metrics — declared here so memos below can reference it ──
@@ -7531,20 +7268,6 @@ function App() {
       setObjectMetricsData({});
     } finally {
       setIsLoadingObjMetrics(false);
-    }
-  }, [results]);
-
-  const loadFullIterationLog = useCallback(async () => {
-    const runId = results?.output_file;
-    if (!runId) return;
-    setIsLoadingFullIterationLog(true);
-    try {
-      const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-      setFullIterationLogLoaded(true);
-    } catch {
-      // keep existing capped logs on failure
-    } finally {
-      setIsLoadingFullIterationLog(false);
     }
   }, [results]);
 
@@ -8166,7 +7889,6 @@ function App() {
     setError(null);
     setResults(null);
     setLogs([]);
-    setFullIterationLogLoaded(false);
 
     // Reset live counters
     setLiveSimTime(null);
@@ -11706,23 +11428,6 @@ function App() {
                                   download={r.output_file}>
                                   Download Event Log
                                 </a>
-                                {r.iteration_log_file && (
-                                  <button className="download-button download-button-secondary"
-                                    onClick={async () => {
-                                      try {
-                                        const res = await axios.get(`/api/run-history/${encodeURIComponent(r.output_file)}/iteration-log`);
-                                        const blob = new Blob([JSON.stringify(res.data, null, 2)], {type:'application/json'});
-                                        const url = URL.createObjectURL(blob);
-                                        const a = document.createElement('a');
-                                        a.href = url;
-                                        a.download = r.iteration_log_file;
-                                        a.click();
-                                        URL.revokeObjectURL(url);
-                                      } catch {}
-                                    }}>
-                                    Download Iteration Trace
-                                  </button>
-                                )}
                               </div>
                             )}
                           </div>
@@ -13271,8 +12976,6 @@ function App() {
                 </Collapsible>
               )}{/* end Evaluation */}
 
-              <TraceHealth results={results} />
-
               {results.activity_sequence && results.activity_sequence.length > 0 && (
                 <div className="flow-chart-section">
                   <h4>Process Flow</h4>
@@ -13548,29 +13251,6 @@ function App() {
             </Collapsible>
           )}
 
-          {results?.iteration_log_file && (
-            <div style={{marginTop:'0.5rem'}}>
-              <button
-                className="download-button download-button-secondary"
-                onClick={async () => {
-                  const runId = results.output_file;
-                  const r = await axios.get(`/api/run-history/${encodeURIComponent(runId)}/iteration-log`);
-                  const lines = (r.data.iteration_logs || []).map(e => JSON.stringify(e)).join('\n');
-                  const blob = new Blob([lines], {type:'application/x-ndjson'});
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url; a.download = `iteration_${runId}.jsonl`;
-                  document.body.appendChild(a); a.click();
-                  document.body.removeChild(a); URL.revokeObjectURL(url);
-                }}
-              >
-                Download Iteration Trace
-              </button>
-              <span style={{fontSize:'0.72rem',color:'#94a3b8',marginLeft:'0.5rem'}}>
-                JSONL — candidates, weights, chosen activity, timestamps
-              </span>
-            </div>
-          )}
           {/* ── Re-run placeholder ── */}
           {results && (
             <div className="rerun-placeholder">

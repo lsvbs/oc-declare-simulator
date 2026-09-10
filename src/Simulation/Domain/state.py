@@ -10,9 +10,10 @@ class RuntimeObject:
     status: Optional[str] = None
     active: bool = True
     attributes: dict[str, Any] = field(default_factory=dict)
+    # [resource/permanent-object handling — disabled, kept for reference]
     # DES occupancy: set while this resource is held by an in-progress activity
-    busy_until: Optional[datetime] = None
-    busy_by: Optional[str] = None   # activity_name holding this resource
+    # busy_until: Optional[datetime] = None
+    # busy_by: Optional[str] = None   # activity_name holding this resource
     # Phase 4: full attribute change history for OCEL 2.0 timestamped export
     # Each entry: (timestamp: Optional[datetime], attr_name: str, new_value: Any)
     attribute_history: list = field(default_factory=list)
@@ -26,7 +27,8 @@ class InProgressActivity:
     object_types_to_create: list[str]
     started_at: datetime
     complete_at: datetime          # when this activity finishes
-    held_resource_ids: list[str]   # resource objects locked for this activity
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # held_resource_ids: list[str]   # resource objects locked for this activity
     created_object_ids: list[str] = field(default_factory=list)
 
     # Make sortable by complete_at for heapq
@@ -34,14 +36,15 @@ class InProgressActivity:
         return self.complete_at < other.complete_at
 
 
-@dataclass
-class WaitingCandidate:
-    """A candidate that could not start because a resource was unavailable."""
-    candidate_activity_name: str
-    participating_object_ids: list[str]
-    object_types_to_create: list[str]
-    arrived_at: datetime           # when it first tried to start
-    blocked_resource_type: str     # which resource type caused the wait
+# [resource/permanent-object handling — disabled, kept for reference]
+# @dataclass
+# class WaitingCandidate:
+#     """A candidate that could not start because a resource was unavailable."""
+#     candidate_activity_name: str
+#     participating_object_ids: list[str]
+#     object_types_to_create: list[str]
+#     arrived_at: datetime           # when it first tried to start
+#     blocked_resource_type: str     # which resource type caused the wait
 
 
 @dataclass
@@ -101,7 +104,10 @@ class SimulationState:
     _start_event_count_by_activity: dict = field(default_factory=dict)
     # set of start activity names — populated once by the simulator before running
     _start_activity_names: set = field(default_factory=set)
+    # [resource/permanent-object handling — disabled, kept for reference]
     # set of resource type names — populated once by the simulator before running
+    # Left in place (always empty now) rather than removed: many call sites do
+    # direct `state._resource_types` attribute access rather than getattr(...).
     _resource_types: set = field(default_factory=set)
 
     # ── O(1) link index (maintained by add_link) ──────────────────────────────
@@ -150,7 +156,9 @@ class SimulationState:
     current_time: Optional[datetime] = None
     # Min-heap of in-progress activities sorted by complete_at (use heapq)
     in_progress: list = field(default_factory=list)
-    # Activities waiting for a resource to become free
+    # [resource/permanent-object handling — disabled, kept for reference]
+    # Activities waiting for a resource to become free. Left in place (always
+    # empty now) rather than removed: several call sites read it directly.
     waiting_queue: list = field(default_factory=list)
     # activity_name -> list of resource-wait durations in seconds
     resource_wait_s: dict[str, list[float]] = field(default_factory=dict)
@@ -184,19 +192,11 @@ class SimulationState:
     # Performance: typed link index — _linked_by_type[oid][object_type] = set of linked oids of that type
     _linked_by_type: dict = field(default_factory=dict)
 
-    # Phase 1b: guard coverage counters — incremented by candidategeneration
-    guard_checks_total: int = 0
-    guard_checks_passed: int = 0
-
     # Phase 1 — Obligation stratification
     # Ready pool: (target_act, scope_oid) → 1 — prerequisites satisfied, inject immediately
     _obligations_ready: dict = field(default_factory=dict)
     # Blocked pool: (blocking_source_act, scope_oid) → set of (target_act, oblg_oid) waiting for it
     _obligations_blocked: dict = field(default_factory=dict)
-
-    # Phase 3 — Activity-object eligibility index
-    # activity_name → set of object_ids currently eligible as primary binding
-    _eligible_for_activity: dict = field(default_factory=dict)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -285,45 +285,47 @@ class SimulationState:
         # Clean up stratified obligation pools (blocked only; ready handled above)
         for k in [k for k in self._obligations_blocked if isinstance(k[1], str) and k[1] == object_id]:
             self._obligations_blocked.pop(k, None)
-        # Remove from eligibility index
-        for act_eligible in self._eligible_for_activity.values():
-            act_eligible.discard(object_id)
+        # [resource/permanent-object handling — disabled, kept for reference]
         # Increment completed trace count for non-resource objects
-        resource_types: set = getattr(self, '_resource_types', set()) or set()
-        if obj.object_type not in resource_types:
-            self.completed_trace_count += 1
+        # resource_types: set = getattr(self, '_resource_types', set()) or set()
+        # if obj.object_type not in resource_types:
+        #     self.completed_trace_count += 1
+        # With resource handling disabled, every deactivated object counts as a
+        # completed trace (equivalent to the above with resource_types always empty).
+        self.completed_trace_count += 1
         # Clear precedence satisfied cache entries for this object
         self._prec_satisfied = {k for k in self._prec_satisfied if k[-1] != object_id}
 
-        # Free resource neighbors whose case-object links are all now inactive.
-        resource_types: set = getattr(self, '_resource_types', set()) or set()
-        if obj.object_type in resource_types:
-            # The deactivated object is itself a resource — nothing extra to do.
-            return
-
-        # For each resource neighbor of the deactivated object, remove the
-        # deactivated object from that resource's runtime link set.
-        # Then, if the resource has NO remaining active (non-resource) neighbors,
-        # clear its entire link set so O2O caps reset for the next case.
-        for neighbor_id in list(self._links_by_object.get(object_id, set())):
-            neighbor = self.objects.get(neighbor_id)
-            if neighbor is None or neighbor.object_type not in resource_types:
-                continue
-            res_links = self._links_by_object.get(neighbor_id)
-            if res_links:
-                res_links.discard(object_id)
-            own_links = self._links_by_object.get(object_id)
-            if own_links:
-                own_links.discard(neighbor_id)
-            if res_links is not None:
-                remaining_active = any(
-                    self.objects.get(nid) is not None
-                    and self.objects[nid].active
-                    and self.objects[nid].object_type not in resource_types
-                    for nid in res_links
-                )
-                if not remaining_active:
-                    res_links.clear()
+        # [resource/permanent-object handling — disabled, kept for reference]
+        # # Free resource neighbors whose case-object links are all now inactive.
+        # resource_types: set = getattr(self, '_resource_types', set()) or set()
+        # if obj.object_type in resource_types:
+        #     # The deactivated object is itself a resource — nothing extra to do.
+        #     return
+        #
+        # # For each resource neighbor of the deactivated object, remove the
+        # # deactivated object from that resource's runtime link set.
+        # # Then, if the resource has NO remaining active (non-resource) neighbors,
+        # # clear its entire link set so O2O caps reset for the next case.
+        # for neighbor_id in list(self._links_by_object.get(object_id, set())):
+        #     neighbor = self.objects.get(neighbor_id)
+        #     if neighbor is None or neighbor.object_type not in resource_types:
+        #         continue
+        #     res_links = self._links_by_object.get(neighbor_id)
+        #     if res_links:
+        #         res_links.discard(object_id)
+        #     own_links = self._links_by_object.get(object_id)
+        #     if own_links:
+        #         own_links.discard(neighbor_id)
+        #     if res_links is not None:
+        #         remaining_active = any(
+        #             self.objects.get(nid) is not None
+        #             and self.objects[nid].active
+        #             and self.objects[nid].object_type not in resource_types
+        #             for nid in res_links
+        #         )
+        #         if not remaining_active:
+        #             res_links.clear()
 
     def add_link(self, source_object_id: str, target_object_id: str) -> None:
         self.links.append(
