@@ -96,6 +96,13 @@ class SimulationState:
     _events_by_object: dict[str, list] = field(default_factory=dict)
     # (activity_name, object_id) -> all events with that activity involving that object
     _events_by_act_obj: dict[tuple, list] = field(default_factory=dict)
+    # (activity_name, object_id) -> set of event_ids, mirroring _events_by_act_obj.
+    # Maintained incrementally in record_event so multi-type constraint checks
+    # (semantics._joint_scope_event_ids) can read a prebuilt set in O(1) instead
+    # of rebuilding a frozenset over the object's whole event history on every
+    # check — that rebuild was the dominant superlinear cost at scale (#24).
+    # Read-only for consumers: never mutate the returned set in place.
+    _event_ids_by_act_obj: dict[tuple, set] = field(default_factory=dict)
     # object_id -> activity_name of the most recent event involving it
     _last_activity_per_object: dict[str, str] = field(default_factory=dict)
     # count of start-activity events (maintained via start_activity_names set in record_event)
@@ -119,6 +126,32 @@ class SimulationState:
     # for that activity. Prevents obligation injection from starting a second
     # concurrent instance before the first has recorded its event.
     _in_progress_objects: set = field(default_factory=set)
+
+    # ── Per-object busy index (#27) ───────────────────────────────────────────
+    # Every object_id currently participating in ANY in-progress activity.
+    # _in_progress_objects above is keyed (activity_name, object_id), so it only
+    # stops the *same* activity restarting on an object; it says nothing about a
+    # different activity claiming it. This set enforces that an object takes part
+    # in at most one activity instance at a time.
+    #
+    # Modelling note: OC-Declare has instantaneous events, so this question does
+    # not arise in the formalism — it appears only once activities are given a
+    # duration. Exclusivity is therefore a simulation assumption, not declarative
+    # semantics, and some object types (a Transport Document referenced by two
+    # concurrent activities) could legitimately opt out of it.
+    _busy_objects: set = field(default_factory=set)
+
+    # ── Per-activity in-progress counter (#26) ────────────────────────────────
+    # activity_name -> number of instances currently started but not completed.
+    # Maintained alongside _in_progress_objects so the concurrency ceiling can
+    # be checked in O(1) instead of scanning the in_progress heap.
+    _in_progress_by_activity: dict[str, int] = field(default_factory=dict)
+
+    # ── Next permitted arrival time per activity (#26) ────────────────────────
+    # activity_name -> datetime before which the activity may not start again.
+    # Only used for activities that have a measured inter-arrival distribution;
+    # absent means "no arrival pacing".
+    _next_arrival_at: dict = field(default_factory=dict)
 
     # ── Active-objects-by-type index (maintained by add_object / deactivate) ──
     # object_type -> set of object_ids that are currently active
@@ -197,6 +230,35 @@ class SimulationState:
     _obligations_ready: dict = field(default_factory=dict)
     # Blocked pool: (blocking_source_act, scope_oid) → set of (target_act, oblg_oid) waiting for it
     _obligations_blocked: dict = field(default_factory=dict)
+
+    # #23 — Incremental candidate pool for the "expand" section of
+    # _generate_candidates_des (activities in Simulator._incremental_safe_activities
+    # only). (activity_name, primary_object_id) -> Candidate, patched
+    # incrementally instead of being rebuilt from scratch every step.
+    _candidate_pool: dict = field(default_factory=dict)
+    # Reverse index: object_id -> set of pool keys whose candidate currently
+    # includes that object as ANY participant (not just the primary). Lets a
+    # change to any participant (deactivation, attribute update, or an event
+    # firing on it) find and re-verify every pool entry it could affect,
+    # without needing to reason about O2O link topology at all.
+    _pool_entries_by_participant: dict = field(default_factory=dict)
+    # Secondary index: activity_name -> set of primary_object_ids currently
+    # pooled for it. Lets _generate_candidates_des emit one activity's pool
+    # entries without scanning the whole pool.
+    _candidate_pool_keys_by_activity: dict = field(default_factory=dict)
+    # Which incremental-safe activities have had their pool entries
+    # populated at least once (via a one-time full rescan the first time
+    # they become eligible) — everything else for that activity is
+    # incremental from then on.
+    _pool_initialized_activities: set = field(default_factory=set)
+    # Transient per-step accumulators, populated by _des_complete_activity as
+    # events complete and consumed (then cleared) by the next
+    # _generate_candidates_des call. _step_dirty_objects = participants +
+    # created-object-ids of every event completed this step.
+    # _step_dirty_types = object types created or attribute-updated this
+    # step (drives the new/updated-supply full-rescan trigger).
+    _step_dirty_objects: set = field(default_factory=set)
+    _step_dirty_types: set = field(default_factory=set)
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -327,6 +389,36 @@ class SimulationState:
         #         if not remaining_active:
         #             res_links.clear()
 
+    def pool_set(self, key: tuple, candidate: Any) -> None:
+        """Insert or replace an incremental-candidate-pool entry (#23),
+        keeping `_pool_entries_by_participant` and
+        `_candidate_pool_keys_by_activity` in sync with the new candidate's
+        participants."""
+        self.pool_remove(key)
+        self._candidate_pool[key] = candidate
+        for oid in candidate.participating_object_ids:
+            self._pool_entries_by_participant.setdefault(oid, set()).add(key)
+        self._candidate_pool_keys_by_activity.setdefault(key[0], set()).add(key[1])
+
+    def pool_remove(self, key: tuple) -> None:
+        """Remove an incremental-candidate-pool entry if present, keeping
+        `_pool_entries_by_participant` and `_candidate_pool_keys_by_activity`
+        in sync (#23)."""
+        old = self._candidate_pool.pop(key, None)
+        if old is None:
+            return
+        act_oids = self._candidate_pool_keys_by_activity.get(key[0])
+        if act_oids is not None:
+            act_oids.discard(key[1])
+            if not act_oids:
+                del self._candidate_pool_keys_by_activity[key[0]]
+        for oid in old.participating_object_ids:
+            entries = self._pool_entries_by_participant.get(oid)
+            if entries is not None:
+                entries.discard(key)
+                if not entries:
+                    del self._pool_entries_by_participant[oid]
+
     def add_link(self, source_object_id: str, target_object_id: str) -> None:
         self.links.append(
             ObjectLink(
@@ -368,6 +460,8 @@ class SimulationState:
             prev_act_for_oid = self._last_activity_per_object.get(oid)
             self._events_by_object.setdefault(oid, []).append(event)
             self._events_by_act_obj.setdefault((activity_name, oid), []).append(event)
+            # #24: keep the event-id set mirror in sync (see field comment)
+            self._event_ids_by_act_obj.setdefault((activity_name, oid), set()).add(event.event_id)
             self._last_activity_per_object[oid] = activity_name
 
             # Per-object streak (#17: inlined, no dict allocation)

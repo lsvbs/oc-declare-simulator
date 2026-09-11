@@ -829,6 +829,44 @@
   line-height: 1.5;
 }
 
+/* Blocking warning: object types missing a creates and/or deactivates binding.
+   Shown in the Model Editor and beside the (disabled) Run buttons. */
+.object-lifecycle-warning {
+  margin-top: 0.65rem;
+  margin-bottom: 0.65rem;
+  padding: 0.7rem 0.9rem;
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  border-left: 4px solid #dc2626;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  color: #b91c1c;
+  line-height: 1.5;
+}
+
+.object-lifecycle-warning-title {
+  font-weight: 700;
+  color: #dc2626;
+  margin-bottom: 0.4rem;
+}
+
+.object-lifecycle-warning-group + .object-lifecycle-warning-group {
+  margin-top: 0.4rem;
+}
+
+.object-lifecycle-warning code {
+  background: #fee2e2;
+  border-radius: 3px;
+  padding: 0 3px;
+  font-size: 0.78rem;
+}
+
+.object-lifecycle-warning-hint {
+  margin: 0.5rem 0 0;
+  color: #7f1d1d;
+  font-size: 0.78rem;
+}
+
 /* ── Step 2.5: Timing discovery ───────────────────────────────────────────── */
 .timing-discovery-section {
   background: white;

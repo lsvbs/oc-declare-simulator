@@ -27,7 +27,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold, discover_wip_caps, discover_activity_concurrency, discover_interarrival_times
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -50,6 +50,88 @@ METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Store discovery results in memory (keyed by event_log_file)
 discovery_cache = {}
+
+
+def _merge_wip_caps(model_data, event_log_file):
+    """Attach work-in-progress caps to a loaded model, measured from the OCEL.
+
+    WIP caps are a simulation parameter, not part of OC-Declare — the model
+    file must stay identical to what the OCPQ-Converter produces, so nothing
+    writes them there. They are derived from the event log here, at simulation
+    setup, once both the OCEL and the OC-Declare model are loaded. This mirrors
+    how activity_durations is merged a few lines above.
+
+    Without them the caps dict is empty, which means "uncapped": admission
+    control is silently inert and the active-object set grows without bound.
+    Results are cached per event log since the measurement is a full sweep.
+
+    A model that already carries wip_caps (e.g. edited in the model editor) is
+    left untouched — explicit values always win.
+    """
+    if not isinstance(model_data, dict) or model_data.get('wip_caps'):
+        return model_data
+    if not event_log_file:
+        return model_data
+    cache_entry = discovery_cache.setdefault(event_log_file, {})
+    caps = cache_entry.get('wip_caps')
+    if caps is None:
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return model_data
+        try:
+            caps = discover_wip_caps(load_ocel2(str(log_path)))
+        except Exception:
+            caps = {}
+        cache_entry['wip_caps'] = caps
+    if not caps:
+        return model_data
+    return {**model_data, 'wip_caps': caps}
+
+
+def _merge_pacing(model_data, event_log_file, time_distributions=None):
+    """Attach activity concurrency ceilings and inter-arrival distributions.
+
+    Both are simulation parameters measured from the OCEL, never written into
+    the OC-Declare model file, and merged here once the log and the model are
+    both loaded — the same contract as wip_caps and activity_durations.
+
+    Concurrency bounds state.in_progress. Objects are created when an activity
+    *starts*, so an activity that starts faster than it completes creates
+    objects indefinitely. Inter-arrival pacing replaces "one candidate per
+    simulation step" as the arrival rate for activities with no input bindings.
+
+    Values already present on the model (e.g. set in the model editor) win.
+    """
+    if not isinstance(model_data, dict) or not event_log_file:
+        return model_data
+    need_conc = not model_data.get('activity_concurrency')
+    need_iat = not model_data.get('interarrival_times')
+    if not need_conc and not need_iat:
+        return model_data
+    cache_entry = discovery_cache.setdefault(event_log_file, {})
+    conc = cache_entry.get('activity_concurrency')
+    iat = cache_entry.get('interarrival_times')
+    if (need_conc and conc is None) or (need_iat and iat is None):
+        log_path = EVENTLOG_DIR / event_log_file
+        if not log_path.exists():
+            return model_data
+        try:
+            ocel = load_ocel2(str(log_path))
+            if need_conc and conc is None:
+                conc = discover_activity_concurrency(ocel, time_distributions or None)
+                cache_entry['activity_concurrency'] = conc
+            if need_iat and iat is None:
+                iat = discover_interarrival_times(ocel)
+                cache_entry['interarrival_times'] = iat
+        except Exception:
+            conc = conc or {}
+            iat = iat or {}
+    out = model_data
+    if need_conc and conc:
+        out = {**out, 'activity_concurrency': conc}
+    if need_iat and iat:
+        out = {**out, 'interarrival_times': iat}
+    return out
 
 # Active simulation runs: run_id -> {state, stop_event, thread, done}
 import threading
@@ -968,6 +1050,11 @@ def run_simulation():
                       if act not in existing}
             merged.update(existing)
             model_data = {**model_data, 'activity_durations': merged}
+
+        # Backfill WIP caps for models discovered before wip_caps existed
+        model_data = _merge_wip_caps(model_data, event_log_file)
+        # Concurrency ceilings + inter-arrival pacing, measured from the OCEL
+        model_data = _merge_pacing(model_data, event_log_file, time_distributions)
 
         # Route to the correct parser based on file format:
         # - list  → hand-crafted arc-list format (Format 1)
@@ -2686,6 +2773,11 @@ def _build_static_model_from_request(data):
         merged = {act: m for act, m in time_distributions.items() if act not in existing}
         merged.update(existing)
         model_data = {**model_data, 'activity_durations': merged}
+
+    # Backfill WIP caps for models discovered before wip_caps existed
+    model_data = _merge_wip_caps(model_data, event_log_file)
+    # Concurrency ceilings + inter-arrival pacing, measured from the OCEL
+    model_data = _merge_pacing(model_data, event_log_file, time_distributions)
 
     if isinstance(model_data, list):
         static_model = parse_ocdeclare_list(model_data)

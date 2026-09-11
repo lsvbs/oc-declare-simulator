@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass, field
+from datetime import timedelta
 from itertools import product as _iproduct
 from typing import Optional
 
@@ -232,6 +233,202 @@ class Simulator:
             if required:
                 self._activity_required_types[activity.name] = required
 
+        # Inverted index of the above: object_type -> activities that need an
+        # existing (non-creates) instance of it. Used by the incremental
+        # candidate pool (#23) to know which activities to fully rescan when
+        # a new instance of a type appears — a previously supply-starved
+        # primary object can only newly succeed for activities that actually
+        # require that type.
+        self._activities_requiring_type: dict = {}
+        for act_name, types in self._activity_required_types.items():
+            for t in types:
+                self._activities_requiring_type.setdefault(t, set()).add(act_name)
+
+        # ── Work-in-progress admission control (#25) ───────────────────────
+        # Per-object-type ceiling on simultaneously-active instances, measured
+        # from the source log by ParameterDiscovery.discover_wip_caps. An
+        # activity that would create an instance of a type already at its
+        # ceiling is skipped this step and retried once capacity frees.
+        #
+        # This is the "capacity" leg of the discrete-event triple (arrival /
+        # capacity / service). OC-Declare constraints cannot express it, so
+        # without a cap any object type whose consuming activity is starved
+        # grows without bound — which both distorts the event mix and makes
+        # candidate generation quadratic in the event count.
+        #
+        # Empty dict (a model with no wip_caps) disables the check entirely,
+        # preserving the previous behaviour exactly.
+        #
+        # [resource/permanent-object handling — disabled, kept for reference]
+        # Caps currently apply to EVERY object type, permanent ones included.
+        # Once permanent-object / resource-type handling is re-enabled,
+        # permanent types should be excluded here and bounded by their pool
+        # size instead — their capacity is the pool, not a WIP ceiling, and
+        # they are never created mid-simulation:
+        # self._wip_caps = {
+        #     t: c for t, c in (getattr(static_model, 'wip_caps', {}) or {}).items()
+        #     if t not in set(getattr(static_model, 'resource_types', []) or [])
+        # }
+        self._wip_caps: dict = dict(getattr(static_model, 'wip_caps', {}) or {})
+        # Only activities that actually create a capped type can ever be
+        # blocked — checked first so the common case costs one set lookup.
+        #
+        # Start activities are deliberately excluded. They model the *arrival*
+        # process, which is governed by its own limits (StartPolicy's
+        # max_case_starts / start_activity_caps, enforced by
+        # _is_start_activity_blocked) and not by internal capacity. Letting a
+        # WIP ceiling gate them conflates arrival rate with capacity: arrivals
+        # would stop whenever the system was momentarily full, and — since a
+        # start activity is typically the only one able to fire with no input
+        # objects — the run would have nothing left to start and terminate via
+        # the `no_candidates` break instead of simply being busy.
+        self._wip_gated_activities: set = {
+            activity.name
+            for activity in static_model.activities
+            if activity.name not in self._start_names_set
+            and any(b.creates and b.object_type in self._wip_caps
+                    for b in activity.bindings)
+        }
+
+        # ── Per-activity concurrency ceiling (#26) ─────────────────────────
+        # Maximum simultaneously in-progress instances of an activity, measured
+        # from the log. Objects are created when an activity *starts*, so an
+        # activity that starts far faster than it completes manufactures
+        # objects without limit: 'Register Customer Order' (service ~51157s,
+        # one candidate per step) reached 593 concurrent instances against a
+        # real-log peak of 3, and every one of them had already created its
+        # Customer Order. This bounds state.in_progress at source.
+        #
+        # This one DOES apply to start activities — it paces arrivals rather
+        # than refusing them for want of downstream capacity, so it is the
+        # "cap set on the start activity" that governs them.
+        self._activity_concurrency: dict = dict(
+            getattr(static_model, 'activity_concurrency', {}) or {})
+
+        # ── Inter-arrival pacing for input-less activities (#26) ───────────
+        # An activity with no input object bindings gets exactly one candidate
+        # per simulation step, so without pacing it fires on essentially every
+        # step and the step structure becomes the arrival rate. Where the log
+        # gives a measured inter-arrival distribution we schedule the next
+        # permitted start instead, and skip the transition-probability gate
+        # (which was only ever a stand-in for this).
+        self._interarrival: dict = dict(
+            getattr(static_model, 'interarrival_times', {}) or {})
+
+        # ── Incremental-candidate-pool safety classification (#23) ─────────
+        # An activity is "incremental-safe" iff none of its relevant
+        # constraints can reach a global-fallback branch — one whose result
+        # depends on model-wide state rather than the specific candidate's
+        # own participants (e.g. check_absence's "not scope_ids" branch
+        # falling back to a raw len(state._events_by_activity[...]) count).
+        # Activities that fail this are simply excluded from incremental
+        # treatment and always get the full per-step rescan — see
+        # _generate_candidates_des. This was derived by auditing every
+        # constraint checker in semantics.py; see the design plan for the
+        # full derivation (playful-frolicking-squirrel.md).
+        def _has_required_binding(act_name: str, object_type: str) -> bool:
+            act = self._act_by_name.get(act_name)
+            if act is None:
+                return False
+            return any(b.object_type == object_type and b.min_count >= 1 for b in act.bindings)
+
+        def _has_creates_binding(act_name: str, object_type: str) -> bool:
+            act = self._act_by_name.get(act_name)
+            if act is None:
+                return False
+            return any(b.object_type == object_type and b.creates for b in act.bindings)
+
+        unsafe_activities: set = set()
+        for con in static_model.constraints:
+            kind = con.constraint_type
+            scope = con.scope
+            is_multitype = bool(getattr(scope, 'bindings', None))
+            scope_kind_ok = scope.kind in ('each', 'any', 'all')
+            src, tgt, ot = con.source_activity, con.target_activity, scope.object_type
+
+            if not scope_kind_ok and not is_multitype:
+                # Truly unscoped constraint — always model-wide, for any type
+                # except response/responded_existence which never look at
+                # scope at all (checked again below, but short-circuit here).
+                if kind not in ('response', 'responded_existence'):
+                    unsafe_activities.update((src, tgt))
+                continue
+
+            if kind in ('response', 'responded_existence', 'not_coexistence',
+                        'not_precedence', 'chain_precedence', 'init', 'coexistence'):
+                # Every branch of these checkers is either candidate-local or
+                # already returns a safe (True) result on an empty scope —
+                # confirmed by reading each function in semantics.py.
+                continue
+
+            if kind == 'precedence' or kind == 'succession':
+                if is_multitype:
+                    continue  # joint multi-type check is always candidate-local
+                if con.nmin and con.nmin > 0 and not _has_required_binding(tgt, ot):
+                    unsafe_activities.add(tgt)
+                continue
+
+            if kind == 'chain_response' or kind == 'chain_succession':
+                # Global "armed" scan over state._active_by_type only reachable
+                # when this activity is the source AND creates the scope type.
+                if _has_creates_binding(src, ot):
+                    unsafe_activities.add(src)
+                continue
+
+            if kind in ('absence', 'exactly', 'not_succession', 'not_chain_succession'):
+                # Unlike precedence, these have NO nmin/nmax escape hatch and
+                # fall back to a global count unconditionally for any
+                # non-"each" scope kind (including any/all — not just empty
+                # scope) — confirmed by reading the actual branch structure.
+                if scope.kind != 'each' or not _has_required_binding(tgt, ot):
+                    unsafe_activities.add(tgt)
+                continue
+
+            if kind == 'exclusive_choice':
+                if scope.kind != 'each':
+                    unsafe_activities.update((src, tgt))
+                continue
+
+            if kind == 'alternate_response':
+                if scope.kind != 'each':
+                    unsafe_activities.add(src)
+                continue
+
+            if kind == 'alternate_precedence':
+                if scope.kind != 'each':
+                    unsafe_activities.add(tgt)
+                continue
+
+            if kind == 'alternate_succession':
+                if scope.kind != 'each':
+                    unsafe_activities.update((src, tgt))
+                continue
+
+            # Any future/unrecognised constraint type: conservatively unsafe.
+            unsafe_activities.update((src, tgt))
+
+        # #25: an activity whose start can be deferred by WIP admission control
+        # is never incremental-safe. Before #25 every generated candidate started
+        # immediately, so _des_start_activity pruned it and the pool was drained
+        # each step — pool entries never actually survived a step, and the
+        # dirty-tracking was never exercised for persistence. A deferred
+        # candidate does persist, and can then go stale without any of its
+        # participants being dirtied (caught by SIM_DEBUG_POOL_CHECK as a
+        # spurious extra pool entry for 'Order Empty Containers'). These
+        # activities therefore keep the unmodified full rescan every step.
+        # The cost is small precisely because WIP caps bound the active-object
+        # sets the rescan iterates over.
+        self._incremental_safe_activities: set = {
+            a.name for a in static_model.activities
+        } - unsafe_activities - self._wip_gated_activities
+
+        # Debug-only cross-check (#23): when enabled, every call to
+        # _generate_candidates_des re-derives a fresh full rescan for each
+        # incremental-safe activity and asserts it matches the pool exactly.
+        # Off by default (real per-step cost) — opt in for testing.
+        import os as _os
+        self._debug_pool_check: bool = _os.environ.get('SIM_DEBUG_POOL_CHECK') == '1'
+
         # Reusable set for obligation dedup — cleared each step, avoids per-step allocation
         self._seen_obligation_keys: set = set()
         # Delta tracking for iteration log: last-seen cumulative counters
@@ -250,6 +447,114 @@ class Simulator:
     def run(self, state=None):
         """Alias for run_des — the sole simulation entry point."""
         return self.run_des(state)
+
+    def _pool_invalidate_activity(self, activity_name: str, state: SimulationState) -> None:
+        """Drop every pooled entry for an activity and force a full rescan next time.
+
+        Needed wherever _generate_candidates_des skips an activity before its
+        incremental update runs: this step's dirty sets are consumed and
+        cleared once at the top of the call, so a skipped activity never sees
+        them and any entry that should have been invalidated would survive
+        indefinitely. Dropping the entries and clearing the bootstrap flag
+        makes the activity re-derive from scratch when it is next considered.
+        """
+        keys = state._candidate_pool_keys_by_activity.get(activity_name)
+        if keys:
+            for oid in list(keys):
+                state.pool_remove((activity_name, oid))
+        state._pool_initialized_activities.discard(activity_name)
+
+    def _wip_allows(self, candidate, state: SimulationState) -> bool:
+        """Return True unless starting `candidate` would exceed a WIP ceiling (#25).
+
+        Checked immediately before the candidate starts rather than during
+        candidate generation, because objects are created at *start* time
+        (_des_start_activity) and several candidates generated in the same
+        step may each create an instance of the same type — a generation-time
+        check would let all of them through against one stale count.
+
+        A blocked candidate is simply not started this step. It stays in the
+        incremental pool (#23) and is retried on subsequent steps, so it
+        starts as soon as an existing instance is deactivated. Nothing is
+        dropped and no pool bookkeeping is needed.
+        """
+        caps = self._wip_caps
+        if not caps or candidate.activity_name not in self._wip_gated_activities:
+            return True
+        creating = candidate.object_types_to_create
+        if not creating:
+            return True
+        # Count this candidate's own creations per type: one candidate may
+        # create several instances of the same type in a single event.
+        wanted: dict = {}
+        for t in creating:
+            wanted[t] = wanted.get(t, 0) + 1
+        for t, n in wanted.items():
+            cap = caps.get(t)
+            if cap is None:
+                continue
+            if len(state._active_by_type.get(t, ())) + n > cap:
+                return False
+        return True
+
+    def _objects_free(self, candidate, state: SimulationState) -> bool:
+        """Return True unless any participant is already inside another activity (#27).
+
+        Must be re-checked in the start loop, not only at candidate generation:
+        the whole candidate set is derived against the pre-start state, so two
+        candidates can each be built holding object X while X was free, and the
+        first to start claims it. Without the re-check the second would start
+        anyway and X would sit in two activity instances at once.
+        """
+        busy = state._busy_objects
+        if not busy:
+            return True
+        for oid in candidate.participating_object_ids:
+            if oid in busy:
+                return False
+        return True
+
+    def _concurrency_allows(self, candidate, state: SimulationState) -> bool:
+        """Return True unless the activity is already at its concurrency ceiling (#26).
+
+        Same placement rationale as _wip_allows: completions happen in
+        _des_complete_activity before candidate generation and starts happen in
+        the start loop after it, so the in-progress count only grows within a
+        step. That makes the check exact at generation time and still correct
+        when re-applied per candidate as the start loop proceeds.
+        """
+        caps = self._activity_concurrency
+        if not caps:
+            return True
+        cap = caps.get(candidate.activity_name)
+        if cap is None:
+            return True
+        return state._in_progress_by_activity.get(candidate.activity_name, 0) < cap
+
+    def _arrival_allows(self, activity_name: str, state: SimulationState) -> bool:
+        """Return True if `activity_name` may start now under inter-arrival pacing (#26).
+
+        Activities without a measured inter-arrival distribution are never
+        gated here. The first start is always permitted; subsequent ones wait
+        until the sampled gap has elapsed on the simulation clock.
+        """
+        if not self._interarrival or activity_name not in self._interarrival:
+            return True
+        due = state._next_arrival_at.get(activity_name)
+        if due is None:
+            return True
+        return state.current_time >= due
+
+    def _schedule_next_arrival(self, activity_name: str, state: SimulationState) -> None:
+        """Sample the next permitted start time for a paced activity (#26)."""
+        dur = self._interarrival.get(activity_name)
+        if dur is None or state.current_time is None:
+            return
+        from src.Simulation.Engine.timepolicy import _sample_duration
+        gap = _sample_duration(dur, rng=self.rng)
+        if gap is None or gap < 0:
+            gap = 0.0
+        state._next_arrival_at[activity_name] = state.current_time + timedelta(seconds=gap)
 
     def _is_start_activity_blocked(self, candidate, state: SimulationState) -> bool:
         """Return True if this start activity has hit its cap (global or per-activity)."""
@@ -314,13 +619,56 @@ class Simulator:
         max_consec: dict = getattr(self.static_model, "max_consecutive", {}) or {}
         max_consec_obj: dict = getattr(self.static_model, "max_consecutive_per_object", {}) or {}
 
+        # #23: consume this step's dirty-tracking accumulators (populated by
+        # _des_complete_activity for every event that completed since the
+        # last call) and clear them for the next step. Drives the
+        # incremental candidate pool below.
+        step_dirty_objects: set = state._step_dirty_objects
+        step_dirty_types: set = state._step_dirty_types
+        full_rescan_activities: set = set()
+        for _t in step_dirty_types:
+            full_rescan_activities.update(self._activities_requiring_type.get(_t, ()))
+        if max_consec and step_dirty_objects:
+            # Global (not per-object) max_consecutive resets whenever a
+            # different activity fires. Precisely tracking which cap(s)
+            # reset within one batch of same-instant completions isn't
+            # worth the complexity (this is rarely used) — conservatively
+            # treat any completion this step as a possible reset for every
+            # capped activity.
+            full_rescan_activities.update(max_consec.keys())
+        state._step_dirty_objects = set()
+        state._step_dirty_types = set()
+
         for activity in self.static_model.activities:
             if is_simulation_start and activity.name not in start_activity_names:
+                # #23 correctness: a skipped activity never consumes this step's
+                # dirty sets (they are cleared once, above), so anything it has
+                # pooled must be dropped rather than silently kept.
+                self._pool_invalidate_activity(activity.name, state)
+                continue
+
+            # #26: already running as many instances as the log ever showed, or
+            # not yet due under inter-arrival pacing — produce no candidate at
+            # all this step. Filtering here (rather than only at start) keeps
+            # `candidates` honest for the deadlock bypass below, same as #25.
+            if not self._arrival_allows(activity.name, state):
+                self._pool_invalidate_activity(activity.name, state)
+                continue
+            _conc_cap = self._activity_concurrency.get(activity.name)
+            if (_conc_cap is not None
+                    and state._in_progress_by_activity.get(activity.name, 0) >= _conc_cap):
+                self._pool_invalidate_activity(activity.name, state)
                 continue
 
             # Phase 2: skip if all required object types have zero active instances
             _req_types = self._activity_required_types.get(activity.name)
             if _req_types and _req_types.issubset(state._inactive_scope_types):
+                # Same as above, and doubly justified here: with every required
+                # type inactive no candidate for this activity can be valid, so
+                # every pooled entry is stale by definition. Missing this is what
+                # left a stale 'Order Empty Containers' entry behind when all
+                # Transport Documents were momentarily deactivated.
+                self._pool_invalidate_activity(activity.name, state)
                 continue
 
             # Find the primary non-resource input binding (first creates=False, non-resource type)
@@ -346,7 +694,13 @@ class Simulator:
                     and not state.in_progress
                     and not candidates
                 )
-                if self.transition_matrix and activity.name in start_activity_names and state.executed_events and not is_potential_deadlock:
+                # #26: where the log supplies a real inter-arrival distribution
+                # the probability gate is redundant — pacing is handled by
+                # _arrival_allows above, which already let this activity through.
+                # The gate was only ever a stand-in for a measured arrival rate,
+                # and applying both would throttle twice.
+                _paced = activity.name in self._interarrival
+                if (not _paced) and self.transition_matrix and activity.name in start_activity_names and state.executed_events and not is_potential_deadlock:
                     last_act = state.executed_events[-1].activity_name
                     row = self.transition_matrix.get(last_act, {})
                     epsilon = 1e-6
@@ -368,7 +722,16 @@ class Simulator:
                         continue
 
                 candidate = build_candidate_for_activity(activity, state, resource_types=resource_types, pool_cache=pool_cache)
-                if candidate and is_candidate_semantically_allowed(self.static_model, candidate, state):
+                if (candidate
+                        and is_candidate_semantically_allowed(self.static_model, candidate, state)
+                        # #25: same WIP pre-filter as the primary-object path —
+                        # see the comment there for why this must not be left
+                        # to the start loop alone.
+                        and self._wip_allows(candidate, state)
+                        # #27: an input-less activity usually only creates, but
+                        # it can reuse an existing object via a creates-binding
+                        # with max_count, so it needs the exclusivity check too.
+                        and self._objects_free(candidate, state)):
                     key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
                            tuple(sorted(candidate.object_types_to_create)))
                     if key not in seen_keys:
@@ -378,7 +741,6 @@ class Simulator:
 
             # Expand: one candidate per active object of the primary binding type.
             primary_type = primary_bindings[0].object_type
-            active_ids = list(state._active_by_type.get(primary_type, set()))
 
             # Pre-compute cheap precedence gates for this activity (nmin and nmax)
             # using only the primary object id — avoids building the full candidate.
@@ -395,73 +757,156 @@ class Simulator:
                 and getattr(con, 'nmax', None) is not None
             ]
 
-            for oid in active_ids:
-                if (activity.name, oid) in state._in_progress_objects:
-                    continue
+            def _derive_primary_candidate(oid, _activity=activity, _primary_type=primary_type,
+                                           _prec_gates_nmin=prec_gates_nmin,
+                                           _prec_gates_nmax=prec_gates_nmax):
+                """Build+check the candidate for `_activity` with `oid` as the
+                primary object — returns None if blocked/invalid. Identical
+                logic to the pre-#23 inline loop body, just reusable for both
+                the full-rescan and incremental-pool paths below."""
+                if (_activity.name, oid) in state._in_progress_objects:
+                    return None
 
-                # Early exit: check precedence nmin for this primary object before
-                # the expensive build_candidate_for_activity call
-                if prec_gates_nmin:
-                    blocked = False
+                if _prec_gates_nmin:
                     prec_satisfied = getattr(state, '_prec_satisfied', None)
-                    for con in prec_gates_nmin:
-                        cache_key = (con.source_activity, activity.name, 'each', oid)
+                    for con in _prec_gates_nmin:
+                        cache_key = (con.source_activity, _activity.name, 'each', oid)
                         if prec_satisfied is not None and cache_key in prec_satisfied:
                             continue  # already permanently satisfied
                         src_count = len(state._events_by_act_obj.get(
                             (con.source_activity, oid), []))
                         if src_count < con.nmin:
-                            blocked = True
-                            break
-                    if blocked:
-                        continue
+                            return None
 
-                # Early exit: check precedence nmax (target count cap only)
-                if prec_gates_nmax:
-                    blocked = False
-                    for con in prec_gates_nmax:
+                if _prec_gates_nmax:
+                    for con in _prec_gates_nmax:
                         t_count = len(state._events_by_act_obj.get(
-                            (activity.name, oid), []))
+                            (_activity.name, oid), []))
                         if t_count >= con.nmax:
-                            blocked = True
-                            break
-                    if blocked:
-                        continue
+                            return None
 
                 # #6: pass force_object_id instead of mutating _active_by_type
                 candidate = build_candidate_for_activity(
-                    activity, state,
+                    _activity, state,
                     resource_types=resource_types,
                     force_object_id=oid,
                     pool_cache=pool_cache,
                 )
-
                 if candidate is None:
-                    continue
+                    return None
                 if not is_candidate_semantically_allowed(self.static_model, candidate, state):
-                    continue
+                    return None
 
                 # max_consecutive checks (O(1) via cached streaks)
-                if activity.name in max_consec:
-                    cap = max_consec[activity.name]
-                    streak = state._global_streak.get(activity.name, 0)
+                if _activity.name in max_consec:
+                    cap = max_consec[_activity.name]
+                    streak = state._global_streak.get(_activity.name, 0)
                     if streak >= cap:
-                        continue
+                        return None
 
-                if activity.name in max_consec_obj:
-                    cap_obj = max_consec_obj[activity.name]
-                    blocked = False
+                if _activity.name in max_consec_obj:
+                    cap_obj = max_consec_obj[_activity.name]
                     for pid in candidate.participating_object_ids:
-                        # [resource/permanent-object handling — disabled, kept for reference]
-                        # if state._type_of_object.get(pid) in resource_types:
-                        #     continue  # resources are freely reusable — exempt from per-object streak cap
-                        streak_obj = state._object_streak.get((activity.name, pid), 0)
+                        streak_obj = state._object_streak.get((_activity.name, pid), 0)
                         if streak_obj >= cap_obj:
-                            blocked = True
-                            break
-                    if blocked:
-                        continue
+                            return None
 
+                # #25: drop candidates already barred by a WIP ceiling so they
+                # never enter `candidates`. The start loop re-checks this (it
+                # is the authoritative test — several candidates in one step can
+                # each create the same type), but filtering here matters for a
+                # second reason: `is_potential_deadlock` below tests `not
+                # candidates`, and a candidate that is destined to be rejected
+                # would otherwise defeat that bypass, letting the probability
+                # gate skip the start activities and halting the run outright.
+                # Exact, not speculative: deactivations happen in
+                # _des_complete_activity before this pass, creations happen in
+                # the start loop after it, so active counts only grow within a
+                # step — a type at its cap now is at its cap for the whole step.
+                if not self._wip_allows(candidate, state):
+                    return None
+
+                # #26: concurrency ceiling. Exact here for the same reason as
+                # the WIP check — completions precede this pass, starts follow it.
+                if not self._concurrency_allows(candidate, state):
+                    return None
+
+                # #27: per-object exclusivity. Filters candidates whose objects
+                # are already held; the start loop re-checks authoritatively
+                # because participants can be claimed within this same step.
+                if not self._objects_free(candidate, state):
+                    return None
+
+                return candidate
+
+            if activity.name not in self._incremental_safe_activities:
+                # Not provably safe for incremental treatment (see
+                # Simulator.__init__'s constraint-checker audit) — full
+                # rescan every step, exactly as before #23.
+                for oid in state._active_by_type.get(primary_type, set()):
+                    candidate = _derive_primary_candidate(oid)
+                    if candidate is None:
+                        continue
+                    key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
+                           tuple(sorted(candidate.object_types_to_create)))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        candidates.append(candidate)
+                continue
+
+            # #23: incremental-safe activity — patch the persistent pool
+            # instead of a full rescan, unless this is the first time it's
+            # considered or this step's dirty-type/streak triggers demand a
+            # full rescan of it specifically.
+            needs_full_rescan = (
+                activity.name not in state._pool_initialized_activities
+                or activity.name in full_rescan_activities
+            )
+            if needs_full_rescan:
+                oids_to_check = state._active_by_type.get(primary_type, set())
+                state._pool_initialized_activities.add(activity.name)
+            else:
+                oids_to_check = set()
+                for _dirty_oid in step_dirty_objects:
+                    if state._type_of_object.get(_dirty_oid) == primary_type:
+                        oids_to_check.add(_dirty_oid)
+                    for _key in state._pool_entries_by_participant.get(_dirty_oid, ()):
+                        if _key[0] == activity.name:
+                            oids_to_check.add(_key[1])
+
+            for oid in oids_to_check:
+                pool_key = (activity.name, oid)
+                candidate = _derive_primary_candidate(oid)
+                if candidate is None:
+                    state.pool_remove(pool_key)
+                else:
+                    state.pool_set(pool_key, candidate)
+
+            if self._debug_pool_check:
+                expected = set()
+                for _oid in state._active_by_type.get(primary_type, set()):
+                    if _derive_primary_candidate(_oid) is not None:
+                        expected.add((activity.name, _oid))
+                actual = {
+                    (activity.name, _oid)
+                    for _oid in state._candidate_pool_keys_by_activity.get(activity.name, ())
+                }
+                if expected != actual:
+                    raise AssertionError(
+                        f"#23 pool mismatch for {activity.name!r}: "
+                        f"pool has {actual - expected} extra, missing {expected - actual}"
+                    )
+
+            # #23: merge this activity's current pool entries into the
+            # returned candidate list now, in the same activity-declaration-
+            # order position the legacy full rescan would have appended them
+            # — keeps candidate ordering close to the pre-#23 engine (a
+            # no-primary-binding activity declared later no longer jumps
+            # ahead of an earlier incremental-safe activity's candidates).
+            for _oid in state._candidate_pool_keys_by_activity.get(activity.name, ()):
+                candidate = state._candidate_pool.get((activity.name, _oid))
+                if candidate is None:
+                    continue
                 key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
                        tuple(sorted(candidate.object_types_to_create)))
                 if key not in seen_keys:
@@ -547,6 +992,10 @@ class Simulator:
                     if candidate is None:
                         continue
                     if not is_candidate_semantically_allowed(self.static_model, candidate, state):
+                        continue
+                    # #27: obligation-injected candidates bypass the normal
+                    # derivation path, so they need the exclusivity check too.
+                    if not self._objects_free(candidate, state):
                         continue
                     key2 = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
                            tuple(sorted(candidate.object_types_to_create)))
@@ -1029,6 +1478,35 @@ class Simulator:
         # Maintain _in_progress_objects index
         for oid in in_prog.participating_object_ids:
             state._in_progress_objects.add((in_prog.candidate_activity_name, oid))
+        # #27: claim every participant so no other activity can take it while
+        # this instance runs.
+        state._busy_objects.update(in_prog.participating_object_ids)
+        # #27: claiming an object invalidates every *other* activity's pooled
+        # candidate that references it — those candidates were derived while the
+        # object was free and would now be refused by _objects_free. Becoming
+        # busy is a state change like any other, so mark the participants dirty
+        # and let the next generation pass re-derive them. (pool_remove below
+        # only clears this activity's own entries.) Without this the pool keeps
+        # entries the legacy full rescan would reject — caught by
+        # SIM_DEBUG_POOL_CHECK as a spurious extra entry once activities have
+        # non-zero duration and objects stay claimed across steps.
+        state._step_dirty_objects.update(in_prog.participating_object_ids)
+        # #26: per-activity in-progress counter + next permitted arrival
+        _act_name = in_prog.candidate_activity_name
+        state._in_progress_by_activity[_act_name] = (
+            state._in_progress_by_activity.get(_act_name, 0) + 1)
+        self._schedule_next_arrival(_act_name, state)
+
+        # #23: a candidate that just started can no longer be a fresh
+        # incremental-pool entry — prune it immediately so it isn't offered
+        # again before it completes (nothing else would mark it dirty in the
+        # meantime, since dirtying only happens on event completion). Safe
+        # to call unconditionally per participant: pool_remove is a no-op
+        # for keys that were never pooled (unsafe activities, or a
+        # participant that never was any activity's primary).
+        if candidate.activity_name in self._incremental_safe_activities:
+            for oid in in_prog.participating_object_ids:
+                state.pool_remove((candidate.activity_name, oid))
 
         return in_prog
 
@@ -1041,6 +1519,16 @@ class Simulator:
         # Remove from _in_progress_objects index
         for oid in in_prog.participating_object_ids:
             state._in_progress_objects.discard((in_prog.candidate_activity_name, oid))
+        # #27: release every participant. Safe to discard unconditionally — an
+        # object can only be held by one instance at a time by construction.
+        state._busy_objects.difference_update(in_prog.participating_object_ids)
+        # #26: release this instance's slot in the per-activity concurrency count
+        _act_name = in_prog.candidate_activity_name
+        _remaining = state._in_progress_by_activity.get(_act_name, 0) - 1
+        if _remaining > 0:
+            state._in_progress_by_activity[_act_name] = _remaining
+        else:
+            state._in_progress_by_activity.pop(_act_name, None)
 
         activity = self._get_activity_by_name(in_prog.candidate_activity_name)
         # [resource/permanent-object handling — disabled, kept for reference]
@@ -1068,6 +1556,13 @@ class Simulator:
                     if obj and obj.object_type == binding.object_type:
                         for upd in updates:
                             _apply_attribute_update(obj, upd, timestamp=in_prog.complete_at)
+                        # #23: an attribute update can newly satisfy (or
+                        # break) a binding guard on this type, unblocking
+                        # candidates that never had this object selected
+                        # before — the reverse-participant index can't see
+                        # that, so mark the whole type dirty for a full
+                        # rescan of activities that require it.
+                        state._step_dirty_types.add(binding.object_type)
 
             # Phase 3: capture event-level attributes
             evt_attrs: dict = {}
@@ -1094,6 +1589,34 @@ class Simulator:
             attributes=evt_attrs if activity else {},
         )
         state.current_time = in_prog.complete_at
+
+        # #23: mark every participant of this event dirty (covers direct
+        # precedence/streak/in-progress effects and, via the reverse
+        # participant index, any pooled candidate that used any of them as
+        # a secondary participant too — see _generate_candidates_des).
+        # Newly-created objects also mark their type dirty (new-supply
+        # trigger for activities that require that type).
+        state._step_dirty_objects.update(in_prog.participating_object_ids)
+        for _created_oid in in_prog.created_object_ids:
+            _created_obj = state.objects.get(_created_oid)
+            if _created_obj is not None:
+                state._step_dirty_types.add(_created_obj.object_type)
+        # Every participant also leaves _in_progress_objects here, which makes
+        # it newly available as a *secondary* for other activities. The reverse
+        # participant index cannot see that: an activity whose primary object
+        # has no pool entry yet (because it was previously blocked for want of
+        # this very object) is not reachable from the dirty object at all. So
+        # mark the participants' types dirty too, which full-rescans every
+        # activity requiring them. Without this, ('Load Truck', 'Container_2')
+        # was never re-derived once its Handling Unit came free — a candidate
+        # silently missing from the pool rather than a stale one.
+        # Only observable once activities have non-zero duration; with the
+        # DefaultTimePolicy everything completes instantly and nothing is ever
+        # meaningfully in progress, which is why #23's verification missed it.
+        for _oid in in_prog.participating_object_ids:
+            _obj = state.objects.get(_oid)
+            if _obj is not None:
+                state._step_dirty_types.add(_obj.object_type)
 
         # Track service time broken down by object type — enables per-(activity, type) metrics
         if in_prog.started_at and in_prog.complete_at:
@@ -1244,6 +1767,14 @@ class Simulator:
 
         start_activity_names = self._start_names_set
 
+        # #26: consecutive clock jumps taken while nothing was running. Reset
+        # whenever an activity actually starts; bounded so a model that can
+        # never make progress terminates instead of advancing the clock forever
+        # (step_count, and therefore max_steps, only moves when an event is
+        # recorded).
+        _idle_jumps = 0
+        _MAX_IDLE_JUMPS = 1000
+
         while True:
             # Early stop requested by the frontend (Stop button)
             if self.stop_event is not None and self.stop_event.is_set():
@@ -1330,6 +1861,21 @@ class Simulator:
                     continue
                 if self._is_start_activity_blocked(cand, state):
                     continue
+                # #25: admission control — skip (do not drop) candidates that
+                # would push an object type past its measured WIP ceiling.
+                if not self._wip_allows(cand, state):
+                    continue
+                # #26: authoritative concurrency re-check. Candidate generation
+                # already filtered on this, but several candidates for the same
+                # activity can be started within one step, so the count must be
+                # re-read as the loop proceeds.
+                if not self._concurrency_allows(cand, state):
+                    continue
+                # #27: authoritative per-object exclusivity. Candidates were all
+                # built against the pre-start state, so an earlier candidate in
+                # this same loop may already have claimed one of these objects.
+                if not self._objects_free(cand, state):
+                    continue
 
                 # [resource/permanent-object handling — disabled, kept for reference]
                 # _des_resources_available always returns (True, []) now, so the
@@ -1362,9 +1908,27 @@ class Simulator:
 
             # ── Advance clock to next completion ──────────────────────────────
             if not state.in_progress:
+                # #26: nothing is running, but an inter-arrival gap may simply
+                # not have elapsed yet. That is an idle system, not a deadlock:
+                # jump the clock to the earliest scheduled arrival, exactly as
+                # a next-event simulation would. Only genuinely unreachable
+                # states (no pending arrival at all) terminate the run.
+                _future = [t for t in state._next_arrival_at.values()
+                           if t is not None and t > state.current_time]
+                if _future:
+                    state.current_time = min(_future)
+                    _idle_jumps += 1
+                    # Guard: step_count only advances when an event is recorded,
+                    # so a run that jumps forever would never hit max_steps.
+                    if _idle_jumps > _MAX_IDLE_JUMPS:
+                        self._trace("stop", {"reason": "idle_no_progress",
+                                             "step_count": state.step_count})
+                        break
+                    continue
                 self._trace("stop", {"reason": "no_candidates", "step_count": state.step_count})
                 break
 
+            _idle_jumps = 0
             state.current_time = state.in_progress[0].complete_at
 
         self._trace("stop", {"reason": "stop_condition_met", "step_count": state.step_count,

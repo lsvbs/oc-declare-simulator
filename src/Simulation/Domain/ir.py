@@ -164,6 +164,26 @@ class StaticModel:
     # How many instances of each resource type to pre-populate at sim start.
     # Defaults to 1 for any resource type not listed here.
     resource_pool_sizes: dict[str, int] = field(default_factory=dict)
+    # Per-object-type work-in-progress ceiling, measured from the source log
+    # (see ParameterDiscovery.discover_wip_caps). An activity that would create
+    # an instance of a type already at its ceiling is not started until an
+    # existing instance is deactivated. Empty dict = uncapped (previous
+    # behaviour). This is a capacity assumption layered on top of OC-Declare,
+    # not something the constraints themselves express.
+    wip_caps: dict[str, int] = field(default_factory=dict)
+    # Per-activity ceiling on simultaneously in-progress instances, measured
+    # from the source log (ParameterDiscovery.discover_activity_concurrency).
+    # Bounds state.in_progress — and therefore start-time object creation —
+    # for activities that start far faster than they complete. Empty = unbounded.
+    # Unlike wip_caps this DOES apply to start activities: it paces arrivals
+    # rather than refusing them for lack of downstream capacity.
+    activity_concurrency: dict[str, int] = field(default_factory=dict)
+    # Per-activity inter-arrival distribution, measured from the log
+    # (ParameterDiscovery.discover_interarrival_times). Paces activities with
+    # no input object bindings, which would otherwise fire once per simulation
+    # step — making the step structure the de facto arrival rate. Same shape as
+    # activity_durations so the existing sampler is reused.
+    interarrival_times: dict[str, ActivityDuration] = field(default_factory=dict)
     max_consecutive: dict[str, int] = field(default_factory=dict)
     # Per-object max consecutive: activity may repeat at most N times on the
     # same object ID before another activity must touch that object.

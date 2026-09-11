@@ -281,6 +281,17 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             for k, v in (data.get("resource_pool_sizes") or {}).items()
             if v is not None and int(v) >= 1
         },
+        wip_caps={
+            str(k): int(v)
+            for k, v in (data.get("wip_caps") or {}).items()
+            if v is not None and int(v) >= 1
+        },
+        activity_concurrency={
+            str(k): int(v)
+            for k, v in (data.get("activity_concurrency") or {}).items()
+            if v is not None and int(v) >= 1
+        },
+        interarrival_times=_parse_activity_durations(data.get("interarrival_times") or {}),
         max_consecutive={
             str(k): int(v)
             for k, v in (data.get("max_consecutive") or {}).items()

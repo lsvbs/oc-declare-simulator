@@ -101,6 +101,12 @@ def _joint_scope_event_ids(
     check_all_constraints, grouping ALL participants by type including
     resource types), reuses it instead of rebuilding the same grouping from
     scratch on every multi-type-binding precedence check for this candidate.
+
+    NOTE (#24): the returned set may be a direct reference into
+    ``state._event_ids_by_act_obj`` rather than a fresh copy, so callers must
+    treat it as READ-ONLY. Copying it here would reintroduce the
+    O(events-per-object) cost this indirection exists to remove. The only
+    caller (check_precedence) just takes len() of it.
     """
     bindings = scope.bindings
     if not bindings:
@@ -115,9 +121,16 @@ def _joint_scope_event_ids(
             if rt:
                 cand_by_type.setdefault(rt.object_type, []).append(oid)
 
-    def _src_eids_for_obj(oid: str) -> frozenset:
-        return frozenset(e.event_id for e in
-                         _events_for_activity_and_object(state, source_activity, oid))
+    # #24: read the prebuilt event-id set maintained by state.record_event
+    # instead of rebuilding a frozenset over the object's full event history
+    # on every call — the rebuild was O(events-for-this-object) per check and
+    # was the dominant superlinear cost as object histories grew.
+    # The returned set is shared state: treat as read-only (all uses below
+    # are intersections/unions, which produce new sets).
+    _eids_index = state._event_ids_by_act_obj
+
+    def _src_eids_for_obj(oid: str):
+        return _eids_index.get((source_activity, oid), _EMPTY_SET)
 
     single_sets: list = []
     each_multi_groups: list = []  # list of [frozenset, ...] per "each" group with multiple objects
@@ -129,9 +142,8 @@ def _joint_scope_event_ids(
         if inv == 'any':
             s: set = set()
             for oid in A_objs:
-                s.update(e.event_id for e in
-                         _events_for_activity_and_object(state, source_activity, oid))
-            single_sets.append(frozenset(s))
+                s.update(_src_eids_for_obj(oid))
+            single_sets.append(s)
         elif inv == 'all':
             combined = None
             for oid in A_objs:

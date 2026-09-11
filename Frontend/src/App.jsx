@@ -1119,6 +1119,53 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
   );
 }
 
+// ── ObjectLifecycleWarning ────────────────────────────────────────────────────
+// Blocking warning for object types missing a creates and/or deactivates
+// binding. Rendered wherever the user can act on it: the Model Editor (where
+// the fix is made) and the Results section (next to the disabled Run button).
+function ObjectLifecycleWarning({ issues, compact }) {
+  if (!issues || issues.length === 0) return null;
+  const noCreate     = issues.filter(i => i.missingCreate && !i.missingDeactivate);
+  const noDeactivate = issues.filter(i => i.missingDeactivate && !i.missingCreate);
+  const neither      = issues.filter(i => i.missingCreate && i.missingDeactivate);
+  const names = list => list.map(i => i.type).join(', ');
+  return (
+    <div className="object-lifecycle-warning">
+      <div className="object-lifecycle-warning-title">
+        ⚠ Simulation blocked — incomplete object lifecycle
+      </div>
+      {neither.length > 0 && (
+        <div className="object-lifecycle-warning-group">
+          <strong>{names(neither)}</strong> — no activity creates or deactivates {neither.length === 1 ? 'it' : 'them'}.
+        </div>
+      )}
+      {noCreate.length > 0 && (
+        <div className="object-lifecycle-warning-group">
+          <strong>{names(noCreate)}</strong> — no activity has <code>creates: true</code>.
+          Objects of {noCreate.length === 1 ? 'this type' : 'these types'} are never instantiated,
+          so every activity requiring {noCreate.length === 1 ? 'it' : 'them'} can never fire.
+        </div>
+      )}
+      {noDeactivate.length > 0 && (
+        <div className="object-lifecycle-warning-group">
+          <strong>{names(noDeactivate)}</strong> — no activity has <code>deactivates: true</code>.
+          Objects of {noDeactivate.length === 1 ? 'this type' : 'these types'} never leave the active
+          set: they accumulate for the whole run, and once the work-in-progress cap is reached the
+          activity creating {noDeactivate.length === 1 ? 'it' : 'them'} is locked out, which cascades
+          upstream and can starve the start activities.
+        </div>
+      )}
+      {!compact && (
+        <p className="object-lifecycle-warning-hint">
+          Fix in Model Editor → Activities: set <code>creates</code> on the binding that first
+          produces the object, and <code>deactivates</code> on the binding of the activity that
+          finishes with it.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // ── LifecycleDerivationPanel ──────────────────────────────────────────────────
 function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onModelChange }) {
   const [isDerivng, setIsDerivng] = React.useState(false);
@@ -7277,22 +7324,43 @@ function App() {
     : [];
   const hasModelWarnings = bindingWarnings.length > 0;
 
-  // ── Lifecycle warnings (non-resource types with no deactivates=True binding) ──
-  const lifecycleWarnings = React.useMemo(() => {
+  // ── Lifecycle warnings: object types with no creating and/or no terminating
+  // activity. Both ends matter. A type nothing creates never comes into
+  // existence, so every activity requiring it is dead. A type nothing
+  // deactivates never leaves the active set, so it accumulates without bound —
+  // and once work-in-progress caps are active it pins at its ceiling and
+  // locks out its creating activity, which cascades upstream and can starve
+  // the start activities themselves.
+  //
+  // Every object type is checked, resource/permanent types included: they are
+  // treated like any other object here, so a type that repeats forever needs
+  // its deactivation point supplied explicitly in the model.
+  const lifecycleIssues = React.useMemo(() => {
     const activities = activeModel?.activities || [];
-    const resourceTypes = new Set(discoveryResults?.resource_types || []);
+    const creatingTypes = new Set();
     const deactivatingTypes = new Set();
     const allBoundTypes = new Set();
     activities.forEach(act => {
       (act.bindings || []).forEach(b => {
-        if (b.object_type && !resourceTypes.has(b.object_type)) {
-          allBoundTypes.add(b.object_type);
-          if (b.deactivates) deactivatingTypes.add(b.object_type);
-        }
+        if (!b.object_type) return;
+        allBoundTypes.add(b.object_type);
+        if (b.creates) creatingTypes.add(b.object_type);
+        if (b.deactivates) deactivatingTypes.add(b.object_type);
       });
     });
-    return [...allBoundTypes].filter(t => !deactivatingTypes.has(t));
-  }, [activeModel, discoveryResults]);
+    return [...allBoundTypes]
+      .map(t => ({
+        type: t,
+        missingCreate: !creatingTypes.has(t),
+        missingDeactivate: !deactivatingTypes.has(t),
+      }))
+      .filter(i => i.missingCreate || i.missingDeactivate)
+      .sort((a, b) => a.type.localeCompare(b.type));
+  }, [activeModel]);
+
+  // Any issue that must block a run: activities with no bindings at all, or
+  // object types missing a creates/deactivates end.
+  const hasBlockingModelIssues = bindingWarnings.length > 0 || lifecycleIssues.length > 0;
 
   // ── Step 2.5: Timing discovery state ─────────────────────────────────────
   const [timingAnchors,       setTimingAnchors]       = useState({});
@@ -10710,6 +10778,8 @@ function App() {
                 <div style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem',marginBottom:'1.25rem'}}>
                   <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
 
+                  <ObjectLifecycleWarning issues={lifecycleIssues} />
+
                   {/* Run buttons + start activities — two-column layout aligned per model */}
                   <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem',alignItems:'flex-start'}}>
 
@@ -10720,10 +10790,13 @@ function App() {
                           .map(a => a.name)
                           .filter(n => { const d = (modelBase?.activity_durations||{})[n]; return !d || !d.sample_count; });
                         const noTiming = missing.length > 0;
+                        const blocked = noTiming || hasBlockingModelIssues;
                         return (<>
-                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || noTiming ? 0.45 : 1, cursor: noTiming ? 'not-allowed' : 'pointer'}}
-                            disabled={isSimulating || !modelBase || noTiming}
-                            title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}` : undefined}
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelBase || blocked}
+                            title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}`
+                              : lifecycleIssues.length > 0 ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
+                              : undefined}
                             onClick={() => runSimulation('asis')}>
                             {simulatingMode==='asis' ? 'Running…' : '▶ Run Base Model'}
                           </button>
@@ -10806,12 +10879,15 @@ function App() {
                           .filter(n => { const d = (modelToBe?.activity_durations||{})[n]; return !d || !d.sample_count; });
                         const noTiming = missing.length > 0;
                         const noBaseline = !resultsAsIs;
+                        const blocked = noTiming || hasBlockingModelIssues;
                         const tooltipMsg = noTiming
                           ? `Cannot run: missing timing data for: ${missing.join(', ')}`
+                          : lifecycleIssues.length > 0
+                            ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
                           : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
                         return (<>
-                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || noTiming ? 0.45 : 1, cursor: noTiming ? 'not-allowed' : 'pointer'}}
-                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || noTiming}
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || blocked}
                             title={tooltipMsg}
                             onClick={() => runSimulation('tobe')}>
                             {simulatingMode==='tobe' ? 'Running…' : '▶ Run Alternative Model'}
@@ -11888,6 +11964,7 @@ function App() {
               />
             </div>
             <div className="model-editor-warnings-col">
+              <ObjectLifecycleWarning issues={lifecycleIssues} />
               {timingDiscoveryResult && (() => {
                 const zeroMin = [], zeroMax = [];
                 Object.entries(timingDiscoveryResult).forEach(([act, m]) => {
@@ -12678,7 +12755,10 @@ function App() {
             <button
               className="simulate-button"
               onClick={runSimulation}
-              disabled={isSimulating || (workflowMode !== 'external-empty' && !discoveryResults) || !config.ocdeclareFile || config.startActivities.length === 0 || hasModelWarnings}
+              disabled={isSimulating || (workflowMode !== 'external-empty' && !discoveryResults) || !config.ocdeclareFile || config.startActivities.length === 0 || hasBlockingModelIssues}
+              title={lifecycleIssues.length > 0
+                ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
+                : undefined}
             >
               {isSimulating ? 'Simulating...' : 'Run Simulation'}
             </button>
@@ -12689,14 +12769,7 @@ function App() {
                 Open the Model Editor → Activities tab to fix.
               </div>
             )}
-            {lifecycleWarnings.length > 0 && (
-              <div className="model-warnings-notice" style={{background:'#fffbeb',border:'1px solid #fde68a',color:'#92400e'}}>
-                ⚠ No terminal activity found for {lifecycleWarnings.length} object type{lifecycleWarnings.length === 1 ? '' : 's'}:{' '}
-                <strong>{lifecycleWarnings.join(', ')}</strong>.
-                Objects of these types will never be deactivated and will accumulate throughout the run.
-                Add <code>deactivates: true</code> to the terminal binding in the model to fix.
-              </div>
-            )}
+            <ObjectLifecycleWarning issues={lifecycleIssues} />
           </div>
 
           {/* Simulation Results */}

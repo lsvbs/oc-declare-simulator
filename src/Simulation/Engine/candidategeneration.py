@@ -136,14 +136,25 @@ def build_candidate_for_activity(
             if _fobj:
                 _forced_ids_by_type.setdefault(_fobj.object_type, []).append(_foid)
 
+    # Whether force_object_id has been pinned yet. Tracked explicitly rather
+    # than inferred from `len(participating_object_ids) == 0`: a creates-binding
+    # that appears earlier in activity.bindings can reuse an existing object and
+    # so make the participant list non-empty before the primary binding is
+    # reached (e.g. Order Empty Containers, whose Container binding precedes its
+    # Transport Document binding). The old test then silently failed to pin the
+    # forced object, and the normal link-preference path picked an arbitrary
+    # instance of that type instead — so _generate_candidates_des believed it
+    # was producing one candidate per active primary object while actually
+    # producing duplicates for one object and skipping others entirely.
+    _forced_primary_used = False
     for binding in activity.bindings:
         # #6: if force_object_id pins this binding's type, the pool is replaced
         # outright below — skip the (potentially expensive) full-pool lookup.
         is_forced_primary = (
             force_object_id is not None
+            and not _forced_primary_used
             and not binding.creates
             and binding.object_type == _forced_type
-            and len(participating_object_ids) == 0  # only for the first/primary binding
         )
         is_forced_set = (
             not is_forced_primary
@@ -153,6 +164,7 @@ def build_candidate_for_activity(
         )
 
         if is_forced_primary:
+            _forced_primary_used = True
             obj = state.objects.get(force_object_id)
             if obj is None or not obj.active:
                 return None
