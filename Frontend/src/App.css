@@ -3652,6 +3652,63 @@
   letter-spacing: 0.05em;
   margin: 0.25rem 0 0;
 }
+
+/* Inline "?" affordance with a hover/focus explanation.
+   Deliberately CSS-only: a React tooltip would need its own useState, and
+   adding a hook to this component resets its state on hot reload — which
+   during a live run would drop the tracker's polling state. */
+.help-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05em;
+  height: 1.05em;
+  margin-left: 0.4em;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1;
+  cursor: help;
+  opacity: 0.65;
+  position: relative;
+  vertical-align: middle;
+}
+.help-hint:hover,
+.help-hint:focus-visible { opacity: 1; }
+
+.help-hint::after {
+  content: attr(data-help);
+  position: absolute;
+  bottom: calc(100% + 0.5em);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: 17rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 6px;
+  background: #1e293b;
+  color: #f1f5f9;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.45;
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.22);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+  z-index: 40;
+  pointer-events: none;
+}
+.help-hint:hover::after,
+.help-hint:focus-visible::after { opacity: 1; visibility: visible; }
+
+@media (prefers-reduced-motion: reduce) {
+  .help-hint::after { transition: none; }
+}
 .sim-duration-badge {
   display: inline-flex;
   align-items: center;
@@ -4250,3 +4307,76 @@ details[open] .formula-summary::before { content: '▼ '; }
   font-weight: 600;
 }
 .con-filter-btn.active .con-filter-badge { background: rgba(255,255,255,0.25); color: white; }
+
+/* ── Object Timelines (#28) ──────────────────────────────────────────────── */
+.object-timelines { padding: 0.5rem 0 0.25rem; }
+
+.object-timelines-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.9rem;
+  margin-bottom: 0.7rem;
+  font-size: 0.82rem;
+  color: #475569;
+}
+.object-timelines-controls select {
+  font-size: 0.82rem;
+  padding: 0.2rem 0.35rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #fff;
+  max-width: 22rem;
+}
+
+.object-timelines-note { color: #94a3b8; font-size: 0.78rem; }
+
+.object-timelines-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.1rem;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.55rem;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.object-timelines-scroll { overflow-x: auto; max-height: 26rem; overflow-y: auto; }
+
+.object-timelines-table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
+.object-timelines-table th,
+.object-timelines-table td {
+  text-align: left;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid #eef2f7;
+  white-space: nowrap;
+}
+.object-timelines-table thead th {
+  position: sticky;
+  top: 0;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.object-timelines-table tbody tr:hover { background: #f8fafc; }
+
+.ot-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.ot-delta { color: #64748b; }
+.ot-status { font-weight: 600; }
+
+.ot-idle-tag {
+  margin-left: 0.4rem;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}

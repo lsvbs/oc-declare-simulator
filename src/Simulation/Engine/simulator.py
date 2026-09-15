@@ -244,52 +244,21 @@ class Simulator:
             for t in types:
                 self._activities_requiring_type.setdefault(t, set()).add(act_name)
 
-        # ── Work-in-progress admission control (#25) ───────────────────────
-        # Per-object-type ceiling on simultaneously-active instances, measured
-        # from the source log by ParameterDiscovery.discover_wip_caps. An
-        # activity that would create an instance of a type already at its
-        # ceiling is skipped this step and retried once capacity frees.
+        # [#25 work-in-progress caps — REMOVED]
+        # A per-type ceiling on simultaneously-active objects used to be enforced
+        # here. It was admission control: an activity creating an instance of a
+        # type already at its ceiling was refused until one deactivated.
         #
-        # This is the "capacity" leg of the discrete-event triple (arrival /
-        # capacity / service). OC-Declare constraints cannot express it, so
-        # without a cap any object type whose consuming activity is starved
-        # grows without bound — which both distorts the event mix and makes
-        # candidate generation quadratic in the event count.
+        # Removed deliberately. How many objects of a type are alive at once is
+        # not something a process rule decides — in the source log Containers
+        # peak at 102 because arrival rate times lifecycle duration happens to
+        # equal that (L = lambda * W), not because anything refused to create the
+        # 103rd. Capping it suppressed the symptom of an unbalanced model rather
+        # than fixing the cause, and made an emergent quantity an input.
         #
-        # Empty dict (a model with no wip_caps) disables the check entirely,
-        # preserving the previous behaviour exactly.
-        #
-        # [resource/permanent-object handling — disabled, kept for reference]
-        # Caps currently apply to EVERY object type, permanent ones included.
-        # Once permanent-object / resource-type handling is re-enabled,
-        # permanent types should be excluded here and bounded by their pool
-        # size instead — their capacity is the pool, not a WIP ceiling, and
-        # they are never created mid-simulation:
-        # self._wip_caps = {
-        #     t: c for t, c in (getattr(static_model, 'wip_caps', {}) or {}).items()
-        #     if t not in set(getattr(static_model, 'resource_types', []) or [])
-        # }
-        self._wip_caps: dict = dict(getattr(static_model, 'wip_caps', {}) or {})
-        # Only activities that actually create a capped type can ever be
-        # blocked — checked first so the common case costs one set lookup.
-        #
-        # Start activities are deliberately excluded. They model the *arrival*
-        # process, which is governed by its own limits (StartPolicy's
-        # max_case_starts / start_activity_caps, enforced by
-        # _is_start_activity_blocked) and not by internal capacity. Letting a
-        # WIP ceiling gate them conflates arrival rate with capacity: arrivals
-        # would stop whenever the system was momentarily full, and — since a
-        # start activity is typically the only one able to fire with no input
-        # objects — the run would have nothing left to start and terminate via
-        # the `no_candidates` break instead of simply being busy.
-        self._wip_gated_activities: set = {
-            activity.name
-            for activity in static_model.activities
-            if activity.name not in self._start_names_set
-            and any(b.creates and b.object_type in self._wip_caps
-                    for b in activity.bindings)
-        }
-
+        # Object population is now unbounded and emergent. discover_wip_caps is
+        # kept in ParameterDiscovery as a *validation* measure: comparing the
+        # simulated peak against the log's is how you check the model balances.
         # ── Per-activity concurrency ceiling (#26) ─────────────────────────
         # Maximum simultaneously in-progress instances of an activity, measured
         # from the log. Objects are created when an activity *starts*, so an
@@ -312,8 +281,54 @@ class Simulator:
         # gives a measured inter-arrival distribution we schedule the next
         # permitted start instead, and skip the transition-probability gate
         # (which was only ever a stand-in for this).
-        self._interarrival: dict = dict(
-            getattr(static_model, 'interarrival_times', {}) or {})
+        # Only activities with NO input object bindings are arrivals. For every
+        # other activity a measured inter-arrival gap is meaningless: those
+        # events serve many different objects, often concurrently, so gating on
+        # the global gap between consecutive occurrences serialises something
+        # the real process ran in parallel — and it compounds with the other
+        # admission gates, since throughput becomes the minimum of all of them.
+        #
+        # Measured before this restriction: inter-arrival was the largest single
+        # refuser at 12,147 of 26,599 gate refusals, and it was refusing
+        # activities that are not arrivals — 'Reschedule Container' 1,798
+        # refusals for 1 start, 'Order Empty Containers' 1,794 for 48,
+        # 'Depart' 1,785 for 7.
+        _inputless = {
+            a.name for a in static_model.activities
+            if not [b for b in a.bindings if not b.creates]
+        }
+        self._interarrival: dict = {
+            k: v for k, v in (getattr(static_model, 'interarrival_times', {}) or {}).items()
+            if k in _inputless
+        }
+
+        # ── Probabilistic weekly availability calendars (#29) ──────────────
+        # Per-activity slot probabilities discovered from the log. This is the
+        # layer that produces overnight and weekend waiting with the right
+        # shape, rather than sampling a waiting distribution that reproduces
+        # only its mean and emits events at 03:00 on Sundays.
+        # Calendars are per ACTIVITY, not per resource: OCEL events carry no
+        # resource attribute. See discover_activity_calendars for that and the
+        # two other deviations from SIMOD's pipeline.
+        self._activity_calendars: dict = dict(
+            getattr(static_model, 'activity_calendars', {}) or {})
+
+        # ── Object-local candidate ordering (#30) ──────────────────────────
+        # P(next activity | object type, last activity on THAT object), measured
+        # from the log. Used to order candidates that compete for the same
+        # object, replacing the global transition matrix for that decision —
+        # which conditioned on the last event anywhere in the process and so
+        # carried no information about the contested object.
+        self._object_transitions: dict = dict(
+            getattr(static_model, 'object_transitions', {}) or {})
+        # Primary object type per activity = first non-creating binding, the
+        # same rule _generate_candidates_des uses to pick which object a
+        # candidate is derived for.
+        self._primary_type_by_activity: dict = {}
+        for _a in static_model.activities:
+            _nc = [b.object_type for b in _a.bindings if not b.creates]
+            if _nc:
+                self._primary_type_by_activity[_a.name] = _nc[0]
 
         # ── Incremental-candidate-pool safety classification (#23) ─────────
         # An activity is "incremental-safe" iff none of its relevant
@@ -418,9 +433,31 @@ class Simulator:
         # activities therefore keep the unmodified full rescan every step.
         # The cost is small precisely because WIP caps bound the active-object
         # sets the rescan iterates over.
-        self._incremental_safe_activities: set = {
-            a.name for a in static_model.activities
-        } - unsafe_activities - self._wip_gated_activities
+        # #23 incremental candidate pool — DISABLED (empty set = every
+        # activity full-rescans each step, the pre-#23 behaviour).
+        #
+        # The pool cached derived candidates and re-derived only those whose
+        # participants an event had dirtied. It was worth ~19-36% on large runs,
+        # but it has now produced six distinct correctness defects, each found
+        # only because SIM_DEBUG_POOL_CHECK cross-checks it against a full
+        # rescan: force_object_id silently ignored, objects becoming free not
+        # dirtying their type, objects becoming busy not dirtying at all, skipped
+        # activities never consuming the step's dirty set, and two classes of
+        # stale entry once admission gates could defer a candidate.
+        #
+        # The root difficulty is structural: the pool is only sound if every
+        # reason a candidate can appear or disappear is accompanied by an event
+        # that dirties one of ITS participants. Deferral-based gates break that
+        # (a calendar slot opens because the clock moved; a concurrency slot
+        # frees when a different object finishes), and so does secondary-object
+        # selection inside build_candidate_for_activity, which can change
+        # without touching the primary.
+        #
+        # Correctness over speed while the model is still being validated. The
+        # machinery is left intact — restoring it is a matter of computing this
+        # set again — but it should not come back without an argument for why
+        # the invariant now holds.
+        self._incremental_safe_activities: set = set()
 
         # Debug-only cross-check (#23): when enabled, every call to
         # _generate_candidates_des re-derives a fresh full rescan for each
@@ -464,38 +501,123 @@ class Simulator:
                 state.pool_remove((activity_name, oid))
         state._pool_initialized_activities.discard(activity_name)
 
-    def _wip_allows(self, candidate, state: SimulationState) -> bool:
-        """Return True unless starting `candidate` would exceed a WIP ceiling (#25).
+    def _candidate_weight(self, candidate, state: SimulationState) -> float:
+        """P(this activity | type of the candidate's primary object, that object's
+        last activity) — the preference weight used to order candidates (#30).
 
-        Checked immediately before the candidate starts rather than during
-        candidate generation, because objects are created at *start* time
-        (_des_start_activity) and several candidates generated in the same
-        step may each create an instance of the same type — a generation-time
-        check would let all of them through against one stale count.
+        Primary object only. Multiplying across every participating object was
+        measured as an alternative and picks the same winner 99.4% of the time
+        while scoring worse on log-loss (0.464 vs 0.163), because multiplying
+        sub-1 probabilities thins the true activity's score. See
+        discover_object_transition_matrix.
 
-        A blocked candidate is simply not started this step. It stays in the
-        incremental pool (#23) and is retried on subsequent steps, so it
-        starts as soon as an existing instance is deactivated. Nothing is
-        dropped and no pool bookkeeping is needed.
+        Returns 1.0 — neutral — when there is nothing to go on: no matrix, an
+        input-less activity (no primary object), or an unseen state. A weight of
+        0 means "the log never showed this next", which orders the candidate
+        last but never blocks it: the constraints have already ruled on whether
+        it is legal, and this is only a preference.
         """
-        caps = self._wip_caps
-        if not caps or candidate.activity_name not in self._wip_gated_activities:
+        trans = self._object_transitions
+        if not trans:
+            return 1.0
+        ptype = self._primary_type_by_activity.get(candidate.activity_name)
+        if not ptype:
+            return 1.0
+        oid = None
+        for o in candidate.participating_object_ids:
+            if state._type_of_object.get(o) == ptype:
+                oid = o
+                break
+        if oid is None:
+            return 1.0
+        last = state._last_activity_per_object.get(oid, '<START>')
+        by_last = trans.get(ptype)
+        if not by_last:
+            return 1.0
+        row = by_last.get(last)
+        if not row:
+            return 1.0
+        return float(row.get(candidate.activity_name, 0.0))
+
+    def _order_candidates(self, candidates: list, state: SimulationState) -> list:
+        """Order candidates by object-local preference (#30).
+
+        Every candidate is weighted and the whole list is shuffled in proportion
+        to those weights — not just one winner promoted to the front, which is
+        what the old global-matrix path did. The remainder then fell back to the
+        order activities happen to appear in the model file, so whichever
+        activity was declared first won most contests for a shared object. File
+        order is not a modelling decision.
+
+        Weighted shuffle without replacement via Efraimidis-Spirakis: key =
+        U^(1/w), sorted descending. O(n log n), and unlike repeated sampling it
+        needs no rescan per pick.
+        """
+        if len(candidates) < 2:
+            return list(candidates)
+        if not self._object_transitions:
+            # No matrix — keep the previous behaviour exactly.
+            ordered = list(candidates)
+            try:
+                top = self._select_candidate(ordered, state)
+                return [top] + [c for c in ordered if c is not top]
+            except Exception:
+                return ordered
+        _eps = 1e-9
+        keyed = []
+        for c in candidates:
+            w = self._candidate_weight(c, state)
+            if w <= 0.0:
+                w = _eps
+            u = self.rng.random()
+            if u <= 0.0:
+                u = _eps
+            keyed.append((u ** (1.0 / w), c))
+        keyed.sort(key=lambda kc: -kc[0])
+        return [c for _k, c in keyed]
+
+    def _calendar_for(self, activity_name: str):
+        """Weekly availability calendar for an activity, or None if uncalendared (#29)."""
+        cals = self._activity_calendars
+        if not cals:
+            return None
+        per = cals.get('per_activity') or {}
+        cal = per.get(activity_name)
+        if cal is None:
+            cal = cals.get('global')
+        return cal if cal else None
+
+    def _calendar_open(self, activity_name: str, state: SimulationState) -> bool:
+        """Is this activity's calendar open for the current clock hour? (#29)
+
+        ONE shared roll per (activity, hour), not one per candidate. If the hour
+        is open every waiting candidate for the activity may start; if closed,
+        none may. That is the paper's reading of an availability calendar — the
+        resource performing the activity is or is not available in this slot —
+        and it composes with the concurrency ceiling (#26), which then decides
+        how many of the waiting candidates actually run.
+
+        Rolling per candidate instead would model unboundedly many independent
+        resources: with many candidates pending, some would pass even a 1%
+        slot, and starts would smear evenly across the day instead of bursting
+        when the facility opens.
+
+        The decision is cached per activity for the current hour and re-rolled
+        when the clock moves on, so it stays stable within the hour without
+        retaining history.
+        """
+        cal = self._calendar_for(activity_name)
+        if cal is None or state.current_time is None:
             return True
-        creating = candidate.object_types_to_create
-        if not creating:
-            return True
-        # Count this candidate's own creations per type: one candidate may
-        # create several instances of the same type in a single event.
-        wanted: dict = {}
-        for t in creating:
-            wanted[t] = wanted.get(t, 0) + 1
-        for t, n in wanted.items():
-            cap = caps.get(t)
-            if cap is None:
-                continue
-            if len(state._active_by_type.get(t, ())) + n > cap:
-                return False
-        return True
+        hour = state.current_time.replace(minute=0, second=0, microsecond=0)
+        cached = state._calendar_slot_open.get(activity_name)
+        if cached is not None and cached[0] == hour:
+            return cached[1]
+        slot = hour.weekday() * 24 + hour.hour
+        p = cal[slot] if slot < len(cal) else 1.0
+        is_open = self.rng.random() < p
+        state._calendar_slot_open[activity_name] = (hour, is_open)
+        return is_open
 
     def _objects_free(self, candidate, state: SimulationState) -> bool:
         """Return True unless any participant is already inside another activity (#27).
@@ -517,7 +639,7 @@ class Simulator:
     def _concurrency_allows(self, candidate, state: SimulationState) -> bool:
         """Return True unless the activity is already at its concurrency ceiling (#26).
 
-        Same placement rationale as _wip_allows: completions happen in
+        Placement rationale: completions happen in
         _des_complete_activity before candidate generation and starts happen in
         the start loop after it, so the in-progress count only grows within a
         step. That makes the check exact at generation time and still correct
@@ -546,7 +668,25 @@ class Simulator:
         return state.current_time >= due
 
     def _schedule_next_arrival(self, activity_name: str, state: SimulationState) -> None:
-        """Sample the next permitted start time for a paced activity (#26)."""
+        """Sample the next permitted start time for a paced activity (#26).
+
+        The next due time is measured from the *previous due time*, not from
+        the current clock. Scheduling from `state.current_time` lets the
+        arrival process drift late and silently drop arrivals: the clock
+        advances to the next completion — or, when nothing is running, leaps to
+        the next scheduled arrival, which can be tens of thousands of seconds
+        away — and every due time skipped in that leap is lost. One firing
+        happens where five were due, so the effective rate falls below the
+        measured one, less work is in flight, the system idles more, and the
+        clock leaps further. It compounds.
+
+        Anchoring on the previous due time makes the schedule a proper arrival
+        process: a due time left behind by a clock jump stays in the past, so
+        the activity is immediately eligible again and catches up one firing
+        per step until the schedule is ahead of the clock. The per-activity
+        concurrency ceiling (#26) bounds how much can be in flight while it
+        catches up, so this cannot burst without limit.
+        """
         dur = self._interarrival.get(activity_name)
         if dur is None or state.current_time is None:
             return
@@ -554,7 +694,9 @@ class Simulator:
         gap = _sample_duration(dur, rng=self.rng)
         if gap is None or gap < 0:
             gap = 0.0
-        state._next_arrival_at[activity_name] = state.current_time + timedelta(seconds=gap)
+        prev_due = state._next_arrival_at.get(activity_name)
+        base = prev_due if prev_due is not None else state.current_time
+        state._next_arrival_at[activity_name] = base + timedelta(seconds=gap)
 
     def _is_start_activity_blocked(self, candidate, state: SimulationState) -> bool:
         """Return True if this start activity has hit its cap (global or per-activity)."""
@@ -721,17 +863,18 @@ class Simulator:
                     if self.rng.random() > prob:
                         continue
 
-                candidate = build_candidate_for_activity(activity, state, resource_types=resource_types, pool_cache=pool_cache)
+                candidate = build_candidate_for_activity(activity, state, resource_types=resource_types,
+                                                         pool_cache=pool_cache, rng=self.rng)
                 if (candidate
                         and is_candidate_semantically_allowed(self.static_model, candidate, state)
-                        # #25: same WIP pre-filter as the primary-object path —
-                        # see the comment there for why this must not be left
-                        # to the start loop alone.
-                        and self._wip_allows(candidate, state)
                         # #27: an input-less activity usually only creates, but
                         # it can reuse an existing object via a creates-binding
                         # with max_count, so it needs the exclusivity check too.
-                        and self._objects_free(candidate, state)):
+                        and self._objects_free(candidate, state)
+                        # #29: calendar applies to arrivals too — cases do not
+                        # arrive at 03:00 on a Sunday either. Keyed on None
+                        # since these candidates have no primary object.
+                        and self._calendar_open(activity.name, state)):
                     key = (candidate.activity_name, tuple(sorted(candidate.participating_object_ids)),
                            tuple(sorted(candidate.object_types_to_create)))
                     if key not in seen_keys:
@@ -750,10 +893,18 @@ class Simulator:
                 and con.scope.object_type == primary_type
                 and getattr(con, 'nmin', 0) > 0
             ]
+            # Single-binding constraints only. This gate counts target events
+            # per primary object — a marginal. semantics._nmax_blocked bounds
+            # the Definition 8 JOINT count: target events involving every bound
+            # object at once. The two coincide when the scope has one binding,
+            # and the marginal is >= the joint otherwise, so applying this gate
+            # to a multi-type constraint would drop candidates the semantics
+            # accepts — and would do it before _nmax_blocked ever ran.
             prec_gates_nmax = [
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
+                and len(getattr(con.scope, 'bindings', ()) or ()) <= 1
                 and getattr(con, 'nmax', None) is not None
             ]
 
@@ -791,6 +942,7 @@ class Simulator:
                     resource_types=resource_types,
                     force_object_id=oid,
                     pool_cache=pool_cache,
+                    rng=self.rng,
                 )
                 if candidate is None:
                     return None
@@ -811,32 +963,32 @@ class Simulator:
                         if streak_obj >= cap_obj:
                             return None
 
-                # #25: drop candidates already barred by a WIP ceiling so they
-                # never enter `candidates`. The start loop re-checks this (it
-                # is the authoritative test — several candidates in one step can
-                # each create the same type), but filtering here matters for a
-                # second reason: `is_potential_deadlock` below tests `not
-                # candidates`, and a candidate that is destined to be rejected
-                # would otherwise defeat that bypass, letting the probability
-                # gate skip the start activities and halting the run outright.
-                # Exact, not speculative: deactivations happen in
-                # _des_complete_activity before this pass, creations happen in
-                # the start loop after it, so active counts only grow within a
-                # step — a type at its cap now is at its cap for the whole step.
-                if not self._wip_allows(candidate, state):
-                    return None
 
-                # #26: concurrency ceiling. Exact here for the same reason as
-                # the WIP check — completions precede this pass, starts follow it.
-                if not self._concurrency_allows(candidate, state):
-                    return None
 
-                # #27: per-object exclusivity. Filters candidates whose objects
-                # are already held; the start loop re-checks authoritatively
-                # because participants can be claimed within this same step.
-                if not self._objects_free(candidate, state):
-                    return None
-
+                # NO ADMISSION CHECKS HERE — deliberately.
+                #
+                # Derivation answers one question: is this candidate
+                # structurally valid (objects exist, precedence holds, the
+                # constraints accept it)? Whether it may start *right now* is a
+                # separate question, answered in the start loop.
+                #
+                # The split is forced by how the incremental pool (#23) works.
+                # A candidate rejected here leaves the pool and only returns
+                # when one of its participants is dirtied by an event. Every
+                # admission condition lifts for reasons that dirty nothing
+                # relevant to this candidate:
+                #   - object exclusivity (#27): it can be blocked by a SECONDARY
+                #     participant, and since it was never pooled the reverse
+                #     participant index cannot find it when that object frees;
+                #   - concurrency ceiling (#26): a slot frees when some OTHER
+                #     object's instance completes;
+                #   - availability calendar (#29): a slot opens merely because
+                #     the clock advanced — no event at all.
+                # Each left the pool permanently short of a candidate the full
+                # rescan produces, reported by SIM_DEBUG_POOL_CHECK as a missing
+                # entry. Keeping derivation purely structural makes the pool
+                # invariant statable: the pool holds every structurally valid
+                # candidate; admission is decided at start.
                 return candidate
 
             if activity.name not in self._incremental_safe_activities:
@@ -973,7 +1125,7 @@ class Simulator:
                         candidate = build_candidate_for_activity(
                             activity, state, resource_types=resource_types,
                             force_object_ids=[active_members[0]],
-                            pool_cache=pool_cache,
+                            pool_cache=pool_cache, rng=self.rng,
                         )
                     else:
                         # All-mode: target must fire involving all objects in the frozenset
@@ -986,7 +1138,7 @@ class Simulator:
                         candidate = build_candidate_for_activity(
                             activity, state, resource_types=resource_types,
                             force_object_ids=list(frozen_oids),
-                            pool_cache=pool_cache,
+                            pool_cache=pool_cache, rng=self.rng,
                         )
 
                     if candidate is None:
@@ -1076,11 +1228,12 @@ class Simulator:
                 if scope_oid is not None:
                     candidate = build_candidate_for_activity(
                         activity, state, resource_types=resource_types, force_object_id=scope_oid,
-                        pool_cache=pool_cache,
+                        pool_cache=pool_cache, rng=self.rng,
                     )
                 else:
                     candidate = build_candidate_for_activity(
-                        activity, state, resource_types=resource_types, pool_cache=pool_cache
+                        activity, state, resource_types=resource_types,
+                        pool_cache=pool_cache, rng=self.rng,
                     )
 
                 if candidate is None:
@@ -1481,6 +1634,11 @@ class Simulator:
         # #27: claim every participant so no other activity can take it while
         # this instance runs.
         state._busy_objects.update(in_prog.participating_object_ids)
+        # #28: lifecycle entry — each participant goes busy on this activity.
+        for _oid in in_prog.participating_object_ids:
+            state.record_object_status(_oid, 'started', 'busy',
+                                       activity=in_prog.candidate_activity_name,
+                                       timestamp=in_prog.started_at)
         # #27: claiming an object invalidates every *other* activity's pooled
         # candidate that references it — those candidates were derived while the
         # object was free and would now be refused by _objects_free. Becoming
@@ -1522,6 +1680,13 @@ class Simulator:
         # #27: release every participant. Safe to discard unconditionally — an
         # object can only be held by one instance at a time by construction.
         state._busy_objects.difference_update(in_prog.participating_object_ids)
+        # #28: lifecycle entry — each participant goes idle again. Recorded
+        # before the deactivation block below so an object that this activity
+        # also deactivates reads 'completed' then 'deactivated', in that order.
+        for _oid in in_prog.participating_object_ids:
+            state.record_object_status(_oid, 'completed', 'idle',
+                                       activity=in_prog.candidate_activity_name,
+                                       timestamp=in_prog.complete_at)
         # #26: release this instance's slot in the per-activity concurrency count
         _act_name = in_prog.candidate_activity_name
         _remaining = state._in_progress_by_activity.get(_act_name, 0) - 1
@@ -1544,7 +1709,9 @@ class Simulator:
             for oid in in_prog.participating_object_ids:
                 obj = state.objects.get(oid)
                 if obj and obj.object_type in deactivated_types:
-                    state.deactivate_object(oid)
+                    # #28: pass complete_at explicitly — state.current_time is
+                    # not advanced to it until later in this method.
+                    state.deactivate_object(oid, timestamp=in_prog.complete_at)
 
             # Apply attribute updates (DES: fires on completion, not on start)
             for binding in activity.bindings:
@@ -1848,28 +2015,24 @@ class Simulator:
             # Update delta baseline after tracing so next step's deltas are correct
             self._last_deactivations = state.total_deactivations
             self._last_obligations_fulfilled = state.total_obligations_fulfilled
-            ordered = list(candidates)
-            if len(ordered) > 1:
-                try:
-                    top = self._select_candidate(ordered, state)
-                    ordered = [top] + [c for c in ordered if c is not top]
-                except Exception:
-                    pass
+            # #30: order by object-local preference rather than promoting one
+            # candidate and leaving the rest in model-file order.
+            ordered = self._order_candidates(candidates, state)
 
             for cand in ordered:
                 if is_simulation_start and cand.activity_name not in start_activity_names:
                     continue
                 if self._is_start_activity_blocked(cand, state):
                     continue
-                # #25: admission control — skip (do not drop) candidates that
-                # would push an object type past its measured WIP ceiling.
-                if not self._wip_allows(cand, state):
-                    continue
                 # #26: authoritative concurrency re-check. Candidate generation
                 # already filtered on this, but several candidates for the same
                 # activity can be started within one step, so the count must be
                 # re-read as the loop proceeds.
                 if not self._concurrency_allows(cand, state):
+                    continue
+                # #29: availability calendar — the sole enforcement point, for
+                # the reason given in _derive_primary_candidate.
+                if not self._calendar_open(cand.activity_name, state):
                     continue
                 # #27: authoritative per-object exclusivity. Candidates were all
                 # built against the pre-start state, so an earlier candidate in
@@ -1915,6 +2078,14 @@ class Simulator:
                 # states (no pending arrival at all) terminate the run.
                 _future = [t for t in state._next_arrival_at.values()
                            if t is not None and t > state.current_time]
+                # #29: a closed calendar hour is not a deadlock — the next hour
+                # may open. Offer the next hour boundary as a jump target so a
+                # run does not terminate every Friday evening. Bounded by
+                # _MAX_IDLE_JUMPS below.
+                if self._activity_calendars:
+                    _future.append(
+                        (state.current_time + timedelta(hours=1))
+                        .replace(minute=0, second=0, microsecond=0))
                 if _future:
                     state.current_time = min(_future)
                     _idle_jumps += 1

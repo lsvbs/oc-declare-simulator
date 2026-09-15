@@ -4,12 +4,38 @@ from datetime import datetime
 
 
 @dataclass
+class ObjectTimestamp:
+    """One entry in a RuntimeObject's lifecycle log (#28).
+
+    Written on every status change of an object. Purely additive
+    observability: the engine appends to this and never reads it during a run.
+    That boundary is deliberate — the authoritative state lives in
+    _active_by_type, _busy_objects and _in_progress_objects, and adding a
+    second source of truth the engine consulted would let the two drift.
+    Read it after the run (export, inspection, per-object timelines).
+
+    lastupdate : what happened — 'created' | 'started' | 'completed' | 'deactivated'
+    activity   : the activity involved, or None for create/deactivate
+    status     : the object's state *after* this entry —
+                 'idle'     available to be picked up by an activity
+                 'busy'     inside a running activity instance
+                 'inactive' deactivated; will never participate again
+    """
+    timestamp: Optional[datetime]
+    lastupdate: str
+    activity: Optional[str] = None
+    status: str = "idle"
+
+
+@dataclass
 class RuntimeObject:
     object_id: str
     object_type: str
     status: Optional[str] = None
     active: bool = True
     attributes: dict[str, Any] = field(default_factory=dict)
+    # #28: append-only lifecycle log — list[ObjectTimestamp], oldest first.
+    timestamps: list = field(default_factory=list)
     # [resource/permanent-object handling — disabled, kept for reference]
     # DES occupancy: set while this resource is held by an in-progress activity
     # busy_until: Optional[datetime] = None
@@ -78,6 +104,10 @@ class PendingObligation:
 @dataclass
 class SimulationState:
     step_count: int = 0
+    # #28: append per-object lifecycle entries (see ObjectTimestamp). Purely
+    # observability — never read by the engine during a run. Set False for very
+    # long runs, where roughly one entry per object per status change adds up.
+    track_object_timestamps: bool = True
     objects: dict[str, RuntimeObject] = field(default_factory=dict)
     links: list[ObjectLink] = field(default_factory=list)
     executed_events: list[ExecutedEvent] = field(default_factory=list)
@@ -146,6 +176,23 @@ class SimulationState:
     # Maintained alongside _in_progress_objects so the concurrency ceiling can
     # be checked in O(1) instead of scanning the in_progress heap.
     _in_progress_by_activity: dict[str, int] = field(default_factory=dict)
+
+    # ── Calendar slot decision per activity (#29) ─────────────────────────────
+    # activity_name -> (hour_start, is_open). One SHARED availability roll per
+    # activity per clock hour: if the roll opens the hour, every waiting
+    # candidate for that activity may start; if it closes it, none may.
+    #
+    # This reads the calendar as what the ICPM paper describes — the probability
+    # that the resource performing an activity is available in a time slot —
+    # rather than as an independent per-candidate delay. Rolling per candidate
+    # would model unboundedly many independent resources and smear starts across
+    # the day; one shared roll produces the burst-when-open behaviour a real
+    # facility shows, with the concurrency ceiling (#26) deciding how many of
+    # the waiting candidates actually run.
+    #
+    # Only the current hour is retained per activity: the entry is overwritten
+    # when the clock moves into a new hour, so this stays O(activities).
+    _calendar_slot_open: dict = field(default_factory=dict)
 
     # ── Next permitted arrival time per activity (#26) ────────────────────────
     # activity_name -> datetime before which the activity may not start again.
@@ -270,6 +317,33 @@ class SimulationState:
         self.next_event_counter += 1
         return event_id
 
+    def record_object_status(self, object_id: str, lastupdate: str, status: str,
+                             activity: Optional[str] = None,
+                             timestamp: Optional[datetime] = None) -> None:
+        """Append one entry to an object's lifecycle log (#28).
+
+        Append-only. Nothing in the engine reads these entries during a run —
+        see ObjectTimestamp. Falls back to self.current_time when no explicit
+        timestamp is given; callers that know the exact moment (an activity's
+        complete_at, say) should pass it, because current_time is not always
+        advanced yet at the point of the call.
+
+        Disabled wholesale by setting track_object_timestamps = False, which
+        matters for very long runs: this appends roughly one entry per object
+        per status change.
+        """
+        if not self.track_object_timestamps:
+            return
+        obj = self.objects.get(object_id)
+        if obj is None:
+            return
+        obj.timestamps.append(ObjectTimestamp(
+            timestamp=timestamp if timestamp is not None else self.current_time,
+            lastupdate=lastupdate,
+            activity=activity,
+            status=status,
+        ))
+
     def add_object(self, object_type: str, status: Optional[str] = None, attributes: Optional[dict] = None) -> RuntimeObject:
         object_id = self.new_object_id(object_type)
         obj = RuntimeObject(
@@ -280,6 +354,9 @@ class SimulationState:
             attributes=dict(attributes) if attributes else {},
         )
         self.objects[object_id] = obj
+        # #28: first lifecycle entry. Created objects are idle until an
+        # activity actually starts on them.
+        self.record_object_status(object_id, 'created', 'idle')
         self._active_by_type.setdefault(object_type, set()).add(object_id)
         self._type_of_object[object_id] = object_type
         # Object type now has active instances — remove from inactive set
@@ -287,7 +364,7 @@ class SimulationState:
         # New object initially eligible for start activities (eligibility index populated by simulator)
         return obj
 
-    def deactivate_object(self, object_id: str) -> None:
+    def deactivate_object(self, object_id: str, timestamp: Optional[datetime] = None) -> None:
         """Mark an object inactive and update the active-by-type index.
 
         When a non-resource object is deactivated:
@@ -303,6 +380,11 @@ class SimulationState:
         if obj is None:
             return
         obj.active = False
+        # #28: final lifecycle entry. `timestamp` is passed explicitly by
+        # _des_complete_activity because current_time has not yet been advanced
+        # to the completing activity's complete_at at that point.
+        self.record_object_status(object_id, 'deactivated', 'inactive',
+                                  timestamp=timestamp)
         active_set = self._active_by_type.get(obj.object_type)
         if active_set:
             active_set.discard(object_id)
@@ -328,7 +410,36 @@ class SimulationState:
                 else:
                     # all-mode: cancel immediately — full set can never fire
                     keys_to_remove.append(k)
+            else:
+                # Multi-type obligation: the key holds only the 'each'-binding
+                # objects. Secondary any/all bindings live in
+                # _obligation_bindings and were never examined here, so an
+                # obligation whose secondary 'all' object had been deactivated
+                # stayed pending forever — unsatisfiable by construction, yet
+                # never cancelled and never counted as a violation. It also kept
+                # feeding obligation injection with candidates that could not
+                # fire. Measured on container_logistics: 15 of 95 multi-type
+                # obligations were in that state at the end of a 2000-event run.
+                #
+                # Each binding is judged by ITS OWN involvement, not the primary
+                # binding's kind, which is what c_key[3] above records.
+                for _t, _inv, _required in (self._obligation_bindings.get(k) or ()):
+                    if object_id not in _required:
+                        continue
+                    if _inv == 'any':
+                        # satisfiable while any member of this binding lives
+                        if any(oid != object_id and self.objects.get(oid)
+                               and self.objects[oid].active for oid in _required):
+                            continue
+                    # 'all' (or an exhausted 'any'): this binding can never be
+                    # satisfied again, so neither can the obligation.
+                    keys_to_remove.append(k)
+                    break
+        _seen_removals = set()
         for k in keys_to_remove:
+            if k in _seen_removals:
+                continue
+            _seen_removals.add(k)
             del self._obligations_count[k]
             self._obligations_ready.pop(k, None)
             self._obligation_bindings.pop(k, None)

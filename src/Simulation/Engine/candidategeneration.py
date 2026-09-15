@@ -96,6 +96,34 @@ def _find_objects_preferring_linked(
     return selected
 
 
+def _sample_create_count(binding, rng) -> int:
+    """How many new objects this creating binding produces for one event.
+
+    Draws from the binding's measured distribution (count, weight) pairs —
+    ParameterDiscovery.discover_creation_counts — so the simulation reproduces
+    the log's own spread rather than a fixed number or a uniform guess over
+    [min_count, max_count].
+
+    Falls back to min_count when no distribution is available: a hand-written
+    model, the arc-list format, or a model loaded without an event log.
+    """
+    counts = getattr(binding, 'create_counts', ()) or ()
+    if not counts or rng is None:
+        return max(1, binding.min_count)
+    total = 0
+    for _c, w in counts:
+        total += w
+    if total <= 0:
+        return max(1, binding.min_count)
+    threshold = rng.random() * total
+    acc = 0
+    for c, w in counts:
+        acc += w
+        if threshold < acc:
+            return c
+    return counts[-1][0]
+
+
 def build_candidate_for_activity(
     activity: Activity,
     state: SimulationState,
@@ -103,6 +131,7 @@ def build_candidate_for_activity(
     force_object_id: str | None = None,
     force_object_ids: list[str] | None = None,
     pool_cache: dict[tuple, list[str]] | None = None,
+    rng=None,
 ) -> Optional[Candidate]:
     """Build a candidate for ``activity`` from the global active-object pool.
 
@@ -116,6 +145,10 @@ def build_candidate_for_activity(
     results across the many candidates built within one read-only
     candidate-generation pass (state does not mutate mid-pass — see
     Simulator._generate_candidates_des).
+    ``rng`` is the simulator's seeded generator, used to sample how many
+    objects a creating binding produces (see _sample_create_count). Passing
+    None keeps the old fixed min_count behaviour, which is what the smoke
+    scripts and any caller without a simulator get.
     """
     participating_object_ids: list[str] = []
     # Maintained alongside participating_object_ids so _find_objects_preferring_linked
@@ -230,11 +263,37 @@ def build_candidate_for_activity(
             participating_object_ids.extend(selected_ids)
             participating_object_ids_set.update(selected_ids)
         else:
-            # Output binding: this activity instantiates new objects of this type.
+            # Output binding: this activity brings new objects of this type into
+            # existence. How many is SAMPLED FROM THE LOG — see
+            # ParameterDiscovery.discover_creation_counts, merged onto the
+            # binding as create_counts — and the event is NOT topped up to
+            # max_count with objects that already exist.
             #
-            # Reuse: if max_count is set, fill up to (max_count - create_count) slots
-            # with existing linked objects. If max_count is None, no reuse —
-            # the newly created objects are the sole participants of this type.
+            # What this replaces: create min_count objects, then fill the
+            # remaining (max_count - min_count) slots from the active pool,
+            # preferring linked objects but falling back to arbitrary unlinked
+            # ones. Both halves were wrong.
+            #
+            #   * min_count under-creates. `Order Empty Containers` is
+            #     Container[C 1..5] and the log creates 1-5 per event, mean
+            #     3.38 — the engine always made exactly 1, which starved every
+            #     downstream Container activity.
+            #   * the top-up models something the log never shows for a genuine
+            #     creator: 0 of 593 `Order Empty Containers` events involve a
+            #     container seen earlier. Worse, the unlinked fallback pulls an
+            #     object away from the o2o partner it already has. The log says
+            #     `Container -> Transport Document` is 1..1, so a recycled
+            #     container arriving alongside a second document is correctly
+            #     refused by check_o2o_rules and the activity stops firing.
+            #
+            # min_count/max_count still describe how many objects of this type
+            # are *present* in the event, which for a creating binding is a
+            # different quantity from how many are new. Re-use therefore covers
+            # only the shortfall against min_count — never the gap up to
+            # max_count. That is what lets an activity the log shows as a
+            # near-pure re-user work correctly: `Load Truck` is Truck[C 1..1]
+            # but creates a new Truck in 6 of 10553 events, so it samples 0 and
+            # takes the truck the container is already linked to.
             #
             # [resource/permanent-object handling — disabled, kept for reference]
             # Resource types come from the pre-populated pool only.
@@ -250,16 +309,29 @@ def build_candidate_for_activity(
             #     participating_object_ids_set.update(selected_ids)
             #     continue
 
-            create_count = max(1, binding.min_count)
+            create_count = _sample_create_count(binding, rng)
+
+            need_existing = max(0, binding.min_count - create_count)
+            selected_ids = _find_objects_preferring_linked(
+                state, existing_ids, participating_object_ids_set, need_existing
+            )
+
+            shortfall = need_existing - len(selected_ids)
+            if shortfall > 0:
+                # Bootstrap. The log says this event normally re-uses objects,
+                # but not enough exist yet — on an empty pool a distribution
+                # dominated by 0 would stall the activity forever, and nothing
+                # else would ever create the first instance. Create the
+                # shortfall instead.
+                create_count += shortfall
 
             if binding.max_count is not None:
-                reuse_limit = min(len(existing_ids), max(0, binding.max_count - create_count))
-            else:
-                reuse_limit = 0  # no reuse when unbounded — created objects are the sole participants
+                # Defensive: a sampled count cannot exceed what the log showed,
+                # but a hand-edited max_count could be lower than the measured
+                # distribution.
+                create_count = max(0, min(create_count,
+                                          binding.max_count - len(selected_ids)))
 
-            selected_ids = _find_objects_preferring_linked(
-                state, existing_ids, participating_object_ids_set, reuse_limit
-            )
             participating_object_ids.extend(selected_ids)
             participating_object_ids_set.update(selected_ids)
 

@@ -145,6 +145,26 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         )
         object_types.append(ObjectType(name=str(name), attributes=attr_defs))
 
+    # Creation-count distributions measured from the log and merged in by
+    # Backend._merge_pacing. Shape: {activity: {object_type: {"3": 154, ...}}}.
+    # Normalised here to the (count, weight) tuples ObjectBinding carries, so
+    # the candidate builder can sample without re-parsing JSON string keys.
+    creation_counts = data.get("creation_counts") or {}
+
+    def _create_counts_for(activity_name: str, object_type: str) -> tuple:
+        dist = (creation_counts.get(activity_name) or {}).get(object_type)
+        if not dist:
+            return ()
+        pairs = []
+        for count, weight in dist.items():
+            try:
+                c, w = int(count), int(weight)
+            except (TypeError, ValueError):
+                continue
+            if c >= 0 and w > 0:
+                pairs.append((c, w))
+        return tuple(sorted(pairs))
+
     # Activities
     activities = []
     for a in data.get("activities", []) or []:
@@ -153,9 +173,10 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             continue
         bindings = []
         for b in a.get("bindings", []) or []:
+            _otype = str(b.get("object_type"))
             bindings.append(
                 ObjectBinding(
-                    object_type=str(b.get("object_type")),
+                    object_type=_otype,
                     min_count=int(b.get("min_count", 0)),
                     max_count=(None if b.get("max_count") is None else int(b.get("max_count"))),
                     creates=bool(b.get("creates", False)),
@@ -164,6 +185,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                     deactivates=bool(b.get("deactivates", b.get("consumes", False))),
                     guard=b.get("guard") or None,
                     attribute_updates=tuple(b.get("attribute_updates") or ()),
+                    create_counts=_create_counts_for(name, _otype),
                 )
             )
         activities.append(Activity(
@@ -281,17 +303,15 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             for k, v in (data.get("resource_pool_sizes") or {}).items()
             if v is not None and int(v) >= 1
         },
-        wip_caps={
-            str(k): int(v)
-            for k, v in (data.get("wip_caps") or {}).items()
-            if v is not None and int(v) >= 1
-        },
         activity_concurrency={
             str(k): int(v)
             for k, v in (data.get("activity_concurrency") or {}).items()
             if v is not None and int(v) >= 1
         },
         interarrival_times=_parse_activity_durations(data.get("interarrival_times") or {}),
+        activity_calendars=(data.get("activity_calendars") or {}),
+        object_transitions=(data.get("object_transitions") or {}),
+        creation_counts=creation_counts,
         max_consecutive={
             str(k): int(v)
             for k, v in (data.get("max_consecutive") or {}).items()

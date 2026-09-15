@@ -33,9 +33,23 @@ function makeFlowRankSorter(discoveryResults, objectTraces) {
 // ── Scope formatter ───────────────────────────────────────────────────────────
 // Returns "each manuscript" for single-type, "Each(editor,version), All(invitation)"
 // for multi-type bindings.
+// Normalise a constraint scope to [[object_type, involvement], ...].
+// Discovered model JSON carries `involvement_per_label` (a dict); the engine's
+// Scope dataclass carries `bindings` (pairs). Reading only `bindings` meant every
+// multi-type constraint silently rendered as a single-type row, because the JSON
+// the editor loads never has that key.
+function scopeBindings(scope) {
+  if (!scope) return [];
+  if (Array.isArray(scope.bindings) && scope.bindings.length) return scope.bindings;
+  const ipl = scope.involvement_per_label;
+  if (ipl && typeof ipl === 'object') return Object.entries(ipl);
+  if (scope.object_type) return [[scope.object_type, scope.kind || 'each']];
+  return [];
+}
+
 function formatScope(scope) {
   if (!scope) return '';
-  const bindings = scope.bindings || [];
+  const bindings = scopeBindings(scope);
   if (bindings.length <= 1) {
     if (scope.kind && scope.object_type) return `${scope.kind} ${scope.object_type}`;
     return scope.object_type || scope.kind || '';
@@ -1115,6 +1129,143 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
           </span>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ── ObjectTimelines (#28) ─────────────────────────────────────────────────────
+// Per-object lifecycle log from the run: every status change with its timestamp,
+// the activity involved, and the resulting status. The idle gap between one
+// activity completing and the next starting is shown explicitly — that gap is
+// waiting time, and comparing it against the source log is how you see whether
+// the simulation paces objects realistically.
+function ObjectTimelines({ lifecycles, total }) {
+  const [typeFilter, setTypeFilter] = React.useState('all');
+  const [selected, setSelected] = React.useState(lifecycles[0]?.object_id ?? null);
+
+  const types = React.useMemo(
+    () => [...new Set(lifecycles.map(l => l.object_type))].sort(),
+    [lifecycles]
+  );
+  const shown = React.useMemo(
+    () => typeFilter === 'all' ? lifecycles : lifecycles.filter(l => l.object_type === typeFilter),
+    [lifecycles, typeFilter]
+  );
+  const current = shown.find(l => l.object_id === selected) || shown[0] || null;
+
+  const fmtTime = iso => {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString(undefined, {
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+  };
+  const fmtDur = s => {
+    if (s == null) return '';
+    if (s < 60) return `${Math.round(s)}s`;
+    if (s < 3600) return `${(s / 60).toFixed(1)}m`;
+    if (s < 86400) return `${(s / 3600).toFixed(1)}h`;
+    return `${(s / 86400).toFixed(1)}d`;
+  };
+
+  // Rows with the elapsed time since the previous entry, so idle gaps are visible.
+  const rows = React.useMemo(() => {
+    if (!current) return [];
+    let prev = null;
+    return current.entries.map(e => {
+      const t = e.timestamp ? new Date(e.timestamp).getTime() / 1000 : null;
+      const delta = (t != null && prev != null) ? t - prev : null;
+      if (t != null) prev = t;
+      return { ...e, delta };
+    });
+  }, [current]);
+
+  const totalIdle = rows.reduce(
+    (acc, r, i) => acc + ((r.lastupdate === 'started' && i > 0 && r.delta) ? r.delta : 0), 0);
+  const totalBusy = rows.reduce(
+    (acc, r) => acc + ((r.lastupdate === 'completed' && r.delta) ? r.delta : 0), 0);
+
+  const statusColor = s =>
+    s === 'busy' ? '#0d6d78' : s === 'inactive' ? '#94a3b8' : '#b45309';
+
+  return (
+    <div className="object-timelines">
+      <div className="object-timelines-controls">
+        <label>
+          Type&nbsp;
+          <select value={typeFilter} onChange={e => { setTypeFilter(e.target.value); setSelected(null); }}>
+            <option value="all">All ({lifecycles.length})</option>
+            {types.map(t => (
+              <option key={t} value={t}>
+                {t} ({lifecycles.filter(l => l.object_type === t).length})
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Object&nbsp;
+          <select value={current?.object_id ?? ''} onChange={e => setSelected(e.target.value)}>
+            {shown.map(l => (
+              <option key={l.object_id} value={l.object_id}>
+                {l.object_id} — {l.entries.length} change{l.entries.length !== 1 ? 's' : ''}
+                {l.active ? '' : ' · deactivated'}
+              </option>
+            ))}
+          </select>
+        </label>
+        {total > lifecycles.length && (
+          <span className="object-timelines-note">
+            showing the {lifecycles.length} most active of {total} objects
+          </span>
+        )}
+      </div>
+
+      {current ? (
+        <>
+          <div className="object-timelines-summary">
+            <span><strong>{current.object_id}</strong> · {current.object_type}</span>
+            <span>{current.active ? 'active' : 'deactivated'}</span>
+            <span>in activities: <strong>{fmtDur(totalBusy)}</strong></span>
+            <span>idle between activities: <strong>{fmtDur(totalIdle)}</strong></span>
+          </div>
+          <div className="object-timelines-scroll">
+            <table className="object-timelines-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Since previous</th>
+                  <th>Update</th>
+                  <th>Activity</th>
+                  <th>Status after</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i}>
+                    <td className="ot-mono">{fmtTime(r.timestamp)}</td>
+                    <td className="ot-mono ot-delta">
+                      {r.delta != null && r.delta > 0 ? `+${fmtDur(r.delta)}` : ''}
+                      {r.lastupdate === 'started' && r.delta > 0 && (
+                        <span className="ot-idle-tag" title="Object was idle for this long before the activity started">idle</span>
+                      )}
+                    </td>
+                    <td>{r.lastupdate}</td>
+                    <td>{r.activity || '—'}</td>
+                    <td>
+                      <span className="ot-status" style={{ color: statusColor(r.status) }}>
+                        {r.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <p className="object-timelines-note">No objects of this type in the captured sample.</p>
+      )}
     </div>
   );
 }
@@ -6630,33 +6781,49 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
               {sortedConstraints.map(({c, origIdx}) => {
                 const scopeOt = c.scope?.object_type || c.scope_object_type || '';
                 const scopeKind = c.scope?.kind || 'each';
+                // One row per (object type, involvement) binding. A multi-type
+                // constraint is ONE constraint with several object types, each
+                // carrying its own involvement — collapsing them into a single
+                // row hid exactly the part that makes the constraint multi-type.
+                const binds = scopeBindings(c.scope);
+                const rows = binds.length ? binds : [[scopeOt, scopeKind]];
+                const isMulti = rows.length > 1;
                 const rowBg = /^(response|chain_response|alternate_response)$/.test(c.constraint_type) ? '#f0fdf4'
                   : /^(precedence|chain_precedence|alternate_precedence)$/.test(c.constraint_type) ? '#eff6ff'
                   : undefined;
+                const groupStyle = {
+                  ...(rowBg ? {background:rowBg} : {}),
+                  ...(isMulti ? {borderLeft:'3px solid #6366f1'} : {}),
+                };
+                const span = rows.length;
                 return (
-                  <tr key={origIdx} style={rowBg ? {background:rowBg} : undefined}>
-                    {editMode && <td><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
-                    <td>{editMode ? sel(c.constraint_type, BEHAVIOR_CTYPES, v=>updateCon(origIdx,{constraint_type:v})) : <span className="con-type-badge">{c.constraint_type}</span>}</td>
-                    <td>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>
-                    <td>{editMode
+                  <React.Fragment key={origIdx}>
+                  {rows.map(([bType, bInv], bIdx) => (
+                  <tr key={bIdx} style={bIdx === 0 ? groupStyle : {...(rowBg?{background:rowBg}:{}), ...(isMulti?{borderLeft:'3px solid #6366f1'}:{})}}>
+                    {bIdx === 0 && editMode && <td rowSpan={span}><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
+                    {bIdx === 0 && <td rowSpan={span}>{editMode ? sel(c.constraint_type, BEHAVIOR_CTYPES, v=>updateCon(origIdx,{constraint_type:v})) : (<><span className="con-type-badge">{c.constraint_type}</span>{isMulti && <span title={`Multi-type constraint: all ${span} bindings must hold jointly`} style={{marginLeft:'0.35rem',fontSize:'0.62rem',fontWeight:700,color:'#4338ca',background:'#eef2ff',border:'1px solid #c7d2fe',borderRadius:'3px',padding:'0 3px'}}>{span}×</span>}</>)}</td>}
+                    {bIdx === 0 && <td rowSpan={span}>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>}
+                    {bIdx === 0 && <td rowSpan={span}>{editMode
                       ? (isUnary(c.constraint_type) ? <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>—</span>
                         : sel(c.target_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{target_activity:v})))
-                      : (c.target_activity||'—')}</td>
-                    <td>{editMode
+                      : (c.target_activity||'—')}</td>}
+                    <td>{(editMode && !isMulti)
                       ? <select value={scopeOt} onChange={e=>updateCon(origIdx,{scope:{...c.scope,object_type:e.target.value}})}
                           style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
                           <option value="">—</option>{otNames.map(o=><option key={o} value={o}>{o}</option>)}
                         </select>
-                      : <span style={{fontWeight:scopeOt?500:400,color:scopeOt?'#1e293b':'#94a3b8'}}>
-                          {(c.scope?.bindings||[]).length > 1 ? c.scope.bindings.map(([t])=>t).join(', ') : (scopeOt||'—')}
+                      : <span style={{fontWeight:bType?500:400,color:bType?'#1e293b':'#94a3b8'}}>
+                          {bType || '—'}
                         </span>}
                     </td>
-                    <td>{editMode ? <select value={scopeKind} onChange={e=>updateCon(origIdx,{scope:{...c.scope,kind:e.target.value}})}
-                        style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
-                        {BEHAVIOR_SCOPE_KIND_OPTS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
-                      </select> : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{(c.scope?.bindings||[]).length > 1 ? formatScope(c.scope) : scopeKind}</span>}</td>
-                    <td>{editMode ? <EditableCell value={c.nmin??1} type="number" onSave={v=>updateCon(origIdx,{nmin:v})}/> : (c.nmin??'—')}</td>
-                    <td>{editMode ? <EditableCell value={c.nmax??''} type="number" placeholder="∞" onSave={v=>updateCon(origIdx,{nmax:v===''||v===null?null:Number(v)})}/> : (c.nmax??'—')}</td>
+                    <td>{(editMode && !isMulti)
+                      ? <select value={scopeKind} onChange={e=>updateCon(origIdx,{scope:{...c.scope,kind:e.target.value}})}
+                          style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}>
+                          {BEHAVIOR_SCOPE_KIND_OPTS.map(o=><option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      : <span style={{color:'#64748b',fontSize:'0.78rem'}}>{bInv || '—'}</span>}</td>
+                    {bIdx === 0 && <td rowSpan={span}>{editMode ? <EditableCell value={c.nmin??1} type="number" onSave={v=>updateCon(origIdx,{nmin:v})}/> : (c.nmin??'—')}</td>}
+                    {bIdx === 0 && <td rowSpan={span}>{editMode ? <EditableCell value={c.nmax??''} type="number" placeholder="∞" onSave={v=>updateCon(origIdx,{nmax:v===''||v===null?null:Number(v)})}/> : (c.nmax??'—')}</td>}
                     {false && <td style={{minWidth:'10rem'}}>
                       {editMode ? (
                         c.guard ? (
@@ -6683,6 +6850,8 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                       )}
                     </td>}
                   </tr>
+                  ))}
+                  </React.Fragment>
                 );
               })}
             </tbody>
@@ -11017,7 +11186,12 @@ function App() {
                         })()}
                       </div>
                       <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Completed cases</span>
+                        {/* "Start cases": the counter is state._start_event_count,
+                            incremented when an event of a configured start
+                            activity fires — cases begun, not finished. The API
+                            field stays `completed_cases` (wire format, not
+                            user-facing). */}
+                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Start cases -Dev</span>
                         <input type="text" inputMode="numeric" value={config.maxCases ?? ''}
                           placeholder="e.g. 100"
                           onChange={e => handleConfigChange('maxCases', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
@@ -11051,29 +11225,38 @@ function App() {
                   {isSimulating && (
                     <div className="loading-box" style={{padding:'1.5rem',marginTop:'0.75rem'}}>
                       <div className="spinner"></div>
-                      <p>Running… <span className="sim-step-counter">completed events {liveStepCount ?? 0}</span></p>
-                      {liveSimTime != null && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                          {'simulated time '}
-                          {(() => {
-                            const s = liveSimTime;
-                            if (s < 60) return `${Math.floor(s)}s`;
-                            if (s < 3600) return `${Math.floor(s/60)}m ${Math.floor(s%60)}s`;
-                            if (s < 86400) return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
-                            const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
-                            return `${d}d ${h}h`;
-                          })()}
-                          {config.maxSimTimeValue !== '' && config.maxSimTimeValue != null && (() => {
-                            const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
-                            const maxS = parseFloat(config.maxSimTimeValue) * (unitToS[config.maxSimTimeUnit ?? 'days'] ?? 86400);
-                            return ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}`;
-                          })()}
-                        </p>
-                      )}
+                      {/* Simulated time leads: it is what the run is measured
+                          in, and what the stop conditions are usually set on.
+                          Completed events moved to the secondary line below,
+                          where simulated time used to sit. */}
+                      <p>Running… <span className="sim-step-counter">
+                        {liveSimTime == null ? 'starting…' : (() => {
+                          const s = liveSimTime;
+                          const fmt = s < 60     ? `${Math.floor(s)}s`
+                                    : s < 3600   ? `${Math.floor(s/60)}m ${Math.floor(s%60)}s`
+                                    : s < 86400  ? `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`
+                                    : `${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
+                          const cap = (config.maxSimTimeValue !== '' && config.maxSimTimeValue != null)
+                            ? ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}` : '';
+                          return `simulated time ${fmt}${cap}`;
+                        })()}
+                      </span></p>
+                      <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
+                        {'completed events '}{(liveStepCount ?? 0).toLocaleString()}
+                      </p>
                       {liveCases != null && liveCases > 0 && (
                         <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                          {'completed cases: '}{liveCases.toLocaleString()}
+                          {'start cases -Dev: '}{liveCases.toLocaleString()}
                           {config.maxCases !== '' && config.maxCases != null ? ` / ${config.maxCases}` : ''}
+                          {/* Counts state._start_event_count — incremented in
+                              SimulationState.record_event whenever an event of a
+                              configured start activity is recorded. */}
+                          <span
+                            className="help-hint"
+                            data-help="A case is one firing of a start activity — the event that opens a new process instance. The counter goes up by one each time an activity listed under Start Activities fires, so it counts cases begun, not cases finished."
+                            aria-label="What is a start case?"
+                            role="img"
+                          >?</span>
                         </p>
                       )}
                       <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
@@ -11085,11 +11268,16 @@ function App() {
                           {liveObligations.toLocaleString()} pending obligations
                         </p>
                       )}
+                      {/* Per-step deactivation / obligation-removal rates —
+                          hidden from the tracker, kept here because the values
+                          are still polled and are useful when diagnosing a run
+                          that stalls. Re-enable by uncommenting.
                       {liveDeactivPerStep != null && (
                         <p className="sim-elapsed-timer" style={{fontSize:'0.78rem',color:'#64748b'}}>
                           {liveDeactivPerStep}/step deactivated · ✓ {liveObligFulfilledPerStep ?? 0}/step obligations removed
                         </p>
                       )}
+                      */}
                       <button className="sim-stop-btn" onClick={stopSimulation}>Stop</button>
                     </div>
                   )}
@@ -11494,6 +11682,30 @@ function App() {
                                   </Collapsible>
                                 );
                               })()}
+
+                              {/* Object Timelines (#28) — per-object status changes from this run */}
+                              {r.object_lifecycles?.length > 0 && (
+                                <Collapsible
+                                  title="Object Timelines"
+                                  badge={`${r.object_lifecycles.length}${
+                                    r.object_lifecycles_total > r.object_lifecycles.length
+                                      ? ` of ${r.object_lifecycles_total}` : ''} objects`}
+                                  defaultOpen={false}
+                                >
+                                  <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
+                                    Every status change an object went through: when it was created, which
+                                    activity took it and when, when that activity finished, and when it was
+                                    deactivated. The <em>Since previous</em> column shows the gap between
+                                    entries — a gap before a <code>started</code> row is time the object spent
+                                    idle while already eligible, which is what the source log records as
+                                    waiting time.
+                                  </p>
+                                  <ObjectTimelines
+                                    lifecycles={r.object_lifecycles}
+                                    total={r.object_lifecycles_total}
+                                  />
+                                </Collapsible>
+                              )}
 
                             </Collapsible>
 

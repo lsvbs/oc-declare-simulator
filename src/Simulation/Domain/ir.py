@@ -31,6 +31,18 @@ class ObjectBinding:
     creates: bool = False
     deactivates: bool = False
 
+    # How many NEW objects of this type one event actually brings into
+    # existence, as an empirical distribution measured from the log by
+    # ParameterDiscovery.discover_creation_counts. Tuple of (count, weight)
+    # pairs; empty when no log has been merged (hand-written models), in which
+    # case build_candidate_for_activity falls back to min_count.
+    #
+    # Separate from min_count/max_count on purpose: those count objects of this
+    # type *present* in the event, which for a creating binding is a different
+    # quantity — `Load Truck` always has exactly one Truck present and creates
+    # a new one in 6 of 10553 events.
+    create_counts: tuple = ()
+
     # Attribute guard: object must have this attribute and satisfy the condition.
     # e.g. {"attribute": "status", "op": "==", "value": "ready"}
     # If the object does not have the named attribute, it is excluded (fail-absent).
@@ -164,19 +176,12 @@ class StaticModel:
     # How many instances of each resource type to pre-populate at sim start.
     # Defaults to 1 for any resource type not listed here.
     resource_pool_sizes: dict[str, int] = field(default_factory=dict)
-    # Per-object-type work-in-progress ceiling, measured from the source log
-    # (see ParameterDiscovery.discover_wip_caps). An activity that would create
-    # an instance of a type already at its ceiling is not started until an
-    # existing instance is deactivated. Empty dict = uncapped (previous
-    # behaviour). This is a capacity assumption layered on top of OC-Declare,
-    # not something the constraints themselves express.
-    wip_caps: dict[str, int] = field(default_factory=dict)
     # Per-activity ceiling on simultaneously in-progress instances, measured
     # from the source log (ParameterDiscovery.discover_activity_concurrency).
     # Bounds state.in_progress — and therefore start-time object creation —
     # for activities that start far faster than they complete. Empty = unbounded.
-    # Unlike wip_caps this DOES apply to start activities: it paces arrivals
-    # rather than refusing them for lack of downstream capacity.
+    # This DOES apply to start activities: it paces arrivals rather than
+    # refusing them for lack of downstream capacity.
     activity_concurrency: dict[str, int] = field(default_factory=dict)
     # Per-activity inter-arrival distribution, measured from the log
     # (ParameterDiscovery.discover_interarrival_times). Paces activities with
@@ -184,6 +189,29 @@ class StaticModel:
     # step — making the step structure the de facto arrival rate. Same shape as
     # activity_durations so the existing sampler is reused.
     interarrival_times: dict[str, ActivityDuration] = field(default_factory=dict)
+    # Probabilistic weekly availability calendars (#29), discovered from the log
+    # per ParameterDiscovery.discover_activity_calendars. Shape:
+    #   {'slots_per_week': 168, 'global': [...], 'per_activity': {...},
+    #    'fallback_activities': [...]}
+    # Each slot (weekday*24 + hour) carries the probability an activity may
+    # start in it. NOTE: per activity, not per resource — OCEL events carry no
+    # resource attribute; see discover_activity_calendars for that deviation and
+    # two others (synthesised service times, arrival per object type).
+    activity_calendars: dict = field(default_factory=dict)
+    # Per-object-type directly-follows probabilities (#30):
+    #   {object_type: {last_activity: {next_activity: probability}}}
+    # Used to order candidates competing for the same object. Replaces the
+    # global transition matrix for that decision, which conditioned on the last
+    # event anywhere in the process. See discover_object_transition_matrix.
+    object_transitions: dict = field(default_factory=dict)
+    # Per-activity, per-type distribution of how many NEW objects one event
+    # creates: {activity: {object_type: {"3": 154, ...}}}, from
+    # ParameterDiscovery.discover_creation_counts. Merged from the log at load
+    # time (Backend._merge_pacing), never written into the model file — the
+    # same contract as activity_concurrency and activity_calendars. The parser
+    # copies it onto each ObjectBinding.create_counts, which is what the
+    # candidate builder samples.
+    creation_counts: dict = field(default_factory=dict)
     max_consecutive: dict[str, int] = field(default_factory=dict)
     # Per-object max consecutive: activity may repeat at most N times on the
     # same object ID before another activity must touch that object.

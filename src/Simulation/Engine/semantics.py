@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import product as _product
 from typing import Any, Optional
 
 from src.Simulation.Domain.ir import StaticModel
@@ -209,32 +210,130 @@ def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationStat
     return not _activity_fired_globally(state, forbidden)
 
 
+def _nmax_blocked(constraint, candidate, state, target_activity, nmax, scope_ids_cache=None) -> bool:
+    """True if firing `target_activity` now would push a Definition 8 count past nmax.
+
+    Definition 8 (Küsters & van der Aalst, OC-DECLARE, p. 10) bounds exactly
+    ONE quantity per Each assignment::
+
+        e |= D  <=>  for all o_1 in obj^ot1(e), ..., o_n in obj^otn(e):
+                         n_min <= |f(E_L)| <= n_max
+
+        f = filter^act_t  o  filter^time_{ts(e),ar}  o  filter^all_{o_1..o_n}
+              o  filter^all_{ obj^ot(e) | ot in All_oi }
+              o  filter^any_{ obj^ot(e) | ot in Any_oi }
+
+    |f(E_L)| is a JOINT count: target-activity events that involve the chosen
+    Each objects *together with* every All object and at least one Any object.
+    One number per Each assignment — never one number per object type. The
+    bound must hold for every assignment, so the constraint is blocked as soon
+    as a single assignment has reached nmax (firing again would exceed it).
+
+    What this replaces: a per-type marginal — |events of target_activity
+    involving this object|, taken separately for each binding and each compared
+    to nmax. A marginal is always >= the intersection, so the old form was
+    strictly stricter than the paper, and unboundedly so. For
+    `Load Truck -> Drive to Terminal {Container: each, Truck: each}` with
+    nmax=1 the log's joint count is 1 (one Drive to Terminal per
+    container-truck pair) while the Truck marginal is 335 — so once any truck
+    had driven once, every later candidate carrying that truck was refused.
+    Folding All/Any into the event set rather than into a choice between
+    any()/all() over the object list is the same correction: the paper filters
+    *events*, not objects.
+
+    Remaining deviation from Definition 8: no filter^time. The paper evaluates
+    a source event e and looks forward or backward from ts(e); this is called
+    for a *prospective* target event, with no reference source event in hand,
+    so the count runs over the whole executed history. A wider window can only
+    make the count larger, so this stays on the strict side of the paper.
+
+    Index sets from state._event_ids_by_act_obj are treated as READ-ONLY —
+    every combination below builds a new set via `&` or `|`.
+    """
+    if nmax is None:
+        return False
+    bindings = getattr(constraint.scope, 'bindings', None) or (
+        (constraint.scope.object_type, constraint.scope.kind),)
+
+    eids_index = state._event_ids_by_act_obj
+
+    def _tgt_eids(oid: str):
+        return eids_index.get((target_activity, oid), _EMPTY_SET)
+
+    # filter^all / filter^any contribute the same restriction to every Each
+    # assignment, so they are folded once into `base`. None means "no
+    # restriction applied yet", which is different from an empty set.
+    base = None
+    each_groups: list = []
+
+    for obj_type, involvement in bindings:
+        if not obj_type:
+            continue
+        oids = _scope_ids(candidate, state, obj_type, scope_ids_cache)
+
+        if involvement == 'each':
+            if not oids:
+                # The universal quantifier ranges over obj^ot(e). With no
+                # objects of this type the product is empty and the bound holds
+                # vacuously — for any nmax, including 0.
+                return False
+            each_groups.append(oids)
+            continue
+
+        if involvement == 'any':
+            # filter^any: events involving at least one of these objects. With
+            # no objects that is the empty set, not the identity.
+            acc: set = set()
+            for oid in oids:
+                acc |= _tgt_eids(oid)
+        else:  # 'all'
+            # filter^all: events involving all of them. Over no objects this is
+            # the identity, so the binding adds no restriction.
+            if not oids:
+                continue
+            acc = None
+            for oid in oids:
+                s = _tgt_eids(oid)
+                acc = set(s) if acc is None else (acc & s)
+        base = acc if base is None else (base & acc)
+
+    if not each_groups:
+        if base is None:
+            # No object involvement at all. Not reachable from a parsed model —
+            # parse_ocdeclare_dict always populates scope.bindings — and the
+            # global-scope case is handled by the checkers themselves.
+            return False
+        return len(base) >= nmax
+
+    # Every joint count is a subset of `base`, so if `base` itself cannot reach
+    # the ceiling no assignment can either.
+    if base is not None and len(base) < nmax:
+        return False
+
+    for assignment in _product(*each_groups):
+        joint = base
+        for oid in assignment:
+            s = _tgt_eids(oid)
+            joint = s if joint is None else (joint & s)
+            if not joint:
+                break
+        if (len(joint) if joint is not None else 0) >= nmax:
+            return True
+    return False
+
+
 def check_response(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
     """Lazy response enforcement — only upper-bound (nmax) is enforced eagerly."""
     required_target = constraint.target_activity
     nmax = getattr(constraint, "nmax", None)
 
     if candidate.activity_name == required_target:
-        if nmax is not None:
-            scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-            if constraint.scope.kind == "each":
-                for oid in scope_ids:
-                    if _count_activity_for_object(state, required_target, oid) >= nmax:
-                        return False
-            elif constraint.scope.kind == "any":
-                # Block only if ALL scope objects have already reached nmax
-                if scope_ids and all(
-                    _count_activity_for_object(state, required_target, oid) >= nmax
-                    for oid in scope_ids
-                ):
-                    return False
-            elif constraint.scope.kind == "all":
-                # Block if any scope object has reached nmax
-                if any(
-                    _count_activity_for_object(state, required_target, oid) >= nmax
-                    for oid in scope_ids
-                ):
-                    return False
+        # Every binding, not just scope.object_type. A multi-type response
+        # constraint previously degraded to its primary type without warning:
+        # `Reschedule Container -> Depart` over {Container, Transport Document,
+        # Vehicle} was enforced on Container alone.
+        if _nmax_blocked(constraint, candidate, state, required_target, nmax, scope_ids_cache):
+            return False
         return True
 
     return True
@@ -250,13 +349,20 @@ def check_precedence(constraint: Any, candidate: Any, state: SimulationState, sc
     if candidate.activity_name != target:
         return True
 
-    # Multi-type binding: joint check across all object types in the binding
+    # Scope bindings — one or many object types, one path.
+    # parse_ocdeclare_dict populates bindings for single-type constraints too
+    # (length 1), so this runs for every discovered constraint and the
+    # kind-specific code further down is only reached by models that predate
+    # involvement_per_label.
     if constraint.scope.bindings:
-        qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source, cand_by_type_cache)
-        count = len(qualifying)
-        if nmin > 0 and count < nmin:
+        if nmin > 0:
+            qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source, cand_by_type_cache)
+            if len(qualifying) < nmin:
+                return False
+        # nmax was previously never evaluated on this path — see _nmax_blocked.
+        if _nmax_blocked(constraint, candidate, state, target, nmax, scope_ids_cache):
             return False
-        return count >= 1 if nmin > 0 else True
+        return True
 
     if constraint.scope.kind == "each":
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
@@ -610,9 +716,51 @@ def check_alternate_precedence(constraint: Any, candidate: Any, state: Simulatio
     return tgt_count < src_count
 
 
+# Constraint types whose checker resolves scope.bindings itself. Everything else
+# reads scope.object_type only, so the dispatcher splits multi-type constraints
+# for them — see check_constraint.
+_BINDING_AWARE_TYPES = frozenset({"precedence", "response"})
+
+
+def _single_binding_views(constraint: Any):
+    """Yield one constraint per scope binding, each scoped to a single type.
+
+    Used to give binding-unaware checkers multi-type coverage without rewriting
+    each of them. A multi-type OC-Declare arc requires all its bindings to hold,
+    so the dispatcher evaluates the checker once per binding and requires all to
+    pass.
+
+    APPROXIMATION, and worth stating where these results are reported: this
+    tests "for each binding there is a qualifying source event" whereas the true
+    joint semantics is "there is ONE source event qualifying under every binding
+    simultaneously". The former is weaker — different bindings may be satisfied
+    by different events. check_precedence and check_response implement the exact
+    joint test via _joint_scope_event_ids and are excluded from this path. For
+    the remaining types this is still strictly more correct than the previous
+    behaviour, which silently ignored every binding after the first.
+    """
+    import dataclasses
+    bindings = getattr(constraint.scope, "bindings", None) or ()
+    for obj_type, involvement in bindings:
+        scope_view = dataclasses.replace(
+            constraint.scope, kind=involvement, object_type=obj_type, bindings=()
+        )
+        yield dataclasses.replace(constraint, scope=scope_view)
+
+
 def check_constraint(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None,
                       cand_by_type_cache: dict | None = None) -> bool:
     kind = getattr(constraint, "constraint_type", None)
+    # Multi-type constraint on a checker that only reads scope.object_type:
+    # evaluate it once per binding and require all to hold. Without this the
+    # constraint is enforced on its primary object type alone, silently.
+    if kind not in _BINDING_AWARE_TYPES:
+        _bindings = getattr(constraint.scope, "bindings", None) or ()
+        if len(_bindings) > 1:
+            return all(
+                check_constraint(view, candidate, state, scope_ids_cache, cand_by_type_cache)
+                for view in _single_binding_views(constraint)
+            )
     if kind == "not_coexistence":
         return check_not_coexistence(constraint, candidate, state, scope_ids_cache)
     if kind == "response":

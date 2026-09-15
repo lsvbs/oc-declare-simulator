@@ -27,7 +27,7 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold, discover_wip_caps, discover_activity_concurrency, discover_interarrival_times
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold, discover_activity_concurrency, discover_interarrival_times, discover_activity_calendars, discover_object_transition_matrix, discover_creation_counts
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -52,48 +52,19 @@ METRICS_DIR.mkdir(parents=True, exist_ok=True)
 discovery_cache = {}
 
 
-def _merge_wip_caps(model_data, event_log_file):
-    """Attach work-in-progress caps to a loaded model, measured from the OCEL.
-
-    WIP caps are a simulation parameter, not part of OC-Declare — the model
-    file must stay identical to what the OCPQ-Converter produces, so nothing
-    writes them there. They are derived from the event log here, at simulation
-    setup, once both the OCEL and the OC-Declare model are loaded. This mirrors
-    how activity_durations is merged a few lines above.
-
-    Without them the caps dict is empty, which means "uncapped": admission
-    control is silently inert and the active-object set grows without bound.
-    Results are cached per event log since the measurement is a full sweep.
-
-    A model that already carries wip_caps (e.g. edited in the model editor) is
-    left untouched — explicit values always win.
-    """
-    if not isinstance(model_data, dict) or model_data.get('wip_caps'):
-        return model_data
-    if not event_log_file:
-        return model_data
-    cache_entry = discovery_cache.setdefault(event_log_file, {})
-    caps = cache_entry.get('wip_caps')
-    if caps is None:
-        log_path = EVENTLOG_DIR / event_log_file
-        if not log_path.exists():
-            return model_data
-        try:
-            caps = discover_wip_caps(load_ocel2(str(log_path)))
-        except Exception:
-            caps = {}
-        cache_entry['wip_caps'] = caps
-    if not caps:
-        return model_data
-    return {**model_data, 'wip_caps': caps}
-
-
 def _merge_pacing(model_data, event_log_file, time_distributions=None):
-    """Attach activity concurrency ceilings and inter-arrival distributions.
+    """Attach simulation parameters measured from the OCEL to a loaded model.
 
-    Both are simulation parameters measured from the OCEL, never written into
-    the OC-Declare model file, and merged here once the log and the model are
-    both loaded — the same contract as wip_caps and activity_durations.
+    Concurrency ceilings, inter-arrival distributions, availability calendars,
+    per-object transition probabilities and creation counts are all measured
+    from the OCEL, never written into the OC-Declare model file, and merged
+    here once the log and the model are both loaded — the same contract as
+    activity_durations.
+
+    creation_counts is how many NEW objects of each type one event of an
+    activity actually brings into existence, as an empirical distribution
+    (discover_creation_counts). build_candidate_for_activity samples it instead
+    of assuming a creating binding always produces min_count objects.
 
     Concurrency bounds state.in_progress. Objects are created when an activity
     *starts*, so an activity that starts faster than it completes creates
@@ -106,12 +77,20 @@ def _merge_pacing(model_data, event_log_file, time_distributions=None):
         return model_data
     need_conc = not model_data.get('activity_concurrency')
     need_iat = not model_data.get('interarrival_times')
-    if not need_conc and not need_iat:
+    need_cal = not model_data.get('activity_calendars')
+    need_otr = not model_data.get('object_transitions')
+    need_cre = not model_data.get('creation_counts')
+    if not need_conc and not need_iat and not need_cal and not need_otr and not need_cre:
         return model_data
     cache_entry = discovery_cache.setdefault(event_log_file, {})
     conc = cache_entry.get('activity_concurrency')
     iat = cache_entry.get('interarrival_times')
-    if (need_conc and conc is None) or (need_iat and iat is None):
+    cal = cache_entry.get('activity_calendars')
+    otr = cache_entry.get('object_transitions')
+    cre = cache_entry.get('creation_counts')
+    if ((need_conc and conc is None) or (need_iat and iat is None)
+            or (need_cal and cal is None) or (need_otr and otr is None)
+            or (need_cre and cre is None)):
         log_path = EVENTLOG_DIR / event_log_file
         if not log_path.exists():
             return model_data
@@ -123,14 +102,32 @@ def _merge_pacing(model_data, event_log_file, time_distributions=None):
             if need_iat and iat is None:
                 iat = discover_interarrival_times(ocel)
                 cache_entry['interarrival_times'] = iat
+            if need_cal and cal is None:
+                cal = discover_activity_calendars(ocel)
+                cache_entry['activity_calendars'] = cal
+            if need_otr and otr is None:
+                otr = discover_object_transition_matrix(ocel)
+                cache_entry['object_transitions'] = otr
+            if need_cre and cre is None:
+                cre = discover_creation_counts(ocel)
+                cache_entry['creation_counts'] = cre
         except Exception:
             conc = conc or {}
             iat = iat or {}
+            cal = cal or {}
+            otr = otr or {}
+            cre = cre or {}
     out = model_data
     if need_conc and conc:
         out = {**out, 'activity_concurrency': conc}
     if need_iat and iat:
         out = {**out, 'interarrival_times': iat}
+    if need_cal and cal:
+        out = {**out, 'activity_calendars': cal}
+    if need_otr and otr:
+        out = {**out, 'object_transitions': otr}
+    if need_cre and cre:
+        out = {**out, 'creation_counts': cre}
     return out
 
 # Active simulation runs: run_id -> {state, stop_event, thread, done}
@@ -1051,8 +1048,6 @@ def run_simulation():
             merged.update(existing)
             model_data = {**model_data, 'activity_durations': merged}
 
-        # Backfill WIP caps for models discovered before wip_caps existed
-        model_data = _merge_wip_caps(model_data, event_log_file)
         # Concurrency ceilings + inter-arrival pacing, measured from the OCEL
         model_data = _merge_pacing(model_data, event_log_file, time_distributions)
 
@@ -1175,6 +1170,35 @@ def run_simulation():
                 if oid in object_traces or len(object_traces) < _TRACE_CAP:
                     object_traces.setdefault(oid, []).append(event.activity_name)
 
+        # #28: per-object lifecycle timelines for the Results view. Capped for
+        # the same reason as object_traces — the full data lives on the state
+        # and in the saved OCEL file. Objects with the most status changes are
+        # kept first, since those are the interesting ones when diagnosing a run
+        # (an object that only shows 'created' tells you nothing).
+        _LIFECYCLE_CAP = 150
+        _lc_sorted = sorted(
+            final_state.objects.values(),
+            key=lambda o: (-len(getattr(o, 'timestamps', []) or []), o.object_id),
+        )
+        object_lifecycles = [
+            {
+                'object_id': o.object_id,
+                'object_type': o.object_type,
+                'active': o.active,
+                'entries': [
+                    {
+                        'timestamp': e.timestamp.isoformat() if e.timestamp else None,
+                        'lastupdate': e.lastupdate,
+                        'activity': e.activity,
+                        'status': e.status,
+                    }
+                    for e in (getattr(o, 'timestamps', []) or [])
+                ],
+            }
+            for o in _lc_sorted[:_LIFECYCLE_CAP]
+        ]
+        object_lifecycles_total = len(final_state.objects)
+
         # Object-type lookup: object_id → object_type
         object_types_map: dict[str, str] = {
             oid: obj.object_type
@@ -1244,6 +1268,8 @@ def run_simulation():
                     if oid in object_traces
                 },
                 'object_links': object_links,
+                'object_lifecycles': object_lifecycles,
+                'object_lifecycles_total': object_lifecycles_total,
                 'output_file': output_filename,
                 'metrics_file': metrics_filename,
                 # metrics intentionally omitted from inline response — can be very large
@@ -2774,8 +2800,6 @@ def _build_static_model_from_request(data):
         merged.update(existing)
         model_data = {**model_data, 'activity_durations': merged}
 
-    # Backfill WIP caps for models discovered before wip_caps existed
-    model_data = _merge_wip_caps(model_data, event_log_file)
     # Concurrency ceilings + inter-arrival pacing, measured from the OCEL
     model_data = _merge_pacing(model_data, event_log_file, time_distributions)
 

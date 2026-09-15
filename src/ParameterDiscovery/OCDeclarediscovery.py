@@ -41,7 +41,15 @@ def load_ocel2_xml(filename: str) -> Dict[str, Any]:
         attrs: Dict[str, Any] = {}
         for attr in obj.findall('./attributes/attribute'):
             attrs[attr.get('name', '')] = attr.text
-        objects[oid] = {'type': otype, 'attributes': attrs}
+        # Object-to-object relations, kept verbatim — this is the log's own
+        # statement of how objects relate, and discover_o2o_rules reads it
+        # rather than re-deriving relations from event co-participation.
+        rels = [
+            {'objectId': rel.get('object-id'), 'qualifier': rel.get('qualifier') or ''}
+            for rel in obj.findall('./objects/relationship')
+            if rel.get('object-id')
+        ]
+        objects[oid] = {'type': otype, 'attributes': attrs, 'relationships': rels}
 
     # ── events ──────────────────────────────────────────────────────────────
     events: Dict[str, Any] = {}
@@ -185,6 +193,9 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
                 objects_dict[oid] = {
                     'type':       obj.get('ocel:type', ''),
                     'attributes': obj.get('ocel:ovmap', {}),
+                    # OCEL 1.0 has no standard O2O section; carry it if present
+                    # so discover_o2o_rules sees a uniform shape.
+                    'relationships': obj.get('ocel:o2o', []) or [],
                 }
             global_log = data.get('ocel:global-log', {})
             raw_types   = global_log.get('ocel:object-types', [])
@@ -200,7 +211,13 @@ def load_ocel2(filename: str) -> Dict[str, Any]:
                 if obj_id:
                     objects_dict[obj_id] = {
                         'type': obj.get('type') or obj.get('ocel:type'),
-                        'attributes': obj.get('attributes', {})
+                        'attributes': obj.get('attributes', {}),
+                        # OCEL 2.0 object-to-object relations. Preserved rather
+                        # than dropped: discover_o2o_rules reads the log's own
+                        # relations instead of inferring them from which object
+                        # types happen to share an event.
+                        'relationships': obj.get('relationships')
+                                         or obj.get('ocel:o2o') or [],
                     }
             data['objects'] = objects_dict
 
@@ -505,6 +522,60 @@ def _count_df_dp(
     return 0
 
 
+def _occurrences_per_object(idx: Dict[str, Any], activity: str, obj_type: str) -> Dict[str, int]:
+    """object_id -> number of `activity` events that object took part in.
+
+    This is the quantity the simulator's nmin/nmax actually read — see
+    semantics.check_precedence, which counts events of an activity *per scope
+    object*. Discovery's counts_min/counts_max are a different thing: acceptance
+    thresholds on how many qualifying events exist per source event. Measuring
+    the enforced quantity directly is what keeps a discovered nmax and a
+    hand-set one meaning the same thing in the same field.
+    """
+    out: Dict[str, int] = {}
+    for eid in idx['events_by_activity'].get(activity, []):
+        for oid in idx['event_objs_by_type'].get(eid, {}).get(obj_type, []):
+            out[oid] = out.get(oid, 0) + 1
+    return out
+
+
+def _joint_occurrences(idx: Dict[str, Any], activity: str,
+                       each_types: List[str]) -> Dict[tuple, int]:
+    """assignment -> number of `activity` events involving every object in it.
+
+    The multi-type generalisation of _occurrences_per_object. An *assignment* is
+    one object per Each label — exactly what Definition 8's universal quantifier
+    ranges over::
+
+        for all o_1 in obj^ot1(e), ..., o_n in obj^otn(e):  n_min <= |f| <= n_max
+
+    and |f| is the size of a single JOINT event set, so the bound has to be
+    fitted to a joint count too. Measuring the primary label's marginal instead
+    fits the wrong quantity: a marginal is always >= the intersection, so the
+    fitted n_max comes out too permissive. On container_logistics that is
+    `Book Vehicles -> Depart`, fitted 3 from Transport Document where the true
+    joint maximum over (Transport Document, Vehicle) pairs is 1.
+
+    Reduces to _occurrences_per_object when there is exactly one Each label, so
+    single-label arcs keep their previous numbers exactly.
+
+    All/Any labels are deliberately not folded in. They narrow `f` further in
+    semantics._nmax_blocked, so leaving them out can only make the fitted
+    maximum larger than the enforced count — loose, never blocking something
+    the log permits.
+    """
+    from itertools import product as _iproduct
+    out: Dict[tuple, int] = {}
+    for eid in idx['events_by_activity'].get(activity, []):
+        by_type = idx['event_objs_by_type'].get(eid, {})
+        groups = [by_type.get(t) or () for t in each_types]
+        if any(not g for g in groups):
+            continue
+        for assignment in _iproduct(*groups):
+            out[assignment] = out.get(assignment, 0) + 1
+    return out
+
+
 def _check_arc(
     idx: Dict[str, Any],
     act_A: str,
@@ -514,10 +585,23 @@ def _check_arc(
     involvement: str,
     noise_threshold: float,
     counts_min: int = 1,
-    counts_max: Optional[int] = 20,
+    counts_max: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Check one OC-Declare arc (act_A → act_B, arc_type, obj_type, involvement).
+
+    counts_max defaults to None (unbounded), matching the paper: Section 5
+    discovers existence constraints with n_min = 1 and n_max = infinity. An
+    earlier undocumented default of 20 rejected any arc where a source event had
+    more than 20 qualifying target events, which silently removed six arcs the
+    OCPQ converter finds — every arc involving Forklift or Truck. Those objects
+    recur across thousands of events, so the single-type arc blew the cap, never
+    entered X, and the valid multi-type combination (e.g. {Container: each,
+    Forklift: each}) became unreachable because combine() can only merge arcs
+    already in X.
+
+    The per-scope-object nmin/nmax reported on the emitted arc are measured
+    separately (see the observed_counts block below) and are unaffected.
 
     involvement semantics mirror OCPQ/rust4pm OCDeclareArcLabel.get_bindings():
       'each' — one binding per T-object in source event; event violated if ANY fails.
@@ -634,6 +718,22 @@ def _check_arc(
     if support < 1.0 - noise_threshold:
         return None
 
+    # Observed per-scope-object occurrence counts for BOTH endpoints.
+    #
+    # counts_min/counts_max are acceptance thresholds (1 and unbounded) — they
+    # say what this call was willing to accept, not what the log contains. The
+    # arc used to publish them verbatim as its counts, so every discovered
+    # constraint reported nmin=1 because that was the parameter, and nmax=None
+    # even though counts_max had just been verified to hold. Both are now
+    # measured instead, from the quantity the simulator actually enforces:
+    # occurrences of an activity per scope object.
+    occ_A = _occurrences_per_object(idx, act_A, obj_type)
+    occ_B = _occurrences_per_object(idx, act_B, obj_type)
+    obs_min_A = min(occ_A.values()) if occ_A else counts_min
+    obs_max_A = max(occ_A.values()) if occ_A else None
+    obs_min_B = min(occ_B.values()) if occ_B else counts_min
+    obs_max_B = max(occ_B.values()) if occ_B else None
+
     return {
         'from':                  act_A,
         'to':                    act_B,
@@ -641,9 +741,29 @@ def _check_arc(
         'label':                 [obj_type],
         'involvement':           involvement,
         'involvement_per_label': {obj_type: involvement},
-        'counts':                [counts_min, None],
+        'counts':                [counts_min, None],   # legacy field, unused
+        # Per-endpoint observed occurrences per scope object. _arcs_to_deco_constraints
+        # maps these onto nmin/nmax according to which endpoint becomes source
+        # and which becomes target after the EP/DP swap.
+        'observed_counts': {
+            'from': [obs_min_A, obs_max_A],
+            'to':   [obs_min_B, obs_max_B],
+        },
         'support':               round(support, 4),
     }
+
+
+def _stricter_arrow_candidates(base: str, arc_types: Optional[List[str]]) -> List[str]:
+    """Arrow types to try, weakest-first, when escalating a discovered arc (Lemma 1).
+
+    AS ("exists sometime") is the least strict. EF/EP restrict the target events
+    to those after/before the source event; DF/DP restrict them further to the
+    directly-following/preceding one. Trying in this order and keeping the last
+    success yields the strictest satisfied arrow.
+    """
+    allowed = set(arc_types or ['EF', 'EP', 'AS'])
+    order = ['EF', 'DF', 'EP', 'DP']
+    return [a for a in order if a in allowed]
 
 
 def _get_stricter_arc_type(
@@ -743,7 +863,7 @@ def _check_arc_multi_type(
     bindings: List[Tuple[str, str]],
     noise_threshold: float,
     counts_min: int = 1,
-    counts_max: Optional[int] = 20,
+    counts_max: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check a multi-type OC-Declare arc (len(bindings) >= 2).
 
@@ -859,15 +979,25 @@ def _check_arc_multi_type(
             if cnt >= counts_min and (counts_max is None or cnt <= counts_max):
                 satisfied += 1
         else:
-            # Every combination of one object per multi-object-each type must find
-            # a qualifying B-event containing all assigned objects simultaneously.
+            # Definition 8: quantify over the Cartesian product of the Each-type
+            # objects, and for EVERY assignment require
+            #     n_min <= |f(E_L)| <= n_max
+            # where f intersects the qualifying target events of all assigned
+            # objects. This branch previously tested only `if not joint`, i.e.
+            # non-emptiness. That is equivalent to the bounds check for the
+            # counts Algorithm 1 discovers with (n_min = 1, n_max = infinity,
+            # Sec. 5) — so it was correct for mining — but this implementation
+            # also re-checks arcs under other bounds, notably the n_max = 20
+            # resource-like filter. With the bounds ignored, that filter was a
+            # silent no-op for any arc carrying a multi-object 'each' binding.
             from itertools import product as _iproduct
             ok = True
             for assignment in _iproduct(*multi_sets):
                 joint = joint_base
                 for obj_set in assignment:
                     joint = joint & obj_set
-                if not joint:
+                cnt = len(joint)
+                if cnt < counts_min or (counts_max is not None and cnt > counts_max):
                     ok = False
                     break
             if ok:
@@ -881,6 +1011,28 @@ def _check_arc_multi_type(
 
     ipl = {t: inv for t, inv in bindings}
     min_inv = min(bindings, key=lambda x: _involvement_strength(x[1]))[1]
+    # Observed counts, fitted to the JOINT quantity semantics._nmax_blocked
+    # enforces: one count per Each assignment, not one per object type. See
+    # _joint_occurrences. With a single Each label this is identical to the
+    # single-type path's _occurrences_per_object.
+    _each_types = [t for t, inv in bindings if inv == 'each']
+    if _each_types:
+        occ_A = _joint_occurrences(idx, act_A, _each_types)
+        occ_B = _joint_occurrences(idx, act_B, _each_types)
+    else:
+        # No Each label — the quantifier is empty and the count comes from the
+        # All/Any filters alone, which are per-event rather than per-assignment
+        # and so have no assignment to key on. Fall back to the first label's
+        # marginal, which bounds the joint count from above.
+        _primary_type = bindings[0][0] if bindings else None
+        occ_A = _occurrences_per_object(idx, act_A, _primary_type) if _primary_type else {}
+        occ_B = _occurrences_per_object(idx, act_B, _primary_type) if _primary_type else {}
+    observed = {
+        'from': [min(occ_A.values()) if occ_A else counts_min,
+                 max(occ_A.values()) if occ_A else None],
+        'to':   [min(occ_B.values()) if occ_B else counts_min,
+                 max(occ_B.values()) if occ_B else None],
+    }
     return {
         'from':                  act_A,
         'to':                    act_B,
@@ -888,9 +1040,82 @@ def _check_arc_multi_type(
         'label':                 list(obj_types),
         'involvement':           min_inv,
         'involvement_per_label': ipl,
-        'counts':                [counts_min, None],
+        'counts':                [counts_min, None],   # legacy field, unused
+        'observed_counts':       observed,
         'support':               round(support, 4),
     }
+
+
+# ── Algorithm 1 primitives (Kuesters & van der Aalst, OC-DECLARE, Sec. 5) ──────
+
+_INV_RANK = {'any': 0, 'each': 1, 'all': 2}
+
+
+def _arc_ipl(arc: Dict[str, Any]) -> Dict[str, str]:
+    """involvement_per_label for an arc, tolerating the single-type shape."""
+    ipl = arc.get('involvement_per_label')
+    if ipl:
+        return dict(ipl)
+    inv = arc.get('involvement', 'each')
+    return {t: inv for t in (arc.get('label') or [])}
+
+
+def _combine_involvements(ipl_a: Dict[str, str], ipl_b: Dict[str, str]) -> Dict[str, str]:
+    """combine(arc, arc') from Algorithm 1: union of object involvements,
+    preferring the stricter one where both arcs mention a type.
+
+    Strictness order is All > Each > Any, per Lemma 2: an arc holding with a type
+    in All also holds with it in Each, which in turn holds with it in Any.
+    """
+    out = dict(ipl_a)
+    for t, inv in ipl_b.items():
+        if t not in out or _INV_RANK.get(inv, 1) > _INV_RANK.get(out[t], 1):
+            out[t] = inv
+    return out
+
+
+def _is_preferred_over(arc_d: Dict[str, Any], arc_dprime: Dict[str, Any]) -> bool:
+    """D' <= D per Definition 10 — D is at least as preferred as D'.
+
+    Same source, target and arrow type, and every object type D' constrains is
+    constrained at least as strictly by D. Used by reduce() to drop arcs that
+    another arc already implies.
+    """
+    if (arc_d['from'] != arc_dprime['from']
+            or arc_d['to'] != arc_dprime['to']
+            or arc_d['arc_type'] != arc_dprime['arc_type']):
+        return False
+    ipl_d = _arc_ipl(arc_d)
+    ipl_p = _arc_ipl(arc_dprime)
+    for t, inv_p in ipl_p.items():
+        inv_d = ipl_d.get(t)
+        if inv_d is None or _INV_RANK.get(inv_d, 1) < _INV_RANK.get(inv_p, 1):
+            return False
+    return True
+
+
+def _reduce_implied(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """reduce(Arcs) from Algorithm 1 line 22: keep only arcs not implied by another.
+
+    Distinct from _lossless_reduction, which is OCPQ's transitive graph reduction
+    across activity pairs. This one is local to a single (source, target, arrow)
+    group and drops arcs strictly weaker than a sibling.
+    """
+    keep: List[Dict[str, Any]] = []
+    for i, a in enumerate(arcs):
+        dominated = False
+        for j, b in enumerate(arcs):
+            if i == j:
+                continue
+            if _is_preferred_over(b, a):
+                # b implies a; drop a unless they are mutually preferred and a
+                # came first (keeps exactly one of an equivalent pair)
+                if not _is_preferred_over(a, b) or j < i:
+                    dominated = True
+                    break
+        if not dominated:
+            keep.append(a)
+    return keep
 
 
 def _combine_to_multitype_arcs(
@@ -1117,6 +1342,23 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if not ctype:
             continue
         src, tgt = (B, A) if atype in ('EP', 'DP') else (A, B)
+        # nmin/nmax are read by the simulator as counts of the SOURCE and the
+        # TARGET activity per scope object respectively (semantics.check_precedence:
+        # nmin gates on _count_activity_for_object(source, oid); nmax blocks when
+        # _count_activity_for_object(target, oid) is reached). EP/DP swap which
+        # arc endpoint plays which role, so the observed counts must be swapped
+        # with them — otherwise a discovered nmax would bound the wrong activity.
+        obs = arc.get('observed_counts') or {}
+        _from_counts = obs.get('from') or [None, None]
+        _to_counts   = obs.get('to')   or [None, None]
+        if atype in ('EP', 'DP'):
+            src_counts, tgt_counts = _to_counts, _from_counts
+        else:
+            src_counts, tgt_counts = _from_counts, _to_counts
+        if src_counts[0] is not None:
+            nmin = src_counts[0]      # source must have occurred at least this often
+        if tgt_counts[1] is not None:
+            nmax = tgt_counts[1]      # target may occur at most this often
         inv = arc.get('involvement', 'each')
         ipl = arc.get('involvement_per_label', {obj_type: inv})
         constraints.append({
@@ -1152,7 +1394,8 @@ def _discover_kvaanda_arcs(
     noise_threshold: float = 0.2,
     arc_types: Optional[List[str]] = None,
     counts_min: int = 1,
-    counts_max: Optional[int] = 20,
+    counts_max: Optional[int] = None,
+    resource_filter_nmax: Optional[int] = 20,
     reduction: str = 'Lossless',
     refinement: bool = True,
     progress_callback=None,
@@ -1181,12 +1424,21 @@ def _discover_kvaanda_arcs(
     # Pre-compute which object types each activity's B-side has events for
     act_B_otypes: Dict[str, Set[str]] = {}
     for act in activities:
-        s: Set[str] = set()
+        st: Set[str] = set()
         for eid in idx['events_by_activity'].get(act, []):
-            s.update(idx['event_objs_by_type'].get(eid, {}).keys())
-        act_B_otypes[act] = s
+            st.update(idx['event_objs_by_type'].get(eid, {}).keys())
+        act_B_otypes[act] = st
 
-    _log(f"Arc mining: {len(activities)} activities × {len(object_types)} object types, noise threshold {noise_threshold}")
+    _log(f"Arc mining: {len(activities)} activities x {len(object_types)} object types, "
+         f"noise threshold {noise_threshold}")
+
+    # ── Algorithm 1 (Kuesters & van der Aalst, Sec. 5) ────────────────────────
+    # Run the involvement search once with the least strict arrow type, then
+    # escalate arrow types per discovered arc, as the paper prescribes: "the
+    # algorithm is executed once with ar = [AS], and for each discovered
+    # constraint, versions with stricter arrows are checked and added, removing
+    # the less strict versions, as per Lemma 1."
+    BASE_ARROW = 'AS'
 
     n_acts = len(activities)
     for i, act_A in enumerate(activities):
@@ -1194,54 +1446,141 @@ def _discover_kvaanda_arcs(
             progress_callback('Mining arcs', round(100 * i / n_acts) if n_acts else 100)
         _log(f"[{i+1}/{n_acts}] Checking act_A: {act_A}")
         for act_B in activities:
+            # X in Algorithm 1: every satisfied arc for this activity pair
+            X: List[Dict[str, Any]] = []
+
+            # Lines 4-13: per object type, try any -> each -> all, each only
+            # attempted when the laxer one holds (Lemma 2 makes that sound: a
+            # stricter involvement can only hold if the laxer one does). All
+            # satisfied arcs are kept, not just the strictest — combine() and
+            # reduce() below decide what survives.
             for obj_type in object_types:
                 if max_objs.get(act_A, {}).get(obj_type, 0) == 0:
                     continue
                 if obj_type not in act_B_otypes.get(act_B, set()):
                     continue
 
-                is_multiple = max_objs[act_A][obj_type] > 1
-
-                # Step 1: check 'any' with AS to see if this pair is viable at all
-                any_as = _check_arc(idx, act_A, act_B, 'AS', obj_type, 'any',
-                                    noise_threshold, counts_min, counts_max)
-                if any_as is None:
-                    continue
-
-                if is_multiple:
-                    involvements = ['any']
-                    each_as = _check_arc(idx, act_A, act_B, 'AS', obj_type, 'each',
-                                         noise_threshold, counts_min, counts_max)
-                    if each_as is not None:
-                        involvements.append('each')
+                # Involvements only differ when a source event can carry more
+                # than one object of this type. With exactly one, Any, Each and
+                # All correlate the same single object and are semantically
+                # identical — OCPQ reports 'each' for that case, and trying the
+                # stricter ones anyway makes them pass everywhere, after which
+                # reduce() keeps 'all' and the output degenerates (measured:
+                # 'all' on 35 labels, 3/35 agreement with the converter).
+                if max_objs.get(act_A, {}).get(obj_type, 0) > 1:
+                    ladder = ['any', 'each', 'all']
                 else:
-                    # When max objects per event == 1, 'any' and 'each' are equivalent;
-                    # OCPQ returns 'each' in this case.
-                    involvements = ['each']
+                    ladder = ['each']
 
-                # Step 2: escalate arc type for each viable involvement
-                for inv in involvements:
-                    arcs.extend(_get_stricter_arc_type(
-                        idx, act_A, act_B, obj_type, inv, arc_types,
-                        noise_threshold, counts_min, counts_max,
-                    ))
+                for inv in ladder:
+                    arc_inv = _check_arc(idx, act_A, act_B, BASE_ARROW, obj_type, inv,
+                                         noise_threshold, counts_min, counts_max)
+                    if arc_inv is None:
+                        # Lemma 2: a stricter involvement cannot hold once a
+                        # laxer one fails, so stop climbing this ladder.
+                        break
+                    X.append(arc_inv)
 
-    # Step 3: combine single-type arcs into multi-type arcs where possible
-    _log(f"Arc scan done — {len(arcs)} raw arcs found; merging multi-type arcs…")
-    arcs = _combine_to_multitype_arcs(arcs, idx, noise_threshold, counts_min, counts_max)
-    _log(f"After multi-type merge: {len(arcs)} arcs")
+            if not X:
+                continue
 
-    # Step 4: lossless reduction
+            # Lines 14-21: combine pairs until no new satisfied arc appears.
+            # Iterating to a fixpoint is what allows involvements over three or
+            # more object types to be found — a single pass can only ever reach
+            # pairs.
+            seen_ipls = {tuple(sorted(_arc_ipl(a).items())) for a in X}
+            while True:
+                Y: List[Dict[str, Any]] = []
+                for ia in range(len(X)):
+                    for ib in range(ia + 1, len(X)):
+                        merged = _combine_involvements(_arc_ipl(X[ia]), _arc_ipl(X[ib]))
+                        key = tuple(sorted(merged.items()))
+                        if key in seen_ipls:
+                            continue
+                        seen_ipls.add(key)
+                        if len(merged) == 1:
+                            t, inv = next(iter(merged.items()))
+                            cand = _check_arc(idx, act_A, act_B, BASE_ARROW, t, inv,
+                                              noise_threshold, counts_min, counts_max)
+                        else:
+                            cand = _check_arc_multi_type(
+                                idx, act_A, act_B, BASE_ARROW, list(merged.items()),
+                                noise_threshold, counts_min, counts_max)
+                        if cand is not None:
+                            Y.append(cand)
+                if not Y:
+                    break
+                X.extend(Y)
+
+            # Line 22: keep only arcs not implied by another in this group
+            arcs.extend(_reduce_implied(X))
+
+    _log(f"Arc scan done — {len(arcs)} arcs after combine + reduce")
+
+    # ── Resource-like filter (paper, Sec. 5 p.14 and Sec. 6 p.15) ─────────────
+    # "Uninteresting constraints, for example, involving only resource-like
+    #  object types (e.g., employee), can be removed by filtering the result of
+    #  Algorithm 1 before testing other arrow versions."   (Sec. 5)
+    # "Results which would not surpass the confidence threshold with a maximal
+    #  event count of n_max = 20 are removed to exclude undesirable entries
+    #  (e.g., only based on resource-like object types)."  (Sec. 6)
+    #
+    # The filter is a re-check of the already-discovered arc under n_max = 20,
+    # not a bound applied while mining. That distinction is the whole point:
+    # applying it during mining (as this code previously did, via counts_max=20
+    # threaded into _check_arc) rejects the single-type seeds for object types
+    # that recur across many events, and since combine() can only merge arcs
+    # already in X, valid joint involvements such as {Container: each,
+    # Forklift: each} then become unreachable. Six arcs the OCPQ converter finds
+    # were lost that way. Mining runs unbounded (n_max = infinity, per Sec. 5)
+    # and the bound is applied here, to the result.
+    #
+    # Note this removes arcs involving ONLY resource-like types while keeping
+    # mixed ones — an arc whose involvement also constrains a case object
+    # correlates a much smaller event set and stays within the bound.
+    if resource_filter_nmax is not None:
+        def _survives_resource_filter(arc: Dict[str, Any]) -> bool:
+            ipl = _arc_ipl(arc)
+            if len(ipl) == 1:
+                t, inv = next(iter(ipl.items()))
+                return _check_arc(idx, arc['from'], arc['to'], arc['arc_type'], t, inv,
+                                  noise_threshold, counts_min, resource_filter_nmax) is not None
+            return _check_arc_multi_type(idx, arc['from'], arc['to'], arc['arc_type'],
+                                         list(ipl.items()), noise_threshold, counts_min,
+                                         resource_filter_nmax) is not None
+
+        before = len(arcs)
+        arcs = [a for a in arcs if _survives_resource_filter(a)]
+        _log(f"After resource-like filter (n_max={resource_filter_nmax}): "
+             f"{len(arcs)} arcs ({before - len(arcs)} removed)")
+
+    # Arrow-type escalation (Lemma 1): replace each arc with its strictest
+    # satisfied arrow type, keeping its discovered object involvement.
+    escalated: List[Dict[str, Any]] = []
+    for arc in arcs:
+        ipl = _arc_ipl(arc)
+        best = arc
+        for atype in _stricter_arrow_candidates(arc['arc_type'], arc_types):
+            if len(ipl) == 1:
+                t, inv = next(iter(ipl.items()))
+                cand = _check_arc(idx, arc['from'], arc['to'], atype, t, inv,
+                                  noise_threshold, counts_min, counts_max)
+            else:
+                cand = _check_arc_multi_type(
+                    idx, arc['from'], arc['to'], atype, list(ipl.items()),
+                    noise_threshold, counts_min, counts_max)
+            if cand is not None:
+                best = cand
+        escalated.append(best)
+    arcs = escalated
+    _log(f"After arrow-type escalation: {len(arcs)} arcs")
+
+    # OCPQ's transitive lossless reduction — not part of Algorithm 1, retained
+    # because it is the converter's default and the reference output we compare
+    # against was produced with it enabled.
     if reduction == 'Lossless':
         arcs = _lossless_reduction(arcs)
         _log(f"After lossless reduction: {len(arcs)} arcs remain")
-
-    # Step 5: refinement then re-reduce
-    if refinement:
-        arcs = _refine_arcs(arcs, idx, noise_threshold, counts_min, counts_max)
-        if reduction == 'Lossless':
-            arcs = _lossless_reduction(arcs)
-        _log(f"After refinement + re-reduction: {len(arcs)} final arcs")
 
     return arcs
 
@@ -1431,12 +1770,18 @@ def discover_wip_caps(
     number of instances the real process ever had open at once — its
     work-in-progress (WIP) ceiling.
 
-    The simulator uses this as an admission-control cap: an activity that
-    would create an instance of a type already at its ceiling does not start
-    until an existing instance is deactivated. Without such a cap, any object
-    type whose consuming activity is starved grows without bound, which both
-    distorts the generated event mix and makes candidate generation quadratic
-    in the number of events.
+    NOT ENFORCED BY THE SIMULATOR. This was briefly used as an admission-control
+    cap and has been removed: how many objects of a type are alive at once is an
+    emergent quantity, not a rule. Containers peak at 102 in this log because
+    arrival rate times lifecycle duration equals that (L = lambda * W), not
+    because anything refused to create the 103rd. Capping it turned an output
+    into an input and masked an unbalanced model.
+
+    It survives as a VALIDATION measure: run the simulation, sweep the simulated
+    log the same way, and compare peaks against these. If the simulated peak
+    settles near the log's, the model balances on its own; if it grows without
+    bound, something upstream (arrival rate, starved consumer, selection) is
+    wrong — and that is the finding, not something to cap away.
 
     This is a *simulation parameter*, not part of the OC-Declare model, and is
     deliberately never written into the discovered model file — that file must
@@ -1690,6 +2035,163 @@ def discover_interarrival_times(ocel_log: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def discover_activity_calendars(
+    ocel_log: Dict[str, Any],
+    min_events_for_own_calendar: int = 500,   # kept for signature compatibility
+) -> Dict[str, Any]:
+    """Discover a probabilistic weekly availability calendar from the event log.
+
+    Follows the probabilistic-calendar approach of Lopez-Pintado & Dumas (ICPM
+    2023), used by SIMOD's resource-model stage: each weekly slot carries the
+    probability that work may start in it, rather than a crisp on/off boundary
+    that misfits both tails of a ramp (this log: 05:00 5.3%, 07:00 13.3%,
+    17:00 1.1%, 99.5% weekdays).
+
+    ESTIMATOR — availability, not demand. For each of the 168 weekly slots the
+    probability is the fraction of WEEKS in which any activity occurred in it.
+    Two earlier estimators were measured and rejected:
+
+      * per activity, normalised by that activity's busiest slot — measures how
+        *busy* a slot is, not whether work is possible in it. Used as a gate it
+        multiplies throughput by the mean probability: it refused 110,962 of
+        119,024 candidates (93%); 'Load Truck' was offered 66,374 times and
+        started 35.
+      * per activity, fraction of weeks used — still confounded. 'Register
+        Customer Order' fires ~9 times a week across 70 slots, so a slot-week is
+        empty 87% of the time because there was nothing to do, not because the
+        process was closed. Mean availability 0.130.
+
+    Pooling all activities removes the confound: a slot is available if ANY work
+    happened in it. Measured here: 0.800 mean availability weekdays 05:00-17:00,
+    0.08 Saturday, 0.02 Sunday.
+
+    DEVIATION FROM SIMOD: SIMOD derives one calendar per RESOURCE profile from
+    that resource's own events. OCEL 2.0 events carry no resource attribute —
+    container_logistics has none on any of its 35,372 events — so this is one
+    process-level calendar. Per-activity calendars were tried and abandoned for
+    the confound above: an activity's event times measure when it was *needed*;
+    only a resource's full history measures when it was *available*.
+
+    Returns:
+        {'slots_per_week': 168, 'global': [168 floats], 'per_activity': {},
+         'fallback_activities': [...], 'weeks_observed': int}
+        per_activity is intentionally empty — every activity uses the pooled
+        calendar through Simulator._calendar_for.
+    """
+    if isinstance(ocel_log, list):
+        return {}
+    by_act = _event_times_by_activity(ocel_log)
+    if not by_act:
+        return {}
+
+    SLOTS = 7 * 24
+    slot_weeks: Dict[int, Set] = defaultdict(set)
+    all_weeks: Set = set()
+    for times in by_act.values():
+        for t in times:
+            iso = t.isocalendar()
+            wk = (iso[0], iso[1])
+            all_weeks.add(wk)
+            slot_weeks[t.weekday() * 24 + t.hour].add(wk)
+
+    if not all_weeks:
+        return {}
+    n_weeks = len(all_weeks)
+    return {
+        'slots_per_week': SLOTS,
+        'global': [len(slot_weeks.get(s, ())) / n_weeks for s in range(SLOTS)],
+        'per_activity': {},
+        'fallback_activities': sorted(by_act.keys()),
+        'weeks_observed': n_weeks,
+    }
+
+def discover_object_transition_matrix(ocel_log: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-object-type directly-follows probabilities: P(next | type, last activity).
+
+    For each object, the ordered sequence of activities it took part in is read
+    off the log, and transitions are counted per object type. '<START>' is the
+    state of an object that has not yet participated in anything.
+
+    This replaces the global transition matrix as the basis for choosing between
+    candidates that compete for the same object. The global matrix conditions on
+    "the last event anywhere in the process", which across thousands of
+    interleaved objects is scheduling noise — it promoted 'Load Truck' 705 times
+    in a run where it fired 6. Conditioning on the object's own history instead
+    matches how OC-Declare scopes its constraints (each/Container is a statement
+    about that container) and is strongly predictive: measured on
+    container_logistics, the top choice is correct 93.9% of the time on held-out
+    data, from only 32 (type, last_activity) states across 7 object types.
+
+    Scoring uses the candidate's PRIMARY object only. Multiplying probabilities
+    across every participating object was measured as an alternative: the two
+    rules pick the same winner 99.4% of the time, and the product rule is worse
+    on log-loss (0.464 vs 0.163) because multiplying sub-1 probabilities thins
+    the true activity's score. It would become worth revisiting if object
+    attributes ever make two objects of the same type behave differently.
+
+    A simulation parameter, not part of OC-Declare: measured from the log and
+    merged at simulation setup, never written into the model file.
+
+    Returns:
+        {object_type: {last_activity: {next_activity: probability}}}
+    """
+    if isinstance(ocel_log, list):
+        return {}
+    events = ocel_log.get('events', {})
+    evlist = list(events.values()) if isinstance(events, dict) else (events or [])
+    objects = ocel_log.get('objects', {})
+
+    from datetime import datetime
+
+    def _parse_ts(raw):
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw
+        try:
+            return datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        except Exception:
+            return None
+
+    rows = []
+    for ev in evlist:
+        act = (ev.get('activity') or ev.get('type') or ev.get('ocel:activity') or '')
+        t = _parse_ts(ev.get('timestamp') or ev.get('ocel:timestamp') or ev.get('time'))
+        if not act or t is None:
+            continue
+        omap = ev.get('omap') or []
+        if not omap:
+            omap = [r.get('objectId', r) if isinstance(r, dict) else r
+                    for r in (ev.get('relationships') or [])]
+        rows.append((t, act, omap))
+    rows.sort(key=lambda r: r[0])
+
+    obj_seq: Dict[str, List[str]] = defaultdict(list)
+    for _t, act, omap in rows:
+        for oid in omap:
+            obj_seq[oid].append(act)
+
+    counts: Dict[str, Dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+    for oid, seq in obj_seq.items():
+        od = objects.get(oid)
+        ot = od.get('type') if isinstance(od, dict) else None
+        if not ot:
+            continue
+        prev = '<START>'
+        for act in seq:
+            counts[ot][prev][act] += 1
+            prev = act
+
+    out: Dict[str, Any] = {}
+    for ot, by_last in counts.items():
+        out[ot] = {}
+        for last, cnt in by_last.items():
+            total = sum(cnt.values())
+            if total:
+                out[ot][last] = {a: c / total for a, c in cnt.items()}
+    return out
+
+
 def suggest_permanent_object_threshold(ocel_log: Dict[str, Any]) -> Optional[float]:
     """Suggest a threshold for permanent object classification via gap detection.
 
@@ -1853,6 +2355,83 @@ def discover_start_activities(
     return result
 
 
+def discover_creation_counts(ocel_log: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, int]]]:
+    """How many objects of each type an activity actually brings into existence.
+
+    An object counts as created by the first event it appears in — the same
+    first-appearance rule discover_object_lifecycle uses to set the ``creates``
+    flag. The result is the empirical distribution, per (activity, object
+    type), of how many *new* objects a single event introduced::
+
+        {activity: {object_type: {"3": 154, "4": 132, ...}}}
+
+    This is deliberately separate from ObjectBinding.min_count/max_count, which
+    discover_object_bindings measures as the number of objects of that type
+    *present* in the event. For a creating binding those are different
+    quantities, and on container_logistics they disagree sharply:
+
+        Order Empty Containers / Container   present 1-5, created 1-5 (identical)
+        Book Vehicles / Vehicle              present 0-2, created 0 in 79% of events
+        Load Truck / Truck                   present 1,   created 0 in 10547 of 10553
+
+    Collapsing both into one number is what made the engine create min_count
+    objects and then top the event up to max_count with unrelated existing
+    ones — see the output-binding branch of build_candidate_for_activity.
+
+    Counts of 0 are recorded deliberately: they are how the log states "this
+    event re-used objects that already existed", which is the normal case for
+    Truck and Forklift and the reason the engine must not assume a creating
+    binding always creates.
+
+    Returns an empty dict for logs with no usable timestamps or objects.
+    """
+    if isinstance(ocel_log, list):
+        return {}
+
+    events = ocel_log.get('events', {}) or {}
+    objects = ocel_log.get('objects', {}) or {}
+
+    ordered = sorted(
+        ((ed.get('timestamp') or '', eid, ed) for eid, ed in events.items()),
+        key=lambda t: (t[0], t[1]),
+    )
+
+    seen: set = set()
+    counts: Dict[str, Dict[str, Dict[str, int]]] = defaultdict(lambda: defaultdict(Counter))
+
+    for _ts, _eid, event_data in ordered:
+        activity = event_data.get('activity')
+        if not activity:
+            continue
+        object_ids = event_data.get('omap', []) or event_data.get('relationships', [])
+
+        per_type_total: Dict[str, int] = defaultdict(int)
+        per_type_new: Dict[str, int] = defaultdict(int)
+        for obj_id in object_ids:
+            obj_type = (objects.get(obj_id) or {}).get('type')
+            if not obj_type:
+                continue
+            per_type_total[obj_type] += 1
+            if obj_id not in seen:
+                per_type_new[obj_type] += 1
+
+        for obj_type in per_type_total:
+            counts[activity][obj_type][str(per_type_new.get(obj_type, 0))] += 1
+
+        for obj_id in object_ids:
+            seen.add(obj_id)
+
+    # Drop (activity, type) pairs that never create anything — those bindings
+    # are pure inputs and the engine reads min_count/max_count for them.
+    out: Dict[str, Dict[str, Dict[str, int]]] = {}
+    for activity, by_type in counts.items():
+        kept = {ot: dict(dist) for ot, dist in by_type.items()
+                if any(int(k) > 0 for k in dist)}
+        if kept:
+            out[activity] = kept
+    return out
+
+
 def discover_object_bindings(ocel_log: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Discover which object types each activity interacts with and cardinality.
     
@@ -1919,46 +2498,112 @@ def discover_object_bindings(ocel_log: Dict[str, Any]) -> Dict[str, Dict[str, An
     return bindings
 
 
+def _declared_o2o_links(objects: Dict[str, Any]):
+    """Object-to-object links exactly as the log declares them.
+
+    Reads each object's own ``relationships`` list (OCEL 2.0's O2O section,
+    preserved by the loaders above) — NOT event co-participation.
+
+    Both directions of every declared relation are recorded. A relation is a
+    single fact about two objects, and SimulationState.add_link stores links
+    undirected (it indexes both endpoints), so the cardinality of a pair is
+    meaningful read either way: "TR loads CR" appears 1997 times over 6 trucks,
+    which says both "a truck loads 323-337 containers" and "a container is
+    loaded by 1 truck". Emitting only the declared direction would leave the
+    second fact — the one that actually constrains containers — unstated.
+
+    Same-type relations are skipped: O2ORule is keyed on a type pair and the
+    engine has no way to express a rule whose two sides are the same type.
+
+    Returns (links, n_relations) where links maps
+    (source_type, target_type) -> {source_object_id: {target_object_id, ...}}.
+    """
+    links = defaultdict(lambda: defaultdict(set))
+    qualifiers = defaultdict(set)
+    n_relations = 0
+
+    for src_id, src in (objects or {}).items():
+        src_type = (src or {}).get('type')
+        if not src_type:
+            continue
+        for rel in ((src or {}).get('relationships') or ()):
+            if isinstance(rel, dict):
+                tgt_id = (rel.get('objectId') or rel.get('ocel:oid')
+                          or rel.get('object-id') or rel.get('targetId'))
+                qual = rel.get('qualifier') or ''
+            else:
+                tgt_id, qual = rel, ''
+            if not tgt_id or tgt_id == src_id:
+                continue
+            tgt_type = (objects.get(tgt_id) or {}).get('type')
+            if not tgt_type or tgt_type == src_type:
+                continue
+            n_relations += 1
+            links[(src_type, tgt_type)][src_id].add(tgt_id)
+            links[(tgt_type, src_type)][tgt_id].add(src_id)
+            if qual:
+                qualifiers[(src_type, tgt_type)].add(qual)
+                qualifiers[(tgt_type, src_type)].add(qual)
+
+    return links, qualifiers, n_relations
+
+
 def discover_o2o_rules(ocel_log: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Discover object-to-object relationship rules.
-    
+    """Read object-to-object relationship rules from the log's O2O section.
+
+    The cardinalities come from the relations the log itself declares between
+    objects. They are NOT inferred from which object types share an event.
+
+    That distinction matters. Co-participation answers "were these two objects
+    in the same event", which is a different question from "are these two
+    objects related", and on container_logistics the two disagree badly: the
+    log declares 15,920 relations over 7 type pairs, while co-participation
+    produced 17 pairs, 13 of which the log never states. Some were simply
+    wrong — the log says a Container belongs to exactly one Transport Document
+    (1..1), co-participation said 1..13, because ``Depart`` puts a container in
+    one event alongside up to 13 documents. Those invented ceilings are then
+    enforced by check_o2o_rules and silently block activities.
+
+    A log with no O2O section yields no rules. That is the honest answer: the
+    log states no object relations, so none are enforced.
+
     Args:
         ocel_log: OCEL 2.0 log dictionary
-        
+
     Returns:
         List of O2O rules with cardinality constraints
     """
     # Handle simple list format - no O2O rules for simple lists
     if isinstance(ocel_log, list):
         return []
-    
-    events = ocel_log.get('events', {})
+
     objects = ocel_log.get('objects', {})
-    
-    # Track which object types co-occur in events
-    o2o_links = defaultdict(lambda: defaultdict(set))
-    
-    for event_data in events.values():
-        object_ids = event_data.get('omap', []) or event_data.get('relationships', [])
-        
-        # Find all pairs of different object types in this event
-        for obj1_id in object_ids:
-            obj1_type = objects.get(obj1_id, {}).get('type')
-            if not obj1_type:
-                continue
-            
-            for obj2_id in object_ids:
-                if obj1_id == obj2_id:
-                    continue
-                
-                obj2_type = objects.get(obj2_id, {}).get('type')
-                if not obj2_type or obj1_type == obj2_type:
-                    continue
-                
-                # Record link
-                o2o_links[(obj1_type, obj2_type)][obj1_id].add(obj2_id)
-    
+
+    o2o_links, o2o_qualifiers, _n_relations = _declared_o2o_links(objects)
+    if not o2o_links:
+        return []
+
     # Calculate cardinality for each directed pair, then decide bidirectionality
+    def _rule(src, tgt, lo, hi, bidirectional):
+        # max_links is the largest number of distinct partners of `tgt` that any
+        # single `src` object actually has in the log. No ceiling heuristic is
+        # applied: the observed maximum IS what the log says, and capping large
+        # values to "unbounded" would be another inference of the kind this
+        # function exists to avoid.
+        r = {
+            'source_type': src,
+            'target_type': tgt,
+            'min_links': lo,
+            'max_links': hi,
+            'bidirectional': bidirectional,
+        }
+        quals = sorted(o2o_qualifiers.get((src, tgt), ()))
+        if quals:
+            # Provenance only — O2ORule has no qualifier field, so the rule is
+            # the aggregate over all qualifiers joining this type pair.
+            r['qualifiers'] = quals
+        return r
+
     o2o_rules = []
     processed_pairs = set()
 
@@ -1971,50 +2616,26 @@ def discover_o2o_rules(ocel_log: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not fwd_cards:
             continue
 
-        fwd_min = min(fwd_cards)
-        fwd_max = max(fwd_cards)
+        fwd_min, fwd_max = min(fwd_cards), max(fwd_cards)
 
         rev_links = o2o_links.get((type2, type1), {})
         rev_cards = [len(linked_objs) for linked_objs in rev_links.values()]
 
-        if rev_cards:
-            rev_min = min(rev_cards)
-            rev_max = max(rev_cards)
+        if not rev_cards:
+            # Unreachable while _declared_o2o_links records both directions;
+            # kept so a caller passing a one-directional link map still works.
+            o2o_rules.append(_rule(type1, type2, fwd_min, fwd_max, False))
+            continue
 
-            if fwd_max == rev_max and fwd_min == rev_min:
-                # Symmetric: one bidirectional rule with the shared cardinality
-                o2o_rules.append({
-                    'source_type': type1,
-                    'target_type': type2,
-                    'min_links': fwd_min,
-                    'max_links': fwd_max if fwd_max < 100 else None,
-                    'bidirectional': True,
-                })
-            else:
-                # Asymmetric: two separate unidirectional rules
-                o2o_rules.append({
-                    'source_type': type1,
-                    'target_type': type2,
-                    'min_links': fwd_min,
-                    'max_links': fwd_max if fwd_max < 100 else None,
-                    'bidirectional': False,
-                })
-                o2o_rules.append({
-                    'source_type': type2,
-                    'target_type': type1,
-                    'min_links': rev_min,
-                    'max_links': rev_max if rev_max < 100 else None,
-                    'bidirectional': False,
-                })
+        rev_min, rev_max = min(rev_cards), max(rev_cards)
+
+        if fwd_min == rev_min and fwd_max == rev_max:
+            # Symmetric: one bidirectional rule with the shared cardinality
+            o2o_rules.append(_rule(type1, type2, fwd_min, fwd_max, True))
         else:
-            # No reverse links observed — unidirectional rule
-            o2o_rules.append({
-                'source_type': type1,
-                'target_type': type2,
-                'min_links': fwd_min,
-                'max_links': fwd_max if fwd_max < 100 else None,
-                'bidirectional': False,
-            })
+            # Asymmetric: two separate unidirectional rules
+            o2o_rules.append(_rule(type1, type2, fwd_min, fwd_max, False))
+            o2o_rules.append(_rule(type2, type1, rev_min, rev_max, False))
 
     return o2o_rules
 
@@ -2130,7 +2751,7 @@ def discover_ocdeclare_model(
             noise_threshold=noise_threshold,
             arc_types=arc_types,
             counts_min=1,
-            counts_max=20,
+            counts_max=None,
             reduction=reduction,
             refinement=True,
             progress_callback=lambda phase, pct: _cb(phase, 10 + int(pct * 0.8)),
@@ -2141,9 +2762,13 @@ def discover_ocdeclare_model(
 
     # Discover O2O rules
     _cb('Discovering O2O rules', 92)
-    _log("Discovering object-to-object (O2O) relationship rules…")
+    _log("Reading object-to-object (O2O) relationship rules from the log…")
     o2o_rules = discover_o2o_rules(ocel_log)
-    _log(f"Found {len(o2o_rules)} O2O rules")
+    if o2o_rules:
+        _log(f"Found {len(o2o_rules)} O2O rules")
+    else:
+        _log("Found 0 O2O rules — this log declares no object-to-object "
+             "relations, so none are enforced")
 
     # Classify resource object types (high events-per-instance ratio)
     _cb('Classifying object types', 94)
