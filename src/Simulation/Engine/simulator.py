@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import time as _time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import product as _iproduct
@@ -166,6 +167,11 @@ class Simulator:
 
         # Optional stop signal: caller sets this threading.Event to request early stop.
         self.stop_event = stop_event
+
+        # Wall-clock budget bookkeeping (config.max_runtime_s). Set in run_des;
+        # declared here so _should_stop can read them on any code path.
+        self._run_started_at: Optional[float] = None
+        self._stopped_by_runtime: bool = False
 
         # Transition matrix used to probabilistically gate no-input start activities
         # in DES mode (prevents them from firing every single step unconditionally).
@@ -717,6 +723,16 @@ class Simulator:
         return False
 
     def _should_stop(self, state: SimulationState) -> bool:
+        # Wall-clock limit — real seconds spent running, not simulated time.
+        # Checked first and unconditionally: its whole purpose is to cap how
+        # long you wait, so it must fire even when the run is grinding without
+        # recording events (last_generated_timestamp still None, step_count
+        # still 0). _run_started_at is set at the top of run_des.
+        max_rt = getattr(self.config, 'max_runtime_s', None)
+        if max_rt is not None and self._run_started_at is not None:
+            if (_time.monotonic() - self._run_started_at) >= max_rt:
+                self._stopped_by_runtime = True
+                return True
         # Time-based limit (primary)
         max_time = getattr(self.config, 'max_sim_time_s', None)
         if max_time is not None and state.last_generated_timestamp is not None:
@@ -1913,6 +1929,11 @@ class Simulator:
         """
         if state is None:
             state = SimulationState()
+
+        # Wall-clock baseline for max_runtime_s. monotonic(), not time(): a
+        # clock adjustment mid-run must not shorten or extend the budget.
+        self._run_started_at = _time.monotonic()
+        self._stopped_by_runtime = False
 
         state._start_activity_names = self._start_names_set
         # [resource/permanent-object handling — disabled, kept for reference]

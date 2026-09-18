@@ -193,15 +193,24 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             bindings=bindings,
             event_attributes=tuple(a.get("event_attributes") or ()),
         ))
+    # Whether `constraints` are stored in ARC orientation (from = the arc's
+    # source s, to = its target t, as the paper and the OCPQ converter write
+    # them) or already pre-swapped into the engine's source/target roles.
+    # Discovery stamps the marker; the model editor and older files do not.
+    arc_oriented = (data.get("constraint_orientation") == "arc")
+
     # Constraints
     constraints = []
     for c in data.get("constraints", []) or []:
         ctype = c.get("type") or c.get("constraint_type")
-        # Accept all key styles: discovered models use source/target (and also
-        # carry source_activity/target_activity); the model editor emits only
-        # source_activity/target_activity; hand-written arc lists may use a/b.
-        source = c.get("source") or c.get("source_activity") or c.get("a")
-        target = c.get("target") or c.get("target_activity") or c.get("b")
+        # Accept all key styles: arc-oriented models use from/to; the model
+        # editor emits source_activity/target_activity; older discovered models
+        # carry source/target pre-swapped; hand-written arc lists may use a/b.
+        if arc_oriented and c.get("from") and c.get("to"):
+            source, target = c["from"], c["to"]
+        else:
+            source = c.get("source") or c.get("source_activity") or c.get("a")
+            target = c.get("target") or c.get("target_activity") or c.get("b")
         scope = c.get("scope") or {}
         ipl = scope.get("involvement_per_label") or c.get("involvement_per_label") or {}
         if ipl:
@@ -214,6 +223,37 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
             primary_kind = scope.get("kind", "each")
         if not ctype or not source or not target:
             continue
+
+        # ── Orientation: the EP/DP endpoint swap lives HERE, not in discovery ──
+        # An OC-DECLARE tuple (ar, s, t, ...) reads "from s, arrow ar, to t".
+        # For EP that means "every s is eventually preceded by a t", so t is the
+        # earlier activity. The engine's `precedence` reads the other way round —
+        # "source must appear before target" — so the endpoints have to flip.
+        # parse_ocdeclare_list has always done this for the arc-list format;
+        # doing it here too means both formats converge on engine orientation at
+        # the adapter boundary, and the file on disk stays comparable to what the
+        # OCPQ converter writes.
+        arc_type = c.get("arc_type")
+        if arc_oriented:
+            if ctype in {"precedence", "direct_precedence", "chain_precedence"} \
+                    or arc_type in {"EP", "DP"}:
+                source, target = target, source
+
+        # Engine nmin/nmax from the arc's per-endpoint measurements. nmin gates
+        # on occurrences of the SOURCE activity and nmax bounds the TARGET
+        # (semantics.check_precedence / _nmax_blocked), so the endpoint-keyed
+        # observed_counts must follow the same flip applied above.
+        if arc_oriented and c.get("observed_counts"):
+            _obs  = c["observed_counts"] or {}
+            _from = _obs.get("from") or [None, None]
+            _to   = _obs.get("to")   or [None, None]
+            _src_counts, _tgt_counts = ((_to, _from) if arc_type in ("EP", "DP")
+                                        else (_from, _to))
+            if c.get("nmin") is None and _src_counts[0] is not None:
+                c = {**c, "nmin": _src_counts[0]}
+            if c.get("nmax") is None and _tgt_counts[1] is not None:
+                c = {**c, "nmax": _tgt_counts[1]}
+
         # Cardinality bounds (OC-DECLARE). For precedence/chain_precedence/
         # chain_response, nmin=1 is the correct DECLARE default — it means
         # "the source must have occurred at least once before the target".

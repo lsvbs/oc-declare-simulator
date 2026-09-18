@@ -1133,6 +1133,134 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
   );
 }
 
+// ── normalizeModelOrientation ─────────────────────────────────────────────────
+// Discovered models are stored in ARC orientation: `from` is the OC-DECLARE
+// arc's source s and `to` its target t, exactly as the paper and the OCPQ
+// converter write them. The engine reads `precedence` the other way round —
+// "source must appear before target" — so EP/DP arcs have their endpoints
+// swapped when they cross into engine-facing code.
+//
+// That swap used to happen inside discovery, which meant the file on disk
+// carried arc_type: "EP" next to already-flipped activities and could not be
+// compared to OCPQ without undoing it first. It now happens in the adapters:
+// parse_ocdeclare_dict on the Python side, and this function here, so that the
+// ~117 places in this file that read source_activity/target_activity keep
+// working untouched.
+//
+// Applied once as a model enters state. The marker is dropped on the way out,
+// so the normalised model can be POSTed back as modelOverride without the
+// backend applying the swap a second time.
+function normalizeModelOrientation(model) {
+  if (!model || Array.isArray(model) || model.constraint_orientation !== 'arc') return model;
+
+  const constraints = (model.constraints || []).map(c => {
+    const arc = c.arc_type;
+    const flip = arc === 'EP' || arc === 'DP';
+    const source = flip ? c.to   : c.from;
+    const target = flip ? c.from : c.to;
+
+    // nmin gates on occurrences of the SOURCE activity, nmax bounds the TARGET,
+    // so the endpoint-keyed observed_counts follow the same flip.
+    const obs  = c.observed_counts || {};
+    const from = obs.from || [null, null];
+    const to   = obs.to   || [null, null];
+    const [srcCounts, tgtCounts] = flip ? [to, from] : [from, to];
+
+    return {
+      ...c,
+      source_activity: source, target_activity: target,
+      source: source,          target: target,
+      nmin: c.nmin != null ? c.nmin : (srcCounts[0] != null ? srcCounts[0] : 1),
+      nmax: c.nmax != null ? c.nmax : (tgtCounts[1] != null ? tgtCounts[1] : null),
+    };
+  });
+
+  const { constraint_orientation, ...rest } = model;
+  return { ...rest, constraints };
+}
+
+// ── SimThroughputChart ────────────────────────────────────────────────────────
+// Live wall-clock throughput of the running simulation: events produced per
+// second and objects created per second (left axis, lines), against cumulative
+// events (right axis, filled area). Samples come from the 1s status poll.
+//
+// Wall-clock, not simulated time — this answers "how fast is the simulator
+// going", which is the question when a run is grinding. Simulated-time density
+// (events per simulated day) is a different measure and lives in the results.
+//
+// Pure SVG, no chart library: three series over a few hundred points does not
+// justify a dependency, and the surrounding app ships no charting runtime.
+function SimThroughputChart({ samples }) {
+  if (!samples || samples.length < 2) {
+    return (
+      <div className="tp-chart tp-chart--empty">
+        <span className="tp-dev">[DEV]</span>
+        Collecting throughput… (first points appear after ~2s)
+      </div>
+    );
+  }
+
+  const W = 560, H = 150;
+  const P = { t: 10, r: 46, b: 20, l: 42 };
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+
+  // Stride to at most ~240 drawn points so a long run stays cheap to render
+  // and the line stays readable. The newest sample is always kept.
+  const stride = Math.max(1, Math.ceil(samples.length / 240));
+  const pts = samples.filter((_, i) => i % stride === 0 || i === samples.length - 1);
+
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const span = Math.max(t1 - t0, 1e-6);
+  const rateMax = Math.max(1, ...pts.map(p => Math.max(p.ev, p.ob)));
+  const cumMax  = Math.max(1, ...pts.map(p => p.cum));
+
+  const x    = p => P.l + ((p.t - t0) / span) * iw;
+  const yR   = v => P.t + ih - (v / rateMax) * ih;   // left axis: rates
+  const yC   = v => P.t + ih - (v / cumMax)  * ih;   // right axis: cumulative
+  const line = (acc, sel) => pts.map((p, i) => `${i ? 'L' : 'M'}${x(p).toFixed(1)},${acc(sel(p)).toFixed(1)}`).join(' ');
+
+  const areaPath =
+    `M${x(pts[0]).toFixed(1)},${(P.t + ih).toFixed(1)} ` +
+    pts.map(p => `L${x(p).toFixed(1)},${yC(p.cum).toFixed(1)}`).join(' ') +
+    ` L${x(pts[pts.length - 1]).toFixed(1)},${(P.t + ih).toFixed(1)} Z`;
+
+  const last = samples[samples.length - 1];
+  const fmtRate = v => v >= 100 ? Math.round(v) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  const fmtDur  = s => s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, '0')}`;
+
+  return (
+    <div className="tp-chart">
+      <div className="tp-dev">[DEV]</div>
+      <div className="tp-legend">
+        <span className="tp-key tp-key--ev"><i></i>events/s <b>{fmtRate(last.ev)}</b></span>
+        <span className="tp-key tp-key--ob"><i></i>objects/s <b>{fmtRate(last.ob)}</b></span>
+        <span className="tp-key tp-key--cum"><i></i>total events <b>{last.cum.toLocaleString()}</b></span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="tp-svg" role="img"
+           aria-label={`Throughput: ${fmtRate(last.ev)} events per second, ${fmtRate(last.ob)} objects per second, ${last.cum} events total`}>
+        {/* horizontal guides at 0 / 50% / 100% of the rate axis */}
+        {[0, 0.5, 1].map(f => (
+          <line key={f} className="tp-grid"
+                x1={P.l} x2={P.l + iw} y1={yR(rateMax * f)} y2={yR(rateMax * f)} />
+        ))}
+        <path className="tp-area" d={areaPath} />
+        <path className="tp-line tp-line--cum" d={line(yC, p => p.cum)} />
+        <path className="tp-line tp-line--ob"  d={line(yR, p => p.ob)} />
+        <path className="tp-line tp-line--ev"  d={line(yR, p => p.ev)} />
+
+        {/* left axis — rate */}
+        <text className="tp-tick" x={P.l - 6} y={yR(rateMax) + 4} textAnchor="end">{fmtRate(rateMax)}</text>
+        <text className="tp-tick" x={P.l - 6} y={yR(0) + 4} textAnchor="end">0</text>
+        {/* right axis — cumulative */}
+        <text className="tp-tick tp-tick--cum" x={P.l + iw + 6} y={yC(cumMax) + 4}>{cumMax.toLocaleString()}</text>
+        {/* x axis — elapsed wall time */}
+        <text className="tp-tick" x={P.l} y={H - 6}>{fmtDur(t0)}</text>
+        <text className="tp-tick" x={P.l + iw} y={H - 6} textAnchor="end">{fmtDur(t1)}</text>
+      </svg>
+    </div>
+  );
+}
+
 // ── ObjectTimelines (#28) ─────────────────────────────────────────────────────
 // Per-object lifecycle log from the run: every status change with its timestamp,
 // the activity involved, and the resulting status. The idle gap between one
@@ -7382,6 +7510,7 @@ function App() {
     useTraceLimit: false,
     maxTraces: '',
     maxCases: '',
+    maxRuntimeValue: '',          // wall-clock budget in MINUTES; '' disables it
     seed: 42,
     startActivities: [],
     startActivitiesLocked: false, // true once user explicitly toggles ★
@@ -7397,6 +7526,18 @@ function App() {
   const [liveObligations,     setLiveObligations]     = useState(null);
   const [liveDeactivPerStep,  setLiveDeactivPerStep]  = useState(null);
   const [liveObligFulfilledPerStep, setLiveObligFulfilledPerStep] = useState(null);
+  // Live throughput samples, one per status poll (~1s):
+  //   { t, ev, ob, cum } = elapsed wall seconds, events/s, objects created/s,
+  //   cumulative events. Rates are WALL-clock — this measures how fast the
+  //   simulator is running, not how dense the simulated process is.
+  //   objects_count is len(state.objects), which is never shrunk (deactivation
+  //   only flips obj.active), so its delta is genuinely objects created.
+  const [throughput, setThroughput] = useState([]);
+  const throughputRef = useRef({ startMs: null, lastMs: null, lastEvents: 0, lastObjects: 0 });
+  // Per-start-activity firing progress, shown only for activities that were
+  // given a cap: { activity: {fired, cap} }. Sourced from the run's own
+  // _start_event_count_by_activity, the same counter the cap is enforced on.
+  const [liveStartCaps, setLiveStartCaps] = useState(null);
   const [activeRunId,   setActiveRunId]   = useState(null);
   const [simElapsed,    setSimElapsed]    = useState(null); // seconds elapsed during last run
   const [lastRunDuration, setLastRunDuration] = useState(null); // seconds for completed run
@@ -7804,7 +7945,7 @@ function App() {
       if (eventLogFile) params.set('eventLogFile', eventLogFile);
       const res = await axios.get(`/api/model-state?${params}`);
       if (res.data.success) {
-        const model = res.data.model;
+        const model = normalizeModelOrientation(res.data.model);
         if (model && !Array.isArray(model)) {
           setActiveModel(model);
           setModelEdited(false);
@@ -7875,7 +8016,7 @@ function App() {
 
         // Populate editor with the freshly discovered model immediately
         if (data.model && !Array.isArray(data.model)) {
-          setActiveModel(data.model);
+          setActiveModel(normalizeModelOrientation(data.model));
           // Freshly discovered model → not yet edited by the user.
           setModelEdited(false);
         }
@@ -8135,6 +8276,9 @@ function App() {
     setLiveDeactivPerStep(null);
     setLiveObligFulfilledPerStep(null);
     prevPollRef.current = { deactivations: 0, obligFulfilled: 0, step: 0 };
+    setThroughput([]);
+    throughputRef.current = { startMs: Date.now(), lastMs: null, lastEvents: 0, lastObjects: 0 };
+    setLiveStartCaps(null);
 
     // Start polling the live step counter every second
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
@@ -8146,6 +8290,17 @@ function App() {
         setLiveCases(r.data.completed_cases ?? null);
         setLiveActiveObjects(r.data.active_objects ?? null);
         setLiveObligations(r.data.total_obligations ?? null);
+        // Only activities that were actually given a cap — an uncapped start
+        // activity has nothing to count against, so it is left out entirely.
+        {
+          const caps   = r.data.start_activity_caps      || {};
+          const counts = r.data.start_counts_by_activity || {};
+          const capped = Object.keys(caps)
+            .filter(a => caps[a] != null && caps[a] > 0)
+            .sort()
+            .map(a => ({ activity: a, fired: counts[a] ?? 0, cap: caps[a] }));
+          setLiveStartCaps(capped.length ? capped : null);
+        }
         // Compute per-poll deltas (proxy for per-step rates)
         const curStep  = r.data.step_count ?? 0;
         const curDeact = r.data.total_deactivations ?? 0;
@@ -8157,6 +8312,33 @@ function App() {
         const curObligRemoved = curOblig + curObligCancelled;
         setLiveObligFulfilledPerStep(prev.step > 0 ? ((curObligRemoved - (prev.obligFulfilled)) / stepDelta).toFixed(2) : null);
         prevPollRef.current = { deactivations: curDeact, obligFulfilled: curObligRemoved, step: curStep };
+
+        // Throughput sample. Rates come from the delta between polls divided by
+        // the actual wall gap, not the nominal 1s — a busy tab or a slow poll
+        // stretches the interval, and dividing by 1 would understate the rate.
+        {
+          const tp = throughputRef.current;
+          const nowMs = Date.now();
+          const curEvents  = r.data.events_count  ?? 0;
+          const curObjects = r.data.objects_count ?? 0;
+          if (tp.lastMs != null) {
+            const dt = (nowMs - tp.lastMs) / 1000;
+            if (dt >= 0.25) {
+              const sample = {
+                t:   (nowMs - (tp.startMs ?? nowMs)) / 1000,
+                ev:  Math.max(0, (curEvents  - tp.lastEvents)  / dt),
+                ob:  Math.max(0, (curObjects - tp.lastObjects) / dt),
+                cum: curEvents,
+              };
+              // Bounded buffer: a long run would otherwise grow without limit.
+              setThroughput(prev => (prev.length >= 1800 ? [...prev.slice(1), sample] : [...prev, sample]));
+              tp.lastMs = nowMs; tp.lastEvents = curEvents; tp.lastObjects = curObjects;
+            }
+          } else {
+            tp.lastMs = nowMs; tp.lastEvents = curEvents; tp.lastObjects = curObjects;
+            if (tp.startMs == null) tp.startMs = nowMs;
+          }
+        }
         if (r.data.last_timestamp && r.data.start_timestamp) {
           const elapsed = (new Date(r.data.last_timestamp) - new Date(r.data.start_timestamp)) / 1000;
           setLiveSimTime(elapsed >= 0 ? elapsed : null);
@@ -8184,6 +8366,11 @@ function App() {
       const maxCases = config.maxCases !== '' && config.maxCases != null && parseInt(config.maxCases) > 0
         ? parseInt(config.maxCases)
         : null;
+      // Wall-clock budget, entered in minutes, sent in seconds.
+      const maxRuntimeS = config.maxRuntimeValue !== '' && config.maxRuntimeValue != null
+        && parseFloat(config.maxRuntimeValue) > 0
+        ? parseFloat(config.maxRuntimeValue) * 60
+        : null;
 
       const simulationData = {
         ...config,
@@ -8193,6 +8380,7 @@ function App() {
         maxSimTimeS,
         maxTraces,
         maxCases,
+        maxRuntimeS,
         // Send model/probs for the chosen mode
         ...(simModel  ? { modelOverride:       simModel }  : {}),
         ...(simMatrix ? { probMatrixOverride: simMatrix } : {}),
@@ -11209,6 +11397,24 @@ function App() {
                           ) : null;
                         })()}
                       </div>
+                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                        {/* Wall-clock budget. Unlike the limits above it is about
+                            the machine, not the model — it stops mid-process
+                            wherever the clock runs out. */}
+                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Runtime</span>
+                        <input type="text" inputMode="decimal" value={config.maxRuntimeValue ?? ''}
+                          placeholder="e.g. 10"
+                          onChange={e => handleConfigChange('maxRuntimeValue', e.target.value.replace(/[^\d.]/g,''))}
+                          disabled={isSimulating}
+                          style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
+                        <span style={{fontSize:'0.78rem',color:'#64748b'}}>minutes of real time</span>
+                        <span
+                          className="help-hint"
+                          data-help="Caps how long you wait, not how much process is simulated. The run stops wherever it happens to be — the resulting event log is valid but partial."
+                          aria-label="What does the runtime limit do?"
+                          role="img"
+                        >?</span>
+                      </div>
                       <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
                     </div>
                   </div>
@@ -11244,13 +11450,16 @@ function App() {
                       <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
                         {'completed events '}{(liveStepCount ?? 0).toLocaleString()}
                       </p>
+                      {/* Start-cases readout — hidden from the tracker. The value
+                          is still polled into liveCases and the "Start cases -Dev"
+                          stop condition still works; this was only the live line.
+                          Counts state._start_event_count, incremented in
+                          SimulationState.record_event when an event of a configured
+                          start activity is recorded. Re-enable by uncommenting.
                       {liveCases != null && liveCases > 0 && (
                         <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
                           {'start cases -Dev: '}{liveCases.toLocaleString()}
                           {config.maxCases !== '' && config.maxCases != null ? ` / ${config.maxCases}` : ''}
-                          {/* Counts state._start_event_count — incremented in
-                              SimulationState.record_event whenever an event of a
-                              configured start activity is recorded. */}
                           <span
                             className="help-hint"
                             data-help="A case is one firing of a start activity — the event that opens a new process instance. The counter goes up by one each time an activity listed under Start Activities fires, so it counts cases begun, not cases finished."
@@ -11259,6 +11468,7 @@ function App() {
                           >?</span>
                         </p>
                       )}
+                      */}
                       <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
                       {liveActiveObjects != null && (
                         <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>{liveActiveObjects.toLocaleString()} active objects</p>
@@ -11268,6 +11478,22 @@ function App() {
                           {liveObligations.toLocaleString()} pending obligations
                         </p>
                       )}
+                      {liveStartCaps && (
+                        <div className="start-cap-list">
+                          {liveStartCaps.map(s => {
+                            const pct = Math.min(100, (s.fired / s.cap) * 100);
+                            const done = s.fired >= s.cap;
+                            return (
+                              <div key={s.activity} className={`start-cap${done ? ' start-cap--done' : ''}`}>
+                                <span className="start-cap-name" title={s.activity}>{s.activity}</span>
+                                <span className="start-cap-bar"><i style={{width:`${pct}%`}}></i></span>
+                                <span className="start-cap-n">{s.fired.toLocaleString()} / {s.cap.toLocaleString()}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                      <SimThroughputChart samples={throughput} />
                       {/* Per-step deactivation / obligation-removal rates —
                           hidden from the tracker, kept here because the values
                           are still polled and are useful when diagnosing a run

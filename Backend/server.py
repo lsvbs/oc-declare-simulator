@@ -948,6 +948,11 @@ def simulation_status(run_id):
         'total_oblig_cancelled':    total_oblig_cancelled,
         'completed_traces':         completed_traces,
         'completed_cases':          getattr(state, '_start_event_count', 0) if state else 0,
+        # Per-start-activity firing counts, so the tracker can show progress
+        # against each activity's own cap. Mirrors _start_event_count_by_activity,
+        # which Simulator._is_start_activity_blocked reads to enforce the cap.
+        'start_counts_by_activity': dict(getattr(state, '_start_event_count_by_activity', {}) or {}) if state else {},
+        'start_activity_caps':      run.get('start_activity_caps') or {},
         'last_timestamp':           last_ts,
         'start_timestamp':          start_ts,
         'done':                     run['done'],
@@ -994,6 +999,16 @@ def run_simulation():
                 max_cases = int(max_cases)
             except (TypeError, ValueError):
                 max_cases = None
+        # Wall-clock budget in real seconds — how long you are willing to wait,
+        # as opposed to every other limit here, which is about the model.
+        max_runtime_s = data.get('maxRuntimeS')
+        if max_runtime_s is not None:
+            try:
+                max_runtime_s = float(max_runtime_s)
+                if max_runtime_s <= 0:
+                    max_runtime_s = None
+            except (TypeError, ValueError):
+                max_runtime_s = None
         seed = int(data.get('seed', 42))
         # Accept either startActivities (list, new) or startActivity (string, legacy)
         start_activities = data.get('startActivities')
@@ -1074,6 +1089,7 @@ def run_simulation():
             max_sim_time_s=max_sim_time_s,
             max_traces=max_traces,
             max_cases=max_cases,
+            max_runtime_s=max_runtime_s,
             seed=seed,
             start_policy=start_policy,
             anchor_object_types=[ot.name for ot in static_model.object_types]
@@ -1136,6 +1152,9 @@ def run_simulation():
                 'stop_event': stop_event,
                 'done': False,
                 'start_timestamp': config.start_timestamp.isoformat() if config.start_timestamp else None,
+                # Echoed back on each status poll so the tracker can render
+                # "fired / cap" without the frontend re-deriving it from config.
+                'start_activity_caps': dict(start_activity_caps or {}),
             }
 
         result_holder = [None]

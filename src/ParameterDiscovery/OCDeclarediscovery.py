@@ -1319,12 +1319,35 @@ def _refine_arcs(
     return refined
 
 
-def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Map OC-Declare arcs to the DeCo simulator constraint format.
+#: Marks a discovered model whose constraints are stored in ARC orientation,
+#: i.e. `from`/`to` mean what the OC-DECLARE tuple (ar, s, t, oi, n_min, n_max)
+#: and the OCPQ converter mean by them. Files without this key predate the
+#: change and are stored pre-swapped in engine orientation — the adapter needs
+#: to tell the two apart, so this is an explicit marker rather than a guess.
+CONSTRAINT_ORIENTATION = 'arc'
 
-    EF/DF(A→B, T): response(source=A, target=B)
-    EP/DP(A→B, T): precedence(source=B, target=A)
-    AS(A→B, T):    coexistence(source=A, target=B)
+
+def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Serialise OC-Declare arcs in the orientation the paper defines them.
+
+    `from` is the arc's source activity s and `to` its target t, exactly as in
+    Definition 7 and as the OCPQ converter writes them. No endpoint is swapped
+    here, and no simulator-facing `source_activity`/`target_activity` is
+    emitted.
+
+    That swap belongs to the adapter, not to discovery. The engine reads
+    `precedence` as "source must appear before target", which is the reverse of
+    an EP arc, so *something* has to flip the endpoints — but discovery is the
+    wrong place for it. Doing it here produced a file that carried
+    `arc_type: "EP"` next to already-flipped activities, so nothing downstream
+    could tell which orientation it was looking at without knowing the
+    convention, and comparing the output against OCPQ meant undoing the flip
+    first. Simulation.Models.OCDeclare.parse_ocdeclare_dict now performs it,
+    mirroring what parse_ocdeclare_list has always done for the arc-list format.
+
+    `observed_counts` stays keyed by arc endpoint (`from`/`to`) for the same
+    reason: it is a measurement of the arc, and mapping it onto the engine's
+    nmin/nmax roles is the adapter's job.
     """
     ARC_TO_CTYPE = {
         'EF': 'response',  'DF': 'response',
@@ -1336,45 +1359,28 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
         A, B      = arc['from'], arc['to']
         atype     = arc['arc_type']
         obj_type  = arc['label'][0] if arc.get('label') else ''
-        nmin, nmax = arc.get('counts', [1, None])
+        counts    = list(arc.get('counts', [1, None]))
         support   = arc.get('support', 0.0)
         ctype     = ARC_TO_CTYPE.get(atype)
         if not ctype:
             continue
-        src, tgt = (B, A) if atype in ('EP', 'DP') else (A, B)
-        # nmin/nmax are read by the simulator as counts of the SOURCE and the
-        # TARGET activity per scope object respectively (semantics.check_precedence:
-        # nmin gates on _count_activity_for_object(source, oid); nmax blocks when
-        # _count_activity_for_object(target, oid) is reached). EP/DP swap which
-        # arc endpoint plays which role, so the observed counts must be swapped
-        # with them — otherwise a discovered nmax would bound the wrong activity.
-        obs = arc.get('observed_counts') or {}
-        _from_counts = obs.get('from') or [None, None]
-        _to_counts   = obs.get('to')   or [None, None]
-        if atype in ('EP', 'DP'):
-            src_counts, tgt_counts = _to_counts, _from_counts
-        else:
-            src_counts, tgt_counts = _from_counts, _to_counts
-        if src_counts[0] is not None:
-            nmin = src_counts[0]      # source must have occurred at least this often
-        if tgt_counts[1] is not None:
-            nmax = tgt_counts[1]      # target may occur at most this often
         inv = arc.get('involvement', 'each')
         ipl = arc.get('involvement_per_label', {obj_type: inv})
         constraints.append({
+            # ── arc orientation (canonical) ──────────────────────────────────
+            'from':                  A,
+            'to':                    B,
+            'arc_type':              atype,
+            # Which DECLARE template the arrow type corresponds to. Derived, and
+            # orientation-free — it names the template, not an endpoint role.
             'type':                  ctype,
             'constraint_type':       ctype,
-            'source':                src,
-            'target':                tgt,
-            'source_activity':       src,
-            'target_activity':       tgt,
-            'source_type':           obj_type,
-            'target_type':           obj_type,
-            'nmin':                  nmin,
-            'nmax':                  nmax,
-            'support':               support,
-            'confidence':            support,
-            'arc_type':              atype,
+            # Paper counts on |f(E_L)|. Left at the discovery default; the
+            # adapter fits the engine's nmin/nmax from observed_counts below.
+            'counts':                counts,
+            # Per-endpoint measurements, keyed by ARC endpoint.
+            'observed_counts':       arc.get('observed_counts') or {},
+            # Object involvement — orientation-independent.
             'involvement':           inv,
             'involvement_per_label': ipl,
             'label':                 arc.get('label', []),
@@ -1383,6 +1389,8 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 'object_type':            obj_type,
                 'involvement_per_label':  ipl,
             },
+            'support':               support,
+            'confidence':            support,
         })
     return constraints
 
@@ -2903,6 +2911,11 @@ def discover_ocdeclare_model(
 
     # Build discovered model
     discovered_model = {
+        # Declares that `constraints` use arc orientation (from = the arc's
+        # source s, to = its target t, as in the paper and the OCPQ converter).
+        # Readers swap for EP/DP themselves; see _arcs_to_deco_constraints.
+        # Absent on files written before this change, which are pre-swapped.
+        'constraint_orientation': CONSTRAINT_ORIENTATION,
         'object_types': object_types_with_attrs,
         'activities': activity_structures,
         'constraints': all_constraints,

@@ -3653,6 +3653,139 @@
   margin: 0.25rem 0 0;
 }
 
+/* ── Per-start-activity cap progress (simulation progress box) ─────────────
+   One row per start activity that was given a cap: name, fill, fired / cap. */
+.start-cap-list {
+  width: 100%;
+  max-width: 34rem;
+  margin: 0.8rem auto 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+}
+.start-cap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 5rem auto;
+  align-items: center;
+  gap: 0.55rem;
+  font-size: 0.75rem;
+  letter-spacing: 0;
+  color: #475569;
+}
+.start-cap-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.start-cap-bar {
+  height: 0.38rem;
+  border-radius: 999px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+.start-cap-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: #6366f1;
+  transition: width 0.3s ease;
+}
+.start-cap-n {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #1e293b;
+  white-space: nowrap;
+}
+.start-cap--done .start-cap-bar i { background: #16a34a; }
+.start-cap--done .start-cap-n     { color: #16a34a; }
+
+@media (prefers-reduced-motion: reduce) {
+  .start-cap-bar i { transition: none; }
+}
+
+/* ── Live throughput chart (simulation progress box) ───────────────────────
+   Wall-clock rates on the left axis, cumulative events on the right. */
+.tp-chart {
+  width: 100%;
+  max-width: 34rem;
+  margin: 0.9rem auto 0;
+  padding: 0.7rem 0.8rem 0.4rem;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  text-align: left;
+}
+.tp-chart--empty {
+  padding: 1.1rem 0.8rem;
+  text-align: center;
+  font-size: 0.78rem;
+  color: #94a3b8;
+  letter-spacing: 0;
+}
+
+/* Marks the throughput chart as a development measure, matching the
+   "-Dev" suffix used on the start-cases readout. */
+.tp-dev {
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: #94a3b8;
+  margin-bottom: 0.2rem;
+}
+.tp-chart--empty .tp-dev {
+  display: inline;
+  margin-right: 0.4rem;
+  margin-bottom: 0;
+}
+
+.tp-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
+  margin-bottom: 0.35rem;
+}
+.tp-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: #64748b;
+}
+.tp-key i {
+  width: 0.7rem;
+  height: 0.2rem;
+  border-radius: 2px;
+  flex: none;
+}
+.tp-key b {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: #1e293b;
+}
+.tp-key--ev  i { background: #6366f1; }
+.tp-key--ob  i { background: #0d9488; }
+.tp-key--cum i { background: #cbd5e1; }
+
+.tp-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.tp-grid { stroke: #eef2f6; stroke-width: 1; }
+.tp-area { fill: #e2e8f0; opacity: 0.55; }
+.tp-line { fill: none; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
+.tp-line--ev  { stroke: #6366f1; }
+.tp-line--ob  { stroke: #0d9488; }
+.tp-line--cum { stroke: #cbd5e1; stroke-width: 1.2; }
+.tp-tick {
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 600;
+  fill: #94a3b8;
+  letter-spacing: 0;
+}
+.tp-tick--cum { fill: #b6c2ce; }
+
 /* Inline "?" affordance with a hover/focus explanation.
    Deliberately CSS-only: a React tooltip would need its own useState, and
    adding a hook to this component resets its state on hot reload — which

@@ -32,6 +32,12 @@ class SimulationConfig:
     max_traces: Optional[int] = None
     # Case-based limit: stop when this many cases (start-activity firings) have completed
     max_cases: Optional[int] = None
+    # Wall-clock limit in real seconds. Unlike every other stop condition this
+    # one is about the machine, not the model: it bounds how long you are
+    # willing to wait, and stops mid-process rather than at a meaningful point.
+    # A run cut short by it is a partial run — the event log is still valid, it
+    # just ends wherever the clock ran out. None disables it.
+    max_runtime_s: Optional[float] = None
     seed: Optional[int] = None
     start_policy: StartPolicy = field(default_factory=StartPolicy)
     selection_weights: dict[str, float] = field(default_factory=dict)
