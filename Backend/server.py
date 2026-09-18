@@ -28,7 +28,10 @@ from src.Simulation.Domain.config import SimulationConfig, StartPolicy
 from src.Simulation.Domain.state import SimulationState, RuntimeObject
 from src.Simulation.Engine.simulator import Simulator
 from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_permanent_object_types, suggest_permanent_object_threshold, discover_activity_concurrency, discover_interarrival_times, discover_activity_calendars, discover_object_transition_matrix, discover_creation_counts
+from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_activity_concurrency, discover_interarrival_times, discover_activity_calendars, discover_object_transition_matrix
+# Object-lifecycle discovery is a separate concern from Algorithm 1 and
+# lives in its own module.
+from src.ParameterDiscovery.lifecycle import discover_permanent_object_types, suggest_permanent_object_threshold, discover_creation_counts
 from src.Simulation.Engine.selection import select_candidate
 from src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -2554,7 +2557,7 @@ def derive_lifecycle():
                         ocel_log = None
 
         if ocel_log and isinstance(ocel_log, dict) and 'objects' in ocel_log:
-            from src.ParameterDiscovery.OCDeclarediscovery import discover_lifecycle
+            from src.ParameterDiscovery.lifecycle import discover_lifecycle
             entry: dict = {}
             exit_: dict = {}
             objects_raw = ocel_log['objects']
