@@ -7,6 +7,7 @@ Handles simulation orchestration and file management.
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
+import re
 import sys
 import json
 import statistics as _statistics
@@ -1232,13 +1233,27 @@ def run_simulation():
             for link in final_state.links
         ]
         
-        # Save output
-        output_file = write_ocel2_json(final_state, static_model=static_model)
+        # Save output. The log is named after the event log it was simulated
+        # from — "<input>_simulated_log_<date>_<time>.json" — so an output file
+        # still says what it came from once it has been moved or shared.
+        _stem = Path(event_log_file).stem if event_log_file else ''
+        _stem = re.sub(r'[^A-Za-z0-9._-]+', '_', _stem).strip('_')
+        _log_id = f'{_stem}_simulated_log' if _stem else 'log'
+        output_file = write_ocel2_json(final_state, static_model=static_model, log_id=_log_id)
         output_filename = os.path.basename(output_file)
 
-        # Compute and save timing metrics
+        # Compute and save timing metrics. Built from the log_id rather than by
+        # string-replacing "log_" in the filename: the input log's own name is
+        # now part of it, and a name such as "my_log_export" would have had the
+        # wrong substring rewritten.
         metrics = compute_metrics(final_state)
-        metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=output_filename.replace('log_', 'metrics_'))
+        _metrics_id = f'{_stem}_simulated_metrics' if _stem else 'metrics'
+        _metrics_filename = (
+            output_filename.replace(f'{_log_id}_', f'{_metrics_id}_', 1)
+            if output_filename.startswith(f'{_log_id}_')
+            else f'{_metrics_id}_{output_filename}'
+        )
+        metrics_file = write_metrics_json(final_state, out_dir=METRICS_DIR, filename=_metrics_filename)
         metrics_filename = os.path.basename(metrics_file)
 
         # Compute object lifecycle and activity participation audits
