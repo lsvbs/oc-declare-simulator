@@ -2389,29 +2389,6 @@ def discover_ocdeclare_model(
     _log(f"Loaded {n_events:,} events, {n_objects:,} objects — {len(object_types)} object types, {len(activities)} activities")
     _log(f"Object types: {', '.join(object_types)}")
 
-    # Discover object bindings
-    _cb('Building bindings', 8)
-    _log("Discovering object bindings (cardinality per activity)…")
-    bindings_data = discover_object_bindings(ocel_log)
-    _log(f"Bindings done for {len(bindings_data)} activities")
-
-    # Update bindings with lifecycle info (creates/deactivates flags)
-    n_types = len(object_types)
-    for ti, obj_type in enumerate(object_types):
-        pct = 8 + int(2 * (ti + 1) / max(n_types, 1))  # 8→10 across all types
-        _cb('Lifecycle discovery', pct)
-        _log(f"Lifecycle [{ti+1}/{n_types}]: scanning events for '{obj_type}'…")
-        creating_acts, terminating_acts = discover_lifecycle(
-            ocel_log, obj_type, lifecycle_threshold
-        )
-        _log(f"  → creates: {sorted(creating_acts) or 'none'}  |  deactivates: {sorted(terminating_acts) or 'none'}")
-        for activity in creating_acts:
-            if activity in bindings_data and obj_type in bindings_data[activity]:
-                bindings_data[activity][obj_type]['creates'] = True
-        for activity in terminating_acts:
-            if activity in bindings_data and obj_type in bindings_data[activity]:
-                bindings_data[activity][obj_type]['deactivates'] = True
-
     # Discover OC-Declare constraints using Küsters & van der Aalst (2025) algorithm
     _cb('Mining arcs', 10)
     all_constraints = _arcs_to_deco_constraints(
@@ -2431,163 +2408,15 @@ def discover_ocdeclare_model(
     )
     _log(f"Constraint translation done — {len(all_constraints)} constraints discovered")
 
-    # Discover O2O rules
-    _cb('Discovering O2O rules', 92)
-    _log("Reading object-to-object (O2O) relationship rules from the log…")
-    o2o_rules = discover_o2o_rules(ocel_log)
-    if o2o_rules:
-        _log(f"Found {len(o2o_rules)} O2O rules")
-    else:
-        _log("Found 0 O2O rules — this log declares no object-to-object "
-             "relations, so none are enforced")
-
-    # Classify resource object types (high events-per-instance ratio)
-    _cb('Classifying object types', 94)
-    _log("Classifying permanent (resource) object types…")
-    resource_types = discover_permanent_object_types(ocel_log, permanent_threshold)
-    _log(f"Permanent/resource types: {', '.join(resource_types) if resource_types else 'none detected'}")
-
-    # Discover ranked start activity candidates
-    start_activities_ranked = discover_start_activities(ocel_log)
-
-    # Collect attribute schema and default values from the log.
-    # attribute_schema: { object_type: { attr_name: initial_value } }
-    # Phase 4d: when attribute entries carry timestamps, use the earliest-observed
-    # value per attribute (object's initial state) instead of most-common.
-    # object_type_attr_defs: { object_type: [ {name, type} ] }
-    attribute_schema: Dict[str, Any] = {}
-    object_type_attr_defs: Dict[str, list] = {}
-
-    raw_objects = ocel_log.get("objects", {})
-    raw_object_types_meta = ocel_log.get("objectTypes", []) or []
-
-    for ot_entry in raw_object_types_meta:
-        if not isinstance(ot_entry, dict):
-            continue
-        ot_name = ot_entry.get("name", "")
-        if not ot_name:
-            continue
-        attr_defs = ot_entry.get("attributes", []) or []
-        object_type_attr_defs[ot_name] = [
-            {"name": str(a.get("name", "")), "type": str(a.get("type", "string"))}
-            for a in attr_defs if isinstance(a, dict) and a.get("name")
-        ]
-
-    # Buckets: (object_type, attr_name) -> list of (timestamp_str_or_None, value)
-    attr_value_buckets: Dict[str, Dict[str, list]] = {}
-    obj_iter = raw_objects.values() if isinstance(raw_objects, dict) else (raw_objects if isinstance(raw_objects, list) else [])
-    for obj_entry in obj_iter:
-        if not isinstance(obj_entry, dict):
-            continue
-        ot = obj_entry.get("type", "")
-        attrs = obj_entry.get("attributes", []) or []
-        if isinstance(attrs, list):
-            for a in attrs:
-                if not isinstance(a, dict):
-                    continue
-                name = a.get("name")
-                value = a.get("value")
-                ts = a.get("time")  # may be None for unversioned entries
-                if name is not None and value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((ts, value))
-        elif isinstance(attrs, dict):
-            for name, value in attrs.items():
-                if value is not None:
-                    attr_value_buckets.setdefault(ot, {}).setdefault(name, []).append((None, value))
-
-    for ot, attr_map in attr_value_buckets.items():
-        defaults = {}
-        for attr_name, ts_value_pairs in attr_map.items():
-            # Use earliest timestamped value when available; fall back to most-common
-            timestamped = [(ts, v) for ts, v in ts_value_pairs if ts is not None]
-            if timestamped:
-                timestamped.sort(key=lambda x: x[0])
-                defaults[attr_name] = timestamped[0][1]
-            else:
-                values = [v for _, v in ts_value_pairs]
-                counter = Counter(str(v) for v in values)
-                most_common_str, _ = counter.most_common(1)[0]
-                defaults[attr_name] = next((v for v in values if str(v) == most_common_str), most_common_str)
-        attribute_schema[ot] = defaults
-
-    # Phase 3e: discover event-level attribute names per activity type
-    # Collect attribute names observed on events in the log — user still decides
-    # capture source; this pre-populates the known attribute names.
-    event_attr_names: Dict[str, list] = {}  # activity_name -> [attr_name, ...]
-    raw_events = ocel_log.get("events", []) or []
-    ev_iter = raw_events.values() if isinstance(raw_events, dict) else raw_events
-    for ev_entry in ev_iter:
-        if not isinstance(ev_entry, dict):
-            continue
-        act_name = ev_entry.get("type") or ev_entry.get("activity") or ""
-        ev_attrs = ev_entry.get("attributes", []) or []
-        seen = event_attr_names.setdefault(act_name, [])
-        if isinstance(ev_attrs, list):
-            for ea in ev_attrs:
-                if isinstance(ea, dict):
-                    n = ea.get("name")
-                    if n and n not in seen:
-                        seen.append(n)
-        elif isinstance(ev_attrs, dict):
-            for n in ev_attrs:
-                if n not in seen:
-                    seen.append(n)
-
-    # Build object_types list: strings for backward compat, but enrich with attr defs
-    object_types_with_attrs = []
-    for ot_name in object_types:
-        entry: Dict[str, Any] = {"name": ot_name}
-        if ot_name in object_type_attr_defs:
-            entry["attributes"] = object_type_attr_defs[ot_name]
-        object_types_with_attrs.append(entry)
-
-    # Build activity structures with bindings
-    activity_structures = []
-    for activity in activities:
-        bindings_list = []
-        if activity in bindings_data:
-            for obj_type, binding_info in bindings_data[activity].items():
-                bindings_list.append({
-                    'object_type': obj_type,
-                    'min_count': binding_info['min_count'],
-                    'max_count': binding_info['max_count'],
-                    'creates': binding_info['creates'],
-                    'deactivates': binding_info['deactivates']
-                })
-
-        act_entry: Dict[str, Any] = {
-            'name': activity,
-            'bindings': bindings_list,
-        }
-        # Phase 3e: attach discovered event attribute names so the UI can
-        # pre-populate the event_attributes capture list
-        if activity in event_attr_names and event_attr_names[activity]:
-            act_entry['discovered_event_attr_names'] = event_attr_names[activity]
-        activity_structures.append(act_entry)
-
-    # NOTE: work-in-progress caps are deliberately NOT written here. They are a
-    # simulation parameter measured from the OCEL, not part of the OC-Declare
-    # model, so writing them would make this file diverge from what the
-    # OCPQ-Converter produces. They are computed and merged at simulation setup
-    # instead — exactly like activity_durations. See discover_wip_caps and
-    # Backend.server._merge_wip_caps.
-
-    # Build discovered model
+    # Constraint discovery exports no simulation parameters. Bindings and
+    # lifecycle flags are derived explicitly by simulation-parameter discovery.
     discovered_model = {
-        # Declares that `constraints` use arc orientation (from = the arc's
-        # source s, to = its target t, as in the paper and the OCPQ converter).
-        # Readers swap for EP/DP themselves; see _arcs_to_deco_constraints.
-        # Absent on files written before this change, which are pre-swapped.
-        'constraint_orientation': CONSTRAINT_ORIENTATION,
-        'object_types': object_types_with_attrs,
-        'activities': activity_structures,
-        'constraints': all_constraints,
-        'o2o_rules': o2o_rules,
-        'resource_types': resource_types,
-        'attribute_schema': attribute_schema,
-        'event_attribute_names': event_attr_names,  # Phase 3e
+        "constraint_orientation": CONSTRAINT_ORIENTATION,
+        "object_types": [{"name": name} for name in object_types],
+        "activities": [{"name": name} for name in activities],
+        "constraints": all_constraints,
     }
-    
+
     # Save to file if requested
     if output_filename:
         if output_dir:
@@ -2611,7 +2440,7 @@ def discover_ocdeclare_model(
         'num_object_types': len(object_types),
         'num_activities': len(activities),
         'num_constraints': len(all_constraints),
-        'num_o2o_rules': len(o2o_rules),
+        'num_o2o_rules': 0,
         'constraint_breakdown': constraint_breakdown,
         'avg_support': round(sum(c['support'] for c in all_constraints) / len(all_constraints), 3) if all_constraints else 0,
         'avg_confidence': round(sum(c['confidence'] for c in all_constraints) / len(all_constraints), 3) if all_constraints else 0
@@ -2621,14 +2450,11 @@ def discover_ocdeclare_model(
         'model': discovered_model,
         'stats': stats,
         'output_file': output_filename,
-        'start_activities_ranked': start_activities_ranked,
+        'start_activities_ranked': [],
         'parameters': {
             'min_support': min_support,
             'min_confidence': min_confidence,
             'noise_threshold': noise_threshold,
-            'lifecycle_threshold': lifecycle_threshold,
-            'permanent_threshold': permanent_threshold,
-            'resource_types': resource_types,
             'constraint_types': constraint_types
         }
     }

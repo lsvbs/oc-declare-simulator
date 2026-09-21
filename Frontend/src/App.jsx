@@ -8021,21 +8021,6 @@ function App() {
           setModelEdited(false);
         }
 
-        // Populate activities + ranked start candidates from the discovered model
-        const modelActivities = (data.model?.activities || []).map(a => a.name);
-        const ranked = data.start_activities_ranked || [];
-        setStartActivityCandidates(ranked.length > 0
-          ? ranked
-          : modelActivities.map(a => ({ activity: a, count: null, pct: null }))
-        );
-        const topStart = ranked[0]?.activity || modelActivities[0];
-        if (modelActivities.length > 0) {
-          setAvailableActivities(modelActivities);
-          setConfig(prev => prev.startActivitiesLocked || prev.startActivities.length > 0
-            ? prev
-            : { ...prev, startActivities: topStart ? [topStart] : [] });
-        }
-
         // Reload available files (preserve current selections to avoid overwrite)
         await loadAvailableFiles({ preserveSelections: true });
 
@@ -8044,49 +8029,7 @@ function App() {
           setConfig(prev => ({ ...prev, ocdeclareFile: data.filename }));
         }
 
-        // Automatically run probability discovery on the same event log so the
-        // simulation can proceed without requiring the user to run Step 1 manually.
-        try {
-          const discResponse = await axios.post('/api/discover', {
-            eventLogFile: ocdeclareDiscoveryConfig.eventLogFile
-          });
-          if (discResponse.data.success) {
-            setDiscoveryResults(discResponse.data.results);
-            setDiscoveryLogs(discResponse.data.logs || []);
-            // Update available activities from prob-discovery result;
-            // only reset start selection if we don't already have ranked candidates
-            const discActivities = discResponse.data.results.activities || [];
-            if (discActivities.length > 0) {
-              setAvailableActivities(discActivities);
-            }
-            if (startActivityCandidates.length === 0) {
-              const firstActivity = discResponse.data.results.first_activity || discActivities[0];
-              if (firstActivity) {
-                setConfig(prev => prev.startActivitiesLocked || prev.startActivities.length > 0
-                  ? prev
-                  : { ...prev, startActivities: [firstActivity] });
-              }
-            }
-            // Sync the Step 1 event log selector to match
-            setDiscoveryConfig(prev => ({
-              ...prev,
-              eventLogFile: ocdeclareDiscoveryConfig.eventLogFile
-            }));
-            // Load normalised probability matrix for the new model file
-            if (data.filename) {
-              loadModelState(data.filename, ocdeclareDiscoveryConfig.eventLogFile);
-            }
-          } else {
-            setOcdeclareDiscoveryError(
-              `OC-Declare model was discovered, but automatic parameter discovery failed: ${discResponse.data.error || 'Unknown error'}. Please run Step 1 manually with the same event log to unlock simulation.`
-            );
-          }
-        } catch (discErr) {
-          const reason = discErr.response?.data?.error || discErr.message || 'Unknown error';
-          setOcdeclareDiscoveryError(
-            `OC-Declare model was discovered, but automatic parameter discovery failed: ${reason}. Please run Step 1 manually with the same event log to unlock simulation.`
-          );
-        }
+        // Simulation parameters are discovered explicitly in the separate workflow.
       } else {
         setOcdeclareDiscoveryError(data.error || 'OC-Declare discovery failed');
       }

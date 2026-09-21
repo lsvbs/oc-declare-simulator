@@ -1696,19 +1696,12 @@ def run_ocdeclare_discovery():
         noise_threshold     = float(data.get('noiseThreshold', 0.2))
         arc_types           = data.get('arcTypes', ['EF', 'EP', 'AS'])
         reduction           = data.get('reduction', 'Lossless')
-        lifecycle_threshold = float(data.get('lifecycleThreshold', 0.5))
-        permanent_threshold = float(data.get('resourceThreshold', 50.0))
         run_id              = data.get('runId') or str(__import__('uuid').uuid4())
 
         if not event_log_file:
             return jsonify({'error': 'Missing event log file'}), 400
         if not (0 <= noise_threshold <= 1):
             return jsonify({'error': 'noiseThreshold must be between 0 and 1'}), 400
-        if not (0 <= lifecycle_threshold <= 1):
-            return jsonify({'error': 'lifecycleThreshold must be between 0 and 1'}), 400
-        if permanent_threshold < 1:
-            return jsonify({'error': 'resourceThreshold must be >= 1'}), 400
-
         log_path = EVENTLOG_DIR / event_log_file
         if not log_path.exists():
             return jsonify({'error': f'Event log file not found: {event_log_file}'}), 404
@@ -1737,8 +1730,6 @@ def run_ocdeclare_discovery():
                     noise_threshold=noise_threshold,
                     arc_types=arc_types,
                     reduction=reduction,
-                    lifecycle_threshold=lifecycle_threshold,
-                    permanent_threshold=permanent_threshold,
                     output_filename=output_filename,
                     output_dir=str(OCDECLARE_DIR),
                     progress_callback=_progress,
@@ -2558,6 +2549,27 @@ def derive_lifecycle():
 
         if ocel_log and isinstance(ocel_log, dict) and 'objects' in ocel_log:
             from src.ParameterDiscovery.lifecycle import discover_lifecycle
+            from src.ParameterDiscovery.OCDeclarediscovery import discover_object_bindings
+            from src.Simulation.Domain.ir import ObjectBinding
+            from dataclasses import replace
+
+            # Pure constraint exports have no simulation bindings. Derive them
+            # here, with lifecycle parameters, without rewriting the source file.
+            # Keep existing bindings (including user-set cardinalities) intact.
+            discovered_bindings = discover_object_bindings(ocel_log)
+            enriched_activities = []
+            for activity in base_model.activities:
+                bindings = list(activity.bindings)
+                known_types = {b.object_type for b in bindings}
+                for object_type, info in discovered_bindings.get(activity.name, {}).items():
+                    if object_type not in known_types:
+                        bindings.append(ObjectBinding(
+                            object_type=object_type,
+                            min_count=info["min_count"],
+                            max_count=info["max_count"],
+                        ))
+                enriched_activities.append(replace(activity, bindings=bindings))
+            base_model = replace(base_model, activities=enriched_activities)
             entry: dict = {}
             exit_: dict = {}
             objects_raw = ocel_log['objects']
