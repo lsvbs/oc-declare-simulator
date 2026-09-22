@@ -19,33 +19,40 @@ import tempfile
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.Simulation.Models.OCDeclare import (
+from Backend.src.Simulation.Models.OCDeclare import (
     parse_ocdeclare_list,
     derive_provisional_lifecycle_from_list,
     apply_lifecycle_from_provisional_info,
 )
-from src.Simulation.Domain.config import SimulationConfig, StartPolicy
-from src.Simulation.Domain.state import SimulationState, RuntimeObject
-from src.Simulation.Engine.simulator import Simulator
-from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
-from src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model, compute_ocpa_metrics, load_ocel2, discover_o2o_rules, discover_activity_concurrency, discover_interarrival_times, discover_activity_calendars, discover_object_transition_matrix
+from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy
+from Backend.src.Simulation.Domain.state import SimulationState
+from Backend.src.Simulation.Engine.simulator import Simulator
+from Backend.src.ParameterDiscovery.timediscovery import compute_ocpa_metrics
+from Backend.src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
+from Backend.src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model
+from Backend.src.Simulation.IO.input.ocel import load_ocel2
+from Backend.src.ParameterDiscovery.O2O import discover_o2o_rules
+from Backend.src.ParameterDiscovery.concurrency import discover_activity_concurrency
+from Backend.src.ParameterDiscovery.arrival import discover_interarrival_times
+from Backend.src.ParameterDiscovery.calendar import discover_activity_calendars
+from Backend.src.ParameterDiscovery.probabilitydiscovery import discover_object_transition_matrix
 # Object-lifecycle discovery is a separate concern from Algorithm 1 and
 # lives in its own module.
-from src.ParameterDiscovery.lifecycle import discover_permanent_object_types, suggest_permanent_object_threshold, discover_creation_counts
-from src.Simulation.Engine.selection import select_candidate
-from src.Simulation.IO.output.OCEL2 import write_ocel2_json
-from src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
+from Backend.src.ParameterDiscovery.lifecycle import discover_permanent_object_types, suggest_permanent_object_threshold, discover_creation_counts
+from Backend.src.Simulation.Engine.selection import select_candidate
+from Backend.src.Simulation.IO.output.OCEL2 import write_ocel2_json
+from Backend.src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
 
 app = Flask(__name__)
 CORS(app)
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
-OCDECLARE_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'ocdeclare'
-EVENTLOG_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'eventlog'
-PARAMETERS_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'input' / 'parameters'
-OUTPUT_DIR = BASE_DIR / 'src' / 'Simulation' / 'IO' / 'output' / 'eventlogs'
-METRICS_DIR = BASE_DIR / 'metrics'
+OCDECLARE_DIR = BASE_DIR / 'Backend' / 'src' / 'Simulation' / 'IO' / 'input' / 'ocdeclare'
+EVENTLOG_DIR = BASE_DIR / 'Backend' / 'src' / 'Simulation' / 'IO' / 'input' / 'eventlog'
+PARAMETERS_DIR = BASE_DIR / 'Backend' / 'src' / 'Simulation' / 'IO' / 'input' / 'parameters'
+OUTPUT_DIR = BASE_DIR / 'Backend' / 'src' / 'Simulation' / 'IO' / 'output' / 'eventlogs'
+METRICS_DIR = BASE_DIR / 'Backend' / 'metrics'
 HISTORY_FILE = METRICS_DIR / 'run_history.json'
 DISCOVERY_DIR = Path(tempfile.gettempdir()) / 'decocprototype_discovery'
 DISCOVERY_DIR.mkdir(exist_ok=True)
@@ -444,7 +451,7 @@ def run_discovery():
         # Discover transition probabilities — use object-centric aggregation when
         # the log is OCEL 2.0 (eliminates spurious cross-case transitions and
         # includes trace-end probabilities in the denominator).
-        from src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix_object_centric
+        from Backend.src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix_object_centric
         trace_end_prob = {}
         trace_position = {}
         start_counts = {}
@@ -770,7 +777,7 @@ def get_model_state():
         # External OC-Declare files are raw constraint lists (from/to/arc_type format).
         # Parse them into the same normalised dict the frontend Model Editor expects.
         if isinstance(model_data, list):
-            from src.Simulation.Models.OCDeclare import parse_ocdeclare_list
+            from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_list
             static = parse_ocdeclare_list(model_data)
             model_data = {
                 'object_types': [
@@ -1078,7 +1085,7 @@ def run_simulation():
             lifecycle_info = derive_provisional_lifecycle_from_list(model_data)
             static_model = apply_lifecycle_from_provisional_info(static_model, lifecycle_info)
         else:
-            from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
+            from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
             static_model = parse_ocdeclare_dict(model_data)
         
         # Build simulation config
@@ -1110,33 +1117,9 @@ def run_simulation():
                 transition_matrix=prob_matrix
             )
 
-        # Initialize state with initial objects (for Order Management)
+        # Objects are created by the loaded model, independently of its filename.
         initial_state = SimulationState()
-        
-        # Add initial products and employees if Order Management
-        if 'order' in ocdeclare_file.lower() or 'management' in ocdeclare_file.lower():
-            initial_state.objects['products_1'] = RuntimeObject(
-                object_id='products_1', 
-                object_type='products', 
-                active=True
-            )
-            initial_state.objects['products_2'] = RuntimeObject(
-                object_id='products_2', 
-                object_type='products', 
-                active=True
-            )
-            initial_state.objects['employees_1'] = RuntimeObject(
-                object_id='employees_1', 
-                object_type='employees', 
-                active=True
-            )
-            initial_state.objects['employees_2'] = RuntimeObject(
-                object_id='employees_2', 
-                object_type='employees', 
-                active=True
-            )
-            initial_state.next_object_counter = {'products': 3, 'employees': 3}
-        
+
         # Run simulation
         stop_event = threading.Event()
         simulator = Simulator(
@@ -1260,7 +1243,7 @@ def run_simulation():
         metrics_filename = os.path.basename(metrics_file)
 
         # Compute object lifecycle and activity participation audits
-        from src.Simulation.IO.output.metrics import compute_audit
+        from Backend.src.Simulation.IO.output.metrics import compute_audit
         audit = compute_audit(final_state, static_model=static_model, prob_matrix=prob_matrix)
 
         # Persist run entry to history
@@ -1842,7 +1825,7 @@ def constraint_health():
         # e.g. "no active Container (created by: Order Empty Containers,
         # deactivated by: Depart, Reschedule Container)".
         try:
-            from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+            from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
             if isinstance(model_dict, list):
                 _sm = parse_ocdeclare_list(model_dict)
             else:
@@ -1965,10 +1948,10 @@ def analyze_blocking():
     try:
         import sys as _sys
         _sys.path.insert(0, str(BASE_DIR))
-        from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
-        from src.Simulation.Engine.simulator import Simulator
-        from src.Simulation.Domain.config import SimulationConfig, StartPolicy
-        from src.Simulation.Domain.state import SimulationState
+        from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+        from Backend.src.Simulation.Engine.simulator import Simulator
+        from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy
+        from Backend.src.Simulation.Domain.state import SimulationState
         from datetime import datetime
 
         data = request.json or {}
@@ -2129,10 +2112,10 @@ def analyze_pressure():
     try:
         import sys as _sys
         _sys.path.insert(0, str(BASE_DIR))
-        from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
-        from src.Simulation.Engine.simulator import Simulator
-        from src.Simulation.Domain.config import SimulationConfig, StartPolicy
-        from src.Simulation.Domain.state import SimulationState
+        from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_dict, parse_ocdeclare_list
+        from Backend.src.Simulation.Engine.simulator import Simulator
+        from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy
+        from Backend.src.Simulation.Domain.state import SimulationState
         from collections import defaultdict
         from datetime import datetime
 
@@ -2516,7 +2499,7 @@ def derive_lifecycle():
         with open(model_path, 'r') as f:
             raw = json.load(f)
 
-        from src.Simulation.Models.OCDeclare import (
+        from Backend.src.Simulation.Models.OCDeclare import (
             parse_ocdeclare_list,
             parse_ocdeclare_dict,
             derive_provisional_lifecycle_from_list,
@@ -2542,15 +2525,15 @@ def derive_lifecycle():
                 log_path = EVENTLOG_DIR / event_log_file
                 if log_path.exists():
                     try:
-                        from src.ParameterDiscovery.OCDeclarediscovery import load_ocel2
+                        from Backend.src.Simulation.IO.input.ocel import load_ocel2
                         ocel_log = load_ocel2(str(log_path))
                     except Exception:
                         ocel_log = None
 
         if ocel_log and isinstance(ocel_log, dict) and 'objects' in ocel_log:
-            from src.ParameterDiscovery.lifecycle import discover_lifecycle
-            from src.ParameterDiscovery.OCDeclarediscovery import discover_object_bindings
-            from src.Simulation.Domain.ir import ObjectBinding
+            from Backend.src.ParameterDiscovery.lifecycle import discover_lifecycle
+            from Backend.src.ParameterDiscovery.bindings import discover_object_bindings
+            from Backend.src.Simulation.Domain.ir import ObjectBinding
             from dataclasses import replace
 
             # Pure constraint exports have no simulation bindings. Derive them
@@ -2821,7 +2804,7 @@ def _build_static_model_from_request(data):
 
     Returns (static_model, prob_matrix, cached) or raises ValueError.
     """
-    from src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
+    from Backend.src.Simulation.Models.OCDeclare import parse_ocdeclare_dict
     ocdeclare_file = data.get('ocdeclareFile')
     event_log_file = data.get('eventLogFile')
     model_override  = data.get('modelOverride')
@@ -3404,7 +3387,8 @@ def further_eval_ocpa_ocpq_comparison():
     Calls existing discover-timing-output and discover-timing logic, then pairs results.
     """
     try:
-        from src.ParameterDiscovery.OCDeclarediscovery import compute_ocpa_metrics, load_ocel2
+        from Backend.src.Simulation.IO.input.ocel import load_ocel2
+        from Backend.src.ParameterDiscovery.timediscovery import compute_ocpa_metrics
         data = request.json or {}
         output_file    = data.get('outputFile')
         event_log_file = data.get('eventLogFile')

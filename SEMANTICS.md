@@ -215,7 +215,7 @@ primary case object (e.g. Register Customer Order creates a Customer Order).
 
 ## 8. Metrics
 
-Computed after the run by `compute_metrics` in `src/Simulation/IO/output/metrics.py`:
+Computed after the run by `compute_metrics` in `Backend/src/Simulation/IO/output/metrics.py`:
 
 | Metric | Definition |
 |---|---|

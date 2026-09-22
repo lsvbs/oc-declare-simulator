@@ -74,7 +74,7 @@ PART 2 — HOW THE SIMULATOR GENERATES AN OCEL 2.0 LOG
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 After a simulation run completes, the final SimulationState is passed to the
-OCEL exporter (src/Simulation/IO/output/OCEL2.py → write_ocel2_json).
+OCEL exporter (Backend/src/Simulation/IO/output/OCEL2.py → write_ocel2_json).
 
 The SimulationState contains:
   - objects: dict of RuntimeObject (object_id → type, active, attributes)
@@ -119,7 +119,7 @@ Exporter pipeline (build_ocel2_dict):
     after each activity fires.
 
 Output: JSON written to
-  src/Simulation/IO/output/eventlogs/log_YYYYMMDD_HHMMSS.json
+  Backend/src/Simulation/IO/output/eventlogs/log_YYYYMMDD_HHMMSS.json
 
 Naming: the filename uses the timestamp at the moment write_ocel2_json is called,
 not the simulation clock. Multiple runs produce separate files with different
@@ -131,7 +131,7 @@ PART 3 — THE METRICS FILE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Alongside the OCEL log, a metrics JSON is written to
-  metrics/metrics_YYYYMMDD_HHMMSS.json
+  Backend/metrics/metrics_YYYYMMDD_HHMMSS.json
 
 This is NOT an OCEL file — it is a separate analysis file derived from the
 SimulationState. It contains two sections:
@@ -171,7 +171,7 @@ and the activity distribution chart.
 PART 4 — HOW EXTERNAL OCEL LOGS ARE LOADED FOR DISCOVERY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Two loaders exist, both in src/ParameterDiscovery/OCDeclarediscovery.py:
+Two loaders exist, both in Backend/src/ParameterDiscovery/OCDeclarediscovery.py:
 
 load_ocel2(filename) — primary loader for discovery
   Handles both JSON and XML (delegates XML to load_ocel2_xml).
@@ -206,7 +206,7 @@ Supported formats:
   - Simple trace list JSON: [[act1, act2, ...], [...], ...] (flat, no objects)
 
 File location for discovery:
-  src/Simulation/IO/input/eventlog/
+  Backend/src/Simulation/IO/input/eventlog/
   Drop any OCEL 2.0 JSON or XML file here and it will appear in the Step 1
   event log dropdown after refreshing the page.
 

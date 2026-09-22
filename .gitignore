@@ -11,19 +11,19 @@ node_modules/
 # Input/output data files (keep folders via .gitkeep)
 # eventlog/: ignore generated/example OCEL logs, but keep the container
 # logistics input log and the arrow-semantics constructed test fixtures.
-src/Simulation/IO/input/eventlog/*.xml
-src/Simulation/IO/input/eventlog/*.json
-!src/Simulation/IO/input/eventlog/container_logistics.json
-!src/Simulation/IO/input/eventlog/Example_OCEL_arrow_*.json
-src/Simulation/IO/input/ocdeclare/*.json
-src/Simulation/IO/input/ocdeclare/*.txt
-src/Simulation/IO/input/parameters/*.json
-src/Simulation/IO/output/eventlogs/*.json
+Backend/src/Simulation/IO/input/eventlog/*.xml
+Backend/src/Simulation/IO/input/eventlog/*.json
+!Backend/src/Simulation/IO/input/eventlog/container_logistics.json
+!Backend/src/Simulation/IO/input/eventlog/Example_OCEL_arrow_*.json
+Backend/src/Simulation/IO/input/ocdeclare/*.json
+Backend/src/Simulation/IO/input/ocdeclare/*.txt
+Backend/src/Simulation/IO/input/parameters/*.json
+Backend/src/Simulation/IO/output/eventlogs/*.json
 
 # Simulation metrics output (can be very large — regenerated on each run)
-metrics/*.json
-metrics/*.jsonl
+Backend/metrics/*.json
+Backend/metrics/*.jsonl
 
 # Frontend build output
 Frontend/dist/
-src/Simulation/IO/input/eventlog/*.jsonocel
+Backend/src/Simulation/IO/input/eventlog/*.jsonocel
