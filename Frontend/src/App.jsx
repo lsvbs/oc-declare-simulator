@@ -5,6 +5,8 @@ import './App.css';
 import FlowChart from './FlowChart';
 import ModelEditor from './ModelEditor';
 import { O2ODiagram, CONSTRAINT_HELP } from './ModelEditor';
+import { resolveStartActivityCaps } from './startActivityCounts.mjs';
+import EvaluationWrapper from './NotebookEvaluation';
 
 // ── Shared utility: sort activities by log flow order ─────────────────────────
 // Uses trace_position (avg position in log traces) first, then first-occurrence
@@ -608,6 +610,45 @@ function HelpTip({ text }) {
       {visible && <span className="help-tip-popup">{text}</span>}
     </span>
   );
+}
+
+function ObjectRelationshipAudit({ rows }) {
+  if (!rows?.length) return null;
+  return <Collapsible className="logs-box" title="Object Relationship Audit" defaultOpen={false}>
+    <p>
+      Relationship counts at the end of this run. Active objects may still acquire
+      partners later; inactive objects have finished their lifecycle. These checks
+      are separate from OC-Declare conformance.
+    </p>
+    <div style={{ overflowX: 'auto' }}>
+      <table className="audit-table">
+        <thead>
+          <tr>
+            <th>Object → partner type</th>
+            <th className="audit-num">Partners per object</th>
+            <th className="audit-num">Objects checked</th>
+            <th className="audit-num">Below minimum (active)</th>
+            <th className="audit-num">Below minimum (inactive)</th>
+            <th className="audit-num">Above maximum</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i}>
+              <td className="audit-type">{row.source_type} → {row.target_type}</td>
+              <td className="audit-num">{row.min_links}–{row.max_links ?? '∞'}</td>
+              <td className="audit-num">{row.checked_object_count}</td>
+              <td className="audit-num" title={row.below_min_active_examples.join(', ')}>{row.below_min_active_count}</td>
+              <td className={`audit-num ${row.below_min_inactive_count ? 'audit-warn' : ''}`}
+                title={row.below_min_inactive_examples.join(', ')}>{row.below_min_inactive_count}</td>
+              <td className={`audit-num ${row.above_max_count ? 'audit-warn' : ''}`}
+                title={row.above_max_examples.join(', ')}>{row.above_max_count}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </Collapsible>;
 }
 
 // ── Collapsible (reusable foldable section) ───────────────────────────────────
@@ -4065,1062 +4106,6 @@ function SummaryMetricCard({ m }) {
   );
 }
 
-// ── EvaluationWrapper — side-by-side As-Is / To-Be with comparison header ────
-function EvaluationWrapper({ resultsAsIs, resultsToBe, results, discoveryResults, activeModel, modelBase, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile, onRerunEvaluation, evalRunCount, onEventLogFileChange }) {
-  const hasBoth = !!(resultsAsIs && resultsToBe);
-  const rAsis = resultsAsIs ?? results;
-  const rTobe = resultsToBe;
-  const [evalTab, setEvalTab] = React.useState('conformance');
-  const [cmpSections, setCmpSections] = React.useState({conformance: true});
-  const [ocpqTotals,        setOcpqTotals]        = React.useState(null);
-  const [liveConfScores,    setLiveConfScores]    = React.useState(null);
-  const [ocpqTotalsTobe,    setOcpqTotalsTobe]    = React.useState(null);
-  const [liveConfScoresTobe,setLiveConfScoresTobe] = React.useState(null);
-
-  // Reset live scores when the run changes
-  React.useEffect(() => { setLiveConfScores(null); setOcpqTotals(null); }, [rAsis?.output_file]);
-  React.useEffect(() => { setLiveConfScoresTobe(null); setOcpqTotalsTobe(null); }, [rTobe?.output_file]);
-
-  // WMAPE: sim mean vs log mean — computed from rAsis metrics + model durations
-  const wmapeAsis = React.useMemo(() => {
-    const sm = rAsis?.metrics?.activity_metrics || {};
-    const ld = activeModel?.activity_durations || {};
-    let num = 0, den = 0;
-    Object.keys({...sm, ...ld}).forEach(a => {
-      const sim = sm[a]?.mean_service_s, log = ld[a]?.service_mean, w = sm[a]?.execution_count || 1;
-      if (sim != null && log != null && log > 0) { num += Math.abs(sim - log) * w; den += log * w; }
-    });
-    return den > 0 ? (num / den * 100) : null;
-  }, [rAsis?.output_file, activeModel]);
-
-  const confScores     = liveConfScores     || rAsis?.conformance;
-  const confScoresTobe = liveConfScoresTobe || rTobe?.conformance;
-
-  const wmapeTobe = React.useMemo(() => {
-    const sm = rTobe?.metrics?.activity_metrics || {};
-    const ld = activeModel?.activity_durations || {};
-    let num = 0, den = 0;
-    Object.keys({...sm, ...ld}).forEach(a => {
-      const sim = sm[a]?.mean_service_s, log = ld[a]?.service_mean, w = sm[a]?.execution_count || 1;
-      if (sim != null && log != null && log > 0) { num += Math.abs(sim - log) * w; den += log * w; }
-    });
-    return den > 0 ? (num / den * 100) : null;
-  }, [rTobe?.output_file, activeModel]);
-
-  // Weighted mean real sojourn time — used to normalise W1 colour grading
-  const meanSojourn = React.useMemo(() => {
-    const sm = rAsis?.metrics?.activity_metrics || {};
-    const ld = activeModel?.activity_durations || {};
-    let weightedSum = 0, totalW = 0;
-    Object.keys(ld).forEach(a => {
-      const mean = ld[a]?.service_mean;
-      const w = (sm[a]?.execution_count) || 1;
-      if (mean != null && mean > 0) { weightedSum += mean * w; totalW += w; }
-    });
-    return totalW > 0 ? weightedSum / totalW : null;
-  }, [rAsis?.output_file, activeModel]);
-
-  // Satisfiability + cross-object inconsistency from model constraints
-  const modelQuality = React.useMemo(() => {
-    const constraints = activeModel?.constraints || [];
-    const activities  = activeModel?.activities  || [];
-    if (!constraints.length || !activities.length) return null;
-    const actNames = new Set(activities.map(a => a.name || a));
-    const precFwd = {}, respEdges = {}, notCoex = [], absences = new Set();
-    constraints.forEach(c => {
-      if (c.constraint_type === 'precedence') { (precFwd[c.source_activity] = precFwd[c.source_activity]||[]).push(c.target_activity); }
-      else if (c.constraint_type === 'response') { (respEdges[c.source_activity] = respEdges[c.source_activity]||[]).push(c.target_activity); }
-      else if (c.constraint_type === 'not_coexistence') { notCoex.push([c.source_activity, c.target_activity]); }
-      else if (c.constraint_type === 'absence' && (c.nmax === 0 || c.nmax === null)) { absences.add(c.source_activity || c.target_activity); }
-    });
-    const visited = new Set();
-    const hasCycle = (node, path) => { if (path.includes(node)) return true; if (visited.has(node)) return false; visited.add(node); return (precFwd[node]||[]).some(n => hasCycle(n, [...path, node])); };
-    let satisfOk = true;
-    for (const a of actNames) { if (hasCycle(a, [])) { satisfOk = false; break; } }
-    if (satisfOk) notCoex.forEach(([a,b]) => { if ((respEdges[a]||[]).includes(b)||(respEdges[b]||[]).includes(a)) satisfOk = false; });
-    if (satisfOk) absences.forEach(act => { if (Object.values(respEdges).some(tgts => tgts.includes(act))) satisfOk = false; });
-    const actBindings = {};
-    activities.forEach(a => { actBindings[a.name||a] = a.bindings || []; });
-    let crossOk = true;
-    constraints.forEach(c => {
-      if (c.scope?.kind !== 'each' || !c.scope?.object_type) return;
-      const stype = c.scope.object_type;
-      if (actNames.has(c.source_activity) && !(actBindings[c.source_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
-      if (!['not_coexistence','absence','exactly','init'].includes(c.constraint_type) && actNames.has(c.target_activity) && !(actBindings[c.target_activity]||[]).some(b=>b.object_type===stype)) crossOk = false;
-    });
-    return { satisfOk, crossOk };
-  }, [activeModel]);
-
-  const vacuityStatus = React.useMemo(() => {
-    const constraints = activeModel?.constraints || [];
-    const objectTraces = rAsis?.object_traces || {};
-    if (!constraints.length || Object.keys(objectTraces).length === 0) return null;
-    const fired = new Set();
-    Object.values(objectTraces).forEach(trace => trace.forEach(act => fired.add(act)));
-    const count = constraints.filter(c => c.source_activity && !fired.has(c.source_activity)).length;
-    return { ok: count === 0, count };
-  }, [activeModel, rAsis]);
-
-  const fmtDur = s => { if (!s) return '—'; if (s<60) return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s'; if (s<3600) return Math.floor(s/60)+'m'; if (s<86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
-
-  // ── Compute object trace completions ──────────────────────────────────────
-  const computeTraceCompletions = (r) => {
-    if (!r) return null;
-    const audit = r.audit?.object_lifecycle_audit || {};
-    const resourceTypes = new Set(r.resource_types || []);
-    const totalByType = {}, deactByType = {};
-    Object.entries(audit).forEach(([ot, a]) => {
-      if (resourceTypes.has(ot)) return;
-      totalByType[ot] = a.instance_count || 0;
-      deactByType[ot] = a.deactivated_count || 0;
-    });
-    const totalAll = Object.values(totalByType).reduce((s,v)=>s+v,0);
-    const deactAll = Object.values(deactByType).reduce((s,v)=>s+v,0);
-    return { totalByType, deactByType, totalAll, deactAll, pct: totalAll>0?Math.round(deactAll/totalAll*100):0 };
-  };
-  const tracesAsis = computeTraceCompletions(rAsis);
-  const tracesTobe = computeTraceCompletions(rTobe);
-
-  // Log trace completion from discoveryResults
-  const logTraces = discoveryResults?.log_object_trace_count ?? null;
-
-  const [distFidAsis,    setDistFidAsis]    = React.useState(null);
-  const [distFidTobe,    setDistFidTobe]    = React.useState(null);
-  const [distFidLoading, setDistFidLoading] = React.useState(false);
-  const [distFidError,   setDistFidError]   = React.useState(null);
-  const [distFidOpen,    setDistFidOpen]    = React.useState(true);
-  const [evalAllLoading, setEvalAllLoading] = React.useState(false);
-
-  const runDistFidelity = async () => {
-    if (!rAsis?.output_file || !inputEventLogFile) return;
-    setDistFidLoading(true);
-    setDistFidError(null);
-    setDistFidAsis(null);
-    setDistFidTobe(null);
-    try {
-      const promises = [
-        axios.post('/api/further-eval/distribution-fidelity', {
-          outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
-        })
-      ];
-      if (rTobe?.output_file) {
-        promises.push(axios.post('/api/further-eval/distribution-fidelity', {
-          outputFile: rTobe.output_file, eventLogFile: inputEventLogFile,
-        }));
-      }
-      const [asisRes, tobeRes] = await Promise.all(promises);
-      setDistFidAsis(asisRes.data);
-      if (tobeRes) setDistFidTobe(tobeRes.data);
-    } catch (e) {
-      setDistFidError(e.response?.data?.error || e.message);
-    } finally {
-      setDistFidLoading(false);
-    }
-  };
-
-  const [xlogData,    setXlogData]    = React.useState(null);
-  const [xlogLoading, setXlogLoading] = React.useState(false);
-  const [xlogError,   setXlogError]   = React.useState(null);
-
-  const [ngdData,    setNgdData]    = React.useState(null);
-  const [ngdLoading, setNgdLoading] = React.useState(false);
-  const [ngdError,   setNgdError]   = React.useState(null);
-
-  const [cardFidAsis,    setCardFidAsis]    = React.useState(null);
-  const [cardFidLoading, setCardFidLoading] = React.useState(false);
-  const [cardFidError,   setCardFidError]   = React.useState(null);
-
-  // Input log coverage reference — synthetic results-like object for CoverageRadarMini
-  const [inputLogCovResults, setInputLogCovResults] = React.useState(null);
-  React.useEffect(() => {
-    if (!inputEventLogFile) { setInputLogCovResults(null); return; }
-    axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
-      .then(resp => {
-        const evts = resp.data.events || [];
-        const tmap = resp.data.object_types_map || {};
-        const traces = {};
-        evts.forEach(e => { (e.object_ids || []).forEach(oid => { (traces[oid] = traces[oid] || []).push(e.activity); }); });
-        const objTypes = {};
-        Object.entries(tmap).forEach(([oid, ot]) => { objTypes[ot] = (objTypes[ot] || 0) + 1; });
-        setInputLogCovResults({ activity_sequence: evts.map(e => e.activity), object_types: objTypes, object_traces: traces, object_types_map: tmap });
-      })
-      .catch(() => setInputLogCovResults(null));
-  }, [inputEventLogFile]);
-
-
-  const runXlogFidelity = async () => {
-    if (!rAsis?.output_file || !inputEventLogFile) return;
-    setXlogLoading(true); setXlogError(null); setXlogData(null);
-    try {
-      const r = await axios.post('/api/further-eval/log-fidelity', {
-        outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
-      });
-      setXlogData(r.data);
-    } catch (e) { setXlogError(e.response?.data?.error || e.message); }
-    finally { setXlogLoading(false); }
-  };
-
-  const runCardFidelity = async () => {
-    if (!rAsis?.output_file || !inputEventLogFile) return;
-    setCardFidLoading(true); setCardFidError(null); setCardFidAsis(null);
-    try {
-      const r = await axios.post('/api/further-eval/cardinality-fidelity', {
-        outputFile: rAsis.output_file, eventLogFile: inputEventLogFile,
-      });
-      setCardFidAsis(r.data);
-    } catch (e) { setCardFidError(e.response?.data?.error || e.message); }
-    finally { setCardFidLoading(false); }
-  };
-
-  const ocdeclareFile = activeModel?._source_file || null;
-  const modelOverride = activeModel || null;
-  const safeStartActivities = discoveryResults?.strict_start_activities || discoveryResults?.likely_start_activities || [];
-  const constraintStats = rAsis?.constraint_obligation_stats || {};
-  const obligationsFulfilled = rAsis?.obligations_fulfilled ?? 0;
-  const obligationsViolated  = rAsis?.obligations_violated  ?? 0;
-  const obligationsCancelled = rAsis?.obligations_cancelled ?? 0;
-  const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
-  const fmtNum = v => v == null ? '—' : Number.isInteger(v) ? v.toLocaleString() : v.toFixed(3);
-
-  const [confData,    setConfData]    = React.useState(null);
-  const [confLoading, setConfLoading] = React.useState(false);
-  const [confError,   setConfError]   = React.useState(null);
-
-  const runConformanceCheck = async () => {
-    if (!rAsis?.output_file) return;
-    setConfLoading(true); setConfError(null); setConfData(null);
-    try {
-      const r = await axios.post('/api/further-eval/conformance-check', { outputFile: rAsis.output_file, ocdeclareFile, modelOverride });
-      setConfData(r.data);
-    } catch(e) { setConfError(e.response?.data?.error || e.message); }
-    finally { setConfLoading(false); }
-  };
-
-  // Run all summary-strip metrics when Run Evaluation is clicked
-  React.useEffect(() => {
-    if (!rAsis?.output_file) return;
-
-    setEvalAllLoading(true);
-    const _promises = [];
-
-    // Fitness / Precision / OC-Declare Confidence — synchronous from object_traces
-    const computeAndSetConf = (r, setter) => {
-      if (!r?.object_traces) return;
-      const s = computeConformance(r.object_traces, activeModel?.constraints || [], activeModel?.activities || []);
-      if (s.fitness != null) setter({ fitness: s.fitness, constraint_fitness: s.constraintFitness, precision: s.precision });
-    };
-    computeAndSetConf(rAsis, setLiveConfScores);
-    if (rTobe?.output_file) computeAndSetConf(rTobe, setLiveConfScoresTobe);
-
-    // Overall Reach / Exclusivity — async OCPQ fetch
-    const fetchOcpq = async (outputFile, setter) => {
-      try {
-        const resp = await axios.get(`/api/run-history/${encodeURIComponent(outputFile)}/ocpq`);
-        const all = resp.data.schemas || [];
-        const _mean = (arr, k) => { const vs = arr.map(x => x[k]).filter(x => x != null); return vs.length ? vs.reduce((s,x) => s+x, 0)/vs.length : null; };
-        setter({ reach: _mean(all,'reach'), exclusivity: _mean(all,'exclusivity') });
-      } catch(e) {}
-    };
-    _promises.push(fetchOcpq(rAsis.output_file, setOcpqTotals));
-    if (rTobe?.output_file) _promises.push(fetchOcpq(rTobe.output_file, setOcpqTotalsTobe));
-
-    // Post-hoc Fitness — async conformance check
-    _promises.push(runConformanceCheck());
-
-    // Distribution + cross-log fidelity — require event log
-    if (inputEventLogFile) {
-      _promises.push(runDistFidelity());
-      _promises.push(runXlogFidelity());
-      _promises.push(runCardFidelity());
-
-      // NGD — load real log traces and compute n-gram distance (n=2)
-      if (rAsis?.object_traces) {
-        setNgdData(null); setNgdError(null); setNgdLoading(true);
-        _promises.push(
-          axios.get(`/api/eventlog-events?file=${encodeURIComponent(inputEventLogFile)}`)
-            .then(resp => {
-              const evts = resp.data.events || [];
-              const realTraces = {};
-              evts.forEach(e => {
-                (e.object_ids || []).forEach(oid => {
-                  (realTraces[oid] = realTraces[oid] || []).push(e.activity);
-                });
-              });
-              setNgdData(computeNGD(rAsis.object_traces, realTraces, 2));
-            })
-            .catch(e => setNgdError(e.response?.data?.error || e.message))
-            .finally(() => setNgdLoading(false))
-        );
-      }
-    }
-
-    Promise.allSettled(_promises).finally(() => setEvalAllLoading(false));
-  }, [evalRunCount]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const [multiSeeds,   setMultiSeeds]   = React.useState('42,99,123,456,789');
-  const [multiData,    setMultiData]    = React.useState(null);
-  const [multiLoading, setMultiLoading] = React.useState(false);
-  const [multiError,   setMultiError]   = React.useState(null);
-
-  const runMultiSeed = async () => {
-    const seeds = multiSeeds.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    if (!seeds.length) return;
-    setMultiLoading(true); setMultiError(null); setMultiData(null);
-    try {
-      const r = await axios.post('/api/further-eval/multi-run', {
-        seeds, ocdeclareFile, modelOverride, eventLogFile: inputEventLogFile,
-        startActivities: safeStartActivities, maxEvents: 50000,
-      });
-      setMultiData(r.data);
-    } catch(e) { setMultiError(e.response?.data?.error || e.message); }
-    finally { setMultiLoading(false); }
-  };
-
-  // Tab buttons for top navigation
-  const tabs = [
-    { key: 'conformance',    label: 'Conformance' },
-    { key: 'coverage',       label: 'Coverage' },
-    { key: 'time',           label: 'Time' },
-    { key: 'log-comparison', label: 'Log comparison' },
-  ];
-
-  return (
-    <div>
-      {evalAllLoading ? (
-        <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'4rem 2rem',gap:'1rem'}}>
-          <div className="spinner" />
-          <div style={{fontSize:'0.9rem',color:'#64748b',fontWeight:500}}>Computing evaluation metrics…</div>
-        </div>
-      ) : (
-        <>
-      {/* Model / run header */}
-      {rAsis && (
-        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.75rem',padding:'0.4rem 0.75rem',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',fontSize:'0.78rem',color:'#475569'}}>
-          <span style={{fontWeight:600}}>Evaluating:</span>
-          <span>{(activeModel?.activities||[]).length > 0 ? `${(activeModel.activities||[]).length} activities · ${(activeModel.constraints||[]).length} constraints` : 'Current model'}</span>
-          {inputEventLogFile && <><span style={{color:'#cbd5e1'}}>·</span><span style={{color:'#64748b'}}>compared against <strong style={{color:'#475569'}}>{inputEventLogFile.split('/').pop()}</strong></span></>}
-        </div>
-      )}
-
-      {/* Log file picker — shown when no event log is linked (e.g. parameters loaded directly) */}
-      {!inputEventLogFile && onEventLogFileChange && (eventLogFiles||[]).length > 0 && (
-        <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap',marginBottom:'0.75rem',padding:'0.4rem 0.75rem',background:'#fffbeb',border:'1px solid #fde68a',borderRadius:'6px',fontSize:'0.78rem',color:'#92400e'}}>
-          <span style={{fontWeight:600}}>⚠ No event log linked.</span>
-          <span style={{color:'#78350f'}}>Select a log to enable log-comparison measures:</span>
-          <select
-            defaultValue=""
-            style={{fontSize:'0.78rem',padding:'0.2rem 0.4rem',borderRadius:'4px',border:'1px solid #fcd34d',background:'#fff',color:'#334155'}}
-            onChange={e => { if (e.target.value) onEventLogFileChange(e.target.value); }}
-          >
-            <option value="">— select event log —</option>
-            {(eventLogFiles||[]).map(f => <option key={f} value={f}>{f}</option>)}
-          </select>
-        </div>
-      )}
-
-      {/* Re-run button mirrored from Results tab */}
-      {onRerunEvaluation && (
-        <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'0.75rem'}}>
-          <button className="simulate-button"
-            style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',background:'#475569'}}
-            onClick={onRerunEvaluation}>
-            ↻ Re-run Evaluation
-          </button>
-        </div>
-      )}
-
-      {/* ── Key Metrics Summary Strip ── */}
-      {(() => {
-        const pct  = v => v == null ? null : `${(v * 100).toFixed(1)}%`;
-        const fmtW = v => {
-          if (v == null) return null;
-          if (v >= 86400) { const d=Math.floor(v/86400), h=Math.floor((v%86400)/3600); return h>0?`${d}d ${h}h`:`${d}d`; }
-          if (v >= 3600)  { const h=Math.floor(v/3600),  m=Math.floor((v%3600)/60);   return m>0?`${h}h ${m}m`:`${h}h`; }
-          if (v >= 60)    { const m=Math.floor(v/60),    s=Math.floor(v%60);           return s>0?`${m}m ${s}s`:`${m}m`; }
-          return v < 10 ? `${v.toFixed(1)}s` : `${Math.round(v)}s`;
-        };
-        const ga = (v, hi, mid) => v == null ? '#64748b' : v >= hi ? '#16a34a' : v >= mid ? '#d97706' : '#dc2626';
-        const ra = (v, lo, mid) => v == null ? '#64748b' : v <= lo ? '#16a34a' : v <= mid ? '#d97706' : '#dc2626';
-
-        const secLabel = txt => (
-          <div style={{fontSize:'0.57rem',fontWeight:700,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.09em',padding:'0.45rem 0.75rem 0.2rem'}}>
-            {txt}
-          </div>
-        );
-        const secRow = children => (
-          <div style={{padding:'0.2rem 0.75rem 0.55rem',display:'flex',alignItems:'center',gap:'0.65rem',flexWrap:'wrap'}}>
-            {children}
-          </div>
-        );
-        const inlineMeasure = (label, value, ok, hint) => (
-          <div key={label} style={{display:'flex',alignItems:'center',gap:'0.3rem',fontSize:'0.74rem',color:'#475569'}}>
-            <span style={{color:'#64748b'}}>{label}{hint && <InfoTip text={hint}/>}:</span>
-            <span style={{fontWeight:700,color:ok===true?'#16a34a':ok===false?'#dc2626':'#64748b'}}>{value}</span>
-          </div>
-        );
-
-        const hasConformance = confData?.overall_fitness != null || modelQuality;
-        const hasCoverage    = !!(rAsis?.output_file || rAsis?.metrics);
-        const hasTime        = distFidAsis?.overall_w1_s != null || wmapeAsis != null;
-        const hasLogComp     = xlogData?.activity_kl_divergence != null || true; // always show (NGD placeholder)
-        if (!hasConformance && !hasCoverage && !hasTime) return null;
-
-        return (
-          <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'8px',overflow:'hidden'}}>
-
-            {/* CONFORMANCE */}
-            {hasConformance && (<>
-              {secLabel('Conformance')}
-              {secRow(<>
-                {confData?.overall_fitness != null && (
-                  <SummaryMetricCard m={{label:'Post-hoc Fitness',display:pct(confData.overall_fitness),color:ga(confData.overall_fitness,0.9,0.7),hint:'Post-hoc OC-Declare conformance — fraction of constraint checks that passed when replaying the output OCEL.\nHigher is better: ≥90% excellent · ≥70% acceptable.'}} />
-                )}
-                {modelQuality && inlineMeasure('Satisfiability', modelQuality.satisfOk?'✓ OK':'✗ Issues', modelQuality.satisfOk, 'Checks whether the constraint set can ever be satisfied — detects logical conflicts where no valid execution trace could satisfy all constraints simultaneously.')}
-                {modelQuality && inlineMeasure('Cross-object inconsistency', modelQuality.crossOk?'✓ OK':'✗ Issues', modelQuality.crossOk, 'Checks whether constraints referencing the same activities across different object types are mutually consistent — e.g. one type requires A before B while another requires B before A.')}
-           {vacuityStatus && inlineMeasure('Vacuity conformance', vacuityStatus.ok?'✓ OK':`✗ ${vacuityStatus.count} vacuous`, vacuityStatus.ok, "Checks whether every constraint's source activity fired at least once. A constraint whose trigger never occurred is technically satisfied but only vacuously — it was never actually tested.")}
-              </>)}
-            </>)}
-
-            {/* COVERAGE */}
-            {hasCoverage && (
-              <div style={{borderTop:'1px solid #f1f5f9'}}>
-                {secLabel('Coverage')}
-                <div style={{padding:'0.1rem 0.75rem 0.5rem'}}>
-                  <CoverageRadarMini results={rAsis} model={activeModel} discoveryResults={discoveryResults} logResults={inputLogCovResults} />
-                </div>
-              </div>
-            )}
-
-            {/* TIME */}
-            {hasTime && (
-              <div style={{borderTop:'1px solid #f1f5f9'}}>
-                {secLabel('Time')}
-                {secRow(<>
-                  {wmapeAsis != null && <SummaryMetricCard m={{label:'WMAPE',display:`${wmapeAsis.toFixed(1)}%`,color:ra(wmapeAsis,20,50),hint:'Weighted Mean Absolute % Error — avg difference between simulated and real-log activity service times, weighted by execution count.\nLower is better: <20% excellent · <50% acceptable.'}} />}
-                  {distFidAsis?.overall_w1_s != null && (() => {
-                    const w1Pct = meanSojourn ? distFidAsis.overall_w1_s / meanSojourn * 100 : null;
-                    return <SummaryMetricCard m={{label:'Overall W1',display:fmtW(distFidAsis.overall_w1_s),color:ra(w1Pct,10,30),hint:'Wasserstein-1 on per-activity sojourn time distributions.\nColour = W1 as % of weighted mean real sojourn time.\nLower is better: <10% excellent · <30% acceptable.'}} />;
-                  })()}
-                </>)}
-              </div>
-            )}
-
-            {/* LOG COMPARISON */}
-            <div style={{borderTop:'1px solid #f1f5f9'}}>
-              {secLabel('Log Comparison')}
-              {secRow(<>
-                {xlogData?.activity_kl_divergence != null && <SummaryMetricCard m={{label:'Activity KL Div.',display:xlogData.activity_kl_divergence.toFixed(4),color:ra(xlogData.activity_kl_divergence,0.2,0.5),hint:'KL divergence on activity frequency distributions — how much the simulated activity mix differs from the real log.\n0 = identical · lower is better: <0.2 excellent · <0.5 acceptable.'}} />}
-                {ngdData != null
-                  ? <SummaryMetricCard m={{label:'NGD (n=2)',display:ngdData.ngd.toFixed(4),color:ra(ngdData.ngd,0.1,0.3),hint:'N-Gram Distance (n=2): measures how well the simulator reproduces consecutive activity pairs (bigrams) in object traces — e.g. "Create Order→Pay Invoice" is one bigram. 0 = identical pair distributions; 1 = completely different. Lower is better: <0.10 excellent · <0.30 acceptable. (Chapela-Campa et al., 2023)'}} />
-                  : ngdLoading
-                    ? <span style={{fontSize:'0.74rem',color:'#94a3b8',fontStyle:'italic'}}>NGD computing…</span>
-                    : <span style={{fontSize:'0.74rem',color:'#94a3b8',fontStyle:'italic'}}>NGD — run evaluation</span>
-                }
-              </>)}
-            </div>
-
-          </div>
-        );
-      })()}
-
-      {/* Top navigation */}
-      <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',marginBottom:'1rem',borderBottom:'1px solid #e2e8f0',paddingBottom:'0.5rem'}}>
-        {tabs.map(t => (
-          <button key={t.key} onClick={() => setEvalTab(t.key)}
-            style={{padding:'0.3rem 0.75rem',fontSize:'0.78rem',fontWeight:600,border:'none',borderRadius:'4px',cursor:'pointer',
-              background: evalTab===t.key ? '#1e293b' : 'transparent',
-              color: evalTab===t.key ? 'white' : '#64748b'}}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {evalTab === 'conformance' && (
-        <>
-          {/* ── Per-Constraint Obligation Rates ── */}
-          <Collapsible className="eval-section" title="Per-Constraint Obligation Rates" defaultOpen={false}
-            stickyContent={rAsis ? (
-              <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-                {[
-                  {label:'Fulfilled',  val:obligationsFulfilled, color:'#16a34a', tip:'Total obligations fulfilled — response target fired before the case closed.'},
-                  {label:'Violated',   val:obligationsViolated,  color:'#dc2626', tip:'Total obligations violated — case closed before the response target ever fired.'},
-                  {label:'Cancelled',  val:obligationsCancelled, color:'#ca8a04', tip:'Obligations removed at case-close without being fulfilled or counted as violated.'},
-                ].map(({label,val,color,tip}) => (
-                  <div key={label} className="behavior-stat-card" style={{minWidth:'100px'}}>
-                    <div className="behavior-stat-val" style={{color}}>{val.toLocaleString()}</div>
-                    <div className="behavior-stat-label">{label}<InfoTip text={tip} /></div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          >
-            {!rAsis ? (
-              <p className="empty-notice">Run a simulation first.</p>
-            ) : (
-              <div>
-                <div style={{fontSize:'0.72rem',color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'6px',padding:'0.5rem 0.75rem',marginBottom:'0.75rem',lineHeight:'1.6'}}>
-                  <strong>Fulfillment Rate</strong> = obligations fulfilled ÷ (fulfilled + violated). An obligation is created each time a response constraint's source activity fires for a scope object. It is <em>fulfilled</em> when the target activity later fires for that object, and <em>violated</em> when the object is deactivated (case closed) before the target ever fires. <em>Cancelled</em> obligations are a subset of violations — they are removed at case-close time. A rate of 0% means the model has response constraints but the response activity never fired before cases ended; this commonly means the constraint is unenforced or the simulation terminates too early.
-                </div>
-                {Object.keys(constraintStats).length === 0 ? (
-                  (() => {
-                    const hasResponseConstraints = (activeModel?.constraints || [])
-                      .some(c => c.constraint_type === 'response' || c.constraint_type === 'chain_response');
-                    return (
-                      <p style={{fontSize:'0.8rem',color:'#94a3b8',fontStyle:'italic'}}>
-                        {!hasResponseConstraints
-                          ? 'No response constraints in the active model — obligation tracking only applies to response/chain_response constraints.'
-                          : 'Response constraints exist but no obligations were recorded in this run. This may mean the source activities never fired, or the model was not loaded when the simulation ran (re-simulate to populate).'}
-                      </p>
-                    );
-                  })()
-                ) : (
-                  <table className="conf-detail-table" style={{width:'100%'}}>
-                    <thead>
-                      <tr>
-                        <th title="The declarative constraint (type, source → target)" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                        <th className="audit-num" title="Number of times an obligation was created and later met (target fired before case closed)">Fulfilled</th>
-                        <th className="audit-num" title="Number of obligations that were not met — target never fired before case closed">Violated</th>
-                        <th className="audit-num" title="Obligations removed at case-close without being fulfilled or recorded as violated">Cancelled</th>
-                        <th className="audit-num" title="Fulfilled ÷ (Fulfilled + Violated) — fraction of obligations that were met">Fulfillment Rate</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(constraintStats).sort((a,b) => {
-                        const ra = a[1].violated/(a[1].fulfilled+a[1].violated||1);
-                        const rb = b[1].violated/(b[1].fulfilled+b[1].violated||1);
-                        return rb - ra;
-                      }).map(([key, stats]) => {
-                        const total = stats.fulfilled + stats.violated;
-                        const rate  = total > 0 ? stats.fulfilled / total : null;
-                        return (
-                          <tr key={key}>
-                            <td style={{fontSize:'0.72rem',color:'#475569',fontFamily:'monospace'}}>{key}</td>
-                            <td className="audit-num" style={{color:'#16a34a'}}>{stats.fulfilled}</td>
-                            <td className="audit-num" style={{color:'#dc2626'}}>{stats.violated}</td>
-                            <td className="audit-num" style={{color:'#ca8a04'}}>{stats.cancelled}</td>
-                            <td className="audit-num">
-                              <span style={{
-                                color: rate == null ? '#94a3b8' : rate >= 0.9 ? '#16a34a' : rate >= 0.7 ? '#ca8a04' : '#dc2626',
-                                fontWeight: 600,
-                              }}>
-                                {rate == null ? '—' : fmtPct(rate)}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            )}
-          </Collapsible>
-
-          {/* ── Post-hoc Conformance Check ── */}
-          <Collapsible className="eval-section" title="Post-hoc Conformance Check" defaultOpen={false}>
-            {!rAsis?.output_file ? (
-              <p className="empty-notice">No simulation output — run a simulation first.</p>
-            ) : (
-              <>
-                {confLoading && <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.5rem',display:'flex',alignItems:'center',gap:'0.4rem'}}><span className="spinner spinner-sm"/>Checking conformance…</p>}
-                {confError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{confError}</p>}
-                {confData && (
-                  <div>
-                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-                      {[
-                        {label:'Overall Fitness', val: confData.overall_fitness != null ? fmtPct(confData.overall_fitness) : '—', color: confData.overall_fitness >= 0.9 ? '#16a34a' : confData.overall_fitness >= 0.7 ? '#ca8a04' : '#dc2626', tip:'Fraction of all constraint checks that passed — satisfied ÷ total checked.'},
-                        {label:'Constraints Checked', val: confData.num_constraints, color:'#1e293b', tip:'Number of distinct OC-Declare constraints evaluated in this replay.'},
-                        {label:'Scope Objects Checked', val: confData.total_checked, color:'#1e293b', tip:'Total number of (constraint, object) pairs evaluated during replay.'},
-                        {label:'Violations', val: confData.total_violated, color: confData.total_violated > 0 ? '#dc2626' : '#16a34a', tip:'Total number of (constraint, object) pairs where the constraint was not satisfied.'},
-                      ].map(({label,val,color,tip}) => (
-                        <div key={label} className="behavior-stat-card" style={{minWidth:'120px'}}>
-                          <div className="behavior-stat-val" style={{color}}>{typeof val === 'number' ? val.toLocaleString() : val}</div>
-                          <div className="behavior-stat-label">{label}<InfoTip text={tip} /></div>
-                        </div>
-                      ))}
-                    </div>
-                    <table className="conf-detail-table" style={{width:'100%'}}>
-                      <thead>
-                        <tr>
-                          <th style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint<InfoTip text="The OC-Declare constraint being checked." /></th>
-                          <th className="audit-num">Scope Type<InfoTip text="Object type scope for which this constraint is evaluated." /></th>
-                          <th className="audit-num">Checked<InfoTip text="Total number of (constraint, object) instances evaluated." /></th>
-                          <th className="audit-num">Violated<InfoTip text="Number of instances where the constraint was not satisfied." /></th>
-                          <th className="audit-num">Violation Rate<InfoTip text="Violated ÷ Checked — fraction of instances that violated this constraint." /></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(() => {
-                          const sorted = (confData.constraint_results || []).sort((a,b) => (b.violation_rate||0)-(a.violation_rate||0));
-                          const violRates = sorted.map(r => r.violation_rate).filter(v => v != null);
-                          const violCounts = sorted.map(r => r.violated).filter(v => v != null && v > 0);
-                          return sorted.map((r,i) => (
-                          <tr key={i}>
-                            <td style={{fontSize:'0.72rem',fontFamily:'monospace',color:'#475569'}}>{r.constraint}</td>
-                            <td className="audit-num" style={{color:'#64748b',fontSize:'0.7rem'}}>{r.scope_type || '—'}</td>
-                            <td className="audit-num">{r.checked}</td>
-                            <td className="audit-num" style={{color: r.violated > 0 ? normColor(r.violated, violCounts, false) : '#16a34a'}}>{r.violated}</td>
-                            <td className="audit-num">
-                              <span style={{color: r.violation_rate == null ? '#94a3b8' : normColor(r.violation_rate, violRates, false), fontWeight:600}}>
-                                {r.violation_rate == null ? '—' : fmtPct(r.violation_rate)}
-                              </span>
-                            </td>
-                          </tr>
-                          ));
-                        })()}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </>
-            )}
-          </Collapsible>
-
-          {/* ── OCPQ Analysis ── */}
-          <Collapsible className="eval-section" title="OCPQ Analysis" defaultOpen={false}>
-            <div style={{padding:'0.75rem 0'}}>
-              <OCPQPanel results={rAsis} onTotalsComputed={setOcpqTotals} />
-            </div>
-          </Collapsible>
-        </>
-      )}
-
-      {evalTab === 'time' && (
-        <>
-          {/* Distribution & Cross-Log Fidelity — merged */}
-          {inputEventLogFile && (() => {
-        const ksColor = (v) => v == null ? '#64748b' : v < 0.1 ? '#16a34a' : v < 0.2 ? '#d97706' : '#dc2626';
-        const allRows = distFidAsis?.activity_rows || [];
-        const fmtPct = v => v == null ? '—' : `${(v * 100).toFixed(1)}%`;
-        const pctCls = d => d == null ? '' : Math.abs(d) < 10 ? 'cmp-ok' : Math.abs(d) < 30 ? 'cmp-under' : 'cmp-over';
-        return (
-          <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
-            <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap', cursor:'pointer', userSelect:'none'}} onClick={() => setDistFidOpen(o => !o)}>
-              <span style={{fontSize:'0.7rem', color:'#94a3b8', flexShrink:0}}>{distFidOpen ? '▼' : '▶'}</span>
-              <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
-                Distribution Fidelity (sim vs real log)
-              </span>
-              <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
-                W1/KS on sojourn times · KL divergence on activity &amp; object distributions · EMD on timing
-              </span>
-              {(distFidLoading || xlogLoading) && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
-            </div>
-            {distFidError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{distFidError}</p>}
-            {xlogError   && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{xlogError}</p>}
-
-            {/* Always-visible summary cards — stacked rows */}
-            {(distFidAsis || xlogData) && (
-              <div style={{display:'flex', flexDirection:'column', gap:'0.4rem', marginBottom:'0.5rem'}}>
-                {/* Row 1: Overall W1 */}
-                {distFidAsis && (
-                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
-                    <div className="compare-metric-card" style={{minWidth:'120px'}}>
-                      <div className="compare-metric-label">Overall W1 (timing)<InfoTip text="Wasserstein-1 distance between the per-activity sojourn time distributions of the simulated and real log. Computed as a weighted mean over all activities (weight = real-log sample count). Lower is better; unit is seconds." /></div>
-                      <div className="compare-metric-asis">{fmtDur(distFidAsis.overall_w1_s)}</div>
-                    </div>
-                  </div>
-                )}
-                {/* Row 2: Overall KS */}
-                {distFidAsis && (
-                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
-                    <div className="compare-metric-card" style={{minWidth:'100px'}}>
-                      <div className="compare-metric-label">Overall KS (sojourn)<InfoTip text="Kolmogorov-Smirnov statistic comparing per-activity sojourn time distributions. Weighted mean over all activities (weight = real-log sample count). Range 0–1; lower is better (0 = identical distributions, >0.2 = high divergence)." /></div>
-                      <div className="compare-metric-asis" style={{color: ksColor(distFidAsis.overall_ks_s)}}>
-                        {distFidAsis.overall_ks_s?.toFixed(3) ?? '—'}
-                      </div>
-                    </div>
-                  </div>
-                )}
-                {/* Row 3: Activity KL Div. | Object Type KL Div. | Timing EMD */}
-                {xlogData && (
-                  <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap'}}>
-                    {[
-                      {label:'Activity KL Div.',    val: xlogData.activity_kl_divergence?.toFixed(4),    tip:'KL divergence between simulated and real per-activity frequency distributions. 0 = identical; lower is better.'},
-                      {label:'Object Type KL Div.', val: xlogData.object_type_kl_divergence?.toFixed(4), tip:'KL divergence between simulated and real object type count distributions. 0 = identical; lower is better.'},
-                      {label:'Timing EMD',         val: xlogData.timing_emd_s != null ? fmtDur(xlogData.timing_emd_s) : '—',   tip:'Earth Mover\'s Distance (Wasserstein-1) on inter-event time gaps between simulation and real log. Lower is better.'},
-                    ].map(({label,val,tip}) => (
-                      <div key={label} className="compare-metric-card" style={{minWidth:'110px'}}>
-                        <div className="compare-metric-label">{label}<InfoTip text={tip} /></div>
-                        <div className="compare-metric-asis">{val ?? '—'}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Expandable detail content */}
-            {distFidOpen && (
-              <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginTop:'0.25rem'}}>
-                {/* Per-activity sojourn table */}
-                {distFidAsis && allRows.length > 0 && (
-                  <div style={{maxHeight:'260px', overflowY:'auto', fontSize:'0.7rem'}}>
-                    <table style={{width:'100%', borderCollapse:'collapse'}}>
-                      <thead>
-                        <tr style={{background:'#f1f5f9', position:'sticky', top:0}}>
-                          <th style={{textAlign:'left', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Activity</th>
-                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Real n</th>
-                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>Sim n</th>
-                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>W1 (timing)<InfoTip text="Wasserstein-1 distance between sojourn time distributions for this activity. Sojourn = backward gap to the last event sharing an object. Unit: seconds; lower = closer match to the real log." /></th>
-                          <th style={{textAlign:'right', padding:'3px 6px', fontWeight:600, color:'#475569'}}>KS (sojourn)<InfoTip text="Kolmogorov-Smirnov statistic on sojourn time distributions for this activity. Range 0–1; lower = closer match." /></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {allRows.map((row, i) => {
-                          const fmtVal = (v, isDur) => v != null ? (isDur ? fmtDur(v) : v.toFixed(3)) : '—';
-                          const valColor = (v) => v != null ? '#334155' : '#94a3b8';
-                          return (
-                            <tr key={row.activity} style={{background: i%2===0?'#fff':'#f8fafc', borderBottom:'1px solid #f1f5f9'}}>
-                              <td style={{padding:'3px 6px', color:'#334155'}}>{row.activity}</td>
-                              <td style={{padding:'3px 6px', textAlign:'right', color:'#64748b'}}>{row.real_n}</td>
-                              <td style={{padding:'3px 6px', textAlign:'right', color:'#64748b'}}>{row.sim_n}</td>
-                              <td style={{padding:'3px 6px', textAlign:'right', color: valColor(row.w1_s)}}>{fmtVal(row.w1_s, true)}</td>
-                              <td style={{padding:'3px 6px', textAlign:'right', color: valColor(row.ks_s)}}>{fmtVal(row.ks_s, false)}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                {/* Cross-log detail content */}
-                {!rAsis?.output_file ? (
-                  <p className="empty-notice">No simulation output — run a simulation first.</p>
-                ) : (distFidAsis || xlogData) && (
-                  <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
-                    <div style={{display:'flex',gap:'1rem',flexWrap:'wrap'}}>
-                      {distFidAsis && [
-                        {label:'Real Events',  val: distFidAsis.real_event_count?.toLocaleString()},
-                        {label:'Sim Events',   val: distFidAsis.sim_event_count?.toLocaleString()},
-                      ].map(({label,val}) => (
-                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
-                          <div className="behavior-stat-val">{val ?? '—'}</div>
-                          <div className="behavior-stat-label">{label}</div>
-                        </div>
-                      ))}
-                      {xlogData && [
-                        {label:'Real Events (xlog)', val: xlogData.real_event_count?.toLocaleString()},
-                        {label:'Sim Events (xlog)',  val: xlogData.sim_event_count?.toLocaleString()},
-                      ].map(({label,val}) => (
-                        <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
-                          <div className="behavior-stat-val">{val ?? '—'}</div>
-                          <div className="behavior-stat-label">{label}</div>
-                        </div>
-                      ))}
-                    </div>
-                    {xlogData && (<>
-                    {xlogData.timing_summary && (
-                      <details>
-                        <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Timing Summary</summary>
-                        <div style={{display:'flex',gap:'1rem',flexWrap:'wrap',marginTop:'0.5rem'}}>
-                          {[
-                            {label:'Real Mean Gap',   val: fmtDur(xlogData.timing_summary.real_gap_mean_s)},
-                            {label:'Sim Mean Gap',    val: fmtDur(xlogData.timing_summary.sim_gap_mean_s)},
-                            {label:'Real Median Gap', val: fmtDur(xlogData.timing_summary.real_gap_median_s)},
-                            {label:'Sim Median Gap',  val: fmtDur(xlogData.timing_summary.sim_gap_median_s)},
-                          ].map(({label,val}) => (
-                            <div key={label} className="behavior-stat-card" style={{minWidth:'110px'}}>
-                              <div className="behavior-stat-val">{val}</div>
-                              <div className="behavior-stat-label">{label}</div>
-                            </div>
-                          ))}
-                        </div>
-                      </details>
-                    )}
-                    <details open>
-                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Activity Frequency Comparison</summary>
-                      <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                        <table className="conf-detail-table" style={{width:'100%'}}>
-                          <thead>
-                            <tr>
-                              <th style={{textAlign:'left',fontSize:'0.72rem'}}>Activity</th>
-                              <th className="audit-num" title="Count in real log">Real Count</th>
-                              <th className="audit-num" title="Count in sim log">Sim Count</th>
-                              <th className="audit-num" title="Fraction in real log">Real Freq</th>
-                              <th className="audit-num" title="Fraction in sim log">Sim Freq</th>
-                              <th className="audit-num" title="Sim − Real in percentage points">Δ Freq</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {(xlogData.activity_freq_table || []).map((row,i) => {
-                              const diff = row.sim_freq - row.real_freq;
-                              return (
-                                <tr key={i}>
-                                  <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.activity}</td>
-                                  <td className="audit-num">{row.real_count.toLocaleString()}</td>
-                                  <td className="audit-num">{row.sim_count.toLocaleString()}</td>
-                                  <td className="audit-num">{(row.real_freq*100).toFixed(1)}%</td>
-                                  <td className="audit-num">{(row.sim_freq*100).toFixed(1)}%</td>
-                                  <td className={`audit-num cmp-diff ${pctCls(diff*100)}`}>
-                                    {diff >= 0 ? '+' : ''}{(diff*100).toFixed(1)}pp
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    </details>
-                    <details>
-                      <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Object Type Count Comparison</summary>
-                      <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                        <table className="conf-detail-table" style={{width:'100%'}}>
-                          <thead>
-                            <tr>
-                              <th style={{textAlign:'left',fontSize:'0.72rem'}}>Object Type</th>
-                              <th className="audit-num">Real Count</th>
-                              <th className="audit-num">Sim Count</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {(xlogData.object_type_table || []).map((row,i) => (
-                              <tr key={i}>
-                                <td style={{fontSize:'0.72rem',color:'#475569'}}>{row.object_type}</td>
-                                <td className="audit-num">{row.real_count.toLocaleString()}</td>
-                                <td className="audit-num">{row.sim_count.toLocaleString()}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </details>
-                    </>)}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })()}
-
-          {/* ── Multi-Seed Variance Analysis ── */}
-          <Collapsible className="eval-section" title="Multi-Seed Variance Analysis" defaultOpen={false}>
-            <p style={{fontSize:'0.8rem',color:'#64748b',marginBottom:'0.75rem'}}>
-              Runs the simulation with multiple random seeds and reports mean ± std for key metrics,
-              quantifying reproducibility and sensitivity to seed choice.
-            </p>
-            <div style={{display:'flex',gap:'0.5rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-              <label style={{fontSize:'0.78rem',color:'#475569',fontWeight:600}}>Seeds (comma-separated):</label>
-              <input
-                value={multiSeeds}
-                onChange={e => setMultiSeeds(e.target.value)}
-                style={{padding:'0.3rem 0.5rem',fontSize:'0.8rem',border:'1px solid #e2e8f0',borderRadius:'4px',width:'220px'}}
-                placeholder="42, 99, 123, 456, 789"
-              />
-              <button className="simulate-button"
-                style={{width:'auto',padding:'0.4rem 1rem',fontSize:'0.82rem',
-                        background: multiLoading ? '#94a3b8' : '#6366f1'}}
-                onClick={runMultiSeed} disabled={multiLoading || !safeStartActivities.length}>
-                {multiLoading ? 'Running…' : 'Run Multi-Seed Analysis'}
-              </button>
-            </div>
-            {!safeStartActivities.length && (
-              <p style={{fontSize:'0.78rem',color:'#ca8a04'}}>Start activities not detected — load a discovery result first.</p>
-            )}
-            {multiError && <p style={{color:'#dc2626',fontSize:'0.8rem'}}>{multiError}</p>}
-            {multiData && (
-              <div style={{display:'flex',flexDirection:'column',gap:'1rem'}}>
-                <div style={{overflowX:'auto'}}>
-                  <table className="conf-detail-table" style={{width:'100%'}}>
-                    <thead>
-                      <tr>
-                        <th title="Simulation metric name" style={{textAlign:'left',fontSize:'0.72rem'}}>Metric</th>
-                        <th className="audit-num" title="Mean value across all seeds">Mean</th>
-                        <th className="audit-num" title="Standard deviation across seeds — lower = more stable">Std Dev</th>
-                        <th className="audit-num" title="Lowest value observed across all seeds">Min</th>
-                        <th className="audit-num" title="Highest value observed across all seeds">Max</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(multiData.summary || {}).map(([key, s]) => (
-                        <tr key={key}>
-                          <td style={{fontSize:'0.72rem',color:'#475569'}}>{key.replace(/_/g,' ')}</td>
-                          <td className="audit-num">{fmtNum(s.mean)}</td>
-                          <td className="audit-num">{fmtNum(s.std)}</td>
-                          <td className="audit-num">{fmtNum(s.min)}</td>
-                          <td className="audit-num">{fmtNum(s.max)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {Object.keys(multiData.constraint_summary || {}).length > 0 && (
-                  <details>
-                    <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Constraint Fulfillment Rate (across seeds)</summary>
-                    <table className="conf-detail-table" style={{width:'100%',marginTop:'0.5rem'}}>
-                      <thead>
-                        <tr>
-                          <th title="Declarative constraint identifier" style={{textAlign:'left',fontSize:'0.72rem'}}>Constraint</th>
-                          <th className="audit-num" title="Mean fulfillment rate across all seeds (Fulfilled ÷ (Fulfilled + Violated))">Mean Rate</th>
-                          <th className="audit-num" title="Standard deviation of fulfillment rate across seeds — lower = more consistent">Std Dev</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {Object.entries(multiData.constraint_summary).map(([ck, s]) => (
-                          <tr key={ck}>
-                            <td style={{fontSize:'0.7rem',fontFamily:'monospace',color:'#475569'}}>{ck}</td>
-                            <td className="audit-num">
-                              <span style={{color: s.mean == null ? '#94a3b8' : s.mean >= 0.9 ? '#16a34a' : s.mean >= 0.7 ? '#ca8a04' : '#dc2626', fontWeight:600}}>
-                                {s.mean != null ? fmtPct(s.mean) : '—'}
-                              </span>
-                            </td>
-                            <td className="audit-num">{s.std != null ? `±${fmtPct(s.std)}` : '—'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </details>
-                )}
-                <details>
-                  <summary style={{fontSize:'0.78rem',fontWeight:600,cursor:'pointer',color:'#475569'}}>Per-Seed Breakdown</summary>
-                  <div style={{overflowX:'auto',marginTop:'0.5rem'}}>
-                    <table className="conf-detail-table" style={{width:'100%'}}>
-                      <thead>
-                        <tr>
-                          <th className="audit-num" title="Random seed used for this simulation run">Seed</th>
-                          <th className="audit-num" title="Total number of events fired in this run">Events</th>
-                          <th className="audit-num" title="Total number of objects instantiated in this run">Objects</th>
-                          <th className="audit-num" title="Number of object traces that completed (lifecycle ended)">Traces</th>
-                          <th className="audit-num" title="Number of response-constraint obligations that were fulfilled">Obl. Fulfilled</th>
-                          <th className="audit-num" title="Number of response-constraint obligations that were violated (case closed before target fired)">Obl. Violated</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(multiData.runs || []).map(r => (
-                          <tr key={r.seed}>
-                            <td className="audit-num" style={{fontWeight:600}}>{r.seed}</td>
-                            <td className="audit-num">{r.events_count.toLocaleString()}</td>
-                            <td className="audit-num">{r.objects_count.toLocaleString()}</td>
-                            <td className="audit-num">{r.completed_traces.toLocaleString()}</td>
-                            <td className="audit-num" style={{color:'#16a34a'}}>{r.obligations_fulfilled}</td>
-                            <td className="audit-num" style={{color: r.obligations_violated > 0 ? '#dc2626' : '#16a34a'}}>{r.obligations_violated}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </details>
-              </div>
-            )}
-          </Collapsible>
-        </>
-      )}
-
-      {evalTab === 'log-comparison' && (
-        <>
-          {/* ── N-Gram Distance ── */}
-          {inputEventLogFile && (() => {
-        const ngdColor = v => v == null ? '#64748b' : v <= 0.1 ? '#16a34a' : v <= 0.3 ? '#d97706' : '#dc2626';
-        const freqTable = xlogData?.activity_freq_table || [];
-        const wmapeEventCount = (() => {
-          const totalReal = freqTable.reduce((s, r) => s + (r.real_count || 0), 0);
-          if (totalReal === 0) return null;
-          const sumAbsErr = freqTable.reduce((s, r) => s + Math.abs((r.sim_count || 0) - (r.real_count || 0)), 0);
-          return sumAbsErr / totalReal;
-        })();
-        return (
-          <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
-            <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap'}}>
-              <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
-                N-Gram Distance (NGD, n=2)
-              </span>
-              <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
-                consecutive activity pairs (bigrams) in object traces · sim vs real log
-              </span>
-              {ngdLoading && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
-            </div>
-            {ngdError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{ngdError}</p>}
-            {ngdData && (
-              <div style={{display:'flex', gap:'0.5rem', marginBottom:'0.5rem', flexWrap:'wrap', alignItems:'flex-start'}}>
-                <div className="compare-metric-card" style={{minWidth:'100px'}}>
-                  <div className="compare-metric-label">NGD<InfoTip text="N-Gram Distance (n=2): counts every consecutive activity pair (bigram) in each object's trace — e.g. for an object appearing in Create→Approve→Pay, the bigrams are (Create→Approve) and (Approve→Pay). Compares how often each bigram occurs in sim vs real. Low NGD = the simulator produces realistic activity orderings; high NGD = transitions between activities differ from the real log. (Chapela-Campa et al., 2023)" /></div>
-                  <div className="compare-metric-asis" style={{color: ngdColor(ngdData.ngd)}}>{ngdData.ngd.toFixed(4)}</div>
-                </div>
-                <div className="compare-metric-card" style={{minWidth:'90px'}}>
-                  <div className="compare-metric-label">Unique bigrams<InfoTip text="Number of distinct activity bigrams (consecutive pairs) observed across both logs." /></div>
-                  <div className="compare-metric-asis">{ngdData.uniqueNgrams}</div>
-                </div>
-                <div className="compare-metric-card" style={{minWidth:'90px'}}>
-                  <div className="compare-metric-label">Real bigrams<InfoTip text="Total number of activity bigrams in the real (input) log." /></div>
-                  <div className="compare-metric-asis">{ngdData.totalRealNgrams.toLocaleString()}</div>
-                </div>
-                <div className="compare-metric-card" style={{minWidth:'90px'}}>
-                  <div className="compare-metric-label">Sim bigrams<InfoTip text="Total number of activity bigrams in the simulated log." /></div>
-                  <div className="compare-metric-asis">{ngdData.totalSimNgrams.toLocaleString()}</div>
-                </div>
-                {wmapeEventCount != null && (
-                  <div className="compare-metric-card" style={{minWidth:'110px'}}>
-                    <div className="compare-metric-label">WMAPE (event count)<InfoTip text="Weighted Mean Absolute Percentage Error over per-activity event counts: Σ|sim−real| ÷ Σreal. Measures how closely the simulated activity frequencies match the real log. Lower is better." /></div>
-                    <div className="compare-metric-asis" style={{color: wmapeEventCount <= 0.2 ? '#16a34a' : wmapeEventCount <= 0.5 ? '#d97706' : '#dc2626'}}>{(wmapeEventCount * 100).toFixed(1)}%</div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })()}
-
-          {/* ── Object Cardinality Fidelity ── */}
-          {inputEventLogFile && (
-            <div style={{background:'#f8fafc', border:'1px solid #e2e8f0', borderRadius:'8px', padding:'0.65rem 0.75rem', marginBottom:'0.75rem'}}>
-              <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem', flexWrap:'wrap'}}>
-                <span style={{fontSize:'0.72rem', fontWeight:700, color:'#475569', whiteSpace:'nowrap'}}>
-                  Object Cardinality Fidelity
-                </span>
-                <span style={{fontSize:'0.65rem', color:'#94a3b8'}}>
-                  objects per event — sim vs real log
-                </span>
-                {cardFidLoading && <span style={{marginLeft:'auto', fontSize:'0.7rem', color:'#94a3b8', whiteSpace:'nowrap'}}>Computing…</span>}
-              </div>
-              {cardFidError && <p style={{color:'#dc2626', fontSize:'0.7rem', margin:'0 0 0.4rem'}}>{cardFidError}</p>}
-              {cardFidAsis?.table && (
-                <table style={{width:'100%', borderCollapse:'collapse', fontSize:'0.71rem', color:'#334155'}}>
-                  <thead>
-                    <tr style={{background:'#f1f5f9', borderBottom:'1px solid #e2e8f0'}}>
-                      <th style={{textAlign:'left', padding:'0.2rem 0.4rem', fontWeight:600}}>Activity</th>
-                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Real mean</th>
-                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Sim mean</th>
-                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Δ mean</th>
-                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Real n</th>
-                      <th style={{textAlign:'right', padding:'0.2rem 0.4rem', fontWeight:600}}>Sim n</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {cardFidAsis.table.map((row, i) => {
-                      const absDiff = row.mean_diff != null ? Math.abs(row.mean_diff) : null;
-                      const diffColor = absDiff == null ? '#64748b' : absDiff < 0.5 ? '#16a34a' : absDiff < 1.5 ? '#d97706' : '#dc2626';
-                      return (
-                        <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
-                          <td style={{padding:'0.2rem 0.4rem'}}>{row.activity}</td>
-                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem'}}>{row.real?.mean?.toFixed(2) ?? '—'}</td>
-                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem'}}>{row.sim?.mean?.toFixed(2) ?? '—'}</td>
-                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:diffColor, fontWeight:600}}>
-                            {row.mean_diff != null ? (row.mean_diff >= 0 ? '+' : '') + row.mean_diff.toFixed(2) : '—'}
-                          </td>
-                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:'#64748b'}}>{row.real?.count ?? '—'}</td>
-                          <td style={{textAlign:'right', padding:'0.2rem 0.4rem', color:'#64748b'}}>{row.sim?.count ?? '—'}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Coverage tab */}
-      {evalTab === 'coverage' && (
-        <OCCoveragePanel results={rAsis} model={activeModel || modelBase} discoveryResults={discoveryResults} logResults={inputLogCovResults} />
-      )}
-
-        </>
-      )}
-    </div>
-  );
-}
 
 function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode, simActivityObjectCounts, onConformanceSaved, onScoresComputed, eventLogFiles, handleFileUpload, inputLogConfResults, inputEventLogFile }) {
   const simMetrics = results?.metrics?.activity_metrics || {};
@@ -7514,7 +6499,7 @@ function App() {
     seed: 42,
     startActivities: [],
     startActivitiesLocked: false, // true once user explicitly toggles ★
-    startActivityCaps: {},        // {activityName: maxFires | ''} — per-activity cap
+    startActivityCaps: {},        // Overrides; missing/blank values use the log count
   });
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulatingMode, setSimulatingMode] = useState(null); // 'asis' | 'tobe' | null
@@ -8191,6 +7176,17 @@ function App() {
   }, [activeRunId]);
 
   const runSimulation = async (mode = 'tobe') => {
+    const startActivities = mode === 'tobe' && tobeStartActivities.length > 0
+      ? tobeStartActivities : config.startActivities;
+    let startActivityCaps;
+    try {
+      startActivityCaps = resolveStartActivityCaps(startActivities,
+        mode === 'tobe' ? tobeStartActivityCaps : config.startActivityCaps,
+        discoveryResults?.activity_counts || {});
+    } catch (err) {
+      setError(err.message);
+      return;
+    }
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     // Pick model/matrix based on mode
     const simModel  = mode === 'asis' ? (modelAsIs ?? modelBase) : (modelToBe  ?? activeModel);
@@ -8327,11 +7323,8 @@ function App() {
         // Send model/probs for the chosen mode
         ...(simModel  ? { modelOverride:       simModel }  : {}),
         ...(simMatrix ? { probMatrixOverride: simMatrix } : {}),
-        // Use per-model start activities
-        ...(mode === 'tobe' ? {
-          startActivities: tobeStartActivities.length > 0 ? tobeStartActivities : config.startActivities,
-          startActivityCaps: tobeStartActivityCaps,
-        } : {}),
+        startActivities,
+        startActivityCaps,
       };
 
       const response = await axios.post('/api/simulate', simulationData);
@@ -11105,7 +10098,7 @@ function App() {
                       })()}
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
                         <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
-                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities</div>
+                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
                           <button onClick={() => setBaseStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
                             {baseStartFolded ? '▶' : '▼'}
                           </button>
@@ -11148,17 +10141,23 @@ function App() {
                           <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
                             {config.startActivities.map(act => {
                               const logCount = discoveryResults?.activity_counts?.[act];
-                              const capVal = config.startActivityCaps?.[act] ?? '';
+                              const capVal = config.startActivityCaps?.[act] ?? logCount ?? '';
                               return (
                                 <div key={act} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.8rem'}}>
                                   <span style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'#334155',fontWeight:500}}>{act}</span>
-                                  <input type="text" inputMode="numeric" placeholder="∞" value={capVal}
+                                  <input type="text" inputMode="numeric" placeholder={logCount ?? 'Required'} value={capVal}
+                                    aria-label={`Base starting count for ${act}`}
                                     onChange={e => {
-                                      const raw = e.target.value.replace(/\D/g,'');
-                                      setConfig(p => ({...p, startActivityCaps:{...(p.startActivityCaps||{}),[act]: raw===''?'':parseInt(raw)||1}}));
+                                      const raw = e.target.value;
+                                      if (/^\d*$/.test(raw)) setConfig(p => ({...p, startActivityCaps:{...(p.startActivityCaps||{}),[act]: raw}}));
                                     }}
+                                    onBlur={() => setConfig(p => {
+                                      if (p.startActivityCaps?.[act] !== '') return p;
+                                      const caps = {...p.startActivityCaps}; delete caps[act];
+                                      return {...p, startActivityCaps: caps};
+                                    })}
                                     style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
-                                    title="Max times this activity may start (leave blank for unlimited)"
+                                    title="Maximum starts. Prefilled from the log; enter your own count or clear to restore the log count."
                                   />
                                   {logCount != null && (
                                     <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
@@ -11197,7 +10196,7 @@ function App() {
                       })()}
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
                         <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
-                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities</div>
+                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
                           <button onClick={() => setAltStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
                             {altStartFolded ? '▶' : '▼'}
                           </button>
@@ -11237,17 +10236,22 @@ function App() {
                           <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
                             {tobeStartActivities.map(act => {
                               const logCount = discoveryResults?.activity_counts?.[act];
-                              const capVal = tobeStartActivityCaps?.[act] ?? '';
+                              const capVal = tobeStartActivityCaps?.[act] ?? logCount ?? '';
                               return (
                                 <div key={act} style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.8rem'}}>
                                   <span style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'#2563eb',fontWeight:500}}>{act}</span>
-                                  <input type="text" inputMode="numeric" placeholder="∞" value={capVal}
+                                  <input type="text" inputMode="numeric" placeholder={logCount ?? 'Required'} value={capVal}
+                                    aria-label={`Alternative starting count for ${act}`}
                                     onChange={e => {
-                                      const raw = e.target.value.replace(/\D/g,'');
-                                      setTobeStartActivityCaps(p => ({...p,[act]: raw===''?'':parseInt(raw)||1}));
+                                      const raw = e.target.value;
+                                      if (/^\d*$/.test(raw)) setTobeStartActivityCaps(p => ({...p,[act]: raw}));
                                     }}
+                                    onBlur={() => setTobeStartActivityCaps(p => {
+                                      if (p[act] !== '') return p;
+                                      const caps = {...p}; delete caps[act]; return caps;
+                                    })}
                                     style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
-                                    title="Max times this activity may start (leave blank for unlimited)"
+                                    title="Maximum starts. Prefilled from the log; enter your own count or clear to restore the log count."
                                   />
                                   {logCount != null && (
                                     <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
@@ -11778,6 +10782,7 @@ function App() {
                                 </Collapsible>
                               );
                             })()}
+                            <ObjectRelationshipAudit rows={r.audit?.object_relationship_audit} />
                             {/* Dev measures */}
                             <Collapsible title="Dev measures" defaultOpen={false}>
                               {/* Case Tracker */}
@@ -11904,12 +10909,15 @@ function App() {
                 </div>
               ) : (
                 <EvaluationWrapper
+                  enabled={evaluationReady}
                   resultsAsIs={resultsAsIs}
                   resultsToBe={resultsToBe}
                   results={results}
                   discoveryResults={discoveryResults}
                   activeModel={activeModel}
                   modelBase={modelBase}
+                  modelAsIs={modelAsIs}
+                  modelToBe={modelToBe}
                   serviceTimeMode={serviceTimeMode}
                   simActivityObjectCounts={simActivityObjectCounts}
                   onConformanceSaved={() => axios.get('/api/run-history').then(r => setRunHistory(r.data.runs||[])).catch(()=>{})}
@@ -13361,6 +12369,8 @@ function App() {
                   </table>
                 </Collapsible>
               )}
+
+              <ObjectRelationshipAudit rows={results.audit?.object_relationship_audit} />
 
               {/* ── Activity Participation Audit ── */}
               {results.audit?.activity_participation_audit && Object.keys(results.audit.activity_participation_audit).length > 0 && (

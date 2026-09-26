@@ -24,7 +24,7 @@ from Backend.src.Simulation.Models.OCDeclare import (
     derive_provisional_lifecycle_from_list,
     apply_lifecycle_from_provisional_info,
 )
-from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy
+from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy, resolve_start_activity_caps
 from Backend.src.Simulation.Domain.state import SimulationState
 from Backend.src.Simulation.Engine.simulator import Simulator
 from Backend.src.ParameterDiscovery.timediscovery import compute_ocpa_metrics
@@ -1026,13 +1026,8 @@ def run_simulation():
         if not start_activities:
             sa = data.get('startActivity')
             start_activities = [sa] if sa else []
-        # Per-activity start caps: {activity_name: max_fires} — optional
-        start_activity_caps = data.get('startActivityCaps') or {}
-        if isinstance(start_activity_caps, dict):
-            # Coerce values to int, drop null/empty
-            start_activity_caps = {k: int(v) for k, v in start_activity_caps.items() if v not in (None, '', 0)}
-        else:
-            start_activity_caps = {}
+        # Blank/missing entries use the activity's occurrence count in the log.
+        start_activity_caps = data.get('startActivityCaps')
         model_override = data.get('modelOverride')            # full edited model dict (optional)
         prob_matrix_override = data.get('probMatrixOverride') # normalised prob matrix (optional)
 
@@ -1046,11 +1041,25 @@ def run_simulation():
         cached = {}
         if event_log_file and event_log_file in discovery_cache:
             cached = discovery_cache[event_log_file]
-            prob_matrix = cached['prob_matrix']
-            time_distributions = cached['time_distributions']
+            prob_matrix = cached.get('prob_matrix', {})
+            time_distributions = cached.get('time_distributions', {})
         else:
             prob_matrix = {}
             time_distributions = {}
+
+        discovered_counts = cached.get('activity_counts', {})
+        needs_defaults = not isinstance(start_activity_caps, dict) or any(
+            start_activity_caps.get(a) is None or str(start_activity_caps.get(a)).strip() == ''
+            for a in start_activities)
+        if needs_defaults and not discovered_counts and event_log_file and (EVENTLOG_DIR / event_log_file).is_file():
+            # Also support running after a server restart, before rediscovery.
+            ocel = load_ocel2(str(EVENTLOG_DIR / event_log_file))
+            discovered_counts = Counter(e.get('activity') for e in ocel.get('events', {}).values())
+        try:
+            start_activity_caps = resolve_start_activity_caps(
+                start_activities, start_activity_caps, discovered_counts)
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
 
         # Apply overrides supplied by the model editor
         if prob_matrix_override:
@@ -1257,6 +1266,7 @@ def run_simulation():
             'max_sim_time_s': max_sim_time_s,
             'seed':           seed,
             'start_activities': start_activities,
+            'start_activity_caps': start_activity_caps,
             'steps_executed': final_state.step_count,
             'events_count':   len(final_state.executed_events),
             'objects_count':  len(final_state.objects),
@@ -1276,6 +1286,7 @@ def run_simulation():
             'success': True,
             'results': {
                 'steps_executed': final_state.step_count,
+                'start_activity_caps': start_activity_caps,
                 'events_count': len(final_state.executed_events),
                 'objects_count': len(final_state.objects),
                 'object_types': dict(obj_types),
@@ -2798,6 +2809,39 @@ def health_check():
 
 
 # ── Further Evaluations endpoints ────────────────────────────────────────────
+
+@app.route('/api/evaluation/notebook', methods=['POST'])
+def notebook_evaluation():
+    """Evaluate complete saved OCELs using the reference notebook's measures."""
+    from Backend.src.Evaluation.service import evaluate_logs
+
+    def read_selected_file(root, filename):
+        if not isinstance(filename, str) or not filename:
+            raise ValueError('A saved log filename is required.')
+        path = (root / filename).resolve()
+        if not path.is_relative_to(root.resolve()):
+            raise ValueError('Select a file from the project logs.')
+        with path.open(encoding='utf-8') as stream:
+            return json.load(stream)
+
+    try:
+        data = request.get_json(silent=True) or {}
+        simulated = read_selected_file(OUTPUT_DIR, data.get('outputFile'))
+        reference = (read_selected_file(EVENTLOG_DIR, data['eventLogFile'])
+                     if data.get('eventLogFile') else None)
+        model = data.get('modelOverride')
+        if model is None and data.get('ocdeclareFile'):
+            model = read_selected_file(OCDECLARE_DIR, data['ocdeclareFile'])
+        report = evaluate_logs(reference, simulated, model,
+                               service_time_mode=data.get('serviceTimeMode', 'minimum'),
+                               anchor_activities=data.get('anchorActivities', []))
+        report['files'] = {'input': data.get('eventLogFile'), 'simulated': data['outputFile']}
+        return jsonify(report)
+    except FileNotFoundError:
+        return jsonify({'error': 'A selected log or model file is no longer available.'}), 404
+    except (ValueError, KeyError, TypeError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
 
 def _build_static_model_from_request(data):
     """Shared helper: parse model + event-log cache from a request dict.

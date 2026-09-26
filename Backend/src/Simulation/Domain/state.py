@@ -101,6 +101,30 @@ class PendingObligation:
     scope_object_id: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ResponseObligation:
+    """One response requirement for one source activation/Each assignment.
+
+    Each and All contribute mandatory objects; each Any group requires at
+    least one member in the same target event. Remaining counts live in
+    SimulationState._obligations_count, so bookkeeping has one count authority.
+    """
+    constraint_key: tuple
+    required_objects: frozenset[str] = frozenset()
+    any_groups: tuple[frozenset[str], ...] = ()
+
+    def matches(self, object_ids) -> bool:
+        present = set(object_ids)
+        return self.required_objects.issubset(present) and all(
+            group.intersection(present) for group in self.any_groups)
+
+    def possible(self, objects) -> bool:
+        def active(oid):
+            return oid in objects and objects[oid].active
+        return all(active(oid) for oid in self.required_objects) and all(
+            any(active(oid) for oid in group) for group in self.any_groups)
+
+
 @dataclass
 class SimulationState:
     step_count: int = 0
@@ -112,9 +136,13 @@ class SimulationState:
     links: list[ObjectLink] = field(default_factory=list)
     executed_events: list[ExecutedEvent] = field(default_factory=list)
     pending_obligations: list[PendingObligation] = field(default_factory=list)
-    # Fast index for obligation resolution: (target_activity, scope_object_id|None) -> count
-    # None key is used for unscoped obligations. Kept in sync with pending_obligations.
+    # (target_activity, (constraint_index, source_event_id, Each assignment))
+    # -> number of qualifying future completions still required.
     _obligations_count: dict[tuple, int] = field(default_factory=dict)
+    _response_obligations: dict[tuple, ResponseObligation] = field(default_factory=dict)
+    _responses_by_target: dict[str, set] = field(default_factory=dict)
+    _responses_by_object: dict[str, set] = field(default_factory=dict)
+    _obligation_waiting_on: dict[tuple, tuple] = field(default_factory=dict)
     next_object_counter: dict[str, int] = field(default_factory=dict)
     next_event_counter: int = 1
     last_generated_timestamp: Optional[datetime] = None
@@ -253,12 +281,6 @@ class SimulationState:
     # Key: (constraint_type, source_activity, target_activity, scope_kind) — matches constraint identity.
     # Value: {"fulfilled": int, "cancelled": int, "violated": int}
     _constraint_obligation_stats: dict = field(default_factory=dict)
-    # Maps each active obligation key → constraint identity tuple, so deactivate_object
-    # can attribute cancellations to the right constraint without a full scan.
-    _obligation_to_constraint: dict = field(default_factory=dict)
-    # Multi-type secondary binding info: obligation_key → [(obj_type, inv, frozenset(required_oids))]
-    # Only populated for multi-type response obligations; empty for single-type.
-    _obligation_bindings: dict = field(default_factory=dict)
     # Running count of deactivated non-resource objects (= completed traces)
     # Maintained in deactivate_object — avoids O(n) scan in _should_stop
     completed_trace_count: int = 0
@@ -273,9 +295,9 @@ class SimulationState:
     _linked_by_type: dict = field(default_factory=dict)
 
     # Phase 1 — Obligation stratification
-    # Ready pool: (target_act, scope_oid) → 1 — prerequisites satisfied, inject immediately
+    # Ready pool: obligation key -> remaining count; full checks still apply.
     _obligations_ready: dict = field(default_factory=dict)
-    # Blocked pool: (blocking_source_act, scope_oid) → set of (target_act, oblg_oid) waiting for it
+    # Blocked pool: (blocking_source_act, scope_oid) -> waiting obligation keys.
     _obligations_blocked: dict = field(default_factory=dict)
 
     # #23 — Incremental candidate pool for the "expand" section of
@@ -306,6 +328,41 @@ class SimulationState:
     # step (drives the new/updated-supply full-rescan trigger).
     _step_dirty_objects: set = field(default_factory=set)
     _step_dirty_types: set = field(default_factory=set)
+
+    def add_response_obligation(self, key, obligation: ResponseObligation, count: int) -> None:
+        self._response_obligations[key] = obligation
+        self._obligations_count[key] = count
+        self._responses_by_target.setdefault(key[0], set()).add(key)
+        for oid in obligation.required_objects.union(*obligation.any_groups):
+            self._responses_by_object.setdefault(oid, set()).add(key)
+
+    def finish_response_obligation(self, key, *, cancelled: bool = False) -> None:
+        obligation = self._response_obligations.pop(key)
+        self._obligations_count.pop(key, None)
+        self._obligations_ready.pop(key, None)
+        blocker = self._obligation_waiting_on.pop(key, None)
+        if blocker is not None:
+            waiting = self._obligations_blocked.get(blocker, set())
+            waiting.discard(key)
+            if not waiting:
+                self._obligations_blocked.pop(blocker, None)
+        for index, values in ((self._responses_by_target, [key[0]]),
+                              (self._responses_by_object, obligation.required_objects.union(*obligation.any_groups))):
+            for value in values:
+                keys = index.get(value, set())
+                keys.discard(key)
+                if not keys:
+                    index.pop(value, None)
+        stats = self._constraint_obligation_stats.setdefault(
+            obligation.constraint_key, {'fulfilled': 0, 'cancelled': 0, 'violated': 0})
+        if cancelled:
+            stats['cancelled'] += 1
+            stats['violated'] += 1
+            self.total_obligations_cancelled += 1
+            self.total_obligations_violated += 1
+        else:
+            stats['fulfilled'] += 1
+            self.total_obligations_fulfilled += 1
 
     def new_object_id(self, object_type: str) -> str:
         current = self.next_object_counter.get(object_type, 0) + 1
@@ -368,9 +425,9 @@ class SimulationState:
         """Mark an object inactive and update the active-by-type index.
 
         When a non-resource object is deactivated:
-        - All pending response obligations scoped to this object are removed
-          from _obligations_count (a deactivated object can never fire activities,
-          so its obligations can never be fulfilled and should not inflate the pool).
+        - Pending response obligations that have become impossible are cancelled.
+          Each/All requirements need every mandatory object to remain active;
+          Any requirements survive while at least one eligible member is active.
         - Any resource-type neighbors whose only remaining active links are to
           now-inactive objects have those links removed from the runtime index.
           The persistent link log (self.links) is untouched so the OCEL output
@@ -392,72 +449,13 @@ class SimulationState:
             if not active_set:
                 self._inactive_scope_types.add(obj.object_type)
 
-        # Clear all pending obligations scoped to this object.
-        keys_to_remove = []
-        for k in self._obligations_count:
-            if isinstance(k[1], str) and k[1] == object_id:
-                keys_to_remove.append(k)
-            elif isinstance(k[1], frozenset) and object_id in k[1]:
-                c_key_ob = self._obligation_to_constraint.get(k)
-                if c_key_ob and len(c_key_ob) > 3 and c_key_ob[3] == 'any':
-                    # any-mode: cancel only when no other active members remain
-                    remaining_active = any(
-                        oid != object_id and self.objects.get(oid) and self.objects[oid].active
-                        for oid in k[1]
-                    )
-                    if not remaining_active:
-                        keys_to_remove.append(k)
-                else:
-                    # all-mode: cancel immediately — full set can never fire
-                    keys_to_remove.append(k)
-            else:
-                # Multi-type obligation: the key holds only the 'each'-binding
-                # objects. Secondary any/all bindings live in
-                # _obligation_bindings and were never examined here, so an
-                # obligation whose secondary 'all' object had been deactivated
-                # stayed pending forever — unsatisfiable by construction, yet
-                # never cancelled and never counted as a violation. It also kept
-                # feeding obligation injection with candidates that could not
-                # fire. Measured on container_logistics: 15 of 95 multi-type
-                # obligations were in that state at the end of a 2000-event run.
-                #
-                # Each binding is judged by ITS OWN involvement, not the primary
-                # binding's kind, which is what c_key[3] above records.
-                for _t, _inv, _required in (self._obligation_bindings.get(k) or ()):
-                    if object_id not in _required:
-                        continue
-                    if _inv == 'any':
-                        # satisfiable while any member of this binding lives
-                        if any(oid != object_id and self.objects.get(oid)
-                               and self.objects[oid].active for oid in _required):
-                            continue
-                    # 'all' (or an exhausted 'any'): this binding can never be
-                    # satisfied again, so neither can the obligation.
-                    keys_to_remove.append(k)
-                    break
-        _seen_removals = set()
-        for k in keys_to_remove:
-            if k in _seen_removals:
-                continue
-            _seen_removals.add(k)
-            del self._obligations_count[k]
-            self._obligations_ready.pop(k, None)
-            self._obligation_bindings.pop(k, None)
-            # Each cancelled unfulfilled obligation is a constraint violation (S8).
-            # Attribute it to the originating constraint via the reverse-lookup dict.
-            c_key = self._obligation_to_constraint.pop(k, None)
-            if c_key is not None:
-                stats = self._constraint_obligation_stats.setdefault(
-                    c_key, {"fulfilled": 0, "cancelled": 0, "violated": 0}
-                )
-                stats["cancelled"] += 1
-                stats["violated"] += 1
-                self.total_obligations_violated += 1
+        # A partial response remains outstanding; deactivation cancels only
+        # requirements that can no longer be met (Any can use surviving members).
+        for key in list(self._responses_by_object.get(object_id, ())):
+            obligation = self._response_obligations[key]
+            if not obligation.possible(self.objects):
+                self.finish_response_obligation(key, cancelled=True)
         self.total_deactivations += 1
-        self.total_obligations_cancelled += len(keys_to_remove)
-        # Clean up stratified obligation pools (blocked only; ready handled above)
-        for k in [k for k in self._obligations_blocked if isinstance(k[1], str) and k[1] == object_id]:
-            self._obligations_blocked.pop(k, None)
         # [resource/permanent-object handling — disabled, kept for reference]
         # Increment completed trace count for non-resource objects
         # resource_types: set = getattr(self, '_resource_types', set()) or set()

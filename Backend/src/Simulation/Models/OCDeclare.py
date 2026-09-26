@@ -324,7 +324,15 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
     }
     _constraints_idx: dict = {}
     for c in constraints:
-        for act in (c.source_activity, c.target_activity):
+        affected = {c.source_activity, c.target_activity}
+        # These rules also reject activities other than their endpoints:
+        # chain rules forbid intervening events; init forbids an earlier event.
+        if c.constraint_type in ('chain_response', 'chain_succession', 'init'):
+            scope_types = {t for t, _ in c.scope.bindings} or {c.scope.object_type}
+            global_scope = c.scope.kind not in ('each', 'any', 'all')
+            affected.update(a.name for a in activities if global_scope or any(
+                b.object_type in scope_types for b in a.bindings))
+        for act in affected:
             if act:
                 _constraints_idx.setdefault(act, []).append(c)
     for act in _constraints_idx:

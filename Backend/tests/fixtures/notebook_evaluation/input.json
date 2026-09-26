@@ -1,0 +1,199 @@
+{
+  "objects": [
+    {
+      "id": "o1",
+      "type": "Order"
+    },
+    {
+      "id": "o2",
+      "type": "Order"
+    },
+    {
+      "id": "unused",
+      "type": "Unused"
+    },
+    {
+      "id": "i1",
+      "type": "Item"
+    },
+    {
+      "id": "i2",
+      "type": "Item"
+    },
+    {
+      "id": "w1",
+      "type": "Worker"
+    }
+  ],
+  "events": [
+    {
+      "id": "z0",
+      "type": "A",
+      "time": "2025-01-01T00:00:00Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "b1",
+      "type": "B",
+      "time": "2025-01-01T00:00:02Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "b2",
+      "type": "B",
+      "time": "2025-01-01T00:00:04Z",
+      "relationships": [
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "b3",
+      "type": "B",
+      "time": "2025-01-01T00:00:06Z",
+      "relationships": [
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "z4",
+      "type": "C",
+      "time": "2025-01-01T00:00:08Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "a4",
+      "type": "A",
+      "time": "2025-01-01T00:00:08Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "a5",
+      "type": "A",
+      "time": "2025-01-01T00:00:10Z",
+      "relationships": [
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "b6",
+      "type": "B",
+      "time": "2025-01-01T00:00:13Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "c7",
+      "type": "C",
+      "time": "2025-01-01T00:00:18Z",
+      "relationships": [
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "free",
+      "type": "Free",
+      "time": "2025-01-01T00:00:20Z",
+      "relationships": []
+    }
+  ]
+}

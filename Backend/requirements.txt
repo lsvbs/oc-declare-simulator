@@ -1,2 +1,5 @@
 flask==3.0.0
 flask-cors==4.0.0
+numpy>=1.26,<3
+pandas>=2.0,<3
+scipy>=1.11,<2

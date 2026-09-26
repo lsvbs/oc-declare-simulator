@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from itertools import combinations
 from typing import Optional
 from collections import defaultdict
 
@@ -21,6 +22,8 @@ class Candidate:
     activity_name: str
     participating_object_ids: list[str] = field(default_factory=list)
     object_types_to_create: list[str] = field(default_factory=list)
+    # Pins survive rebinding when another candidate claims a secondary object.
+    required_object_ids: tuple[str, ...] = field(default=(), compare=False)
 
 
 def find_active_objects_of_type(
@@ -202,6 +205,12 @@ def build_candidate_for_activity(
             if obj is None or not obj.active:
                 return None
             existing_ids = [force_object_id]
+            if binding.min_count > 1:
+                # Pin one member, not the entire binding. Fetch all potential
+                # partners so guards/link preference can still form a batch.
+                existing_ids += [oid for oid in find_active_objects_of_type(
+                    state, binding.object_type, cache=pool_cache)
+                    if oid != force_object_id]
         elif is_forced_set:
             forced = _forced_ids_by_type[binding.object_type]
             # Verify all forced objects are active
@@ -209,7 +218,10 @@ def build_candidate_for_activity(
                 _fobj = state.objects.get(_foid)
                 if _fobj is None or not _fobj.active:
                     return None
-            existing_ids = forced
+            existing_ids = list(forced) + [
+                oid for oid in find_active_objects_of_type(state, binding.object_type)
+                if oid not in forced
+            ]
         else:
             # Determine how many objects to fetch for link-preference selection.
             if binding.creates:
@@ -226,6 +238,10 @@ def build_candidate_for_activity(
         guard = getattr(binding, 'guard', None)
         if guard:
             existing_ids = _apply_guard_filter(existing_ids, guard, state)
+        if is_forced_primary and binding.min_count > 0 and force_object_id not in existing_ids:
+            return None
+        if is_forced_set and any(oid not in existing_ids for oid in forced):
+            return None
 
         # Basic validation: if max_count provided but less than min_count, impossible
         if binding.max_count is not None and binding.max_count < binding.min_count:
@@ -239,7 +255,9 @@ def build_candidate_for_activity(
 
         if not binding.creates:
             eligibility_count = binding.min_count
-            target_count = binding.min_count
+            target_count = max(binding.min_count, len(forced) if is_forced_set else 0)
+            if binding.max_count is not None and target_count > binding.max_count:
+                return None
 
             # Use already existing active objects first (but do not exceed max_count)
             if binding.max_count is None:
@@ -256,6 +274,18 @@ def build_candidate_for_activity(
             selected_ids = _find_objects_preferring_linked(
                 state, existing_ids, participating_object_ids_set, selected_from_existing
             )
+            if is_forced_primary and target_count > 0:
+                # Link preference must not substitute a different primary.
+                selected_ids = [force_object_id] + _find_objects_preferring_linked(
+                    state, [oid for oid in existing_ids if oid != force_object_id],
+                    participating_object_ids_set | {force_object_id},
+                    max(0, target_count - 1),
+                )
+            elif is_forced_set:
+                selected_ids = list(forced) + _find_objects_preferring_linked(
+                    state, [oid for oid in existing_ids if oid not in forced],
+                    participating_object_ids_set | set(forced), target_count - len(forced),
+                )
             if len(selected_ids) < eligibility_count:
                 # Not enough input objects to satisfy this binding
                 return None
@@ -341,7 +371,54 @@ def build_candidate_for_activity(
         activity_name=activity.name,
         participating_object_ids=participating_object_ids,
         object_types_to_create=object_types_to_create,
+        required_object_ids=tuple(dict.fromkeys(
+            ([force_object_id] if force_object_id else []) + (force_object_ids or []))),
     )
+
+
+def alternative_bindings(activity: Activity, candidate: Candidate, state: SimulationState):
+    """Lazily try free alternatives, preserving pins, cardinalities and creation.
+
+    Original free participants and existing neighbours are preferred. Every
+    yielded combination still needs the full semantic/O2O/start checks. No
+    durations, creation distributions or probabilities are resampled here.
+    """
+    pinned = set(candidate.required_object_ids)
+    if not pinned:
+        primary = next((b.object_type for b in activity.bindings if not b.creates), None)
+        pinned.update(next(([oid] for oid in candidate.participating_object_ids
+                            if state._type_of_object.get(oid) == primary), []))
+    if any(oid in state._busy_objects or not state.objects.get(oid)
+           or not state.objects[oid].active for oid in pinned):
+        return
+    choices = []
+    for binding in activity.bindings:
+        original = [oid for oid in candidate.participating_object_ids
+                    if state._type_of_object.get(oid) == binding.object_type]
+        mandatory = sorted(pinned.intersection(original))
+        eligible = _apply_guard_filter(
+            sorted(state._active_by_type.get(binding.object_type, set()) - state._busy_objects),
+            binding.guard, state) if binding.guard else sorted(
+                state._active_by_type.get(binding.object_type, set()) - state._busy_objects)
+        if not set(mandatory).issubset(eligible):
+            return
+        available = [oid for oid in eligible if oid not in mandatory]
+        available.sort(key=lambda oid: (oid not in original,
+            not bool(state._links_by_object.get(oid, set()).intersection(pinned)), oid))
+        needed = len(original) - len(mandatory)
+        if len(available) < needed:
+            return
+        choices.append((mandatory, available, needed))
+
+    def expand(index, selected):
+        if index == len(choices):
+            if selected != candidate.participating_object_ids:
+                yield replace(candidate, participating_object_ids=selected)
+            return
+        mandatory, available, needed = choices[index]
+        for extra in combinations(available, needed):
+            yield from expand(index + 1, selected + mandatory + list(extra))
+    yield from expand(0, [])
 
 
 def build_candidate_for_object_and_activity(
@@ -442,4 +519,3 @@ def is_candidate_semantically_allowed(
         return False
 
     return True
-

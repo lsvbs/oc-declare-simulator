@@ -8,13 +8,10 @@ managed, and how the DES engine operates.
 
 ## 1. Simulation Modes
 
-### Step-based mode
-Used when no resource types are defined. Activities fire one per step. No concurrency, no clock.
-Candidate pool is rebuilt each step and one candidate is selected by the probability matrix.
-
 ### DES mode (Discrete Event Simulation)
-Activated automatically when resource types are configured. Multiple activities can be in-flight
-simultaneously. The simulation clock advances to the next completion time on a min-heap.
+All runs use DES. Multiple activities can be in-flight simultaneously.
+The simulation clock advances to the earliest completion, eligible arrival, or calendar change,
+bounded by the simulation deadline.
 Each activity has a `started_at` and `complete_at` timestamp.
 
 ---
@@ -23,11 +20,21 @@ Each activity has a `started_at` and `complete_at` timestamp.
 
 Each simulation step builds a pool of feasible candidates:
 
-1. For each activity, find all active non-resource objects of the primary binding type (capped at 32 per activity).
+1. For each activity, find active objects of the primary binding type. Pin each primary object in turn,
+   filling any required batch with additional eligible objects of that type. Deduplicate identical candidates.
 2. Build a `Candidate(activity_name, participating_object_ids, object_types_to_create)` for each object.
 3. Filter by `is_candidate_semantically_allowed` — runs all constraint and O2O checks.
+   If a secondary binding fails, try eligible alternatives while keeping the primary object,
+   forced response objects, binding counts and sampled creation counts unchanged.
 4. Apply max-consecutive caps (global and per-object).
-5. **Response obligation injection (Option 4):** for every pending obligation `(B, scope_object_id)` in `_obligations_count`, inject B with that scope object into the pool if not already present. All normal semantic checks still apply.
+5. **Response obligation injection:** offer a complete binding for each ready response
+   requirement not already represented by a candidate. Each/All objects are retained and
+   Any groups contribute an eligible member. All normal semantic checks still apply.
+
+Immediately before starting, recheck constraints against the current state, including
+running instances. If an earlier start has claimed a secondary object, try free alternatives
+using the same checks. Calendars, concurrency caps, start caps and object exclusivity still
+govern admission; no clock or completion scheduling rule is changed by rebinding.
 
 ---
 
@@ -35,6 +42,13 @@ Each simulation step builds a pool of feasible candidates:
 
 ### Scope
 - `each <ObjectType>`: constraint applies per individual object of that type. Checked separately for each scope object in the candidate.
+- `any <ObjectType>` in a response: a qualifying target event contains at least one object
+  of that type from the source event.
+- `all <ObjectType>` in a response: a qualifying target event contains every object of
+  that type from the source event, together in the same event.
+- Multiple response bindings must hold jointly in a target event. Each bindings create
+  separate requirements for each combination of source objects; All and Any groups are
+  retained within each requirement.
 - `global`: constraint applies across all objects of all types.
 
 ### Precedence `precedence(A → B nmin=N nmax=M per ObjectType)`
@@ -49,25 +63,43 @@ Each simulation step builds a pool of feasible candidates:
 Once the source count exceeds `nmax`, B is permanently blocked again (useful for capping cycles).
 
 ### Response `response(A → B nmin=N nmax=M per ObjectType)`
-**Forward obligation + pool injection.** Two distinct mechanisms:
+**Forward obligation + pool injection, with a separate eager upper bound:**
 
 **a) Obligation creation (when A fires):**
-After A fires, for each scope object `o` in the event, an obligation `(B, o)` is added to
-`state._obligations_count`. This obligation persists until B fires on that object.
+Each completion of A creates independent requirements identified by the constraint,
+source event and Each assignment. Each requirement starts with N responses remaining;
+`nmin=0` creates no positive requirement. Repeated activations and different constraints
+sharing the same target are tracked separately.
 
 **b) Pool injection (Option 4 — continuous enforcement):**
-Every step, for every pending obligation `(B, o)`, B is injected into the candidate pool with
-object `o`. B stays a candidate until the obligation is cleared. All other checks (precedence,
-O2O, resources) still apply — injection does not bypass them.
+Every step, ready requirements can inject B with all mandatory objects and an eligible
+member of each Any group. All participants must pass binding bounds, guards, constraints,
+O2O checks and availability checks. Overlapping mandatory groups are joined for a terminal
+response when its binding bounds permit this. An impossible group remains outstanding;
+the engine does not substitute an invalid partial event.
 
 **c) nmax enforcement (eager):**
-If B has already fired `nmax` times on a scope object, B is blocked regardless of pending obligations.
+Completed and running B instances count toward the existing scope-based upper bound.
+Global limits therefore cannot be exceeded by several starts admitted in one simulation
+step. This remains the prototype's history-wide cap, rather than a separate temporal
+upper-bound window for every activation.
 
 **d) Obligation clearance:**
-When B fires on scope object `o`, all obligations `(B, o)` are cleared.
+Each qualifying B completion decrements a requirement once, regardless of how many Any
+members it contains. The requirement is fulfilled only when its remaining count reaches
+zero. One B may count for several earlier activations, but never for activations that have
+not occurred yet. Fulfillment runs before creation of requirements for the completing event.
 
-**Effect:** After A fires, B is always available as a candidate until it fires — "A fires → B must
-eventually happen." The probability matrix still determines when B fires within that window.
+**Effect:** after A, the simulator keeps attempting a feasible B until the minimum is met.
+Injection does not guarantee that incompatible models or bounded runs finish all obligations.
+The probability-based ordering still operates on eligible candidates. A terminal B cannot
+deactivate objects while leaving its own required responses incomplete; unrelated terminal
+activities retain the existing cancellation-and-violation accounting.
+
+Response ordering follows completion processing order, including completions with equal
+timestamps. Strict timestamp ordering in external evaluation can differ for tied events;
+this existing convention and the history-wide upper bound must be stated as prototype
+limitations when comparing with full temporal OC-Declare semantics.
 
 ### Not-Coexistence `not_coexistence(A, B per ObjectType)`
 If A has already fired on scope object `o`, B is blocked for `o` (and vice versa).
@@ -87,7 +119,8 @@ The most recent activity on each scope object must be A. B is only allowed immed
 
 ### Chain-Response `chain_response(A → B per ObjectType)`
 After A fires on a scope object, only B may fire next on that object. Other activities are blocked
-until B fires.
+until B fires. The constraint index includes other activities that can touch the scope type,
+so the check also runs when an intervening activity is proposed. Global chain rules apply to every activity.
 
 ### Alternate-Response `alternate_response(A → B per ObjectType)`
 Between each A firing and its matching B, no other A may occur on the same scope object.
@@ -102,9 +135,12 @@ Post-hoc only — not enforced during the run. Audited at end of simulation.
 
 ### Absence `absence(A nmax=M per ObjectType)`
 A must never fire (nmax=0) or fire at most M times on the scope object.
+Global upper limits reserve capacity for running instances as well as completed events.
+An open calendar controls when work may start; it does not grant additional execution allowance.
 
 ### Exactly `exactly(A nmin=N per ObjectType)`
-A must fire exactly N times. Blocks A after N firings.
+A must fire exactly N times. The admission check enforces the upper bound, including
+running instances for global limits; it does not guarantee the lower bound before a run stops.
 
 ### Init `init(A)`
 A must be the first activity to fire. All others are blocked until A fires at least once.
@@ -125,21 +161,65 @@ Object-to-object cardinality rules constrain how many links can exist between ob
 
 `O2O(TypeA ↔ TypeB min=1 max=M)`
 
-Checked when a candidate would create a new link between participating objects:
-- Count existing links from the candidate's TypeA objects to TypeB objects.
-- Add new links that would be created by this firing.
-- If total > max_links → candidate is **rejected**.
+One pure relationship planner is used both for candidate admission and immediately before
+activity start. It includes existing–existing, existing–new and new–new pairs within the
+candidate. Only type pairs covered by an O2O rule are linked; self-links and duplicate
+partners are excluded. Unrelated objects outside the candidate are never selected here.
 
-**Resource types are exempt from O2O checks.** Resources are shared across cases and should
-not accumulate permanent link caps that block future firings.
+Every applicable maximum is checked against existing distinct partners plus the complete
+proposed set of links, including counts for newly created objects. A directional rule bounds
+its source objects only; `bidirectional=True` applies the same bounds to both ends. Two
+directional rules can therefore express one Order with many Items, each Item with one Order.
+All applicable rules must hold. If the complete plan exceeds any maximum, the candidate is
+rejected before objects, links, ID counters, locks or random samples are changed. The planner
+does not select an arbitrary subset or infer a matching for ambiguous batches.
 
-Links are stored persistently in `state.links` (for the output OCEL) but when a non-resource
-object is deactivated, its links to resource objects are removed from the runtime index
-`state._links_by_object`, freeing the resource for future cases.
+Minimums describe accumulated lifetime partner counts; they are **not immediate creation
+preconditions**, since partners can be created by later activities. The post-run
+`object_relationship_audit` reports objects below each minimum (active and inactive separately)
+and above each maximum. Active objects can be incomplete at the chosen simulation horizon.
+These diagnostics are separate from OC-Declare conformance and do not claim eventual
+fulfilment of minimums. A domain requiring immediate minimums needs an explicit additional
+enabling policy.
+
+Objects and their validated links are committed at activity **start**, as before. Events,
+attribute updates, obligations and deactivation remain at **completion**. The relationship
+planner consumes no randomness and does not change OC-Declare scope or template evaluation,
+candidate ranking, the event calendar, concurrency controls or stopping conditions. Corrected
+links can intentionally change later object binding and transitive lookup. Current runtime
+resource exemptions are disabled; this policy checks every configured O2O rule.
+
+Links remain in `state.links` after object deactivation. Runtime neighbour indexes are
+symmetric for binding/traversal, while export preserves the stored source/target orientation.
+OCEL 2.0 output has four standard collections (`objectTypes`, `eventTypes`, `objects`, `events`),
+with O2O links inside each source object's `relationships` as `{objectId, qualifier: ""}`.
+There is no custom top-level `objectRelations` collection. Empty qualifiers reflect the
+prototype's lack of role-specific relationship semantics.
+
+### Thesis alignment (Master_Thesis-17 draft)
+
+- Section 4.4, printed page 27: replace the five-collection description with the four
+  collections and nested object relationships above. See the
+  [official JSON specification](https://www.ocel-standard.org/specification/formats/json/).
+- Section 4.5, printed page 30: the current discovery reads declared object relationships,
+  not event co-participation. It emits one bidirectional rule for equal bounds, or two
+  directional rules for asymmetric bounds. It does not infer individual partner identity
+  from cardinalities alone; candidate-local link creation is an operational assumption.
+- Section 5.1.2, printed page 34: distinguish hard O2O upper bounds from post-run minimum
+  diagnostics, and distinguish O2O parameters from OC-Declare temporal constraints.
+- The DES start/completion structure is preserved by this change. This is not a claim that
+  every other sentence or algorithm in the draft already matches the implementation.
+  Regenerate affected experimental logs and measurements: relationships that were absent
+  during simulation cannot be reconstructed reliably by changing JSON structure alone.
 
 ---
 
 ## 5. Resource Handling
+
+**Historical policy, currently disabled:** the resource-specific exemptions and cleanup
+described below remain commented out in the implementation. Current runs treat these objects
+like other object types, enforce their configured O2O rules, and use ordinary participant
+locking. This section must not be cited as a description of the active resource policy.
 
 Resource types (e.g. Forklift, Truck) are pre-populated at simulation start from
 `resource_pool_sizes`. They are:
@@ -183,13 +263,16 @@ complete_at += sample_waiting(waiting_mean, waiting_std)
 Recorded separately in `state.process_wait_s`. Does not affect the service time metric.
 
 ### Clock advancement (DES)
-The simulation clock `state.current_time` advances to the earliest `complete_at` in the
-in-progress heap:
-```python
-state.current_time = state.in_progress[0].complete_at
-```
+The simulation clock `state.current_time` advances to the earliest of the next completion,
+scheduled arrival with available capacity, calendar boundary, and simulation deadline.
+Arrivals and calendar changes are considered even while activities are running.
+
 All activities started at the same `current_time` are truly concurrent — they each sample
 their duration from `current_time` independently, not from each other's completion.
+
+Completions exactly at the deadline are included; no new activities start at the deadline.
+Activities completing later remain unfinished and produce no completion event. Explicit event,
+trace, case and runtime limits may stop a run earlier.
 
 ### Resource wait time
 When a candidate's resource is busy, the candidate queues in `state.waiting_queue`.
@@ -210,6 +293,17 @@ an activity with `deactivates=True` fires on them. Deactivated objects are remov
 Start activities (listed in `config.start_policy.start_activity_names`) are the only activities
 allowed to fire at simulation start (step 0). They are typically activities that create their
 primary case object (e.g. Register Customer Order creates a Customer Order).
+
+Each selected starting activity has an editable maximum number of starts in the UI.
+It defaults to that activity's event count in the input log; clearing the field restores that
+default. Without a discovered count, the user must enter a non-negative whole number.
+Zero disables starts for that activity. Caps count both completed and in-progress instances,
+preventing concurrent starts from exceeding the configured number. Reaching a start cap stops
+new starts of that activity; downstream work can continue subject to the run's stop conditions.
+
+On completion, the event fulfills response obligations before its objects are deactivated.
+Lifecycle cleanup cancels only obligations still outstanding, including newly created obligations
+that the deactivated objects can no longer fulfill.
 
 ---
 

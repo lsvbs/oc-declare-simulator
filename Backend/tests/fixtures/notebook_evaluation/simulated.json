@@ -1,0 +1,159 @@
+{
+  "objects": [
+    {
+      "id": "o1",
+      "type": "Order"
+    },
+    {
+      "id": "o2",
+      "type": "Order"
+    },
+    {
+      "id": "unused",
+      "type": "Unused"
+    },
+    {
+      "id": "i1",
+      "type": "Item"
+    },
+    {
+      "id": "i2",
+      "type": "Item"
+    },
+    {
+      "id": "w1",
+      "type": "Worker"
+    },
+    {
+      "id": "new",
+      "type": "New"
+    }
+  ],
+  "events": [
+    {
+      "id": "s0",
+      "type": "A",
+      "time": "2025-01-01T00:00:00Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s1",
+      "type": "B",
+      "time": "2025-01-01T00:00:03Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s2",
+      "type": "B",
+      "time": "2025-01-01T00:00:07Z",
+      "relationships": [
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "type": "C",
+      "time": "2025-01-01T00:00:12Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "o2",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s4",
+      "type": "A",
+      "time": "2025-01-01T00:00:13Z",
+      "relationships": [
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s5",
+      "type": "B",
+      "time": "2025-01-01T00:00:18Z",
+      "relationships": [
+        {
+          "objectId": "o1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i1",
+          "qualifier": ""
+        },
+        {
+          "objectId": "i2",
+          "qualifier": ""
+        },
+        {
+          "objectId": "w1",
+          "qualifier": ""
+        }
+      ]
+    },
+    {
+      "id": "s6",
+      "type": "NewActivity",
+      "time": "2025-01-01T00:00:24Z",
+      "relationships": [
+        {
+          "objectId": "new",
+          "qualifier": ""
+        }
+      ]
+    }
+  ]
+}

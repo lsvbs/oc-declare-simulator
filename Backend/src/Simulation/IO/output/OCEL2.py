@@ -11,6 +11,8 @@ Notes for compatibility with OCPQ / OCEL 2.0 readers:
   Otherwise a single snapshot with the simulation start time is used.
 - Event attributes are exported when populated by activity event_attributes
   capture specs (Phase 3).
+- Object-to-object links use each source object's standard `relationships`
+  array, with an empty qualifier until role semantics are modelled.
 """
 
 from __future__ import annotations
@@ -77,6 +79,14 @@ def _build_event_type_definitions(state: SimulationState, static_model: Any = No
 def _build_objects(state: SimulationState, ref_timestamp: Optional[datetime] = None) -> list[dict[str, Any]]:
     objects: list[dict[str, Any]] = []
     ts_str = _isoformat_or_none(ref_timestamp)
+    relationships: dict[str, set[str]] = {}
+    for link in state.links:
+        if link.source_object_id not in state.objects or link.target_object_id not in state.objects:
+            raise ValueError(
+                f"Object relationship references an unknown object: "
+                f"{link.source_object_id!r} -> {link.target_object_id!r}"
+            )
+        relationships.setdefault(link.source_object_id, set()).add(link.target_object_id)
 
     for obj_id in sorted(state.objects.keys()):
         obj = state.objects[obj_id]
@@ -103,6 +113,10 @@ def _build_objects(state: SimulationState, ref_timestamp: Optional[datetime] = N
             "id": obj_id,
             "type": obj.object_type,
             "attributes": attrs,
+            "relationships": [
+                {"objectId": target, "qualifier": ""}
+                for target in sorted(relationships.get(obj_id, ()))
+            ],
         })
 
     return objects
@@ -153,24 +167,6 @@ def _build_events(
     return events
 
 
-def _build_object_relations(state: SimulationState) -> list[dict[str, Any]]:
-    relations: list[dict[str, Any]] = []
-
-    for link in sorted(
-        state.links,
-        key=lambda x: (x.source_object_id, x.target_object_id),
-    ):
-        relations.append(
-            {
-                "sourceObjectId": link.source_object_id,
-                "targetObjectId": link.target_object_id,
-                "type": "related",
-            }
-        )
-
-    return relations
-
-
 def build_ocel2_dict(
     state: SimulationState,
     *,
@@ -197,7 +193,6 @@ def build_ocel2_dict(
             state,
             include_null_timestamps=include_null_timestamps,
         ),
-        "objectRelations": _build_object_relations(state),
     }
 
     if include_debug_metadata:

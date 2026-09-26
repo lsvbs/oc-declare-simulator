@@ -196,6 +196,59 @@ def _diagnose_never_fired(act_name: str, static_model: Any, state: "SimulationSt
     return reasons if reasons else ['No specific cause identified — may be a probability/seed issue']
 
 
+def compute_o2o_audit(state: SimulationState, static_model: Any = None) -> list[dict[str, Any]]:
+    """Report lifetime partner counts without imposing a new event-enabling gate.
+
+    Active objects below the minimum may still acquire partners after the run's
+    horizon. Inactive objects are reported separately. These are diagnostics of
+    the simulation's relationship parameters, not OC-Declare violation counts.
+    Use persistent links so lifecycle/index maintenance cannot erase history.
+    """
+    rules = getattr(static_model, 'o2o_rules', ()) or ()
+    if not rules:
+        return []
+    by_type: dict[str, list] = {}
+    for obj in state.objects.values():
+        by_type.setdefault(obj.object_type, []).append(obj)
+    partners: dict[tuple[str, str], set[str]] = {}
+    for link in state.links:
+        source = state.objects.get(link.source_object_id)
+        target = state.objects.get(link.target_object_id)
+        if source is not None and target is not None:
+            partners.setdefault((source.object_id, target.object_type), set()).add(target.object_id)
+            partners.setdefault((target.object_id, source.object_type), set()).add(source.object_id)
+
+    result = []
+    for index, rule in enumerate(rules):
+        directions = [(rule.source_type, rule.target_type)]
+        if rule.bidirectional and rule.source_type != rule.target_type:
+            directions.append((rule.target_type, rule.source_type))
+        for source_type, target_type in directions:
+            below_active, below_inactive, above = [], [], []
+            objects = by_type.get(source_type, ())
+            for obj in objects:
+                count = len(partners.get((obj.object_id, target_type), ()))
+                if count < rule.min_links:
+                    (below_active if obj.active else below_inactive).append(obj.object_id)
+                if rule.max_links is not None and count > rule.max_links:
+                    above.append(obj.object_id)
+            result.append({
+                'rule_index': index,
+                'source_type': source_type,
+                'target_type': target_type,
+                'min_links': rule.min_links,
+                'max_links': rule.max_links,
+                'checked_object_count': len(objects),
+                'below_min_active_count': len(below_active),
+                'below_min_inactive_count': len(below_inactive),
+                'above_max_count': len(above),
+                'below_min_active_examples': sorted(below_active)[:20],
+                'below_min_inactive_examples': sorted(below_inactive)[:20],
+                'above_max_examples': sorted(above)[:20],
+            })
+    return result
+
+
 def compute_audit(state: SimulationState, static_model: Any = None, prob_matrix: dict | None = None) -> dict[str, Any]:
     """Compute object lifecycle and activity participation audits from a completed run.
 
@@ -366,6 +419,7 @@ def compute_audit(state: SimulationState, static_model: Any = None, prob_matrix:
     return {
         'object_lifecycle_audit':      object_lifecycle_audit,
         'activity_participation_audit': activity_participation_audit,
+        'object_relationship_audit': compute_o2o_audit(state, static_model),
     }
 
 

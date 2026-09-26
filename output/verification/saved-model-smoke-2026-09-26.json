@@ -1,0 +1,54 @@
+{
+  "settings": {
+    "python_hash_seed": 1,
+    "seed": 7,
+    "event_cap": 500,
+    "start_cap": 30,
+    "fixed_duration_seconds": 1
+  },
+  "precedence_checker_unchanged_from_HEAD": true,
+  "runs": [
+    {
+      "model": "discovered_container_logistics_20260915_090557.json",
+      "events": 165,
+      "objects": 105,
+      "links": 83,
+      "fulfilled": 140,
+      "pending": 50,
+      "cancelled": 15,
+      "in_progress": 0,
+      "seconds": 0.127,
+      "schema_valid": false,
+      "schema_attribute_value_errors": 45,
+      "other_schema_errors": 0,
+      "own_loader_links_preserved": true,
+      "o2o_above_max": 0,
+      "pm4py_links_preserved": true
+    },
+    {
+      "model": "discovered_BPIC17RunOCELlog_20260908_092643.json",
+      "events": 0,
+      "objects": 0,
+      "links": 0,
+      "fulfilled": 0,
+      "pending": 0,
+      "cancelled": 0,
+      "in_progress": 0,
+      "seconds": 0.0,
+      "schema_valid": true,
+      "schema_attribute_value_errors": 0,
+      "other_schema_errors": 0,
+      "own_loader_links_preserved": true,
+      "o2o_above_max": 0,
+      "start_blockers": [
+        {
+          "type": "precedence",
+          "source": "O_Sent (mail and online)",
+          "target": "A_Create Application",
+          "scope": "Case_R",
+          "nmin": 1
+        }
+      ]
+    }
+  ]
+}

@@ -120,6 +120,12 @@ class Constraint:
 
 @dataclass(frozen=True)
 class O2ORule:
+    """Lifetime distinct-partner bounds used by the simulation link policy.
+
+    max_links is an eager gate; min_links is a post-run diagnostic, since
+    partners may be acquired in later activities. A directional rule bounds
+    source objects only. Bidirectional applies the same bounds to both types.
+    """
     source_type: str
     target_type: str
     min_links: int = 0
@@ -218,8 +224,9 @@ class StaticModel:
     max_consecutive_per_object: dict[str, int] = field(default_factory=dict)
     activity_durations: dict[str, ActivityDuration] = field(default_factory=dict)
     attribute_defaults: dict[str, dict[str, Any]] = field(default_factory=dict)
-    # Per-activity constraint index: activity_name -> constraints where that
-    # activity is source_activity or target_activity. Built once after parse.
+    # Per-activity constraint index: activity_name -> constraints that can
+    # reject it, including intervening activities for chain/init rules.
+    # Built once after parse.
     # Reduces check_all_constraints from O(all_constraints) to O(relevant).
     _constraints_by_activity: dict[str, list] = field(default_factory=dict)
 

@@ -3,6 +3,30 @@ from datetime import datetime
 from typing import Optional
 
 
+def resolve_start_activity_caps(start_activities, overrides=None, discovered_counts=None):
+    """Resolve user-entered caps, defaulting blank entries to event-log counts."""
+    overrides = overrides or {}
+    discovered_counts = discovered_counts or {}
+    if not isinstance(overrides, dict):
+        raise ValueError('Starting activity counts must be an object.')
+    caps = {}
+    for activity in start_activities:
+        value = overrides.get(activity)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            value = discovered_counts.get(activity)
+        if value is None:
+            raise ValueError(f'Enter a starting count for "{activity}"; no count was found in the log.')
+        try:
+            count = int(value)
+            valid = not isinstance(value, bool) and float(value) == count and 0 <= count <= 2**53 - 1
+        except (ValueError, TypeError, OverflowError):
+            valid = False
+        if not valid:
+            raise ValueError(f'Starting count for "{activity}" must be a non-negative whole number.')
+        caps[activity] = count
+    return caps
+
+
 @dataclass(frozen=True)
 class StartPolicy:
     """
@@ -15,6 +39,8 @@ class StartPolicy:
     start_activity_caps:
         Per-activity cap: {activity_name: max_fires}. Activities not present are
         uncapped. Checked independently of max_case_starts.
+        Both caps count completed and currently running start instances.
+        The UI/API fills these from log counts unless the user overrides them.
     """
     start_activity_names: list[str] = field(default_factory=list)
     max_case_starts: Optional[int] = None

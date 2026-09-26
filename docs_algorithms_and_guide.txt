@@ -78,10 +78,12 @@ Each constraint is checked per-object (for "each" scope) using O(1) indexes:
     B is blocked for object o of type T unless A has fired >= N times on o.
     Uses: count of events in _events_by_act_obj[(A, o)]
 
-  response(A → B) each T nmax=N :
-    Lazy enforcement (does not force B). Only enforces the nmax cap: B is blocked
-    if it has already fired >= nmax times on object o.
-    Uses: count of events in _events_by_act_obj[(B, o)]
+  response(A → B) each T nmin=N nmax=M :
+    Each A completion creates a requirement for N later matching B completions.
+    Eligible B candidates are injected while the requirement remains pending.
+    Each/All/Any bindings must match within the same target event. Other semantic
+    checks still apply. The existing nmax cap counts completed and running B
+    instances; it remains a history-wide cap rather than a per-activation window.
 
   chain_precedence(A → B) each T :
     B is blocked for object o unless the most recent activity on o was A.
@@ -102,10 +104,14 @@ Each constraint is checked per-object (for "each" scope) using O(1) indexes:
     attribute are excluded (fail-absent semantics).
 
 O2O LINK POLICY (simulator.py → apply_conservative_link_policy)
-  After each activity fires, links are written between participating and newly
-  created objects according to O2O rules. Before writing, _can_link checks
-  that neither side would exceed its max_links cap. This prevents old case
-  objects from contaminating new case O2O caps.
+  One shared planner validates relationships at candidate admission and again
+  immediately before start. It includes old-old, old-new and new-new pairs,
+  but only where an O2O rule covers the types. All applicable upper bounds
+  must hold, including bounds on newly created objects; directional rules
+  constrain only their source side. Invalid plans are rejected before creation.
+  Validated links and objects are committed at start; events and obligations
+  remain at completion. No random matching or extra random draw is introduced.
+  See SEMANTICS.md section 4 for the policy and thesis alignment notes.
 
 
 ────────────────────────────────────────────────────────────────────────────────
@@ -432,9 +438,12 @@ Constraint types:
     nmin=1 (default): B requires A to have happened at least once.
     nmax=N: also caps how many times A may precede B (unusual, use carefully).
 
-  response(A → B) each T nmax=N
-    Lazy: does not force B. Only enforces nmax: B is blocked after nmax firings
-    on an object. Useful for "at most N of this activity per case object".
+  response(A → B) each T nmin=N nmax=M
+    Each A creates an independent requirement for N later matching B events.
+    The simulator offers feasible response candidates until the count is met;
+    nmin=0 creates no positive requirement. The history-wide nmax cap also counts
+    running instances. Incompatible models and bounded runs can leave requirements
+    unfinished; see SEMANTICS.md for the scope and ordering conventions.
 
   chain_precedence(A → B) each T
     B requires A as its immediately preceding event on object o. No other event
@@ -464,12 +473,14 @@ nmin / nmax on precedence:
 ── O2O Rules tab ──────────────────────────
 
 Object-to-object link rules define which types can be linked and how many.
-  Min links — minimum connections required between instances of these two types
-              (used for O2O constraint checking, not enforced as a blocker)
+  Min links — lifetime partner-count target, audited after the run.
+              Below-minimum active and inactive objects are reported separately;
+              this is not a creation-time blocker or OC-Declare violation count.
   Max links — hard cap. Once an object reaches max_links connections of the
               other type, it is excluded from candidates involving that link.
               This prevents cross-case contamination (e.g. items ↔ orders max=1).
-  Bidirectional — whether the link is symmetric (both directions checked).
+  Bidirectional — apply the same cardinality bounds to both endpoints.
+                  Otherwise the bound applies to source objects only.
 
 When max_links is exceeded: check_o2o_rules returns False → activity blocked for
 that object combination. Adjust max_links if the simulation gets stuck.

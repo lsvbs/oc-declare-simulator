@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from Backend.src.Simulation.Domain.ir import StaticModel
 from Backend.src.Simulation.Domain.state import SimulationState
-from Backend.src.Simulation.Domain.ir import O2ORule
+from Backend.src.Simulation.Engine.linkplanning import plan_o2o_links
 from Backend.src.Simulation.Engine.attrutils import apply_guard_filter
 _EMPTY_SET: frozenset = frozenset()  # #14: reusable empty set to avoid alloc in O2O checks
 
@@ -252,13 +252,22 @@ def _nmax_blocked(constraint, candidate, state, target_activity, nmax, scope_ids
     """
     if nmax is None:
         return False
+    pending = [p for p in state.in_progress if p.candidate_activity_name == target_activity]
+    if constraint.scope.kind not in ('each', 'any', 'all') and not constraint.scope.bindings:
+        return len(state._events_by_activity.get(target_activity, ())) + len(pending) >= nmax
     bindings = getattr(constraint.scope, 'bindings', None) or (
         (constraint.scope.object_type, constraint.scope.kind),)
 
     eids_index = state._event_ids_by_act_obj
 
     def _tgt_eids(oid: str):
-        return eids_index.get((target_activity, oid), _EMPTY_SET)
+        completed = eids_index.get((target_activity, oid), _EMPTY_SET)
+        if not pending:
+            return completed
+        # Reserve a distinct event for each running instance, preserving the
+        # same joint Each/Any/All filtering as for completed events.
+        return completed | {('running', index) for index, running in enumerate(pending)
+                            if oid in running.participating_object_ids}
 
     # filter^all / filter^any contribute the same restriction to every Each
     # assignment, so they are folded once into `base`. None means "no
@@ -545,19 +554,20 @@ def check_absence(constraint: Any, candidate: Any, state: SimulationState, scope
     nmax = getattr(constraint, "nmax", 0)
     if nmax is None:
         nmax = 0
+    if nmax <= 0:
+        return False
     if constraint.scope.kind == "each":
         scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
         if not scope_ids:
-            return len(state._events_by_activity.get(target, [])) < nmax if nmax > 0 else not _activity_fired_globally(state, target)
+            return len(state._events_by_activity.get(target, [])) < nmax
         for oid in scope_ids:
             cnt = _count_activity_for_object(state, target, oid)
-            if nmax == 0 and cnt > 0:
-                return False
-            if nmax > 0 and cnt >= nmax:
+            if cnt >= nmax:
                 return False
         return True
-    cnt = len(state._events_by_activity.get(target, []))
-    return cnt < nmax if nmax > 0 else cnt == 0
+    cnt = (len(state._events_by_activity.get(target, []))
+           + state._in_progress_by_activity.get(target, 0))
+    return cnt < nmax
 
 
 def check_exactly(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
@@ -574,7 +584,8 @@ def check_exactly(constraint: Any, candidate: Any, state: SimulationState, scope
             if _count_activity_for_object(state, target, oid) >= nmin:
                 return False
         return True
-    return len(state._events_by_activity.get(target, [])) < nmin
+    return (len(state._events_by_activity.get(target, []))
+            + state._in_progress_by_activity.get(target, 0)) < nmin
 
 
 def check_init(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
@@ -871,81 +882,11 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
 # O2O rule checks
 # ---------------------------------------------------------------------------
 
-def _count_links_for_object(state: SimulationState, object_id: str, other_type: str) -> int:
-    """Count links from object_id to runtime objects of `other_type` — O(1) via typed index."""
-    linked_by_type = getattr(state, '_linked_by_type', None)
-    if linked_by_type is not None:
-        return len(linked_by_type.get(object_id, {}).get(other_type, _EMPTY_SET))
-    # Fallback: O(degree) scan if index not available
-    count = 0
-    for neighbor_id in state._links_by_object.get(object_id, ()):
-        obj = state.objects.get(neighbor_id)
-        if obj and obj.object_type == other_type:
-            count += 1
-    return count
-
-
 def check_o2o_rules(static_model: StaticModel, candidate: Any, state: SimulationState) -> bool:
-    if not static_model.o2o_rules:
-        return True
-
-    # [resource/permanent-object handling — disabled, kept for reference]
-    # resource_types: set = getattr(state, '_resource_types', set()) or set()
-
-    created_counts: dict[str, int] = {}
-    for t in getattr(candidate, "object_types_to_create", []) or []:
-        created_counts[t] = created_counts.get(t, 0) + 1
-
-    participating_ids = getattr(candidate, "participating_object_ids", []) or []
-
-    # Pre-compute types of all participants
-    participant_types: dict[str, str] = {}
-    for oid in participating_ids:
-        t = state._type_of_object.get(oid)
-        if t:
-            participant_types[oid] = t
-
-    # Pre-filter: only check rules whose both sides appear in this candidate's types
-    all_types = set(participant_types.values()) | set(created_counts.keys())
-
-    for rule in static_model.o2o_rules:
-        if rule.max_links is None:
-            continue
-        # Skip rules where either type is absent from this candidate
-        if rule.source_type not in all_types or rule.target_type not in all_types:
-            continue
-        # [resource/permanent-object handling — disabled, kept for reference]
-        # Skip rules where either side is a resource type — resources are
-        # shared across cases and must not accumulate permanent link caps.
-        # if rule.source_type in resource_types or rule.target_type in resource_types:
-        #     continue
-        for oid in participating_ids:
-            otype = participant_types.get(oid)
-            if otype is None:
-                continue
-
-            if otype == rule.source_type:
-                existing = _count_links_for_object(state, oid, rule.target_type)
-                # New links from created objects of target_type
-                new_from_created = created_counts.get(rule.target_type, 0)
-                # New links from other participating objects of target_type not yet linked
-                new_from_participants = sum(
-                    1 for other_id, other_type in participant_types.items()
-                    if other_id != oid and other_type == rule.target_type
-                    and other_id not in state._links_by_object.get(oid, _EMPTY_SET)
-                )
-                if existing + new_from_created + new_from_participants > rule.max_links:
-                    return False
-
-            if rule.bidirectional and otype == rule.target_type:
-                existing = _count_links_for_object(state, oid, rule.source_type)
-                new_from_created = created_counts.get(rule.source_type, 0)
-                new_from_participants = sum(
-                    1 for other_id, other_type in participant_types.items()
-                    if other_id != oid and other_type == rule.source_type
-                    and other_id not in state._links_by_object.get(oid, _EMPTY_SET)
-                )
-                if existing + new_from_created + new_from_participants > rule.max_links:
-                    return False
-
-    return True
+    """Validate exactly the relationship effects that will be applied at start."""
+    return plan_o2o_links(
+        static_model,
+        getattr(candidate, "participating_object_ids", []) or [],
+        state,
+        getattr(candidate, "object_types_to_create", []) or [],
+    ) is not None
