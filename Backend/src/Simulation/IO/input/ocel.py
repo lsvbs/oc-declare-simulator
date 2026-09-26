@@ -2,6 +2,7 @@
 import csv
 import json
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -267,6 +268,7 @@ def convert_simple_list_to_ocel(traces: List[List[str]]) -> Dict[str, Any]:
     
     event_counter = 0
     object_counter = 0
+    base_time = datetime(2024, 1, 1)
     
     for trace_idx, trace in enumerate(traces):
         # Create a "case" object for this trace
@@ -282,7 +284,10 @@ def convert_simple_list_to_ocel(traces: List[List[str]]) -> Dict[str, Any]:
             event_id = f"e_{event_counter}"
             events[event_id] = {
                 'activity': activity,
-                'timestamp': f"2024-01-01T00:{trace_idx:02d}:{event_counter:02d}",
+                # Roll synthetic minutes/seconds over instead of emitting invalid
+                # ISO timestamps once there are more than 59 traces or events.
+                'timestamp': (base_time + timedelta(
+                    minutes=trace_idx, seconds=event_counter)).isoformat(),
                 'omap': [obj_id]
             }
             event_counter += 1
@@ -291,4 +296,3 @@ def convert_simple_list_to_ocel(traces: List[List[str]]) -> Dict[str, Any]:
         'events': events,
         'objects': objects
     }
-

@@ -38,7 +38,10 @@ from Backend.src.ParameterDiscovery.calendar import discover_activity_calendars
 from Backend.src.ParameterDiscovery.probabilitydiscovery import discover_object_transition_matrix
 # Object-lifecycle discovery is a separate concern from Algorithm 1 and
 # lives in its own module.
-from Backend.src.ParameterDiscovery.lifecycle import discover_permanent_object_types, suggest_permanent_object_threshold, discover_creation_counts
+from Backend.src.ParameterDiscovery.lifecycle import (
+    DEFAULT_LIFECYCLE_THRESHOLD, validate_lifecycle_threshold,
+    discover_permanent_object_types, suggest_permanent_object_threshold, discover_creation_counts,
+)
 from Backend.src.Simulation.Engine.selection import select_candidate
 from Backend.src.Simulation.IO.output.OCEL2 import write_ocel2_json
 from Backend.src.Simulation.IO.output.metrics import compute_metrics, write_metrics_json
@@ -1220,6 +1223,27 @@ def run_simulation():
             for oid, obj in final_state.objects.items()
         }
 
+        # The final ten completed events, with every participating object.
+        # Read the full state so the older trace/lifecycle preview caps cannot
+        # omit objects involved late in the run. Preserve completion order,
+        # including the recorded order of events sharing a timestamp.
+        recent_events = [
+            {
+                'sequence': index + 1,
+                'event_id': event.event_id,
+                'activity': event.activity_name,
+                'timestamp': event.timestamp.isoformat() if event.timestamp else None,
+                'objects': [
+                    {'object_id': oid, 'object_type': object_types_map.get(oid)}
+                    for oid in dict.fromkeys(event.object_ids)
+                ],
+            }
+            for index, event in enumerate(
+                final_state.executed_events[-10:],
+                start=max(0, len(final_state.executed_events) - 10),
+            )
+        ]
+
         # Object-to-object links: directed source → target connections.
         # Used by the frontend "Object Tracer" to show, for each seed object,
         # which objects were linked to it (and transitively beyond).
@@ -1291,6 +1315,7 @@ def run_simulation():
                 'objects_count': len(final_state.objects),
                 'object_types': dict(obj_types),
                 'activity_sequence': activity_sequence,
+                'recent_events': recent_events,
                 'object_traces': object_traces,
                 # object_types_map only for the capped trace objects (keeps response small)
                 'object_types_map': {
@@ -2487,13 +2512,13 @@ def discover_timing_output():
 def derive_lifecycle():
     """Derive creates/deactivates flags for an external OC-Declare file.
 
-    Uses the OCEL event log (discover_lifecycle) when available — this is the
-    accurate method. Falls back to the arc-direction heuristic
-    (derive_provisional_lifecycle_from_list) when no OCEL is loaded.
+    Uses the OCEL event log to replace flags using first/last activity shares.
+    A reference log is required: arc directions cannot establish those shares.
 
     Body JSON:
       ocdeclareFile  – filename in OCDECLARE_DIR (required)
-      eventLogFile   – filename in EVENTLOG_DIR (optional, uses OCEL-based discovery)
+      eventLogFile   – filename in EVENTLOG_DIR (required)
+      lifecycleThreshold – minimum instance share (default 0.9)
     """
     try:
         data = request.json or {}
@@ -2502,6 +2527,13 @@ def derive_lifecycle():
 
         if not ocdeclare_file:
             return jsonify({'error': 'Missing ocdeclareFile parameter'}), 400
+        if not event_log_file:
+            return jsonify({'error': 'Select an event log to discover first/last activity shares.'}), 400
+        try:
+            lifecycle_threshold = validate_lifecycle_threshold(
+                data.get('lifecycleThreshold', DEFAULT_LIFECYCLE_THRESHOLD))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
 
         model_path = OCDECLARE_DIR / ocdeclare_file
         if not model_path.exists():
@@ -2513,7 +2545,6 @@ def derive_lifecycle():
         from Backend.src.Simulation.Models.OCDeclare import (
             parse_ocdeclare_list,
             parse_ocdeclare_dict,
-            derive_provisional_lifecycle_from_list,
             apply_lifecycle_from_provisional_info,
         )
 
@@ -2523,7 +2554,7 @@ def derive_lifecycle():
             base_model = parse_ocdeclare_list(raw)
         else:
             base_model = parse_ocdeclare_dict(raw)
-        method_used = 'arc_heuristic'
+        method_used = 'ocel'
 
 
         ocel_log = None
@@ -2571,20 +2602,18 @@ def derive_lifecycle():
                 o.get('type', '')
                 for o in (objects_raw.values() if isinstance(objects_raw, dict) else objects_raw)
                 if o.get('type')
-            })
+            } | {b.object_type for a in base_model.activities for b in a.bindings})
             for ot in object_types:
-                creating_acts, terminating_acts = discover_lifecycle(ocel_log, ot, lifecycle_threshold=0.5)
-                if creating_acts:
-                    entry[ot] = creating_acts
-                if terminating_acts:
-                    exit_[ot] = terminating_acts
+                creating_acts, terminating_acts = discover_lifecycle(
+                    ocel_log, ot, lifecycle_threshold=lifecycle_threshold)
+                entry[ot] = creating_acts
+                exit_[ot] = terminating_acts
             lifecycle_info = {'entry': entry, 'exit': exit_}
-            method_used = 'ocel'
         else:
-            # Fallback: arc-direction heuristic from the constraint file itself
-            lifecycle_info = derive_provisional_lifecycle_from_list(raw)
+            return jsonify({'error': 'A readable OCEL event log is required for lifecycle discovery.'}), 400
 
-        model_with_lc = apply_lifecycle_from_provisional_info(base_model, lifecycle_info)
+        model_with_lc = apply_lifecycle_from_provisional_info(
+            base_model, lifecycle_info, replace_existing=True)
 
         # Serialise to the same dict shape as /api/model-state
         model_data = {
@@ -2637,19 +2666,24 @@ def derive_lifecycle():
         # Report what was inferred
         entry_info = lifecycle_info.get('entry', {})
         exit_info  = lifecycle_info.get('exit', {})
-        summary = [f'Source: {"OCEL event log" if method_used == "ocel" else "arc-direction heuristic"}']
+        summary = [f'Source: OCEL event log; first/last activity threshold: {lifecycle_threshold:.0%} of all instances per object type']
         for ot, acts in sorted(entry_info.items()):
-            summary.append(f'{", ".join(sorted(acts))} → creates {ot}')
+            summary.append(f'{", ".join(sorted(acts))} → creates {ot}' if acts
+                           else f'{ot}: no creating activity meets the threshold')
         for ot, acts in sorted(exit_info.items()):
-            summary.append(f'{", ".join(sorted(acts))} → deactivates {ot}')
+            summary.append(f'{", ".join(sorted(acts))} → deactivates {ot}' if acts
+                           else f'{ot}: no deactivating activity meets the threshold')
 
         return jsonify({
             'success': True,
             'model': model_data,
             'summary': summary,
             'method': method_used,
+            'lifecycle_threshold': lifecycle_threshold,
         })
 
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500

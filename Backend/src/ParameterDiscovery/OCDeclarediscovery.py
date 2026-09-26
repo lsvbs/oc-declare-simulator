@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Any, Optional
 from collections import Counter, defaultdict, deque
 from Backend.src.Simulation.IO.input.ocel import load_ocel2
+from Backend.src.ParameterDiscovery.lifecycle import DEFAULT_LIFECYCLE_THRESHOLD
 
 
 def discover_object_types(ocel_log: Dict[str, Any]) -> List[str]:
@@ -1264,7 +1265,7 @@ def discover_ocdeclare_model(
     noise_threshold: float = 0.2,
     arc_types: Optional[List[str]] = None,
     reduction: str = 'Lossless',
-    lifecycle_threshold: float = 0.5,
+    lifecycle_threshold: float = DEFAULT_LIFECYCLE_THRESHOLD,
     permanent_threshold: float = 50.0,
     # Legacy parameters kept for backward compatibility (ignored by new algorithm)
     min_support: float = 0.7,
@@ -1284,9 +1285,9 @@ def discover_ocdeclare_model(
             for any constraint type not present in constraint_params.
         min_confidence: Global minimum confidence threshold (0-1). Fallback.
         noise_threshold: Global tolerance for violations (0-1). Fallback.
-        lifecycle_threshold: Minimum fraction of object instances for which an
-            activity must be the chronological first/last event to be labelled
-            creates/consumes.  Default 0.5 (majority vote).
+        lifecycle_threshold: Legacy compatibility parameter (default 0.9).
+            Lifecycle flags are derived separately by simulation-parameter
+            discovery; constraint mining does not apply this parameter.
         permanent_threshold: Average events-per-instance above which an object
             type is classified as a permanent object (e.g. Forklift, Truck).
             Default 50.

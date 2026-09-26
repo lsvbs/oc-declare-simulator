@@ -76,6 +76,52 @@ class StartCountApiTests(unittest.TestCase):
         self.assertEqual(200, response.status_code, response.json)
         self.assertEqual(0, response.json['results']['events_count'])
         self.assertEqual(1, response.json['results']['objects_count'])
+        self.assertEqual([], response.json['results']['recent_events'])
+
+    def test_recent_events_include_every_object_beyond_old_preview_cap(self):
+        model = {
+            **self.payload['modelOverride'],
+            'object_types': ['Order', 'Item'],
+            'activities': [{'name': 'Arrive', 'bindings': [
+                {'object_type': 'Order', 'min_count': 1, 'max_count': 1, 'creates': True},
+                {'object_type': 'Item', 'min_count': 2, 'max_count': 2, 'creates': True},
+            ]}],
+        }
+        response = self.client.post('/api/simulate', json={
+            **self.payload, 'modelOverride': model, 'maxEvents': 75,
+            'startActivityCaps': {'Arrive': 75},
+        })
+        self.assertEqual(200, response.status_code, response.json)
+        result = response.json['results']
+        self.assertEqual(75, result['events_count'])
+        self.assertEqual(list(range(66, 76)), [e['sequence'] for e in result['recent_events']])
+        state = self.server.write_ocel2_json.call_args.args[0]
+        for expected, actual in zip(state.executed_events[-10:], result['recent_events']):
+            self.assertEqual(expected.event_id, actual['event_id'])
+            self.assertEqual(expected.activity_name, actual['activity'])
+            self.assertEqual(expected.timestamp.isoformat(), actual['timestamp'])
+            self.assertEqual([
+                {'object_id': oid, 'object_type': state.objects[oid].object_type}
+                for oid in expected.object_ids
+            ], actual['objects'])
+            self.assertEqual(3, len(actual['objects']))
+        self.assertTrue(any(obj['object_id'] not in result['object_types_map']
+                            for e in result['recent_events'] for obj in e['objects']))
+
+    def test_recent_events_handle_short_runs_and_keep_tied_completion_order(self):
+        # Zero duration makes all three completions share one timestamp.
+        model = {**self.payload['modelOverride'],
+                 'activity_durations': {'Arrive': {'dist_type': 'fixed', 'mean_seconds': 0}},
+                 'interarrival_times': {}}
+        response = self.client.post('/api/simulate', json={
+            **self.payload, 'modelOverride': model, 'startActivityCaps': {'Arrive': 3},
+        })
+        self.assertEqual(200, response.status_code, response.json)
+        events = response.json['results']['recent_events']
+        self.assertEqual([1, 2, 3], [e['sequence'] for e in events])
+        state = self.server.write_ocel2_json.call_args.args[0]
+        self.assertEqual([e.event_id for e in state.executed_events], [e['event_id'] for e in events])
+        self.assertEqual(1, len({e['timestamp'] for e in events}))
 
 
 if __name__ == '__main__':

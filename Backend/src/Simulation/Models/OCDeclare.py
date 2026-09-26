@@ -490,6 +490,8 @@ def derive_provisional_lifecycle_from_list(data: list) -> dict[str, dict[str, se
 def apply_lifecycle_from_provisional_info(
     static_model: StaticModel,
     lifecycle_info: dict[str, dict[str, set[str]]],
+    *,
+    replace_existing: bool = False,
 ) -> StaticModel:
     """Apply simple init/exit lifecycle flags to a StaticModel.
 
@@ -507,6 +509,8 @@ def apply_lifecycle_from_provisional_info(
     The logic is deliberately simple and local to object types; it can
     be replaced or extended later (for example, with an OCEL-based
     lifecycle discovery) without changing the rest of the engine.
+    With replace_existing=True, replace flags for explicitly discovered types,
+    including empty entry/exit sets. This removes stale flags on rediscovery.
     """
 
     entry = lifecycle_info.get("entry", {})
@@ -524,9 +528,13 @@ def apply_lifecycle_from_provisional_info(
             init_set = entry.get(ot, set())
             exit_set = exit_.get(ot, set())
 
-            if activity.name in init_set:
+            if replace_existing and ot in entry:
+                creates = activity.name in init_set
+            elif activity.name in init_set:
                 creates = True
-            if activity.name in exit_set:
+            if replace_existing and ot in exit_:
+                deactivates = activity.name in exit_set
+            elif activity.name in exit_set:
                 deactivates = True
 
             new_bindings.append(

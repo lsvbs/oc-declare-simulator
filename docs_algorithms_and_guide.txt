@@ -159,9 +159,11 @@ Input: OCEL 2.0 log dict + configuration thresholds
 Algorithm (per object type, per constraint template):
   1. Object bindings: for each (activity, object_type) pair that co-occur in
      any event, record the binding with observed min/max objects per firing.
-  2. Lifecycle (creates/deactivates): extract per-object traces, identify which
-     activity appears first in >= lifecycle_threshold fraction of instances
-     (= creator) and which appears last (= terminator).
+  2. Lifecycle (a separate simulation-parameter discovery step): identify which
+     activity appears first in >= lifecycle_threshold fraction of all instances
+     of the type (= creator), and independently which appears last (= deactivator).
+     Default threshold: 0.9. Objects without events count in the denominator.
+     No flag is assigned below the threshold, including rare endpoints.
   3. Resource classification: compute average events-per-instance per type.
      Types with avg >= resource_threshold (default 50) are classified as
      resources (shared, never deactivated).
@@ -356,10 +358,16 @@ OC-DECLARE MODEL DISCOVERY
 Event Log File — which OCEL 2.0 log to mine constraints from.
   Should be the same log as Step 1 for consistency.
 
-Lifecycle Threshold (default 0.5)
+Lifecycle Threshold (default 0.9)
   An activity is a creator/terminator of a type if it's first/last in at least
-  this fraction of that type's object traces.
-  High (e.g. 0.9) → conservative, only very dominant lifecycle activities flagged.
+  this fraction of all object instances of that type. Each object counts once;
+  objects without events count in the denominator but supply no first/last vote.
+  Creation and deactivation are independent, so both flags can apply to an activity.
+  If no activity qualifies, no flag is assigned. There are no rare-endpoint exceptions.
+  The threshold is applied by lifecycle discovery in the simulation-parameter step,
+  not by constraint mining. Rediscover lifecycle after changing it; this replaces
+  existing flags. Events are ordered by UTC timestamp, then event ID for ties.
+  High (e.g. 0.9) → only very dominant lifecycle activities flagged.
   Low (e.g. 0.2) → more activities get creates/deactivates, higher false-positive
                     risk in variant-heavy logs.
 
@@ -388,8 +396,9 @@ OC-Declare Model dropdown
   exists but Step 1 hasn't been run), external (file from another tool).
 
 For external files: the "↻ Derive lifecycle" button in the Model Editor header
-  runs the arc-direction heuristic to infer creates/deactivates bindings. This
-  is a one-time explicit action — it does not run automatically on load.
+  uses the selected OCEL event log and lifecycle threshold to derive and replace
+  creates/deactivates flags. A log is required. This is an explicit action — it
+  does not run automatically on load or rewrite the source file.
 
 
 ════════════════════════════════

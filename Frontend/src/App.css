@@ -829,24 +829,23 @@
   line-height: 1.5;
 }
 
-/* Blocking warning: object types missing a creates and/or deactivates binding.
-   Shown in the Model Editor and beside the (disabled) Run buttons. */
+/* Advisory lifecycle warnings in the Model Editor and Simulation tab. */
 .object-lifecycle-warning {
   margin-top: 0.65rem;
   margin-bottom: 0.65rem;
   padding: 0.7rem 0.9rem;
-  background: #fef2f2;
-  border: 1px solid #fca5a5;
-  border-left: 4px solid #dc2626;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-left: 4px solid #b45309;
   border-radius: 8px;
   font-size: 0.82rem;
-  color: #b91c1c;
+  color: #92400e;
   line-height: 1.5;
 }
 
 .object-lifecycle-warning-title {
   font-weight: 700;
-  color: #dc2626;
+  color: #b45309;
   margin-bottom: 0.4rem;
 }
 
@@ -855,7 +854,7 @@
 }
 
 .object-lifecycle-warning code {
-  background: #fee2e2;
+  background: #fef3c7;
   border-radius: 3px;
   padding: 0 3px;
   font-size: 0.78rem;
@@ -863,7 +862,7 @@
 
 .object-lifecycle-warning-hint {
   margin: 0.5rem 0 0;
-  color: #7f1d1d;
+  color: #92400e;
   font-size: 0.78rem;
 }
 
@@ -4440,6 +4439,24 @@ details[open] .formula-summary::before { content: '▼ '; }
   font-weight: 600;
 }
 .con-filter-btn.active .con-filter-badge { background: rgba(255,255,255,0.25); color: white; }
+
+/* Final completed events and their participating objects. */
+.recent-event-note { color: #64748b; font-size: 0.78rem; line-height: 1.5; }
+.recent-event-scroll { overflow: auto; max-height: 32rem; border: 1px solid #e2e8f0; border-radius: 6px; }
+.recent-event-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.recent-event-table th, .recent-event-table td { padding: 0.5rem 0.6rem; text-align: left; vertical-align: top; border-bottom: 1px solid #e2e8f0; }
+.recent-event-table th { position: sticky; top: 0; background: #f1f5f9; color: #475569; }
+.recent-event-table td { overflow-wrap: anywhere; min-width: 7rem; }
+.recent-event-time { font-variant-numeric: tabular-nums; }
+.recent-event-time time { white-space: pre; }
+.recent-event-objects { list-style: none; margin: 0; padding: 0; min-width: 10rem; }
+.recent-event-objects li + li { margin-top: 0.25rem; }
+.recent-event-log code { font-size: 0.75rem; overflow-wrap: anywhere; }
+.recent-object-traces { margin-top: 0.8rem; font-size: 0.8rem; }
+.recent-object-traces summary { cursor: pointer; color: #334155; font-weight: 600; }
+.recent-object-traces > ul { list-style: none; margin: 0.5rem 0 0; padding: 0; max-height: 24rem; overflow: auto; }
+.recent-object-traces li { padding: 0.45rem 0; border-bottom: 1px solid #e2e8f0; overflow-wrap: anywhere; }
+.recent-object-sequence { margin-top: 0.2rem; color: #475569; line-height: 1.7; }
 
 /* ── Object Timelines (#28) ──────────────────────────────────────────────── */
 .object-timelines { padding: 0.5rem 0 0.25rem; }

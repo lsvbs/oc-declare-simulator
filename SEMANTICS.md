@@ -286,6 +286,27 @@ Recorded in `state.candidate_wait_s`.
 
 ## 7. Object Lifecycle
 
+Lifecycle discovery uses a default threshold of **90%**, configurable explicitly in
+the UI/API. For each object type, an activity receives `creates=True` when it is the
+first activity for at least that fraction of the type's instances, and
+`deactivates=True` when it is the last for at least that fraction. Each declared
+object counts once in the denominator, including objects without events; those
+objects contribute no first/last vote. Events are ordered by UTC timestamp, then
+event ID to resolve ties deterministically.
+
+The two flags are independent: an activity can receive both. If no activity reaches
+the threshold, the corresponding flag remains unset. There are no rare-endpoint
+exceptions. Rediscovery replaces previous lifecycle flags for the discovered types
+and requires a reference event log; arc directions alone cannot establish a share.
+Saved models are not rewritten automatically. These flags are simulation parameters;
+their discovery does not change the OC-Declare constraints or simulation loop.
+
+The frontend shows separate advisory warnings for missing create flags, missing
+deactivate flags, and both flags on the same activity/type binding. These warnings
+do not disable simulation. The Simulation tab checks the Base and Alternative
+models independently; unrelated requirements such as timing and object bindings
+still apply.
+
 Objects are created when an activity with `creates=True` fires. They are deactivated when
 an activity with `deactivates=True` fires on them. Deactivated objects are removed from
 `state._active_by_type` and can no longer participate in new candidates.
@@ -308,6 +329,12 @@ that the deactivated objects can no longer fulfill.
 ---
 
 ## 8. Metrics
+
+The Results tab includes the last 10 completed events in recorded completion order
+(including ties), with event IDs, timestamps and every participating object's ID
+and type. Its expandable per-object traces cover only that ten-event window.
+This preview is built from the full simulation state independently of older
+object-preview caps. In-progress activities are not completed events and are excluded.
 
 Computed after the run by `compute_metrics` in `Backend/src/Simulation/IO/output/metrics.py`:
 

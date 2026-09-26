@@ -7,6 +7,11 @@ import ModelEditor from './ModelEditor';
 import { O2ODiagram, CONSTRAINT_HELP } from './ModelEditor';
 import { resolveStartActivityCaps } from './startActivityCounts.mjs';
 import EvaluationWrapper from './NotebookEvaluation';
+import ObjectLifecycleWarning from './ObjectLifecycleWarning';
+import { getModelWarnings } from './modelWarnings.mjs';
+import RecentEventLog from './RecentEventLog';
+
+const DEFAULT_LIFECYCLE_THRESHOLD = 0.9;
 
 // ── Shared utility: sort activities by log flow order ─────────────────────────
 // Uses trace_position (avg position in log traces) first, then first-occurrence
@@ -1439,55 +1444,9 @@ function ObjectTimelines({ lifecycles, total }) {
   );
 }
 
-// ── ObjectLifecycleWarning ────────────────────────────────────────────────────
-// Blocking warning for object types missing a creates and/or deactivates
-// binding. Rendered wherever the user can act on it: the Model Editor (where
-// the fix is made) and the Results section (next to the disabled Run button).
-function ObjectLifecycleWarning({ issues, compact }) {
-  if (!issues || issues.length === 0) return null;
-  const noCreate     = issues.filter(i => i.missingCreate && !i.missingDeactivate);
-  const noDeactivate = issues.filter(i => i.missingDeactivate && !i.missingCreate);
-  const neither      = issues.filter(i => i.missingCreate && i.missingDeactivate);
-  const names = list => list.map(i => i.type).join(', ');
-  return (
-    <div className="object-lifecycle-warning">
-      <div className="object-lifecycle-warning-title">
-        ⚠ Simulation blocked — incomplete object lifecycle
-      </div>
-      {neither.length > 0 && (
-        <div className="object-lifecycle-warning-group">
-          <strong>{names(neither)}</strong> — no activity creates or deactivates {neither.length === 1 ? 'it' : 'them'}.
-        </div>
-      )}
-      {noCreate.length > 0 && (
-        <div className="object-lifecycle-warning-group">
-          <strong>{names(noCreate)}</strong> — no activity has <code>creates: true</code>.
-          Objects of {noCreate.length === 1 ? 'this type' : 'these types'} are never instantiated,
-          so every activity requiring {noCreate.length === 1 ? 'it' : 'them'} can never fire.
-        </div>
-      )}
-      {noDeactivate.length > 0 && (
-        <div className="object-lifecycle-warning-group">
-          <strong>{names(noDeactivate)}</strong> — no activity has <code>deactivates: true</code>.
-          Objects of {noDeactivate.length === 1 ? 'this type' : 'these types'} never leave the active
-          set: they accumulate for the whole run, and once the work-in-progress cap is reached the
-          activity creating {noDeactivate.length === 1 ? 'it' : 'them'} is locked out, which cascades
-          upstream and can starve the start activities.
-        </div>
-      )}
-      {!compact && (
-        <p className="object-lifecycle-warning-hint">
-          Fix in Model Editor → Activities: set <code>creates</code> on the binding that first
-          produces the object, and <code>deactivates</code> on the binding of the activity that
-          finishes with it.
-        </p>
-      )}
-    </div>
-  );
-}
-
 // ── LifecycleDerivationPanel ──────────────────────────────────────────────────
-function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onModelChange }) {
+function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onModelChange,
+  lifecycleThreshold = DEFAULT_LIFECYCLE_THRESHOLD }) {
   const [isDerivng, setIsDerivng] = React.useState(false);
   const [result,    setResult]    = React.useState(null); // null | {summary, method, error}
 
@@ -1495,7 +1454,7 @@ function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onMod
     setIsDerivng(true);
     setResult(null);
     try {
-      const payload = { ocdeclareFile: sourceFile };
+      const payload = { ocdeclareFile: sourceFile, lifecycleThreshold };
       if (eventLogFile) payload.eventLogFile = eventLogFile;
       const res = await axios.post('/api/derive-lifecycle', payload);
       if (res.data.success) {
@@ -1522,16 +1481,16 @@ function LifecycleDerivationPanel({ sourceFile, eventLogFile, activeModel, onMod
         <p>
           Infer <code>creates</code> and <code>deactivates</code> flags for each activity binding.
           {eventLogFile
-            ? <> Uses the loaded OCEL log <strong>{eventLogFile}</strong> for accurate first/last-event analysis.</>
-            : <> No OCEL log loaded — falls back to arc-direction heuristic.</>}
+            ? <> Uses <strong>{eventLogFile}</strong>: an activity must be first or last for at least {Math.round(lifecycleThreshold * 100)}% of all instances of the object type. Rediscovery replaces existing flags.</>
+            : <> Load an OCEL event log to measure first/last activity shares.</>}
         </p>
       </div>
       <button
         className="timing-discover-btn"
         onClick={run}
-        disabled={isDerivng || !sourceFile}
+        disabled={isDerivng || !sourceFile || !eventLogFile}
       >
-        {isDerivng ? 'Deriving…' : `↻ Derive lifecycle${eventLogFile ? ' (OCEL)' : ' (heuristic)'}`}
+        {isDerivng ? 'Deriving…' : '↻ Derive lifecycle (OCEL)'}
       </button>
       {result?.error && (
         <div className="error-box" style={{ marginTop: '0.75rem' }}><p>{result.error}</p></div>
@@ -6446,7 +6405,7 @@ function App() {
   // OC-Declare Discovery state
   const [ocdeclareDiscoveryConfig, setOcdeclareDiscoveryConfig] = useState({
     eventLogFile: '',
-    lifecycleThreshold: 0.5,
+    lifecycleThreshold: DEFAULT_LIFECYCLE_THRESHOLD,
     resourceThreshold: 2,
     constraintTypes: {
       precedence: true,
@@ -6613,49 +6572,10 @@ function App() {
     }
   }, [results]);
 
-  // ── Model warnings (activities with no bindings) ──────────────────────────
-  const bindingWarnings = activeModel
-    ? (activeModel.activities || []).filter(a => !(a.bindings?.length))
-    : [];
+  // Lifecycle warnings are advisory and never disable simulation.
+  const { bindingWarnings, lifecycleIssues, hasBlockingModelIssues } = React.useMemo(
+    () => getModelWarnings(activeModel), [activeModel]);
   const hasModelWarnings = bindingWarnings.length > 0;
-
-  // ── Lifecycle warnings: object types with no creating and/or no terminating
-  // activity. Both ends matter. A type nothing creates never comes into
-  // existence, so every activity requiring it is dead. A type nothing
-  // deactivates never leaves the active set, so it accumulates without bound —
-  // and once work-in-progress caps are active it pins at its ceiling and
-  // locks out its creating activity, which cascades upstream and can starve
-  // the start activities themselves.
-  //
-  // Every object type is checked, resource/permanent types included: they are
-  // treated like any other object here, so a type that repeats forever needs
-  // its deactivation point supplied explicitly in the model.
-  const lifecycleIssues = React.useMemo(() => {
-    const activities = activeModel?.activities || [];
-    const creatingTypes = new Set();
-    const deactivatingTypes = new Set();
-    const allBoundTypes = new Set();
-    activities.forEach(act => {
-      (act.bindings || []).forEach(b => {
-        if (!b.object_type) return;
-        allBoundTypes.add(b.object_type);
-        if (b.creates) creatingTypes.add(b.object_type);
-        if (b.deactivates) deactivatingTypes.add(b.object_type);
-      });
-    });
-    return [...allBoundTypes]
-      .map(t => ({
-        type: t,
-        missingCreate: !creatingTypes.has(t),
-        missingDeactivate: !deactivatingTypes.has(t),
-      }))
-      .filter(i => i.missingCreate || i.missingDeactivate)
-      .sort((a, b) => a.type.localeCompare(b.type));
-  }, [activeModel]);
-
-  // Any issue that must block a run: activities with no bindings at all, or
-  // object types missing a creates/deactivates end.
-  const hasBlockingModelIssues = bindingWarnings.length > 0 || lifecycleIssues.length > 0;
 
   // ── Step 2.5: Timing discovery state ─────────────────────────────────────
   const [timingAnchors,       setTimingAnchors]       = useState({});
@@ -6688,6 +6608,10 @@ function App() {
   const [modelBase, setModelBase] = useState(null);        // immutable discovered model snapshot (never edited)
   const [modelAsIs, setModelAsIs] = useState(null);        // editable as-is model (shown in Model Behavior)
   const [modelToBe, setModelToBe] = useState(null);        // editable to-be model (Scenario Builder)
+  const baseModelWarnings = React.useMemo(
+    () => getModelWarnings(modelAsIs ?? modelBase), [modelAsIs, modelBase]);
+  const alternativeModelWarnings = React.useMemo(
+    () => getModelWarnings(modelToBe ?? activeModel), [modelToBe, activeModel]);
   const [probMatrixBase, setProbMatrixBase] = useState(null);
   const [probMatrixToBe, setProbMatrixToBe] = useState(null);
   const [resultsAsIs, setResultsAsIs] = useState(null);    // Run As-Is results
@@ -7106,7 +7030,8 @@ function App() {
     setLifecycleError(null);
     setLifecycleResult(null);
     try {
-      const payload = { ocdeclareFile: config.ocdeclareFile };
+      const payload = { ocdeclareFile: config.ocdeclareFile,
+        lifecycleThreshold: ocdeclareDiscoveryConfig.lifecycleThreshold };
       if (discoveryConfig.eventLogFile) payload.eventLogFile = discoveryConfig.eventLogFile;
       const res = await axios.post('/api/derive-lifecycle', payload);
       if (res.data.success) {
@@ -7123,7 +7048,7 @@ function App() {
     } catch (e) {
       setLifecycleError(e.response?.data?.error || e.message);
     }
-  }, [config.ocdeclareFile, discoveryConfig.eventLogFile]);
+  }, [config.ocdeclareFile, discoveryConfig.eventLogFile, ocdeclareDiscoveryConfig.lifecycleThreshold]);
 
   const runPermanentObjectDiscovery = useCallback(async () => {
     setPermanentError(null);
@@ -7888,7 +7813,7 @@ function App() {
         noiseThreshold:     0.2,
         arcTypes:           ['EF', 'EP', 'AS'],
         reduction:          'Lossless',
-        lifecycleThreshold: 0.5,
+        lifecycleThreshold: DEFAULT_LIFECYCLE_THRESHOLD,
         resourceThreshold:  50.0,
       };
       const { data: { run_id } } = await axios.post('/api/discover-ocdeclare', payload);
@@ -10071,7 +9996,8 @@ function App() {
                 <div style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem',marginBottom:'1.25rem'}}>
                   <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
 
-                  <ObjectLifecycleWarning issues={lifecycleIssues} />
+                  <ObjectLifecycleWarning issues={baseModelWarnings.lifecycleIssues} label="Base Model" />
+                  <ObjectLifecycleWarning issues={alternativeModelWarnings.lifecycleIssues} label="Alternative Model" />
 
                   {/* Run buttons + start activities — two-column layout aligned per model */}
                   <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem',alignItems:'flex-start'}}>
@@ -10083,12 +10009,12 @@ function App() {
                           .map(a => a.name)
                           .filter(n => { const d = (modelBase?.activity_durations||{})[n]; return !d || !d.sample_count; });
                         const noTiming = missing.length > 0;
-                        const blocked = noTiming || hasBlockingModelIssues;
+                        const blocked = noTiming || baseModelWarnings.hasBlockingModelIssues;
                         return (<>
                           <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
                             disabled={isSimulating || !modelBase || blocked}
                             title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}`
-                              : lifecycleIssues.length > 0 ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
+                              : baseModelWarnings.hasBlockingModelIssues ? `Cannot run: missing object bindings for ${baseModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
                               : undefined}
                             onClick={() => runSimulation('asis')}>
                             {simulatingMode==='asis' ? 'Running…' : '▶ Run Base Model'}
@@ -10178,11 +10104,11 @@ function App() {
                           .filter(n => { const d = (modelToBe?.activity_durations||{})[n]; return !d || !d.sample_count; });
                         const noTiming = missing.length > 0;
                         const noBaseline = !resultsAsIs;
-                        const blocked = noTiming || hasBlockingModelIssues;
+                        const blocked = noTiming || alternativeModelWarnings.hasBlockingModelIssues;
                         const tooltipMsg = noTiming
                           ? `Cannot run: missing timing data for: ${missing.join(', ')}`
-                          : lifecycleIssues.length > 0
-                            ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
+                          : alternativeModelWarnings.hasBlockingModelIssues
+                            ? `Cannot run: missing object bindings for ${alternativeModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
                           : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
                         return (<>
                           <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
@@ -10644,6 +10570,10 @@ function App() {
                               })()}
                             </div>
 
+                            <Collapsible title="Last 10 events" badge={r.recent_events?.length ?? null} defaultOpen={true}>
+                              <RecentEventLog events={r.recent_events} total={r.events_count} />
+                            </Collapsible>
+
                             {/* Verification Matrix */}
                             <VerificationMatrix
                               results={r}
@@ -10983,14 +10913,14 @@ function App() {
                 <div className="form-group">
                   <label>
                     Lifecycle Threshold
-                    <HelpTip text={'Controls which activity is labelled as the creator or deactivator of an object type.\n\nHigh (e.g. 0.9): conservative — must almost always be first/last.\nLow (e.g. 0.2): more assignments, riskier for variant-heavy logs.\n\nDefault: 0.5'} />
+                    <HelpTip text={'Default: 0.9 (90%). An activity receives the create flag if it is first for at least this share of all instances of its object type, and the deactivate flag if it is last for that share. The two checks are independent.\n\nNo qualifying activity means no flag. Rediscover lifecycle to apply a changed threshold; existing flags are replaced.'} />
                     <span className="help-text">fraction of instances to count as creates/deactivates</span>
                   </label>
                   <input
                     type="number"
                     value={ocdeclareDiscoveryConfig.lifecycleThreshold}
                     onChange={(e) => handleOcdeclareDiscoveryConfigChange('lifecycleThreshold', parseFloat(e.target.value))}
-                    min="0" max="1" step="0.05"
+                    min="0.01" max="1" step="0.01"
                     disabled={isOcdeclareDiscovering}
                   />
                 </div>
@@ -11499,6 +11429,7 @@ function App() {
                   eventLogFile={discoveryConfig.eventLogFile}
                   activeModel={activeModel}
                   onModelChange={handleModelEdit}
+                  lifecycleThreshold={ocdeclareDiscoveryConfig.lifecycleThreshold}
                 />
               )}
             </div>
@@ -12145,8 +12076,8 @@ function App() {
               className="simulate-button"
               onClick={runSimulation}
               disabled={isSimulating || (workflowMode !== 'external-empty' && !discoveryResults) || !config.ocdeclareFile || config.startActivities.length === 0 || hasBlockingModelIssues}
-              title={lifecycleIssues.length > 0
-                ? `Cannot run: incomplete object lifecycle for ${lifecycleIssues.map(i => i.type).join(', ')}`
+              title={hasBlockingModelIssues
+                ? `Cannot run: missing object bindings for ${bindingWarnings.map(a => a.name).join(', ')}`
                 : undefined}
             >
               {isSimulating ? 'Simulating...' : 'Run Simulation'}
@@ -12224,6 +12155,10 @@ function App() {
                 );
               })()}
 
+
+              <Collapsible title="Last 10 events" badge={results.recent_events?.length ?? null} defaultOpen={true}>
+                <RecentEventLog events={results.recent_events} total={results.events_count} />
+              </Collapsible>
 
               {/* ── Evaluation ── */}
               {(results.audit?.object_lifecycle_audit || results.audit?.activity_participation_audit) && (

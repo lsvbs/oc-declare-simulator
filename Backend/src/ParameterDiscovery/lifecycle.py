@@ -13,8 +13,8 @@ Algorithm 1 discovers ordinary arcs on them and no lifecycle-specific discovery
 step exists at all. That was implemented and measured; the discovery side works,
 but the simulator's object supply is a push (activities flagged `creates` mint
 objects) where the paper's semantics is a pull (an object is created because a
-candidate needs one), so it is not wired in. See the note above
-discover_lifecycle for the measured comparison.
+candidate needs one), so it is not wired in. This module uses observed first/last
+activity shares to assign the prototype's lifecycle flags.
 
 Contents
     discover_lifecycle                  creates/deactivates flags per object type
@@ -27,153 +27,94 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+DEFAULT_LIFECYCLE_THRESHOLD = 0.9
+
+
+def validate_lifecycle_threshold(value: Any) -> float:
+    """Accept a finite fraction in (0, 1], including JSON numeric strings."""
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Lifecycle threshold must be a number greater than 0 and at most 1.") from None
+    if isinstance(value, bool) or not math.isfinite(threshold) or not 0 < threshold <= 1:
+        raise ValueError("Lifecycle threshold must be a number greater than 0 and at most 1.")
+    return threshold
 
 
 def discover_lifecycle(
     ocel_log: Dict[str, Any],
     object_type: str,
-    lifecycle_threshold: float = 0.5
+    lifecycle_threshold: float = DEFAULT_LIFECYCLE_THRESHOLD,
 ) -> Tuple[Set[str], Set[str]]:
-    """Discover which activities create and terminate objects.
+    """Flag activities first/last for at least 90% of an object type by default.
 
-    An activity is considered a *creator* only if it is the first activity for
-    at least ``lifecycle_threshold`` fraction of all instances of ``object_type``
-    (default 50 %).  Likewise for *terminators*.  An activity that already
-    qualifies as a creator is never additionally marked as a terminator, which
-    prevents the spurious ``creates AND consumes`` flag that arises when a small
-    number of single-event object instances make the first and last activity
-    identical.
+    Every declared instance of the requested type contributes to the denominator,
+    including objects with no events. Each observed object contributes exactly one
+    first and one last activity. Timestamp ties use event ID as a stable tie-break.
+    Creation and deactivation are independent: an activity may receive both flags.
+    There are no rare-endpoint exceptions or fallback assignments below the threshold.
 
-    The threshold approach follows the support-based filtering convention used in
-    Declare/OC-Declare mining (Di Ciccio & Montali, 2022).
-
-    Args:
-        ocel_log: OCEL 2.0 log dictionary
-        object_type: Object type to analyze
-        lifecycle_threshold: Minimum fraction of instances (0–1) for which an
-            activity must be the first/last event to qualify as a
-            creator/terminator.  Default is 0.5 (majority).
-
-    Returns:
-        Tuple of (creating_activities, terminating_activities)
+    A list of activity traces represents one object instance per trace (empty
+    traces count in the denominator). Explicit threshold overrides remain supported.
     """
-    from collections import Counter
-
-    # Handle both OCEL 2.0 (dict) and simple list format
+    threshold = validate_lifecycle_threshold(lifecycle_threshold)
     if isinstance(ocel_log, list):
-        # For simple list format, just use first/last activity in traces
-        creating_activities = set()
-        terminating_activities = set()
-        
-        for trace in ocel_log:
-            if trace:
-                creating_activities.add(trace[0])
-                terminating_activities.add(trace[-1])
-        
-        return creating_activities, terminating_activities
-    
-    objects = ocel_log.get('objects', {})
-    events = ocel_log.get('events', {})
+        first_counts = Counter(trace[0] for trace in ocel_log if trace)
+        last_counts = Counter(trace[-1] for trace in ocel_log if trace)
+        n_objects = len(ocel_log)
+    else:
+        objects = ocel_log.get('objects', {}) or {}
+        object_items = (objects.items() if isinstance(objects, dict) else
+                        ((obj['id'], obj) for obj in objects))
+        obj_ids = {oid for oid, obj in object_items
+                   if isinstance(obj, dict) and obj.get('type') == object_type}
+        n_objects = len(obj_ids)
+        if not n_objects:
+            return set(), set()
 
-    # Build object-type filter set for this type — O(N_objects)
-    obj_ids_of_type = {
-        oid for oid, od in objects.items()
-        if isinstance(od, dict) and od.get('type') == object_type
-    }
-    if not obj_ids_of_type:
+        # Keep only the two endpoints per object; no full trace sort is needed.
+        first, last = {}, {}
+        events = ocel_log.get('events', {}) or {}
+        event_items = (events.items() if isinstance(events, dict) else
+                       ((event['id'], event) for event in events))
+        for eid, event in event_items:
+            if not isinstance(event, dict):
+                continue
+            activity = event.get('activity') or event.get('type')
+            if not activity:
+                continue
+            relations = event.get('omap') or event.get('relationships') or []
+            involved = {rel.get('objectId') if isinstance(rel, dict) else rel for rel in relations}
+            involved.intersection_update(obj_ids)
+            if not involved:
+                continue
+            timestamp = event.get('timestamp') or event.get('time')
+            try:
+                ts = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(
+                    str(timestamp).replace('Z', '+00:00'))
+            except (TypeError, ValueError):
+                raise ValueError(f"Event {eid!r} needs a valid timestamp for lifecycle discovery.") from None
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            key = (ts.astimezone(timezone.utc), str(eid))
+            for oid in involved:
+                if oid not in first or key < first[oid][0]:
+                    first[oid] = (key, activity)
+                if oid not in last or key > last[oid][0]:
+                    last[oid] = (key, activity)
+        first_counts = Counter(activity for _, activity in first.values())
+        last_counts = Counter(activity for _, activity in last.values())
+
+    if not n_objects:
         return set(), set()
-
-    # Single pass over events: collect (timestamp, activity) per relevant object — O(N_events)
-    obj_timeline: Dict[str, list] = defaultdict(list)
-    ev_iter = events.items() if isinstance(events, dict) else []
-    for eid, edata in ev_iter:
-        if not isinstance(edata, dict):
-            continue
-        activity  = edata.get('activity') or edata.get('type', '')
-        timestamp = edata.get('timestamp', '')
-        if not activity:
-            continue
-        omap = edata.get('omap') or edata.get('relationships') or []
-        for oid in omap:
-            if oid in obj_ids_of_type:
-                obj_timeline[oid].append((timestamp, activity))
-
-    # Extract first/last activity per object
-    object_first_activity = {}
-    object_last_activity  = {}
-    for oid, timeline in obj_timeline.items():
-        timeline.sort(key=lambda x: x[0])
-        object_first_activity[oid] = timeline[0][1]
-        object_last_activity[oid]  = timeline[-1][1]
-    
-    # Aggregate: only keep activities that appear as first/last for enough instances
-    n = len(object_first_activity)
-    if n == 0:
-        return set(), set()
-
-    first_counts = Counter(object_first_activity.values())
-    last_counts  = Counter(object_last_activity.values())
-
-    creating_activities = {
-        act for act, cnt in first_counts.items()
-        if cnt / n >= lifecycle_threshold
-    }
-
-    # Objects whose entire life is a single event. For those, first and last
-    # activity are necessarily the same, and "creates AND deactivates on the
-    # same binding" is not a spurious flag — it is what the log says. The
-    # engine supports it: _des_start_activity appends created objects to the
-    # in-progress record's participating_object_ids, so _des_complete_activity
-    # retires them when the activity finishes.
-    single_event_share = Counter()
-    for oid, timeline in obj_timeline.items():
-        if len(timeline) == 1:
-            single_event_share[timeline[0][1]] += 1
-
-    terminating_activities = set()
-    for act, cnt in last_counts.items():
-        if cnt / n < lifecycle_threshold:
-            continue
-        if act not in creating_activities:
-            terminating_activities.add(act)
-            continue
-        # The activity is also a creator. Keep the original guard — which
-        # exists to suppress a creates+consumes flag caused by a handful of
-        # single-event instances — UNLESS single-event objects are the norm for
-        # this type rather than the exception.
-        #
-        # On BPIC17 they are the norm: 96.9% of Offer objects appear only in
-        # O_Create Offer, and 97.8% of Workflow objects only in W_Handle leads.
-        # The unconditional guard therefore fired on the majority case and left
-        # those types with no terminator at all, so they were never retired and
-        # accumulated for the whole run.
-        if single_event_share[act] / n >= lifecycle_threshold:
-            terminating_activities.add(act)
-
-    # Rare but unambiguous endpoints: an activity that EVERY object of this type
-    # ends on, however few reach it. The frequency vote above cannot see these —
-    # O_Refused terminates 0.3% of Offers, far under any sensible threshold —
-    # yet an object reaching one is finished, and leaving it active leaks it.
-    #
-    # Measured from the log rather than inferred from the model's structure. The
-    # obvious alternative is "an activity with no outgoing response constraint
-    # is an endpoint", but absence of an obligation means nothing is *required*
-    # after A, not that nothing *happens* after A. Checked on container
-    # logistics, 3 of 8 such structural endpoints are not terminal at all:
-    # Place in Stock ends 0% of Forklifts and Drive to Terminal ends 17% of
-    # Trucks — exactly the reused resource types. Marking those would retire
-    # objects mid-life. The log-based test cannot make that mistake: if an
-    # object ever continues past A, A is not marked.
-    for act in last_counts:
-        if act in terminating_activities:
-            continue
-        reached = sum(1 for tlin in obj_timeline.values()
-                      if any(a == act for _ts, a in tlin))
-        if reached and last_counts[act] == reached:
-            terminating_activities.add(act)
-
-    return creating_activities, terminating_activities
+    return (
+        {activity for activity, count in first_counts.items() if count / n_objects >= threshold},
+        {activity for activity, count in last_counts.items() if count / n_objects >= threshold},
+    )
 
 
 def discover_permanent_object_types(
@@ -427,4 +368,3 @@ def discover_creation_counts(ocel_log: Dict[str, Any]) -> Dict[str, Dict[str, Di
         if kept:
             out[activity] = kept
     return out
-
