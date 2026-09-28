@@ -112,6 +112,9 @@ class ResponseObligation:
     constraint_key: tuple
     required_objects: frozenset[str] = frozenset()
     any_groups: tuple[frozenset[str], ...] = ()
+    activated_at: Optional[datetime] = None
+    activation_event_id: Optional[str] = None
+    direct: bool = False
 
     def matches(self, object_ids) -> bool:
         present = set(object_ids)

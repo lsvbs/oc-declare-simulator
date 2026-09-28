@@ -200,7 +200,7 @@ class ObligationTests(unittest.TestCase):
             Activity('A', [ObjectBinding('Order', 1, 1, creates=True)]),
             Activity(terminal, [ObjectBinding('Order', 1, 1, deactivates=True)]),
         ], constraints=[Constraint('response', 'A', 'B', Scope('each', 'Order'), nmin=1),
-                        *extra_constraints])
+                        *extra_constraints], activity_durations={terminal: fixed(1)})
         return Simulator(model, SimulationConfig(max_steps=10, start_policy=StartPolicy(
             ['A'], max_case_starts=1))).run()
 

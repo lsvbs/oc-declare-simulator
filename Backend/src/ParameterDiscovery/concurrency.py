@@ -177,7 +177,7 @@ def discover_activity_concurrency(
     if not by_act:
         return {}
     if metrics is None:
-        metrics = compute_ocpa_metrics(ocel_log, [], service_time_mode='minimum')
+        metrics = compute_ocpa_metrics(ocel_log, [], service_time_mode='p25')
 
     import math
     caps: Dict[str, int] = {}
@@ -205,4 +205,3 @@ def discover_activity_concurrency(
 def _timedelta_seconds(seconds: float):
     from datetime import timedelta
     return timedelta(seconds=seconds)
-

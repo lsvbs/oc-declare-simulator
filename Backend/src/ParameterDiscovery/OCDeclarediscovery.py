@@ -166,6 +166,37 @@ def _count_qualifying_events(
     return len(b_events)  # AS
 
 
+def _direct_binding_counts(idx, activation, target, arrow, bindings):
+    """Object filters first, nearest strict timestamp second, activity last."""
+    from itertools import product
+    by_type = idx['event_objs_by_type'].get(activation, {})
+    each, required, anys = [], set(), []
+    for typ, mode in bindings:
+        ids = set(by_type.get(typ, ()))
+        if mode == 'each':
+            each.append(sorted(ids))
+        elif mode == 'all':
+            required.update(ids)
+        elif mode == 'any':
+            anys.append(ids)
+    timestamp = idx['event_time'][activation]
+    for assignment in product(*each):
+        filters = [{eid for _, eid in idx['events_by_object'].get(oid, ())}
+                   for oid in required.union(assignment)]
+        for group in anys:
+            filters.append({eid for oid in group for _, eid in idx['events_by_object'].get(oid, ())})
+        candidates = set.intersection(*filters) if filters else set(idx['event_time'])
+        candidates = {eid for eid in candidates
+                      if (idx['event_time'][eid] > timestamp if arrow == 'DF'
+                          else idx['event_time'][eid] < timestamp)}
+        if not candidates:
+            yield 0
+            continue
+        nearest = (min if arrow == 'DF' else max)(idx['event_time'][eid] for eid in candidates)
+        yield sum(idx['event_activity'][eid] == target for eid in candidates
+                  if idx['event_time'][eid] == nearest)
+
+
 def _count_df_dp(
     oid: str,
     t_A: str,
@@ -310,6 +341,10 @@ def _check_arc(
             continue
         t_A = event_time.get(eid_A, '')
         total += 1
+        if arc_type in ('DF', 'DP'):
+            counts = _direct_binding_counts(idx, eid_A, act_B, arc_type, [(obj_type, involvement)])
+            satisfied += int(all(n >= counts_min and (counts_max is None or n <= counts_max) for n in counts))
+            continue
         event_ok = False
 
         if involvement == 'each':
@@ -406,7 +441,7 @@ def _check_arc(
         'label':                 [obj_type],
         'involvement':           involvement,
         'involvement_per_label': {obj_type: involvement},
-        'counts':                [counts_min, None],   # legacy field, unused
+        'counts':                [counts_min, counts_max],
         # Per-endpoint observed occurrences per scope object. _arcs_to_deco_constraints
         # maps these onto nmin/nmax according to which endpoint becomes source
         # and which becomes target after the EP/DP swap.
@@ -575,6 +610,11 @@ def _check_arc_multi_type(
         t_A = event_time.get(eid_A, '')
         total += 1
 
+        if arc_type in ('DF', 'DP'):
+            counts = _direct_binding_counts(idx, eid_A, act_B, arc_type, bindings)
+            satisfied += int(all(n >= counts_min and (counts_max is None or n <= counts_max) for n in counts))
+            continue
+
         # Compute qualifying B-event sets per binding.
         # Most bindings produce a single frozenset; multi-object 'each' produces
         # a list of per-object frozensets that are checked separately.
@@ -705,7 +745,7 @@ def _check_arc_multi_type(
         'label':                 list(obj_types),
         'involvement':           min_inv,
         'involvement_per_label': ipl,
-        'counts':                [counts_min, None],   # legacy field, unused
+        'counts':                [counts_min, counts_max],
         'observed_counts':       observed,
         'support':               round(support, 4),
     }
@@ -1010,14 +1050,13 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
     first. Simulation.Models.OCDeclare.parse_ocdeclare_dict now performs it,
     mirroring what parse_ocdeclare_list has always done for the arc-list format.
 
-    `observed_counts` stays keyed by arc endpoint (`from`/`to`) for the same
-    reason: it is a measurement of the arc, and mapping it onto the engine's
-    nmin/nmax roles is the adapter's job.
+    `observed_counts` stays keyed by arc endpoint (`from`/`to`) as descriptive
+    statistics. It never replaces the declared matching-event bounds.
     """
     ARC_TO_CTYPE = {
-        'EF': 'response',  'DF': 'response',
-        'EP': 'precedence', 'DP': 'precedence',
-        'AS': 'coexistence',
+        'EF': 'response',  'DF': 'chain_response',
+        'EP': 'precedence', 'DP': 'chain_precedence',
+        'AS': 'responded_existence',
     }
     constraints = []
     for arc in arcs:
@@ -1040,8 +1079,7 @@ def _arcs_to_deco_constraints(arcs: List[Dict[str, Any]]) -> List[Dict[str, Any]
             # orientation-free — it names the template, not an endpoint role.
             'type':                  ctype,
             'constraint_type':       ctype,
-            # Paper counts on |f(E_L)|. Left at the discovery default; the
-            # adapter fits the engine's nmin/nmax from observed_counts below.
+            # Declared bounds on |f(E_L)|, also used by the runtime adapter.
             'counts':                counts,
             # Per-endpoint measurements, keyed by ARC endpoint.
             'observed_counts':       arc.get('observed_counts') or {},

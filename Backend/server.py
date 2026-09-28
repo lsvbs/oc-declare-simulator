@@ -2443,7 +2443,7 @@ def discover_timing():
         data = request.json or {}
         event_log_file = data.get('eventLogFile')
         anchor_activities = data.get('anchorActivities', [])
-        service_time_mode = data.get('serviceTimeMode', 'minimum')
+        service_time_mode = data.get('serviceTimeMode', 'p25')
         if not event_log_file:
             return jsonify({'error': 'Missing eventLogFile parameter'}), 400
 
@@ -2481,12 +2481,12 @@ def discover_timing_output():
 
     Body JSON:
       outputFile        – filename in OUTPUT_DIR (e.g. 'log_20260721_123456.json')
-      serviceTimeMode   – 'minimum' | 'p25' | 'p50'  (default: 'minimum')
+      serviceTimeMode   – 'minimum' | 'p25' | 'p50' | 'mean'  (default: 'p25')
     """
     try:
         data = request.json or {}
         output_file = data.get('outputFile')
-        service_time_mode = data.get('serviceTimeMode', 'minimum')
+        service_time_mode = data.get('serviceTimeMode', 'p25')
         if not output_file:
             return jsonify({'error': 'Missing outputFile parameter'}), 400
 
@@ -2867,7 +2867,7 @@ def notebook_evaluation():
         if model is None and data.get('ocdeclareFile'):
             model = read_selected_file(OCDECLARE_DIR, data['ocdeclareFile'])
         report = evaluate_logs(reference, simulated, model,
-                               service_time_mode=data.get('serviceTimeMode', 'minimum'),
+                               service_time_mode=data.get('serviceTimeMode', 'p25'),
                                anchor_activities=data.get('anchorActivities', []))
         report['files'] = {'input': data.get('eventLogFile'), 'simulated': data['outputFile']}
         return jsonify(report)
@@ -3470,7 +3470,7 @@ def further_eval_ocpa_ocpq_comparison():
         data = request.json or {}
         output_file    = data.get('outputFile')
         event_log_file = data.get('eventLogFile')
-        service_mode   = data.get('serviceTimeMode', 'sojourn')
+        service_mode   = data.get('serviceTimeMode', 'p25')
         if not output_file:
             return jsonify({'error': 'outputFile is required'}), 400
         if not event_log_file:

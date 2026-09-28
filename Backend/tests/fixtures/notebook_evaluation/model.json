@@ -118,6 +118,48 @@
       "involvement_per_label": {
         "Item": "all"
       }
+    },
+    {
+      "from": "A",
+      "to": "B",
+      "arc_type": "AS",
+      "counts": [
+        1,
+        2
+      ],
+      "involvement_per_label": {
+        "Order": "each",
+        "Item": "all",
+        "Worker": "any"
+      }
+    },
+    {
+      "from": "A",
+      "to": "B",
+      "arc_type": "DF",
+      "counts": [
+        1,
+        2
+      ],
+      "involvement_per_label": {
+        "Order": "each",
+        "Item": "all",
+        "Worker": "any"
+      }
+    },
+    {
+      "from": "B",
+      "to": "A",
+      "arc_type": "DP",
+      "counts": [
+        1,
+        2
+      ],
+      "involvement_per_label": {
+        "Order": "each",
+        "Item": "all",
+        "Worker": "any"
+      }
     }
   ]
 }

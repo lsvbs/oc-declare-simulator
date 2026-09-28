@@ -42,6 +42,7 @@ class NotebookParityTests(unittest.TestCase):
     def check_notebook(self, mode, anchors=None):
         name = mode + ('_anchors' if anchors else '')
         expected = fixture(f'expected_{name}')
+        self.assertEqual(expected['reference_sha256'], nm.REFERENCE_NOTEBOOK_SHA256)
         raw_a, raw_b, model = fixture('input'), fixture('simulated'), fixture('model')
         with contextlib.redirect_stdout(io.StringIO()):
             actual = evaluate_logs(raw_a, raw_b, model, mode, anchors)
@@ -73,6 +74,9 @@ class NotebookParityTests(unittest.TestCase):
 
     def test_notebook_p50(self):
         self.check_notebook('p50')
+
+    def test_notebook_full_mean(self):
+        self.check_notebook('mean')
 
     def test_notebook_anchors(self):
         self.check_notebook('minimum', [{'name': 'A', 'mean_seconds': 12, 'std_seconds': 2}])
@@ -114,7 +118,7 @@ class NotebookParityTests(unittest.TestCase):
         json.dumps(report, allow_nan=False)
 
     def test_unsupported_model_does_not_get_fictitious_scores(self):
-        for update in [{'arc_type': 'DF'}, {'involvement_per_label': {'Order>Item': 'all'}}]:
+        for update in [{'arc_type': 'UNKNOWN'}, {'involvement_per_label': {'Order>Item': 'all'}}]:
             with self.subTest(update=update):
                 model = fixture('model')
                 model['constraints'][0].update(update)
@@ -123,16 +127,16 @@ class NotebookParityTests(unittest.TestCase):
                 self.assertNotIn('simulated', report['conformance'])
                 self.assertEqual('ok', report['kl']['activities']['status'])
 
-    def test_arc_model_uses_declared_counts_not_discovered_runtime_caps(self):
+    def test_editor_model_uses_edited_bounds_and_ignores_stale_imported_counts(self):
         model = fixture('model')
         del model['constraint_orientation']  # UI adapter removes this marker
-        model['constraints'][1].update(source_activity='A', target_activity='B', nmin=9, nmax=11)
+        model['constraints'][1].update(constraint_type='precedence', source_activity='A', target_activity='B', nmin=9, nmax=11)
         canonical = canonical_model(model)
         normalized = nm.load_confidence_model(canonical)
         c = normalized['constraints'][1]
         self.assertEqual(('B', 'A'), (c['source_activity'], c['target_activity']))
-        self.assertEqual(1, c['nmin'])
-        self.assertTrue(math.isinf(c['nmax']))
+        self.assertEqual(9, c['nmin'])
+        self.assertEqual(11, c['nmax'])
 
     def test_legacy_editor_precedence_converts_orientation_explicitly(self):
         model = {'activities': ['A', 'B'], 'object_types': ['Order'], 'constraints': [
@@ -150,13 +154,55 @@ class NotebookParityTests(unittest.TestCase):
         self.assertEqual('ok', report['conformance']['status'])
         self.assertNotIn('input', report['conformance'])
 
+    def test_external_arc_list_is_evaluated_with_every_object_label(self):
+        raw = [{'arc_type': 'DF', 'from': 'A', 'to': 'B', 'counts': [1, None],
+                'label': {'each': [{'object_type': 'Order'}], 'all': [{'object_type': 'Item'}]}}]
+        normalized = nm.load_confidence_model(canonical_model(raw))
+        self.assertEqual({'Order': 'each', 'Item': 'all'}, normalized['constraints'][0]['involvement_per_label'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            report = evaluate_logs(fixture('input'), fixture('simulated'), raw)
+        self.assertEqual('ok', report['conformance']['status'])
+
     def test_ngd_requires_timezone_without_replacing_score_with_zero(self):
         raw = fixture('simulated')
         raw['events'][0]['time'] = '2025-01-01T00:00:00'
         with contextlib.redirect_stdout(io.StringIO()):
             report = evaluate_logs(fixture('input'), raw, fixture('model'))
         self.assertEqual('unavailable', report['ngd']['status'])
-        self.assertIn('timezone', report['ngd']['reason'])
+        self.assertIn('timezones', report['ngd']['reason'])
+
+    def test_ocel1_normalization_preserves_scores_and_original_log(self):
+        raw = fixture('input')
+        old = {'ocel:objects': {o['id']: {'ocel:type': o['type']} for o in raw['objects']},
+               'ocel:events': {e['id']: {'ocel:activity': e['type'], 'ocel:timestamp': e['time'],
+                               'ocel:omap': [r['objectId'] for r in e.get('relationships', [])]}
+                              for e in raw['events']}}
+        saved = copy.deepcopy(old)
+        with contextlib.redirect_stdout(io.StringIO()):
+            a = evaluate_logs(old, fixture('simulated'), fixture('model'))
+            b = evaluate_logs(raw, fixture('simulated'), fixture('model'))
+        self.assertEqual(a, b)
+        self.assertEqual(saved, old)
+
+    def test_constraint_violation_fraction_uses_constraints_as_denominator(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = evaluate_logs(fixture('input'), fixture('simulated'), fixture('model'))
+        for role in ('input', 'simulated'):
+            v = result['conformance'][role]['violations']
+            self.assertEqual(v['n_constraints_affected'] / v['n_constraints'], v['constraint_violation_rate'])
+        empty = evaluate_logs({'objects': [], 'events': []}, {'objects': [], 'events': []},
+                              {'constraint_orientation': 'arc', 'constraints': [], 'activities': [], 'object_types': []})
+        self.assertIsNone(empty['conformance']['input']['violations']['constraint_violation_rate'])
+
+    def test_naive_times_are_ordered_without_inventing_timezone_for_ngd(self):
+        raw = fixture('input')
+        for e in raw['events']:
+            e['time'] = e['time'].replace('Z', '')
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = evaluate_logs(raw, fixture('input'), fixture('model'))
+        self.assertEqual('ok', result['ngd']['status'])
+        self.assertEqual('naive', result['ngd']['diagnostics']['input']['timestamp_mode'])
+        self.assertEqual(0, result['ngd']['summary']['NGD_2gram_relative'])
 
 
 class NotebookEvaluationApiTests(unittest.TestCase):
@@ -182,8 +228,9 @@ class NotebookEvaluationApiTests(unittest.TestCase):
         response = self.request({**self.data, 'object_traces': {'ignored': ['Wrong']}})
         self.assertEqual(200, response.status_code, response.json)
         self.assertEqual(10, response.json['logs']['input']['events'])
-        self.assertEqual(fixture('expected_minimum')['conformance']['simulated']['violations'],
-                         response.json['conformance']['simulated']['violations'])
+        expected = fixture('expected_p25')['conformance']['simulated']['violations']
+        self.assertEqual(expected, {k: response.json['conformance']['simulated']['violations'][k] for k in expected})
+        self.assertEqual('p25', response.json['settings']['service_time_mode'])
         self.assertNotIn('NaN', response.get_data(as_text=True))
 
     def test_model_override_is_used(self):
@@ -192,7 +239,7 @@ class NotebookEvaluationApiTests(unittest.TestCase):
         self.assertEqual(1, response.json['conformance']['simulated']['confidence']['global_confidence'])
 
     def test_invalid_requests_are_explained(self):
-        for update in [{'serviceTimeMode': 'mean'}, {'outputFile': '../outside.json'}, {'outputFile': None},
+        for update in [{'serviceTimeMode': 'p75'}, {'outputFile': '../outside.json'}, {'outputFile': None},
                        {'anchorActivities': 'bad'}]:
             with self.subTest(update=update):
                 self.assertEqual(400, self.request({**self.data, **update}).status_code)

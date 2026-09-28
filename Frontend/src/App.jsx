@@ -6,6 +6,7 @@ import FlowChart from './FlowChart';
 import ModelEditor from './ModelEditor';
 import { O2ODiagram, CONSTRAINT_HELP } from './ModelEditor';
 import { resolveStartActivityCaps } from './startActivityCounts.mjs';
+import { normalizeModelOrientation } from './modelOrientation.mjs';
 import EvaluationWrapper from './NotebookEvaluation';
 import ObjectLifecycleWarning from './ObjectLifecycleWarning';
 import { getModelWarnings } from './modelWarnings.mjs';
@@ -1177,52 +1178,6 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
       </div>
     </div>
   );
-}
-
-// ── normalizeModelOrientation ─────────────────────────────────────────────────
-// Discovered models are stored in ARC orientation: `from` is the OC-DECLARE
-// arc's source s and `to` its target t, exactly as the paper and the OCPQ
-// converter write them. The engine reads `precedence` the other way round —
-// "source must appear before target" — so EP/DP arcs have their endpoints
-// swapped when they cross into engine-facing code.
-//
-// That swap used to happen inside discovery, which meant the file on disk
-// carried arc_type: "EP" next to already-flipped activities and could not be
-// compared to OCPQ without undoing it first. It now happens in the adapters:
-// parse_ocdeclare_dict on the Python side, and this function here, so that the
-// ~117 places in this file that read source_activity/target_activity keep
-// working untouched.
-//
-// Applied once as a model enters state. The marker is dropped on the way out,
-// so the normalised model can be POSTed back as modelOverride without the
-// backend applying the swap a second time.
-function normalizeModelOrientation(model) {
-  if (!model || Array.isArray(model) || model.constraint_orientation !== 'arc') return model;
-
-  const constraints = (model.constraints || []).map(c => {
-    const arc = c.arc_type;
-    const flip = arc === 'EP' || arc === 'DP';
-    const source = flip ? c.to   : c.from;
-    const target = flip ? c.from : c.to;
-
-    // nmin gates on occurrences of the SOURCE activity, nmax bounds the TARGET,
-    // so the endpoint-keyed observed_counts follow the same flip.
-    const obs  = c.observed_counts || {};
-    const from = obs.from || [null, null];
-    const to   = obs.to   || [null, null];
-    const [srcCounts, tgtCounts] = flip ? [to, from] : [from, to];
-
-    return {
-      ...c,
-      source_activity: source, target_activity: target,
-      source: source,          target: target,
-      nmin: c.nmin != null ? c.nmin : (srcCounts[0] != null ? srcCounts[0] : 1),
-      nmax: c.nmax != null ? c.nmax : (tgtCounts[1] != null ? tgtCounts[1] : null),
-    };
-  });
-
-  const { constraint_orientation, ...rest } = model;
-  return { ...rest, constraints };
 }
 
 // ── SimThroughputChart ────────────────────────────────────────────────────────
@@ -4219,7 +4174,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
   const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
   const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
 
-  const modeLabel = { minimum: 'Minimum [min–P25]', p25: 'P25 [min–P50]', p50: 'P50 IQR [P25–P75]', p75: 'P75 [P50–max]', mean: 'Full mean' };
+  const modeLabel = { minimum: 'Minimum [lowest value]', p25: 'P25 [lowest 25%]', p50: 'P50 [lowest 50%]', mean: 'Full mean [all values]' };
 
   return (
     <div className="evaluation-tab">
@@ -5745,7 +5700,16 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
   const [sortCon, cycleCon, setSortCon] = useSortState();
   const isUnary = t => ['absence','exactly','init'].includes(t);
 
-  const updateCon = (i, patch) => onUpdate(constraints.map((x,j) => j===i ? {...x,...patch} : x));
+  const updateCon = (i, patch) => onUpdate(constraints.map((x,j) => {
+    if (j !== i) return x;
+    if (patch.scope && scopeBindings(x.scope).length <= 1) {
+      const scope = patch.scope;
+      const involvement = scope.object_type ? { [scope.object_type]: scope.kind || 'each' } : {};
+      return {...x, ...patch, involvement_per_label: involvement,
+        scope: {...scope, involvement_per_label: involvement, bindings: Object.entries(involvement)}};
+    }
+    return {...x, ...patch};
+  }));
   const deleteCon = i => onUpdate(constraints.filter((_,j) => j!==i));
   const addCon = () => {
     const errs = {};
@@ -6581,7 +6545,7 @@ function App() {
   const [timingAnchors,       setTimingAnchors]       = useState({});
   const [timingMode,          setTimingMode]          = useState('single');
   const [timingSingleAct,     setTimingSingleAct]     = useState('');
-  const [serviceTimeMode,     setServiceTimeMode]     = useState('minimum'); // 'minimum' | 'p25' | 'p50' | 'p75' | 'mean'
+  const [serviceTimeMode,     setServiceTimeMode]     = useState('p25'); // 'minimum' | 'p25' | 'p50' | 'mean'
   const [discoveryDistType,   setDiscoveryDistType]   = useState('lognormal'); // distribution assigned to discovered activities
   const [isDiscoveringTiming, setIsDiscoveringTiming] = useState(false);
   const [timingDiscoveryResult, setTimingDiscoveryResult] = useState(null);
@@ -8873,11 +8837,10 @@ function App() {
                           <label className="landing-option-label">Timing Discovery</label>
                           <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
                             {[
-                              { value: 'minimum', label: 'Minimum',    desc: 'Mean of [min…P25] — conservative, strips tail' },
-                              { value: 'p25',     label: 'P25',        desc: 'Mean of [min…P50] — slightly broader' },
-                              { value: 'p50',     label: 'P50 (IQR)',  desc: 'Mean of [P25…P75] — ignores extremes' },
-                              { value: 'p75',     label: 'P75',        desc: 'Mean of [P50…max] — upper bound' },
-                              { value: 'mean',    label: 'Full mean',  desc: 'Mean of entire distribution' },
+                              { value: 'minimum', label: 'Minimum',   desc: 'Use only the lowest collected value' },
+                              { value: 'p25',     label: 'P25',       desc: 'Use the lowest 25% of collected values' },
+                              { value: 'p50',     label: 'P50',       desc: 'Use the lowest 50% of collected values' },
+                              { value: 'mean',    label: 'Full mean', desc: 'Use all collected values' },
                             ].map(opt => (
                               <label key={opt.value} style={{display:'flex',alignItems:'flex-start',gap:'0.4rem',fontSize:'0.82rem',cursor:'pointer'}}>
                                 <input type="radio" name="landingTimingMode" value={opt.value}

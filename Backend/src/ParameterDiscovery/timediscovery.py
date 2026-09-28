@@ -4,13 +4,44 @@ Used by timing discovery, concurrency estimation, and timing evaluation.
 """
 
 from collections import defaultdict
+import math
 from typing import Any, Dict, List, Optional
+
+
+TIMING_DISCOVERY_MODES = {"minimum", "p25", "p50", "mean"}
+
+
+def _select_timing_window(values: List[float], mode: str) -> List[float]:
+    """Select the lower-tail sample window used for timing estimation.
+
+    ``minimum`` intentionally means the single lowest observed value.  The
+    percentile modes use the lowest fraction of the ordered observations, and
+    ``mean`` uses the complete sample.  At least one observation is retained
+    whenever values are available so sparse activities remain estimable.
+    """
+    if mode not in TIMING_DISCOVERY_MODES:
+        raise ValueError(
+            "service_time_mode must be 'minimum', 'p25', 'p50', or 'mean'."
+        )
+    if not values:
+        return []
+
+    ordered = sorted(values)
+    if mode == "minimum":
+        count = 1
+    elif mode == "p25":
+        count = max(1, int(math.ceil(0.25 * len(ordered))))
+    elif mode == "p50":
+        count = max(1, int(math.ceil(0.50 * len(ordered))))
+    else:  # full mean
+        count = len(ordered)
+    return ordered[:count]
 
 
 def compute_ocpa_metrics(
     ocel_log: Dict[str, Any],
     anchor_activities: List[Dict[str, Any]] = None,
-    service_time_mode: str = 'minimum',
+    service_time_mode: str = 'p25',
 ) -> Dict[str, Dict[str, Any]]:
     """Compute OCPA time metrics per activity from an OCEL 2.0 log.
 
@@ -51,8 +82,12 @@ def compute_ocpa_metrics(
           mean_seconds, std_seconds, min_seconds, max_seconds   # = service params
         }
     """
-    import math
     import statistics
+
+    if service_time_mode not in TIMING_DISCOVERY_MODES:
+        raise ValueError(
+            "service_time_mode must be 'minimum', 'p25', 'p50', or 'mean'."
+        )
 
     if isinstance(ocel_log, list):
         return {}
@@ -228,7 +263,6 @@ def compute_ocpa_metrics(
             raw_source = soj_vals_nonzero
         else:
             raw_source = soj_vals  # all zeros — keep as fallback
-        using_fallback = raw_source is not direct and not raw_source
         if act in anchor_map:
             anc = anchor_map[act]
             svc_mean = float(anc.get("mean_seconds", soj["mean"]))
@@ -237,26 +271,7 @@ def compute_ocpa_metrics(
             svc_max  = anc.get("max_seconds")
             svc_max  = float(svc_max) if svc_max is not None else None
         elif raw_source:
-            sorted_svc = sorted(raw_source)
-            n = len(sorted_svc)
-
-            # For terminal activities using sojourn fallback, always use minimum
-            # window to strip idle-time inflation from the backward-looking sojourn.
-            effective_mode = 'minimum' if using_fallback else service_time_mode
-
-            if effective_mode == 'p25':
-                lo_idx = 0
-                hi_idx = max(0, int(math.ceil(0.50 * n)) - 1)  # [min, P50]
-            elif effective_mode == 'p50':
-                lo_idx = max(0, int(math.ceil(0.25 * n)) - 1)  # [P25, P75]
-                hi_idx = max(0, int(math.ceil(0.75 * n)) - 1)
-            else:  # 'minimum' — [min, P25]
-                lo_idx = 0
-                hi_idx = max(0, int(math.ceil(0.25 * n)) - 1)
-
-            sub = sorted_svc[lo_idx : hi_idx + 1]
-            if not sub:
-                sub = sorted_svc  # fallback: use all if window is empty
+            sub = _select_timing_window(raw_source, service_time_mode)
 
             sub_stats = _stats(sub)
             svc_mean = sub_stats["mean"]
@@ -330,4 +345,3 @@ def _event_times_by_activity(ocel_log: Dict[str, Any]) -> Dict[str, List]:
     for act in by_act:
         by_act[act].sort()
     return by_act
-

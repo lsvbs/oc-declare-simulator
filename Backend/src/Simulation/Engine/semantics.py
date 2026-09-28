@@ -80,104 +80,75 @@ def _scope_ids(candidate: Any, state: SimulationState, scope_type: str,
     return _get_scope_object_ids_from_candidate(candidate, state, scope_type)
 
 
-def _joint_scope_event_ids(
-    candidate: Any,
-    state: SimulationState,
-    scope: Any,
-    source_activity: str,
-    cand_by_type_cache: dict | None = None,
-) -> frozenset:
-    """Return event IDs of source_activity events jointly satisfying all multi-type bindings.
+def _scope_assignments(candidate, state, scope, cache=None):
+    """Definition 8: one joint filter for EVERY Cartesian Each assignment.
 
-    For each binding (obj_type, involvement):
-      'any' → any candidate object of that type must appear in the source event
-      'all' → all candidate objects of that type must appear in the source event
-      'each' (single obj) → that object must appear in the source event
-      'each' (multi obj) → each object individually must have a qualifying source
-                            event (per-object existential check against joint_base)
-
-    Returns empty frozenset if no qualifying event exists (constraint not satisfied).
-
-    ``cand_by_type_cache`` — when supplied (built once per candidate in
-    check_all_constraints, grouping ALL participants by type including
-    resource types), reuses it instead of rebuilding the same grouping from
-    scratch on every multi-type-binding precedence check for this candidate.
-
-    NOTE (#24): the returned set may be a direct reference into
-    ``state._event_ids_by_act_obj`` rather than a fresh copy, so callers must
-    treat it as READ-ONLY. Copying it here would reintroduce the
-    O(events-per-object) cost this indirection exists to remove. The only
-    caller (check_precedence) just takes len() of it.
+    Empty Each domains are vacuous; empty All is the identity; empty Any
+    matches nothing. Prospective creations have no previous events.
     """
-    bindings = scope.bindings
-    if not bindings:
-        return frozenset()
+    by_type = {t: list(ids) for t, ids in (cache or {}).items()}
+    if cache is None:
+        for oid in candidate.participating_object_ids:
+            obj = state.objects.get(oid)
+            if obj:
+                by_type.setdefault(obj.object_type, []).append(oid)
+    for i, typ in enumerate(getattr(candidate, 'object_types_to_create', ())):
+        by_type.setdefault(typ, []).append(('new', i, typ))
+    bindings = scope.bindings or (((scope.object_type, scope.kind),) if scope.object_type else ())
+    each, required, anys = [], set(), []
+    for typ, mode in bindings:
+        ids = by_type.get(typ, [])
+        if mode == 'each':
+            each.append(ids)
+        elif mode == 'all':
+            required.update(ids)
+        elif mode == 'any':
+            anys.append(frozenset(ids))
+    for assignment in _product(*each):
+        yield required.union(assignment), tuple(anys)
 
-    if cand_by_type_cache is not None:
-        cand_by_type = cand_by_type_cache
-    else:
-        cand_by_type = {}
-        for oid in (getattr(candidate, 'participating_object_ids', []) or []):
-            rt = state.objects.get(oid)
-            if rt:
-                cand_by_type.setdefault(rt.object_type, []).append(oid)
 
-    # #24: read the prebuilt event-id set maintained by state.record_event
-    # instead of rebuilding a frozenset over the object's full event history
-    # on every call — the rebuild was O(events-for-this-object) per check and
-    # was the dominant superlinear cost as object histories grew.
-    # The returned set is shared state: treat as read-only (all uses below
-    # are intersections/unions, which produce new sets).
-    _eids_index = state._event_ids_by_act_obj
+def _matches_objects(object_ids, required, anys):
+    ids = set(object_ids)
+    return required.issubset(ids) and all(ids.intersection(group) for group in anys)
 
-    def _src_eids_for_obj(oid: str):
-        return _eids_index.get((source_activity, oid), _EMPTY_SET)
 
-    single_sets: list = []
-    each_multi_groups: list = []  # list of [frozenset, ...] per "each" group with multiple objects
+def _scope_events(state, required, anys, activity=None, extra=()):
+    """Filter objects before nearest-time selection; retain equal-time ties."""
+    pools = [state._events_by_object.get(oid, ()) for oid in required]
+    if activity is not None:
+        pools.append(state._events_by_activity.get(activity, ()))
+    for group in anys:
+        pool = {e.event_id: e for oid in group for e in state._events_by_object.get(oid, ())}
+        pools.append(list(pool.values()))
+    pool = min(pools, key=len) if pools else state.executed_events
+    return [e for e in [*pool, *extra]
+            if (activity is None or e.activity_name == activity)
+            and _matches_objects(e.object_ids, required, anys)]
 
-    for obj_type, inv in bindings:
-        A_objs = cand_by_type.get(obj_type, [])
-        if not A_objs:
-            return frozenset()
-        if inv == 'any':
-            s: set = set()
-            for oid in A_objs:
-                s.update(_src_eids_for_obj(oid))
-            single_sets.append(s)
-        elif inv == 'all':
-            combined = None
-            for oid in A_objs:
-                es = _src_eids_for_obj(oid)
-                combined = es if combined is None else combined & es
-            single_sets.append(combined if combined is not None else frozenset())
-        else:  # each
-            if len(A_objs) <= 1:
-                single_sets.append(_src_eids_for_obj(A_objs[0]))
-            else:
-                each_multi_groups.append([_src_eids_for_obj(oid) for oid in A_objs])
 
-    joint_base = single_sets[0] if single_sets else frozenset(
-        e.event_id for e in _events_for_activity(state, source_activity)
-    )
-    for s in single_sets[1:]:
-        joint_base = joint_base & s
+def _nearest_events(events, forward):
+    if not events:
+        return []
+    if any(e.timestamp is None for e in events):
+        # Legacy, untimed in-memory histories retain their recorded order.
+        return [events[0] if forward else events[-1]]
+    moment = (min if forward else max)(e.timestamp for e in events)
+    return [e for e in events if e.timestamp == moment]
 
-    if not each_multi_groups:
-        return joint_base
 
-    # Per-object existential check: each individual object in an "each" group must
-    # have at least one qualifying source event within joint_base.  Collect all such
-    # events into the return set so the caller can count them.
-    qualifying: set = set()
-    for group_event_sets in each_multi_groups:
-        for obj_events in group_event_sets:
-            local = joint_base & obj_events
-            if not local:
-                return frozenset()  # this object has no qualifying source event
-            qualifying.update(local)
+def _precedence_counts(constraint, candidate, state, scope_ids_cache=None, direct=False):
+    timestamp = getattr(candidate, 'evaluation_timestamp', None)
+    extra = getattr(candidate, 'projected_events', ())
+    for required, anys in _scope_assignments(candidate, state, constraint.scope, scope_ids_cache):
+        events = _scope_events(state, required, anys,
+                               None if direct else constraint.source_activity, extra)
+        if timestamp is not None:
+            events = [e for e in events if e.timestamp is None or e.timestamp < timestamp]
+        if direct:
+            events = _nearest_events(events, forward=False)
+        yield sum(e.activity_name == constraint.source_activity for e in events)
 
-    return frozenset(qualifying)
 
 
 def check_not_coexistence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
@@ -350,88 +321,11 @@ def check_response(constraint: Any, candidate: Any, state: SimulationState, scop
 
 def check_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None,
                       cand_by_type_cache: dict | None = None) -> bool:
-    source = constraint.source_activity
-    target = constraint.target_activity
-    nmin = getattr(constraint, "nmin", 0)
-    nmax = getattr(constraint, "nmax", None)
-
-    if candidate.activity_name != target:
+    if candidate.activity_name != constraint.target_activity:
         return True
-
-    # Scope bindings — one or many object types, one path.
-    # parse_ocdeclare_dict populates bindings for single-type constraints too
-    # (length 1), so this runs for every discovered constraint and the
-    # kind-specific code further down is only reached by models that predate
-    # involvement_per_label.
-    if constraint.scope.bindings:
-        if nmin > 0:
-            qualifying = _joint_scope_event_ids(candidate, state, constraint.scope, source, cand_by_type_cache)
-            if len(qualifying) < nmin:
-                return False
-        # nmax was previously never evaluated on this path — see _nmax_blocked.
-        if _nmax_blocked(constraint, candidate, state, target, nmax, scope_ids_cache):
-            return False
-        return True
-
-    if constraint.scope.kind == "each":
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-
-        created_scope_count = sum(
-            1 for t in (getattr(candidate, "object_types_to_create", []) or [])
-            if t == constraint.scope.object_type
-        )
-
-        if not scope_ids and created_scope_count == 0:
-            if nmin > 0:
-                return _activity_fired_globally(state, source)
-            return True
-
-        if created_scope_count > 0:
-            if constraint.scope.object_type not in (candidate.object_types_to_create or []):
-                return False
-
-        prec_satisfied = getattr(state, '_prec_satisfied', None)
-        cache_key_base = (source, target, 'each')
-
-        for oid in scope_ids:
-            # Fast path: already cached as permanently satisfied for this object
-            if prec_satisfied is not None and (cache_key_base + (oid,)) in prec_satisfied:
-                continue
-            a_count = _count_activity_for_object(state, source, oid)
-            if nmin > 0 and a_count < nmin:
-                return False
-            if nmax is not None:
-                t_count = _count_activity_for_object(state, target, oid)
-                if t_count >= nmax:
-                    return False
-            # Cache if permanently satisfied: nmin met and no nmax upper bound
-            if prec_satisfied is not None and a_count >= max(nmin, 1) and nmax is None:
-                prec_satisfied.add(cache_key_base + (oid,))
-
-        return True
-
-    if constraint.scope.kind in ("any", "all"):
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-        if not scope_ids:
-            return _activity_fired_globally(state, source) if nmin > 0 else True
-        results = []
-        for oid in scope_ids:
-            a_count = _count_activity_for_object(state, source, oid)
-            ok = True
-            if nmin > 0 and a_count < nmin:
-                ok = False
-            if nmax is not None and ok:
-                t_count = _count_activity_for_object(state, target, oid)
-                if t_count >= nmax:
-                    ok = False
-            results.append(ok)
-        if constraint.scope.kind == "any":
-            return any(results)   # pass if at least one object satisfies
-        else:  # all
-            return all(results)   # pass only if all objects satisfy
-
-    # Global fallback
-    return _activity_fired_globally(state, source)
+    lower, upper = constraint.nmin, constraint.nmax
+    return all(count >= lower and (upper is None or count <= upper)
+               for count in _precedence_counts(constraint, candidate, state, scope_ids_cache))
 
 
 def check_not_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
@@ -455,89 +349,74 @@ def check_not_precedence(constraint: Any, candidate: Any, state: SimulationState
 
 
 def check_chain_precedence(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
-    source = constraint.source_activity
-    target = constraint.target_activity
-
-    if candidate.activity_name != target:
+    if candidate.activity_name != constraint.target_activity:
         return True
-
-    if constraint.scope.kind == "each":
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-
-        created_scope_count = sum(
-            1 for t in (getattr(candidate, "object_types_to_create", []) or [])
-            if t == constraint.scope.object_type
-        )
-
-        if not scope_ids and created_scope_count == 0:
-            return True
-        if created_scope_count > 0:
-            return False
-
-        for oid in scope_ids:
-            if _last_activity_for_scope_object(state, oid) != source:
-                return False
-        return True
-
-    if constraint.scope.kind in ("any", "all"):
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-        if not scope_ids:
-            return True
-        results = [_last_activity_for_scope_object(state, oid) == source for oid in scope_ids]
-        if constraint.scope.kind == "any":
-            return any(results)   # pass if at least one has source as last event
-        else:  # all
-            return all(results)   # pass only if all have source as last event
-
-    if not state.executed_events:
-        return False
-    return state.executed_events[-1].activity_name == source
+    return all(count >= constraint.nmin and (constraint.nmax is None or count <= constraint.nmax)
+               for count in _precedence_counts(constraint, candidate, state, scope_ids_cache, direct=True))
 
 
 def check_chain_response(constraint: Any, candidate: Any, state: SimulationState, scope_ids_cache: dict | None = None) -> bool:
-    source = constraint.source_activity
-    target = constraint.target_activity
+    """A DF activation constrains its nearest later JOINT-scope timestamp.
 
-    if constraint.scope.kind == "each":
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-
-        for oid in scope_ids:
-            if _last_activity_for_scope_object(state, oid) == source:
-                if candidate.activity_name != target:
-                    return False
-
-        if candidate.activity_name == source and candidate.activity_name != target:
-            created_scope = sum(
-                1 for t in (getattr(candidate, "object_types_to_create", []) or [])
-                if t == constraint.scope.object_type
-            )
-            if created_scope > 0:
-                armed = sum(
-                    1 for oid in state._active_by_type.get(constraint.scope.object_type, ())
-                    if _last_activity_for_scope_object(state, oid) == source
-                )
-                if armed > 0:
-                    return False
-
-        return True
-
-    if constraint.scope.kind in ("any", "all"):
-        scope_ids = _scope_ids(candidate, state, constraint.scope.object_type, scope_ids_cache)
-        armed = [oid for oid in scope_ids if _last_activity_for_scope_object(state, oid) == source]
-        if armed:
-            if constraint.scope.kind == "any":
-                # Any: if at least one is armed and this is not the target, block
-                if candidate.activity_name != target:
-                    return False
-            else:  # all
-                # All: if all are armed and this is not the target, block
-                if len(armed) == len(scope_ids) and candidate.activity_name != target:
-                    return False
-        return True
-
-    if state.executed_events:
-        if state.executed_events[-1].activity_name == source and candidate.activity_name != target:
-            return False
+    Historical activations keep their own Each/All/Any objects. Looking only
+    at the proposed event's last activity incorrectly treats partial matches
+    as intervening events and loses Any groups. Future lower bounds remain
+    explicit response obligations until a qualifying completion occurs.
+    """
+    from types import SimpleNamespace
+    timestamp = getattr(candidate, 'evaluation_timestamp', None)
+    extra = getattr(candidate, 'projected_events', ())
+    proposed = SimpleNamespace(event_id=('proposed',), activity_name=candidate.activity_name,
+                               object_ids=candidate.participating_object_ids, timestamp=timestamp)
+    bindings = constraint.scope.bindings or ((constraint.scope.object_type, constraint.scope.kind),)
+    if constraint.scope.object_type and any(mode in ('each', 'any') for _, mode in bindings):
+        # Such an activation must share a participant to be affected. Avoid
+        # rescanning all completed cases for every new object-local candidate.
+        activations = list({e.event_id: e for oid in candidate.participating_object_ids
+                            for e in state._events_by_act_obj.get((constraint.source_activity, oid), ())}.values())
+    else:
+        activations = list(state._events_by_activity.get(constraint.source_activity, ()))
+    activations.extend(e for e in extra if e.activity_name == constraint.source_activity)
+    # A new source cannot be admitted if already scheduled work would
+    # immediately violate it. Its newly created objects have no scheduled work.
+    if timestamp is not None and candidate.activity_name == constraint.source_activity:
+        activations.append(proposed)
+    for activation in activations:
+        if activation is not proposed and timestamp is not None and activation.timestamp is not None and timestamp <= activation.timestamp:
+            continue
+        by_type = {}
+        for oid in activation.object_ids:
+            obj = state.objects.get(oid)
+            if obj:
+                by_type.setdefault(obj.object_type, []).append(oid)
+        if constraint.guard and constraint.scope.object_type:
+            typ = constraint.scope.object_type
+            by_type[typ] = apply_guard_filter(by_type.get(typ, []), constraint.guard, state)
+            if not by_type[typ]:
+                continue
+        view = candidate if activation is proposed else activation
+        for required, anys in _scope_assignments(view, state, constraint.scope, by_type):
+            if activation is not proposed and not _matches_objects(proposed.object_ids, required, anys):
+                continue
+            events = _scope_events(state, required, anys, extra=extra)
+            if activation.timestamp is None:
+                # Untimed test/legacy histories: only events recorded after A.
+                positions = {e.event_id: i for i, e in enumerate(state.executed_events)}
+                events = [e for e in events if positions.get(e.event_id, -1) > positions.get(activation.event_id, -1)]
+            else:
+                events = [e for e in events if e.timestamp is not None and e.timestamp > activation.timestamp]
+            if activation is not proposed:
+                # Without a sampled timestamp the proposal is after completed
+                # history. An already resolved direct window is unaffected.
+                if timestamp is None and events:
+                    continue
+                events.append(proposed)
+            nearest = _nearest_events(events, forward=True)
+            if not nearest:
+                continue  # still a future obligation
+            count = sum(e.activity_name == constraint.target_activity for e in nearest)
+            if count < constraint.nmin or (constraint.nmax is not None and count > constraint.nmax):
+                return False
     return True
 
 
@@ -730,7 +609,7 @@ def check_alternate_precedence(constraint: Any, candidate: Any, state: Simulatio
 # Constraint types whose checker resolves scope.bindings itself. Everything else
 # reads scope.object_type only, so the dispatcher splits multi-type constraints
 # for them — see check_constraint.
-_BINDING_AWARE_TYPES = frozenset({"precedence", "response"})
+_BINDING_AWARE_TYPES = frozenset({"precedence", "response", "chain_precedence", "chain_response", "direct_precedence", "direct_response", "chain_succession"})
 
 
 def _single_binding_views(constraint: Any):
@@ -745,8 +624,8 @@ def _single_binding_views(constraint: Any):
     tests "for each binding there is a qualifying source event" whereas the true
     joint semantics is "there is ONE source event qualifying under every binding
     simultaneously". The former is weaker — different bindings may be satisfied
-    by different events. check_precedence and check_response implement the exact
-    joint test via _joint_scope_event_ids and are excluded from this path. For
+    by different events. The binding-aware temporal checkers implement joint
+    object filters themselves and are excluded from this path. For
     the remaining types this is still strictly more correct than the previous
     behaviour, which silently ignored every binding after the first.
     """
@@ -782,9 +661,9 @@ def check_constraint(constraint: Any, candidate: Any, state: SimulationState, sc
         return check_not_precedence(constraint, candidate, state, scope_ids_cache)
     if kind == "responded_existence":
         return check_responded_existence(constraint, candidate, state, scope_ids_cache)
-    if kind == "chain_response":
+    if kind in ("chain_response", "direct_response"):
         return check_chain_response(constraint, candidate, state, scope_ids_cache)
-    if kind == "chain_precedence":
+    if kind in ("chain_precedence", "direct_precedence"):
         return check_chain_precedence(constraint, candidate, state, scope_ids_cache)
     # New constraint types
     if kind == "absence":
@@ -830,11 +709,10 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
     # resource_types = getattr(state, '_resource_types', set()) or set()
     scope_ids_cache: dict[str, list[str]] = {}
     # Same pass also builds the resource-inclusive type grouping multi-type
-    # precedence bindings need (_joint_scope_event_ids) — avoids that function
+    # precedence bindings need — avoids that function
     # rebuilding an identical grouping from scratch on every such check (#21).
     # (With resource handling disabled, scope_ids_cache and cand_by_type_cache
-    # always end up identical — no type is ever excluded as a resource — but
-    # both are kept so _joint_scope_event_ids's caller signature stays intact.)
+    # always end up identical — no type is ever excluded as a resource.)
     cand_by_type_cache: dict[str, list[str]] = {}
     for oid in getattr(candidate, "participating_object_ids", []) or []:
         runtime = state.objects.get(oid)
@@ -852,7 +730,7 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
 
     for constraint in relevant:
         # Skip constraint if its scope type is fully inactive and not being created now
-        if inactive_types is not None:
+        if inactive_types is not None and constraint.constraint_type not in _BINDING_AWARE_TYPES:
             scope_type = getattr(constraint.scope, 'object_type', None)
             if scope_type and scope_type in inactive_types and scope_type not in creates_set:
                 continue
@@ -869,7 +747,7 @@ def check_all_constraints(static_model: StaticModel, candidate: Any, state: Simu
                 if not guarded_ids:
                     continue  # no objects subject to this constraint — passes trivially
                 local_cache = {**scope_ids_cache, scope_type: guarded_ids}
-                if not check_constraint(constraint, candidate, state, local_cache, cand_by_type_cache):
+                if not check_constraint(constraint, candidate, state, local_cache, local_cache):
                     return False
                 continue
 
@@ -890,3 +768,40 @@ def check_o2o_rules(static_model: StaticModel, candidate: Any, state: Simulation
         state,
         getattr(candidate, "object_types_to_create", []) or [],
     ) is not None
+
+
+def check_temporal_schedule(static_model, candidate, state, complete_at):
+    """Validate the sampled completion together with already reserved work.
+
+    This keeps zero durations and concurrent, overlapping Any/global scopes
+    consistent with the strict timestamps used in the exported OCEL log.
+    Nothing is committed here; a rejected reservation has no state effects.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from Backend.src.Simulation.Engine.candidategeneration import Candidate
+
+    temporal = [c for c in static_model.constraints if c.constraint_type in (
+        'precedence', 'chain_precedence', 'direct_precedence', 'chain_response', 'direct_response')]
+    if not temporal:
+        return True
+    temporal_model = replace(static_model, constraints=temporal, _constraints_by_activity={})
+    projected = tuple(SimpleNamespace(event_id=('running', i), activity_name=p.candidate_activity_name,
+                      object_ids=p.participating_object_ids, timestamp=p.complete_at)
+                      for i, p in enumerate(state.in_progress))
+    proposed = replace(candidate, evaluation_timestamp=complete_at, projected_events=projected)
+    if not check_all_constraints(temporal_model, proposed, state):
+        return False
+    extra = SimpleNamespace(event_id=('proposed',), activity_name=candidate.activity_name,
+                            object_ids=candidate.participating_object_ids, timestamp=complete_at)
+    # A new completion may intervene before a DP target already scheduled on
+    # another member of an Any group (or in a global scope).
+    backward_model = replace(temporal_model, constraints=[c for c in temporal if c.constraint_type in (
+        'precedence', 'chain_precedence', 'direct_precedence')])
+    for event in projected:
+        pending = Candidate(event.activity_name, event.object_ids,
+                            evaluation_timestamp=event.timestamp,
+                            projected_events=(*projected, extra))
+        if not check_all_constraints(backward_model, pending, state):
+            return False
+    return True

@@ -74,7 +74,8 @@ class RemainingLogicChecks(unittest.TestCase):
         model = StaticModel(activities=[
             Activity('A', [ObjectBinding('Order', 2, 2, creates=True)]),
             Activity('B', [ObjectBinding('Order', 1, 2, deactivates=True)]),
-        ], constraints=[Constraint('response', 'A', 'B', Scope('all', 'Order'), nmin=1)])
+        ], constraints=[Constraint('response', 'A', 'B', Scope('all', 'Order'), nmin=1)],
+            activity_durations={'B': ActivityDuration(dist_type='fixed', mean_seconds=1)})
         config = SimulationConfig(max_steps=10, seed=7, start_policy=StartPolicy(['A'], max_case_starts=1))
         state = Simulator(model, config).run()
         responses = [e for e in state.executed_events if e.activity_name == 'B']

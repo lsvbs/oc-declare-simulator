@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import heapq
 import time as _time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from itertools import product as _iproduct
 from typing import Optional
@@ -20,7 +20,10 @@ from Backend.src.Simulation.Engine.candidategeneration import (
     build_candidate_for_object_and_activity,
     is_candidate_semantically_allowed,
 )
-from Backend.src.Simulation.Engine.semantics import _count_activity_for_object, check_constraint
+from Backend.src.Simulation.Engine.semantics import (
+    _count_activity_for_object, check_constraint, check_temporal_schedule,
+    _scope_assignments, _scope_events, _nearest_events,
+)
 from Backend.src.Simulation.Engine.linkplanning import plan_o2o_links
 from Backend.src.Simulation.Engine.attrutils import apply_guard_filter
 
@@ -138,7 +141,7 @@ class Simulator:
         self._constraint_indices = {id(c): i for i, c in enumerate(static_model.constraints)}
         self._response_by_source: dict = {}
         for con in static_model.constraints:
-            if con.constraint_type == 'response':
+            if con.constraint_type in ('response', 'chain_response', 'direct_response'):
                 self._response_by_source.setdefault(con.source_activity, []).append(con)
 
         # Phase 2: Non-resource, non-creating object types required per activity
@@ -818,19 +821,16 @@ class Simulator:
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
+                and not con.guard
                 and getattr(con, 'nmin', 0) > 0
             ]
-            # Single-binding constraints only. This gate counts target events
-            # per primary object — a marginal. semantics._nmax_blocked bounds
-            # the Definition 8 JOINT count: target events involving every bound
-            # object at once. The two coincide when the scope has one binding,
-            # and the marginal is >= the joint otherwise, so applying this gate
-            # to a multi-type constraint would drop candidates the semantics
-            # accepts — and would do it before _nmax_blocked ever ran.
+            # A single Each binding permits an exact per-object upper gate:
+            # count predecessors, not lifetime firings of the candidate.
             prec_gates_nmax = [
                 con for con in self._prec_by_target.get(activity.name, [])
                 if con.scope.kind == 'each'
                 and con.scope.object_type == primary_type
+                and not con.guard
                 and len(getattr(con.scope, 'bindings', ()) or ()) <= 1
                 and getattr(con, 'nmax', None) is not None
             ]
@@ -858,9 +858,9 @@ class Simulator:
 
                 if _prec_gates_nmax:
                     for con in _prec_gates_nmax:
-                        t_count = len(state._events_by_act_obj.get(
-                            (_activity.name, oid), []))
-                        if t_count >= con.nmax:
+                        source_count = len(state._events_by_act_obj.get(
+                            (con.source_activity, oid), []))
+                        if source_count > con.nmax:
                             return None
 
                 # #6: pass force_object_id instead of mutating _active_by_type
@@ -1083,6 +1083,18 @@ class Simulator:
         # It counts once per assignment even when several Any members match.
         for key in sorted(state._responses_by_target.get(executed_event.activity_name, ())):
             obligation = state._response_obligations[key]
+            if (obligation.activated_at is not None and executed_event.timestamp is not None
+                    and executed_event.timestamp <= obligation.activated_at):
+                continue
+            if obligation.direct:
+                later = _scope_events(state, set(obligation.required_objects), obligation.any_groups)
+                if obligation.activated_at is not None:
+                    later = [e for e in later if e.timestamp is not None and e.timestamp > obligation.activated_at]
+                else:
+                    positions = {e.event_id: i for i, e in enumerate(state.executed_events)}
+                    later = [e for e in later if positions[e.event_id] > positions[obligation.activation_event_id]]
+                if executed_event not in _nearest_events(later, forward=True):
+                    continue
             if obligation.matches(executed_event.object_ids):
                 remaining = state._obligations_count[key] - 1
                 if remaining == 0:
@@ -1108,20 +1120,14 @@ class Simulator:
                     by_type.get(scope_type, []), constraint.guard, state)
                 if not by_type[scope_type]:
                     continue
-            bindings = constraint.scope.bindings or ((constraint.scope.object_type, constraint.scope.kind),)
-            each_groups, any_groups, all_objects = [], [], set()
-            for object_type, involvement in bindings:
-                objects = sorted(by_type.get(object_type, ()))
-                if involvement == 'each':
-                    each_groups.append(objects)
-                elif involvement == 'all':
-                    all_objects.update(objects)
-                elif involvement == 'any':
-                    any_groups.append(frozenset(objects))
-            for assignment in _iproduct(*each_groups):
+            assignments = _scope_assignments(executed_event, state, constraint.scope, by_type)
+            for assignment_index, (required, any_groups) in enumerate(assignments):
                 key = (constraint.target_activity, (self._constraint_indices[id(constraint)],
-                       executed_event.event_id, tuple(assignment)))
-                obligation = ResponseObligation(c_key, frozenset(all_objects.union(assignment)), tuple(any_groups))
+                       executed_event.event_id, assignment_index))
+                obligation = ResponseObligation(
+                    c_key, frozenset(required), tuple(any_groups),
+                    executed_event.timestamp, executed_event.event_id,
+                    constraint.constraint_type in ('chain_response', 'direct_response'))
                 state.add_response_obligation(key, obligation, minimum)
                 self._queue_response_obligation(key, state)
 
@@ -1210,7 +1216,11 @@ class Simulator:
             if key[0] != candidate.activity_name:
                 continue
             obligation = state._response_obligations[key]
-            if state._obligations_count[key] == 1 and obligation.matches(candidate.participating_object_ids):
+            timestamp = candidate.evaluation_timestamp
+            strictly_later = (timestamp is None or obligation.activated_at is None
+                              or timestamp > obligation.activated_at)
+            if (state._obligations_count[key] == 1 and strictly_later
+                    and obligation.matches(candidate.participating_object_ids)):
                 continue
             if obligation.required_objects.intersection(departing) or any(
                     not any(oid not in departing and state.objects[oid].active for oid in group)
@@ -1322,6 +1332,23 @@ class Simulator:
         )
         if link_plan is None:
             return None
+        started_at = state.current_time
+        # In DES mode the base for sampling must be current_time (when the activity
+        # actually starts), not last_generated_timestamp.
+        saved_rng = self.rng.getstate()
+        saved_ts = state.last_generated_timestamp
+        state.last_generated_timestamp = state.current_time
+        complete_at = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
+        # Restore: don't let this activity's complete_at become the base for the
+        # next concurrently started activity. In DES mode all activities in the same
+        # step start from current_time, not from each other's completion times.
+        state.last_generated_timestamp = saved_ts
+
+        if (not check_temporal_schedule(self.static_model, candidate, state, complete_at)
+                or not self._preserves_target_obligations(replace(candidate, evaluation_timestamp=complete_at), state)):
+            self.rng.setstate(saved_rng)
+            return None
+
         created_object_ids: list[str] = []
         attribute_defaults = getattr(self.static_model, "attribute_defaults", {}) or {}
         # [resource/permanent-object handling — disabled, kept for reference]
@@ -1340,17 +1367,6 @@ class Simulator:
                     obj.attribute_history.append((state.current_time, attr_name, attr_val))
 
         link_plan.apply(state, created_object_ids)
-
-        started_at = state.current_time
-        # In DES mode the base for sampling must be current_time (when the activity
-        # actually starts), not last_generated_timestamp.
-        saved_ts = state.last_generated_timestamp
-        state.last_generated_timestamp = state.current_time
-        complete_at = self.time_policy.next_timestamp(state, candidate, self.config, rng=self.rng)
-        # Restore: don't let this activity's complete_at become the base for the
-        # next concurrently started activity. In DES mode all activities in the same
-        # step start from current_time, not from each other's completion times.
-        state.last_generated_timestamp = saved_ts
 
         # Record pure service time (sampled work duration only)
         if started_at is not None and complete_at is not None:

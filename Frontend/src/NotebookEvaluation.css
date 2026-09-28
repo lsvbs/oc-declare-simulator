@@ -28,4 +28,6 @@
 .notebook-error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 7px; }
 .notebook-pagination { display: flex; gap: 12px; align-items: center; font-size: 12px; }
 .notebook-anchor-settings textarea { display: block; width: min(600px, 100%); box-sizing: border-box; margin-bottom: 8px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px; }
+.notebook-radar { margin: 12px auto; max-width: 600px; text-align: center; }
+.notebook-radar svg { display: block; width: 100%; height: auto; }
 @media (max-width: 640px) { .notebook-run { padding: 12px; } .notebook-controls { flex-direction: column; } }

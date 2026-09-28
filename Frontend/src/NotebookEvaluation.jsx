@@ -7,6 +7,12 @@ const percent = value => value == null ? 'Undefined' : `${(value * 100).toFixed(
 const list = value => value?.length ? value.join(', ') : 'None';
 const col = (key, label, format = number) => ({ key, label, format });
 const textCol = (key, label) => col(key, label, v => v ?? '—');
+const coverageLabels = {
+  'Activity coverage': 'Activities', 'Object-type coverage': 'Object types',
+  'Source-activation coverage': 'Source activations', 'Non-vacuous activation coverage': 'Non-vacuous activations',
+  'Object-presence coverage': 'Object presence', 'Finite-boundary coverage': 'Finite boundaries',
+  'Matching-event coverage': 'Matching events',
+};
 
 function Table({ rows = [], columns, label }) {
   const [page, setPage] = useState(0);
@@ -45,15 +51,18 @@ function Conformance({ result }) {
   if (result?.status !== 'ok') return <Unavailable result={result} />;
   const roles = ['input', 'simulated'].filter(role => result[role]);
   return <>
-    <p className="notebook-note">Both logs are evaluated against the same declared model. EF requires a strictly later event; EP requires a strictly earlier event. Equal-time events cannot fulfil each other. Logs are treated as completed, as in the notebook.</p>
+    <p className="notebook-note">Both logs are evaluated against the same loaded model. EF/EP count strictly later/earlier events. DF/DP count the nearest later/earlier events after filtering the full object scope; AS has no time restriction. Logs are treated as completed, as in the notebook.</p>
+    <h3>OC-Declare confidence and constraint violations</h3>
     <Table label="Confidence and violations" rows={roles.map(role => ({ role, ...result[role].confidence, ...result[role].violations }))}
       columns={[textCol('role', 'Log'), col('global_confidence', 'Global confidence', percent),
         col('mean_constraint_confidence', 'Mean constraint confidence', percent),
+        col('n_constraints_affected', 'Constraints with violations'), col('n_constraints', 'Total constraints'),
+        col('constraint_violation_rate', 'Constraint violation rate', percent),
         col('activation_violation_rate', 'Activation violation rate', percent),
         col('event_violation_rate', 'Event violation rate', percent),
         col('n_activations', 'Activations'), col('n_violating_activations', 'Failed activations'),
         col('n_inactive_constraints', 'Inactive constraints'), col('n_vacuous_activations', 'Vacuous activations')]} />
-    <p className="notebook-note">Each failed event–constraint activation counts once, even if several object combinations fail. Event violation rate equals 1 − global confidence. A constraint with no activations has undefined confidence.</p>
+    <p className="notebook-note">Constraint violation rate is the number of constraints with at least one failed activation divided by all model constraints. The notebook’s activation and event rates are also shown separately. Each failed event–constraint activation counts once, even if several object combinations fail. A constraint with no activations has undefined confidence.</p>
     {roles.map(role => <details key={role}>
       <summary>Per-constraint results · {role}</summary>
       <Table label={`${role} constraints`} rows={result[role].constraints}
@@ -66,12 +75,58 @@ function Conformance({ result }) {
   </>;
 }
 
+function CoverageRadar({ result, roles, categories }) {
+  const cx = 280, cy = 210, radius = 128;
+  const point = (i, value, r = radius) => {
+    const angle = -Math.PI / 2 + i * Math.PI * 2 / categories.length;
+    return [cx + Math.cos(angle) * r * value, cy + Math.sin(angle) * r * value];
+  };
+  const colors = { input: '#4338ca', simulated: '#0f766e' };
+  return <figure className="notebook-radar">
+    <svg viewBox="0 0 560 410" role="img" aria-label="Coverage radar comparing input and simulated logs on seven axes from zero to one hundred percent">
+      <title>Coverage of the loaded model</title>
+      <desc>Each axis shows the same diagnostic value as the coverage table. Undefined values are omitted, leaving gaps.</desc>
+      {[.25, .5, .75, 1].map(level => <g key={level}>
+        <polygon points={categories.map((_, i) => point(i, level).join(',')).join(' ')} fill="none" stroke="#cbd5e1" />
+        <text x={cx + 5} y={cy - radius * level + 12} fontSize="10" fill="#64748b">{level * 100}%</text>
+      </g>)}
+      {categories.map((category, i) => {
+        const [x, y] = point(i, 1), [lx, ly] = point(i, 1, radius + 25);
+        return <g key={category}>
+          <line x1={cx} y1={cy} x2={x} y2={y} stroke="#cbd5e1" />
+          <text x={lx} y={ly} dominantBaseline="middle" textAnchor={Math.abs(lx - cx) < 5 ? 'middle' : lx > cx ? 'start' : 'end'} fontSize="11" fill="#334155">{coverageLabels[category]}</text>
+        </g>;
+      })}
+      {roles.map(role => {
+        const values = categories.map(category => result[role].coverage[category]);
+        const points = values.map((v, i) => v == null ? null : point(i, v));
+        return <g key={role} stroke={colors[role]} fill={colors[role]}>
+          {points.every(Boolean) && <polygon points={points.map(p => p.join(',')).join(' ')} fillOpacity=".07" stroke="none" />}
+          {points.map((p, i) => {
+            const next = points[(i + 1) % points.length];
+            return p && <g key={categories[i]}>
+              {next && <line x1={p[0]} y1={p[1]} x2={next[0]} y2={next[1]} strokeWidth="2" strokeDasharray={role === 'simulated' ? '5 3' : undefined} />}
+              <circle cx={p[0]} cy={p[1]} r={role === 'input' ? 4 : 2.5}><title>{role}: {categories[i]} · {percent(values[i])}</title></circle>
+            </g>;
+          })}
+        </g>;
+      })}
+      {roles.map((role, i) => <g key={role} transform={`translate(${180 + i * 125},390)`}>
+        <line x1="0" x2="22" stroke={colors[role]} strokeWidth="3" strokeDasharray={role === 'simulated' ? '5 3' : undefined} />
+        <text x="30" y="4" fontSize="12" fill="#334155">{role === 'input' ? 'Input' : 'Simulated'}</text>
+      </g>)}
+    </svg>
+    <figcaption className="notebook-note">Scale: 0–100%. Undefined values leave gaps; they are not plotted as zero.</figcaption>
+  </figure>;
+}
+
 function Coverage({ result }) {
   if (result?.status !== 'ok') return <Unavailable result={result} />;
   const roles = ['input', 'simulated'].filter(role => result[role]);
-  const categories = Object.keys(result[roles[0]].coverage);
+  const categories = Object.keys(coverageLabels);
   return <>
     <p className="notebook-note">Seven separate diagnostics describe which parts of the model were observed. The notebook does not combine these into an overall score. Coverage does not imply conformance.</p>
+    <CoverageRadar result={result} roles={roles} categories={categories} />
     <Table label="Coverage diagnostics" rows={categories.map(category => ({ category, ...Object.fromEntries(roles.map(role => [role, result[role].coverage[category]])) }))}
       columns={[textCol('category', 'Coverage category'), ...roles.map(role => col(role, role === 'input' ? 'Input' : 'Simulated', percent))]} />
     {roles.map(role => <details key={role}>
@@ -123,10 +178,10 @@ function Timing({ report }) {
 
 function LogComparison({ report }) {
   if (report.comparison?.status !== 'ok') return <Unavailable result={report.comparison} />;
-  const labels = { activities: 'Activities', objects: 'Object types · declared objects', relations: 'Object types · event attachments' };
+  const labels = { activities: 'Activities', objects: 'Object types · declared objects' };
   return <>
     <h3>KL divergence</h3>
-    <p className="notebook-note">Additive smoothing α = 0.5 over the union of categories, in bits. Objects without events count in the object comparison. Duplicate references to one object in an event count once in the attachment comparison.</p>
+    <p className="notebook-note">Additive smoothing α = 0.5 over the union of categories, in bits. Objects without events count in the object comparison.</p>
     {Object.entries(labels).map(([key, label]) => {
       const data = report.kl[key];
       return <section key={key}><h4>{label}</h4>{data.status === 'ok' ? <>
@@ -191,7 +246,7 @@ function RunEvaluation({ title, outputFile, inputFile, model, mode, anchors, rev
 export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, activeModel, modelBase, modelAsIs, modelToBe,
   inputEventLogFile, eventLogFiles = [], onEventLogFileChange, evalRunCount = 0, onRerunEvaluation, enabled = true }) {
   const [tab, setTab] = useState('conformance');
-  const [mode, setMode] = useState('minimum');
+  const [mode, setMode] = useState('p25');
   const [anchorText, setAnchorText] = useState('[]');
   const [anchors, setAnchors] = useState([]);
   const [anchorError, setAnchorError] = useState(null);
@@ -214,7 +269,7 @@ export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, 
         {[...new Set([inputEventLogFile, ...eventLogFiles].filter(Boolean))].map(file => <option key={file} value={file}>{file}</option>)}
       </select></label>
       <label>Timing window<select value={mode} onChange={e => setMode(e.target.value)}>
-        <option value="minimum">minimum · minimum to P25</option><option value="p25">p25 · minimum to P50</option><option value="p50">p50 · P25 to P75</option>
+        <option value="minimum">Minimum · lowest sample</option><option value="p25">P25 · lowest 25%</option><option value="p50">P50 · lowest 50%</option><option value="mean">Full mean · all samples</option>
       </select></label>
     </div>
     <details className="notebook-anchor-settings"><summary>Optional timing anchors</summary>
@@ -225,7 +280,7 @@ export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, 
     <nav aria-label="Evaluation measures">{[['conformance', 'Conformance'], ['coverage', 'Coverage'], ['time', 'Time'], ['log-comparison', 'Log comparison']].map(([key, label]) =>
       <button key={key} aria-pressed={tab === key} onClick={() => setTab(key)}>{label}</button>
     )}</nav>
-    <p className="notebook-note">Model measures support EF/EP with direct Each/All/Any involvement, using the model’s declared counts. Unsupported models show an explanation. Undefined values remain undefined.</p>
+    <p className="notebook-note">Model measures support EF, EP, AS, DF and DP with direct Each/All/Any involvement and the model’s current bounds. Every measure uses the full saved input and output logs. Undefined values remain undefined.</p>
     {referenceRun?.output_file && <RunEvaluation title={resultsAsIs ? 'As-Is simulation' : 'Simulation'} outputFile={referenceRun.output_file}
       inputFile={inputEventLogFile} model={resultsAsIs ? (modelAsIs || modelBase || activeModel) : (activeModel || modelBase)} mode={mode} anchors={anchors} revision={evalRunCount} tab={tab} />}
     {resultsToBe?.output_file && <RunEvaluation title="To-Be simulation" outputFile={resultsToBe.output_file}

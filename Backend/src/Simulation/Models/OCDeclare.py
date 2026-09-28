@@ -202,17 +202,22 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
     # Constraints
     constraints = []
     for c in data.get("constraints", []) or []:
-        ctype = c.get("type") or c.get("constraint_type")
+        ctype = c.get("constraint_type") or c.get("type")
+        arc_types = {'EF': 'response', 'EP': 'precedence', 'DF': 'chain_response',
+                     'DP': 'chain_precedence', 'AS': 'responded_existence'}
+        if arc_oriented or not ctype:
+            ctype = arc_types.get(c.get('arc_type'), ctype)
+        ctype = {'direct_response': 'chain_response', 'direct_precedence': 'chain_precedence'}.get(ctype, ctype)
         # Accept all key styles: arc-oriented models use from/to; the model
         # editor emits source_activity/target_activity; older discovered models
         # carry source/target pre-swapped; hand-written arc lists may use a/b.
         if arc_oriented and c.get("from") and c.get("to"):
             source, target = c["from"], c["to"]
         else:
-            source = c.get("source") or c.get("source_activity") or c.get("a")
-            target = c.get("target") or c.get("target_activity") or c.get("b")
+            source = c.get("source_activity") or c.get("source") or c.get("a")
+            target = c.get("target_activity") or c.get("target") or c.get("b")
         scope = c.get("scope") or {}
-        ipl = scope.get("involvement_per_label") or c.get("involvement_per_label") or {}
+        ipl = scope.get("involvement_per_label") or c.get("involvement_per_label") or dict(scope.get("bindings") or [])
         if ipl:
             bindings = tuple((str(t), str(v)) for t, v in ipl.items())
             primary_type = next(iter(ipl))
@@ -239,20 +244,10 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
                     or arc_type in {"EP", "DP"}:
                 source, target = target, source
 
-        # Engine nmin/nmax from the arc's per-endpoint measurements. nmin gates
-        # on occurrences of the SOURCE activity and nmax bounds the TARGET
-        # (semantics.check_precedence / _nmax_blocked), so the endpoint-keyed
-        # observed_counts must follow the same flip applied above.
-        if arc_oriented and c.get("observed_counts"):
-            _obs  = c["observed_counts"] or {}
-            _from = _obs.get("from") or [None, None]
-            _to   = _obs.get("to")   or [None, None]
-            _src_counts, _tgt_counts = ((_to, _from) if arc_type in ("EP", "DP")
-                                        else (_from, _to))
-            if c.get("nmin") is None and _src_counts[0] is not None:
-                c = {**c, "nmin": _src_counts[0]}
-            if c.get("nmax") is None and _tgt_counts[1] is not None:
-                c = {**c, "nmax": _tgt_counts[1]}
+        # Canonical bounds apply to matching events, not endpoint lifetime
+        # occurrence statistics. Editor models carry current nmin/nmax fields.
+        if arc_oriented and isinstance(c.get('counts'), list) and len(c['counts']) == 2:
+            c = {**c, 'nmin': c['counts'][0], 'nmax': c['counts'][1]}
 
         # Cardinality bounds (OC-DECLARE). For precedence/chain_precedence/
         # chain_response, nmin=1 is the correct DECLARE default — it means
@@ -262,7 +257,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         nmin_raw = c.get("nmin")
         nmax_raw = c.get("nmax")
         # Types where nmin=0 is meaningless — default to 1
-        _nmin_default_1 = {"precedence", "chain_precedence", "chain_response"}
+        _nmin_default_1 = {"precedence", "response", "chain_precedence", "chain_response", "responded_existence", "chain_succession", "succession"}
         try:
             nmin = int(nmin_raw) if nmin_raw is not None else (1 if ctype in _nmin_default_1 else 0)
         except (TypeError, ValueError):
@@ -275,9 +270,6 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         # Remap to the corresponding not_* type so the simulator uses the correct checker.
         _NEGATION_MAP = {
             'response': 'not_succession',
-            'precedence': 'not_precedence',
-            'chain_response': 'not_chain_succession',
-            'chain_precedence': 'not_chain_succession',
             'responded_existence': 'not_coexistence',
             'coexistence': 'not_coexistence',
         }
@@ -329,7 +321,7 @@ def parse_ocdeclare_dict(data: Dict[str, Any]) -> StaticModel:
         # chain rules forbid intervening events; init forbids an earlier event.
         if c.constraint_type in ('chain_response', 'chain_succession', 'init'):
             scope_types = {t for t, _ in c.scope.bindings} or {c.scope.object_type}
-            global_scope = c.scope.kind not in ('each', 'any', 'all')
+            global_scope = not c.scope.object_type and not c.scope.bindings
             affected.update(a.name for a in activities if global_scope or any(
                 b.object_type in scope_types for b in a.bindings))
         for act in affected:
@@ -573,9 +565,9 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
     arc_type_map = {
         "EF": "response",
         "EP": "precedence",
-        "AS": "responded_existence",  # not yet implemented
-        "DF": "direct_response",      # not yet implemented
-        "DP": "direct_precedence",    # not yet implemented
+        "AS": "responded_existence",  # evaluated after the run
+        "DF": "chain_response",
+        "DP": "chain_precedence",
     }
 
     for item in data:
@@ -584,7 +576,7 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
         f = item.get("from")
         t = item.get("to")
         arc_type = item.get("arc_type")
-        counts = item.get("counts", [0, None])
+        counts = item.get("counts", [1, None])
         nmin = counts[0] if len(counts) > 0 else 0
         nmax = counts[1] if len(counts) > 1 else None
         label = item.get("label") or {}
@@ -649,7 +641,10 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
                 scope_kind = _lk
                 scope_obj_type = str(_entries[0].get("object_type", ""))
                 break
-        scope = Scope(kind=scope_kind, object_type=scope_obj_type)
+        bindings = tuple((str(entry['object_type']), mode)
+                         for mode in ('each', 'any', 'all')
+                         for entry in label.get(mode, []) if entry.get('object_type'))
+        scope = Scope(kind=scope_kind, object_type=scope_obj_type, bindings=bindings)
 
         # OC-DECLARE tuple (ar, s, t, ...) uses `from` = s (constrained/later)
         # and `to` = t (earlier activity that must appear before s).
@@ -657,12 +652,12 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
         # To align with OC-DECLARE, we therefore *swap* from/to for precedence-like
         # constraints when constructing the internal Constraint:
         #   EP  (precedence)        : every `from` must be preceded by `to`
-        #   DP  (direct_precedence) : same, but immediate (not yet implemented here)
+        #   DP  (direct_precedence) : same, but immediate
         if f and t and constraint_type:
             src = str(f)
             tgt = str(t)
 
-            if constraint_type in {"precedence", "direct_precedence"}:
+            if constraint_type in {"precedence", "chain_precedence"}:
                 # Swap roles so that `to` is the required earlier activity and
                 # `from` is the constrained later activity in the engine.
                 src, tgt = tgt, src
@@ -672,10 +667,7 @@ def parse_ocdeclare_list(data: list) -> StaticModel:
             _nmax = None if nmax is None else int(nmax)
             _NEGATION_MAP_LIST = {
                 'response': 'not_succession',
-                'precedence': 'not_precedence',
-                'chain_response': 'not_chain_succession',
-                'chain_precedence': 'not_chain_succession',
-                'responded_existence': 'not_coexistence',
+                            'responded_existence': 'not_coexistence',
                 'coexistence': 'not_coexistence',
             }
             if _nmin == 0 and _nmax == 0 and constraint_type in _NEGATION_MAP_LIST:

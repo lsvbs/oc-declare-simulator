@@ -1,0 +1,66 @@
+[
+  {
+    "case": "EP Cartesian Each: missing cross-pairs",
+    "admission_allowed": true,
+    "executed": [
+      "A",
+      "A",
+      "B"
+    ],
+    "B_conformance": 0.0,
+    "violating_B_events": 1
+  },
+  {
+    "case": "EP nmin=2: second object has only one A",
+    "admission_allowed": true,
+    "executed": [
+      "A",
+      "A",
+      "A",
+      "B"
+    ],
+    "B_conformance": 0.0,
+    "violating_B_events": 1
+  },
+  {
+    "case": "EP nmax=1: two preceding A events",
+    "admission_allowed": true,
+    "executed": [
+      "A",
+      "A",
+      "B"
+    ],
+    "B_conformance": 0.0,
+    "violating_B_events": 1
+  },
+  {
+    "case": "DF imported arc-list",
+    "parsed_type": "direct_response",
+    "invalid_candidate_allowed": true
+  },
+  {
+    "case": "DP imported arc-list",
+    "parsed_type": "direct_precedence",
+    "invalid_candidate_allowed": true
+  },
+  {
+    "case": "evaluation EF",
+    "result": "accepted"
+  },
+  {
+    "case": "evaluation EP",
+    "result": "accepted"
+  },
+  {
+    "case": "evaluation AS",
+    "result": "Constraint 1: unsupported arc type 'AS'."
+  },
+  {
+    "case": "evaluation DF",
+    "result": "Constraint 1: unsupported arc type 'DF'."
+  },
+  {
+    "case": "evaluation DP",
+    "result": "Constraint 1: unsupported arc type 'DP'."
+  }
+]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Optional
+from datetime import datetime
 from collections import defaultdict
 
 from Backend.src.Simulation.Domain.ir import Activity, ObjectBinding, StaticModel
@@ -24,6 +25,9 @@ class Candidate:
     object_types_to_create: list[str] = field(default_factory=list)
     # Pins survive rebinding when another candidate claims a secondary object.
     required_object_ids: tuple[str, ...] = field(default=(), compare=False)
+    # Populated only for the final admission check after duration sampling.
+    evaluation_timestamp: Optional[datetime] = field(default=None, compare=False, repr=False)
+    projected_events: tuple = field(default=(), compare=False, repr=False)
 
 
 def find_active_objects_of_type(

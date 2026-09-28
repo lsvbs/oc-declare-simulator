@@ -1,0 +1,49 @@
+\begin{algorithm}[tbp]
+\caption{Object-centric discrete-event simulation}
+\label{alg:object-centric-discrete-event-simulation}
+\small
+\begin{algorithmic}[1]
+\Require Model $M$, configuration $K$, discovered parameters $D$, random generator $R$
+\Ensure State $S$ containing objects, completed events, pending work, and metrics
+\State $S \gets$ supplied state or empty state; $t \gets K.\mathrm{startTime}$; $idle \gets 0$
+\State Initialise clocks, start-activity set, and wall-clock runtime timer
+\State $d \gets t + K.\mathrm{maxSimTime}$ if configured, otherwise $+\infty$
+\While{no user stop and no non-time stopping limit is reached}
+    \While{a scheduled completion exists at or before $t$}
+        \State Remove the earliest instance and \Call{Complete}{$S$, instance}
+        \If{a non-time stopping limit is reached} \State \textbf{break} \EndIf
+    \EndWhile
+    \If{a stopping limit is reached or $t \ge d$} \State \textbf{break} \EndIf
+    \State $initial \gets$ no completed events and no running instances
+    \State $C \gets \Call{GenerateCandidates}{M,S,D}$ \Comment{includes ready obligations}
+    \State $C \gets \Call{OrderCandidates}{C,S,D,R}$
+    \State $catchup \gets \emptyset$
+    \ForAll{$c \in C$ in this order}
+        \If{$initial$ and $c$ is not a configured start activity} \State \textbf{continue} \EndIf
+        \If{start policy, concurrency limit, or activity calendar blocks $c$}
+            \State \textbf{continue}
+        \EndIf
+        \If{a participant of $c$ is busy}
+            \State $c \gets$ first admissible alternative binding, preserving required objects
+            \If{no such binding exists} \State \textbf{continue} \EndIf
+        \EndIf
+        \State Attempt \Call{AdmitAndSchedule}{$c,M,S,K,R$}
+        \If{a successful start advances an arrival schedule but it remains due}
+            \State Add its activity to $catchup$
+        \EndIf
+    \EndFor
+    \State $F \gets \emptyset$; add the earliest scheduled completion time if work is running
+    \State Add future arrival times whose start policy and concurrency permit arrival to $F$
+    \State Add $t$ for eligible activities in $catchup$ whose calendar is open
+    \If{some otherwise eligible activity has a closed configured calendar}
+        \State Add the next hourly calendar boundary to $F$
+    \EndIf
+    \If{$F=\emptyset$} \State \textbf{break} \EndIf
+    \If{$d<+\infty$} \State $F \gets F\cup\{d\}$ \EndIf
+    \State $idle \gets 0$ if work is running, otherwise $idle+1$
+    \If{$idle>1000$} \State \textbf{break} \EndIf
+    \State $t \gets \min F$; $S.\mathrm{currentTime} \gets t$
+\EndWhile
+\State \Return $S$
+\end{algorithmic}
+\end{algorithm}

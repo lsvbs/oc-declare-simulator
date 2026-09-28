@@ -13,8 +13,10 @@ from collections import Counter, defaultdict
 import numpy as np
 import pandas as pd
 from scipy.stats import wasserstein_distance
+from Backend.src.ParameterDiscovery import timediscovery as timing_discovery
+from Backend.src.ParameterDiscovery import timediscovery as timing_discovery
 
-REFERENCE_NOTEBOOK_SHA256 = "2a02ac8efc15e923a6403d9e1080d9eebf9fc0baf80a215227c63fc60cc44aca"
+REFERENCE_NOTEBOOK_SHA256 = "9f75c3ee987fc2f37a4d217ab23a7a75e743558eb71763c7d0a1742a2c114676"
 
 def _read_json(source):
     if isinstance(source, dict):
@@ -85,220 +87,83 @@ def kl_divergence(cP, cQ, smoothing=SMOOTHING):
 
 
 # Reference notebook cell 11
-def type_counts(log, basis):
-    """
-    basis='objects':
-        Count objects of each type, including objects without events.
-
-    basis='relations':
-        Count event-to-object attachments by object type.
-        An event involving five distinct objects of one type contributes five.
-        Repeated references to the same object within an event count once,
-        regardless of relationship qualifier.
-    """
-    if basis == "objects":
-        return Counter(log["otype"].values())
-
-    if basis != "relations":
-        raise ValueError("basis must be 'objects' or 'relations'.")
-
-    counts = Counter()
-
-    for event_id, _, _, object_ids in log["events"]:
-        for object_id in set(object_ids):
-            if object_id not in log["otype"]:
-                raise ValueError(
-                    f"Event {event_id!r} references unknown object "
-                    f"{object_id!r}."
-                )
-            counts[log["otype"][object_id]] += 1
-
-    return counts
+def type_counts(log):
+    """Count objects by type, including objects without events."""
+    return Counter(log["otype"].values())
 
 
 # Reference notebook cell 14
-def discover_service_times(
-    log_path,
-    service_time_mode="minimum",
-    anchor_activities=None,
-):
-    if service_time_mode not in {"minimum", "p25", "p50"}:
-        raise ValueError("service_time_mode must be 'minimum', 'p25', or 'p50'.")
-
+def discover_service_times(log_path, service_time_mode="p25", anchor_activities=None):
     raw = _read_json(log_path)
-
-    events = raw["events"]
-    if not isinstance(events, list):
-        raise ValueError("Expected an OCEL 2.0 event list.")
-
-    timestamps = pd.to_datetime(
-        [event.get("time") for event in events],
-        utc=True,
-        format="ISO8601",
-        errors="raise",
-    )
+    # The discovery module expects dictionaries and object-ID lists.
+    objects = {obj["id"]: {"type": obj["type"]} for obj in raw["objects"]}
+    timestamps = pd.to_datetime([e["time"] for e in raw["events"]], utc=True, format="ISO8601", errors="raise")
     if timestamps.isna().any():
         raise ValueError("Every event must have a valid timestamp.")
-
-    known_objects = {obj["id"] for obj in raw["objects"]}
+    events = {}
+    for event, timestamp in zip(raw["events"], timestamps):
+        ids = list(dict.fromkeys(r["objectId"] for r in event.get("relationships") or []))
+        if any(oid not in objects for oid in ids):
+            raise ValueError(f"Event {event['id']!r} references an unknown object.")
+        if event["id"] in events:
+            raise ValueError(f"Duplicate event ID: {event['id']!r}")
+        events[event["id"]] = {"activity": event["type"], "timestamp": timestamp.to_pydatetime(), "omap": ids}
+    discovered = timing_discovery.compute_ocpa_metrics(
+        {"events": events, "objects": objects},
+        anchor_activities=anchor_activities,
+        service_time_mode=service_time_mode,
+    )
+    # Recover empirical samples for evaluation without modifying timediscovery.py.
+    # Means and standard deviations above come directly from that module.
+    from collections import defaultdict
+    import statistics
+    import math
     timelines = defaultdict(list)
-    event_objects = []
-
-    for i, event in enumerate(events):
-        object_ids = [
-            relation["objectId"]
-            for relation in event.get("relationships") or []
-        ]
-
-        # Count each event-object pair once, ignoring relationship qualifiers.
-        object_ids = list(dict.fromkeys(object_ids))
-        event_objects.append(object_ids)
-
-        for object_id in object_ids:
-            if object_id not in known_objects:
-                raise ValueError(
-                    f"Event {event['id']!r} references unknown object "
-                    f"{object_id!r}."
-                )
-            timelines[object_id].append(i)
-
-    preceding = defaultdict(list)
-    following = defaultdict(list)
-
+    for eid, event in events.items():
+        for oid in event["omap"]:
+            timelines[oid].append(eid)
+    previous, following = defaultdict(list), defaultdict(list)
     for timeline in timelines.values():
-        # Stable sorting preserves input order for equal timestamps.
-        timeline.sort(key=lambda i: timestamps[i])
-
-        for previous_i, next_i in zip(timeline, timeline[1:]):
-            following[previous_i].append(timestamps[next_i])
-            preceding[next_i].append(timestamps[previous_i])
-
+        timeline.sort(key=lambda eid: events[eid]["timestamp"])
+        for left, right in zip(timeline, timeline[1:]):
+            following[left].append(events[right]["timestamp"])
+            previous[right].append(events[left]["timestamp"])
     buckets = defaultdict(lambda: {"forward": [], "sojourn": []})
-
-    for i, event in enumerate(events):
-        activity = event.get("type")
-        if not activity or not event_objects[i]:
+    for eid, event in events.items():
+        if not event["activity"] or not event["omap"]:
             continue
-
-        complete = timestamps[i]
+        bucket = buckets[event["activity"]]
+        ts = event["timestamp"]
+        bucket["forward"].extend(max(0.0, (t-ts).total_seconds()) for t in following[eid])
+        bucket["sojourn"].append(max(0.0, (ts-max(previous[eid])).total_seconds()) if previous[eid] else 0.0)
+    anchors = {a["name"] for a in anchor_activities or [] if a.get("name")}
+    result = {}
+    for activity, stats in sorted(discovered.items()):
         bucket = buckets[activity]
-
-        # One forward observation per object that has a subsequent event.
-        bucket["forward"].extend(
-            max(0.0, (next_time - complete).total_seconds())
-            for next_time in following[i]
-        )
-
-        # One sojourn observation per event.
-        # Match the prototype's zero fallback when no predecessor exists.
-        sojourn = (
-            max(
-                0.0,
-                (complete - max(preceding[i])).total_seconds(),
-            )
-            if preceding[i]
-            else 0.0
-        )
-        bucket["sojourn"].append(sojourn)
-
-    anchors = {
-        anchor["name"]: anchor
-        for anchor in anchor_activities or []
-        if anchor.get("name")
-    }
-
-    def summarize(values):
-        if not values:
-            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-
-        return {
-            "mean": float(statistics.mean(values)),
-            # Prototype uses population std, not sample std.
-            "std": float(statistics.pstdev(values)),
-            "min": float(min(values)),
-            "max": float(max(values)),
-        }
-
-    results = {}
-
-    for activity in sorted(set(buckets) | set(anchors)):
-        bucket = buckets.get(activity, {"forward": [], "sojourn": []})
-        direct = bucket["forward"]
-        sojourn = bucket["sojourn"]
-        positive_sojourn = [value for value in sojourn if value > 0]
-
-        # Match the prototype's upper-middle observation for even sample sizes.
-        if direct and positive_sojourn:
-            direct_middle = sorted(direct)[len(direct) // 2]
-            sojourn_middle = sorted(positive_sojourn)[len(positive_sojourn) // 2]
-
-            if direct_middle <= sojourn_middle:
-                source, source_name = direct, "forward"
-            else:
-                source, source_name = positive_sojourn, "positive_sojourn"
+        direct, sojourn = bucket["forward"], bucket["sojourn"]
+        positive = [v for v in sojourn if v > 0]
+        if direct and positive:
+            use_forward = sorted(direct)[len(direct)//2] <= sorted(positive)[len(positive)//2]
+            source, name = (direct, "forward") if use_forward else (positive, "positive_sojourn")
         elif direct:
-            source, source_name = direct, "forward"
-        elif positive_sojourn:
-            source, source_name = positive_sojourn, "positive_sojourn"
+            source, name = direct, "forward"
+        elif positive:
+            source, name = positive, "positive_sojourn"
         else:
-            source, source_name = sojourn, "zero_or_empty_sojourn"
-
-        selected_count = 0
-        selected = []   # Anchors and unavailable estimates have no empirical samples.
-
-        if activity in anchors:
-            anchor = anchors[activity]
-            sojourn_stats = summarize(sojourn)
-
-            mean = float(anchor.get("mean_seconds", sojourn_stats["mean"]))
-            std = float(anchor.get("std_seconds", sojourn_stats["std"]))
-            minimum = float(anchor.get("min_seconds", 0.0))
-            maximum = anchor.get("max_seconds")
-            maximum = float(maximum) if maximum is not None else None
-
-            source_name = "anchor"
-            window = "anchor"
-
-        elif source:
-            ordered = sorted(source)
-            n = len(ordered)
-
-            if service_time_mode == "p25":
-                lower = 0
-                upper = max(0, math.ceil(0.50 * n) - 1)
-            elif service_time_mode == "p50":
-                lower = max(0, math.ceil(0.25 * n) - 1)
-                upper = max(0, math.ceil(0.75 * n) - 1)
-            else:
-                lower = 0
-                upper = max(0, math.ceil(0.25 * n) - 1)
-
-            selected = ordered[lower:upper + 1]
-            stats = summarize(selected)
-            selected_count = len(selected)
-
-            mean, std = stats["mean"], stats["std"]
-            minimum, maximum = stats["min"], stats["max"]
-            window = service_time_mode
-
-        else:
-            mean, std, minimum, maximum = 0.0, 0.0, 0.0, None
-            window = "no_observations"
-
-        results[activity] = {
-            "service_mean": mean,     # Seconds
-            "service_std": std,       # Seconds; population standard deviation
-            "service_min": minimum,   # Seconds
-            "service_max": maximum,   # Seconds
-            "estimation_source": source_name,
-            "estimation_window": window,
-            "n_forward_observations": len(direct),
-            "n_sojourn_observations": len(sojourn),
-            "n_selected_observations": selected_count,
-            "service_samples_seconds": list(selected),
+            source, name = sojourn, "zero_or_empty_sojourn"
+        selected = timing_discovery._select_timing_window(source, service_time_mode) if activity not in anchors else []
+        if selected:
+            if not (math.isclose(statistics.mean(selected), stats["service_mean"], abs_tol=1e-9)
+                    and math.isclose(statistics.pstdev(selected), stats["service_std"], abs_tol=1e-9)):
+                raise ValueError("Evaluation samples no longer match timediscovery.py; update the sample adapter.")
+        result[activity] = {
+            "service_mean": stats["service_mean"], "service_std": stats["service_std"],
+            "estimation_source": "anchor" if activity in anchors else name,
+            "estimation_window": "anchor" if activity in anchors else service_time_mode if source else "no_observations",
+            "n_forward_observations": len(direct), "n_sojourn_observations": len(sojourn),
+            "n_selected_observations": len(selected), "service_samples_seconds": list(selected),
         }
-
-    return results
+    return result
 
 
 # Reference notebook cell 16
@@ -402,7 +267,9 @@ def load_ngd_log(path):
 
         object_types[oid] = otype
 
-    # Validate timezone information rather than silently assuming local time.
+    # Each log is ordered independently: retain naive wall-clock timestamps,
+    # or convert aware timestamps to UTC. Never invent a timezone or mix modes.
+    timestamp_mode = None
     timestamps = []
     seen_event_ids = set()
 
@@ -416,14 +283,27 @@ def load_ngd_log(path):
             raise ValueError(f"Duplicate event ID: {eid!r}")
         seen_event_ids.add(eid)
 
-        timestamp = pd.Timestamp(event.get("time"))
+        try:
+            timestamp = pd.Timestamp(event.get("time"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Event {eid!r} needs a valid timestamp.") from exc
 
-        if pd.isna(timestamp) or timestamp.tzinfo is None:
+        if pd.isna(timestamp):
+            raise ValueError(f"Event {eid!r} needs a valid timestamp.")
+
+        event_mode = "naive" if timestamp.tzinfo is None else "aware"
+        if timestamp_mode is None:
+            timestamp_mode = event_mode
+        elif event_mode != timestamp_mode:
             raise ValueError(
-                f"Event {eid!r} needs a valid timestamp with a timezone."
+                f"Event {eid!r}: this log mixes timestamps with and without "
+                "timezones. Use a consistent timestamp format or explicitly "
+                "localize the naive timestamps before NGD evaluation."
             )
 
-        timestamps.append(timestamp.tz_convert("UTC"))
+        timestamps.append(
+            timestamp if event_mode == "naive" else timestamp.tz_convert("UTC")
+        )
 
     timelines = defaultdict(list)
     unattached_events = 0
@@ -469,6 +349,7 @@ def load_ngd_log(path):
         )
 
     return {
+        "timestamp_mode": timestamp_mode or "empty",
         "sequences": dict(sequences),
         "declared_types": set(object_types.values()),
         "unattached_events": unattached_events,
@@ -563,7 +444,7 @@ def load_confidence_model(path):
 
     for i, c in enumerate(model["constraints"], start=1):
         ar = str(c["arc_type"]).upper()
-        if ar not in {"EF", "EP"}:
+        if ar not in {"EF", "EP", "AS", "DF", "DP"}:
             raise NotImplementedError(
                 f"Constraint {i}: unsupported arc type {ar!r}."
             )
@@ -620,7 +501,6 @@ def load_confidence_model(path):
 
 def build_index(path):
     raw = _read_json(path)
-    path = "OCEL data" if isinstance(path, dict) else path
 
     objects = raw["objects"]
     events = raw["events"]
@@ -641,15 +521,16 @@ def build_index(path):
     if timestamps.isna().any():
         raise ValueError(f"{path}: missing event timestamps.")
 
-    # The paper assumes unique timestamps. Do not invent an order for ties.
+    # Equal timestamps remain simultaneous. For DF/DP, retain every event
+    # at the nearest qualifying timestamp rather than breaking ties by ID.
     n_tied_events = int(timestamps.duplicated(keep=False).sum())
 
     if n_tied_events:
         print(
-            f"Note: {path}\n"
+            f"Note: {path if not isinstance(path, dict) else 'OCEL log'}\n"
             f"  {n_tied_events} events share a timestamp with another event.\n"
             "  Equal-time events are treated as simultaneous and cannot "
-            "fulfil an EF/EP requirement for each other."
+            "fulfil an EF/EP/DF/DP requirement for each other."
         )
 
     ev_objs = defaultdict(lambda: defaultdict(set))
@@ -689,35 +570,67 @@ def involvement(c):
     )
 
 def matching_events(idx, eid, c, each_combo, all_objects, any_types):
-    """Return matching target events for one Cartesian Each binding."""
-    target = c["target_activity"]
-    candidates = set(idx["act_events"].get(target, set()))
+    """Apply full object scope, temporal rule, then target activity.
 
-    # Every selected Each object and every All object must be present.
+    DF/DP must consider intervening events of ANY activity within that scope.
+    All events tied at the nearest strictly later/earlier timestamp qualify.
+    """
+    arc = c["arc_type"]
+    if arc not in {"EF", "EP", "AS", "DF", "DP"}:
+        raise NotImplementedError(f"Unsupported arc type {arc!r}.")
+
+    target_events = idx["act_events"].get(c["target_activity"], set())
+    filters = []
+    # For non-direct arcs the activity filter commutes with the other filters.
+    # Direct arcs must defer it until AFTER nearest-timestamp selection.
+    if arc not in {"DF", "DP"}:
+        filters.append(target_events)
+
     required = set(each_combo) | all_objects
     for oid in required:
-        candidates.intersection_update(idx["obj_events"].get(oid, set()))
+        filters.append(idx["obj_events"].get(oid, set()))
 
-    # Each Any type requires at least one object shared with the activation.
     for object_type in any_types:
         source_objects = idx["ev_objs"][eid].get(object_type, set())
-        candidates = {
-            other for other in candidates
-            if idx["ev_objs"][other].get(object_type, set()) & source_objects
-        }
+        shared_events = set()
+        for oid in source_objects:
+            shared_events.update(idx["obj_events"].get(oid, set()))
+        filters.append(shared_events)
+
+    # Start with the smallest set to avoid scanning the whole log for each
+    # scoped activation. With no object scope, directness is global.
+    if filters:
+        filters.sort(key=len)
+        candidates = set(filters[0])
+        for event_set in filters[1:]:
+            candidates.intersection_update(event_set)
+    else:
+        candidates = set(idx["ev_time"])
+
+    if arc == "AS":
+        return candidates
 
     timestamp = idx["ev_time"][eid]
-    if c["arc_type"] == "EF":
-        return {
+    if arc in {"EF", "DF"}:
+        candidates = {
             other for other in candidates
             if idx["ev_time"][other] > timestamp
         }
+    else:  # EP / DP: normalized source activates; targets must be earlier.
+        candidates = {
+            other for other in candidates
+            if idx["ev_time"][other] < timestamp
+        }
 
-    # EP: source still activates, but matching targets must be earlier.
-    return {
-        other for other in candidates
-        if idx["ev_time"][other] < timestamp
-    }
+    if arc in {"DF", "DP"} and candidates:
+        select_time = min if arc == "DF" else max
+        nearest = select_time(idx["ev_time"][other] for other in candidates)
+        candidates = {
+            other for other in candidates
+            if idx["ev_time"][other] == nearest
+        }
+
+    return candidates & target_events
 
 def satisfies(idx, eid, c):
     """Check nmin <= matching count <= nmax for EVERY Each binding."""

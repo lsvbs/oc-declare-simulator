@@ -26,38 +26,69 @@ def json_safe(value):
     return value
 
 
+def normalize_log(raw):
+    """Notebook cell 1's OCEL 1 conversion, in memory without changing files."""
+    if not isinstance(raw, dict):
+        raise ValueError('Expected an OCEL JSON object.')
+    if isinstance(raw.get('events'), list) and isinstance(raw.get('objects'), list):
+        return raw
+    if not isinstance(raw.get('ocel:events'), dict) or not isinstance(raw.get('ocel:objects'), dict):
+        raise ValueError('Expected OCEL 2.0 JSON or OCEL 1.0 JSON-OCEL.')
+    objects = [{'id': str(oid), 'type': obj['ocel:type'], 'attributes': []}
+               for oid, obj in raw['ocel:objects'].items()]
+    events = [{'id': str(eid), 'type': ev['ocel:activity'], 'time': ev['ocel:timestamp'],
+               'attributes': [], 'relationships': [{'objectId': str(oid), 'qualifier': ''}
+               for oid in (ev.get('ocel:omap') or [])]} for eid, ev in raw['ocel:events'].items()]
+    return {'objects': objects, 'events': events,
+            'objectTypes': [{'name': t, 'attributes': []} for t in sorted({o['type'] for o in objects})],
+            'eventTypes': [{'name': a, 'attributes': []} for a in sorted({e['type'] for e in events})]}
+
+
 def canonical_model(model):
     """Undo the UI's orientation adapter without substituting runtime caps.
 
-Original from/to/counts remain authoritative when retained by the editor.
-Older editor models have explicitly engine-oriented source/target fields;
-precedence endpoints are reversed to produce the notebook's EP convention.
+Canonical files use from/to/counts. Editor models use their current engine
+fields, including edited bounds, rather than stale copies of imported fields.
 """
+    if isinstance(model, list):
+        constraints, activities, types = [], set(), set()
+        for c in model:
+            involvement = {entry['object_type']: mode for mode, entries in (c.get('label') or {}).items()
+                           for entry in entries}
+            constraints.append({**c, 'counts': c.get('counts', [1, None]),
+                                'involvement_per_label': involvement})
+            activities.update((c['from'], c['to']))
+            types.update(involvement)
+        model = {'constraint_orientation': 'arc', 'constraints': constraints,
+                 'activities': [{'name': a} for a in sorted(activities)],
+                 'object_types': [{'name': t} for t in sorted(types)]}
     if not isinstance(model, dict):
         raise ValueError('Select an OC-Declare model with activities and constraints.')
     if model.get('constraint_orientation') == 'arc':
         return model
     constraints = []
     for i, c in enumerate(model.get('constraints', []), 1):
-        if all(key in c for key in ('from', 'to', 'counts', 'arc_type')):
+        if not (c.get('source_activity') or c.get('source')) and all(key in c for key in ('from', 'to', 'counts', 'arc_type')):
             constraints.append(dict(c))
             continue
-        kind = c.get('constraint_type') or c.get('type')
-        arrows = {'response': 'EF', 'precedence': 'EP',
+        kind = c.get('constraint_type') or c.get('type') or {
+            'EF': 'response', 'EP': 'precedence', 'AS': 'responded_existence',
+            'DF': 'chain_response', 'DP': 'chain_precedence'}.get(c.get('arc_type'))
+        arrows = {'response': 'EF', 'precedence': 'EP', 'chain_response': 'DF',
+                  'direct_response': 'DF', 'chain_precedence': 'DP', 'direct_precedence': 'DP',
+                  'responded_existence': 'AS',
                   'not_succession': 'EF', 'not_precedence': 'EP'}
         if kind not in arrows:
-            raise NotImplementedError(f'Constraint {i}: unsupported constraint type {kind!r}; the notebook supports EF/EP.')
+            raise NotImplementedError(f'Constraint {i}: unsupported constraint type {kind!r}; the notebook supports EF/EP/AS/DF/DP.')
         source = c.get('source_activity') or c.get('source')
         target = c.get('target_activity') or c.get('target')
         if not source or not target:
             raise ValueError(f'Constraint {i}: missing source or target activity.')
         arrow = arrows[kind]
-        if arrow == 'EP':
+        if arrow in ('EP', 'DP'):
             source, target = target, source
         scope = c.get('scope') or {}
-        involvement = c.get('involvement_per_label')
-        if involvement is None:
-            involvement = scope.get('involvement_per_label')
+        involvement = scope.get('involvement_per_label', c.get('involvement_per_label'))
         if involvement is None:
             involvement = dict(scope.get('bindings') or [])
             if not involvement and scope.get('object_type'):
@@ -166,6 +197,11 @@ def _model_scores(raw, model):
     idx = nm.build_index(raw)
     per_constraint, confidence = nm.evaluate_confidence(idx, model)
     incidents, violations_by_constraint, violations = nm.constraint_violation_report(idx, model)
+    # Display the notebook's affected-constraint count as a fraction too;
+    # do not substitute it for the notebook's activation/event rates.
+    violations['constraint_violation_rate'] = (
+        violations['n_constraints_affected'] / violations['n_constraints']
+        if violations['n_constraints'] else np.nan)
     coverage, coverage_details = nm.model_coverage(idx, {o['type'] for o in raw['objects']}, model)
     # Detailed activation incidents can be enormous; the UI uses the exact
     # summaries and per-constraint counts, all calculated over the complete log.
@@ -174,18 +210,20 @@ def _model_scores(raw, model):
             'coverage': coverage, 'coverage_details': coverage_details.to_dict('records')}
 
 
-def evaluate_logs(input_raw, simulated_raw, model=None, service_time_mode='minimum', anchor_activities=None):
-    if service_time_mode not in {'minimum', 'p25', 'p50'}:
-        raise ValueError('serviceTimeMode must be minimum, p25, or p50.')
+def evaluate_logs(input_raw, simulated_raw, model=None, service_time_mode='p25', anchor_activities=None):
+    if service_time_mode not in {'minimum', 'p25', 'p50', 'mean'}:
+        raise ValueError('serviceTimeMode must be minimum, p25, p50, or mean.')
     if not isinstance(anchor_activities or [], list):
         raise ValueError('anchorActivities must be a list.')
     result = {
-        'method': 'evaluationmeasures.ipynb', 'method_version': 1,
+        'method': 'evaluationmeasures.ipynb', 'method_version': 2,
         'reference_sha256': nm.REFERENCE_NOTEBOOK_SHA256,
         'settings': {'smoothing': 0.5, 'service_time_mode': service_time_mode,
                      'anchor_activities': anchor_activities or [], 'w1_min_samples': 1, 'ngram_sizes': [2, 3]},
         'logs': {},
     }
+    simulated_raw = normalize_log(simulated_raw)
+    input_raw = normalize_log(input_raw) if input_raw is not None else None
     logs = {'simulated': simulated_raw}
     if input_raw is not None:
         logs = {'input': input_raw, **logs}
@@ -207,8 +245,7 @@ def evaluate_logs(input_raw, simulated_raw, model=None, service_time_mode='minim
     a, b = nm.load_ocel(input_raw), nm.load_ocel(simulated_raw)
     result['kl'] = {
         'activities': _attempt(lambda: _kl(Counter(e[1] for e in a['events']), Counter(e[1] for e in b['events']))),
-        **{basis: _attempt(lambda basis=basis: _kl(nm.type_counts(a, basis), nm.type_counts(b, basis)))
-           for basis in ('objects', 'relations')},
+        'objects': _attempt(lambda: _kl(nm.type_counts(a), nm.type_counts(b))),
     }
 
     def timing():
