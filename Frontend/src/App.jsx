@@ -6878,7 +6878,7 @@ function App() {
     }
   }, [config.ocdeclareFile, discoveryConfig.eventLogFile, loadModelState, modelEdited]);
 
-  // Shared helper: start polling a discover-ocdeclare run and resolve when done.
+  // Shared by both discovery workflows: download the saved model once on success.
   // onProgress(phase, pct) is called on each poll tick before completion.
   // Returns a promise that resolves to the server response data, or rejects on error.
   const pollOcdeclareRun = useCallback((runId, onProgress) => {
@@ -6889,7 +6889,18 @@ function App() {
           const d = res.data;
           if (d.error && d.done) { reject(new Error(d.error)); return; }
           onProgress(d.phase || '', d.pct ?? 0, d.logs || []);
-          if (d.done) { resolve(d); return; }
+          if (d.done) {
+            if (d.success && d.filename) {
+              const link = document.createElement('a');
+              link.href = `/api/download-ocdeclare/${encodeURIComponent(d.filename)}`;
+              link.download = d.filename;
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+            }
+            resolve(d);
+            return;
+          }
           ocdeclarePollingRef.current = setTimeout(tick, 1200);
         } catch (err) {
           reject(err);
