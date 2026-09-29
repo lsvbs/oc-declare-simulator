@@ -592,6 +592,34 @@
 .tfc-svg {
   display: block;
 }
+.tfc-tooltip-target:focus-visible { outline: 2px solid #4f46e5; outline-offset: 3px; }
+.tfc-tooltip {
+  position: fixed;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 16px));
+  box-sizing: border-box;
+  padding: 0.4rem 0.6rem;
+  border-radius: 5px;
+  background: #1e293b;
+  color: white;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  z-index: 9999;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+}
+.activity-binding-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  margin-bottom: 0.65rem;
+  color: #475569;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.activity-binding-legend-create { color: #15803d; }
+.activity-binding-legend-deactivate { color: #b91c1c; }
 
 .act-marker {
   display: inline-block;
@@ -857,12 +885,6 @@
   background: #fef3c7;
   border-radius: 3px;
   padding: 0 3px;
-  font-size: 0.78rem;
-}
-
-.object-lifecycle-warning-hint {
-  margin: 0.5rem 0 0;
-  color: #92400e;
   font-size: 0.78rem;
 }
 
@@ -3078,7 +3100,7 @@
   background: white;
 }
 
-/* ── Main tab bar (Parameters | Simulation | Evaluation) ─────────────────── */
+/* ── Main tab bar (Base Model | Simulation | Evaluation) ─────────────────── */
 .main-tab-bar {
   display: flex;
   background: #f1f5f9;
@@ -3093,7 +3115,8 @@
 }
 
 .main-tab-btn {
-  flex: 1;
+  flex: 1 1 0;
+  min-width: 0;
   padding: 0.85rem 1rem;
   background: none;
   border: none;
@@ -3113,6 +3136,50 @@
   border-bottom-color: #4f46e5;
   background: white;
   font-weight: 500;
+}
+.main-tab-model-group {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 4px 4px 0 0;
+}
+.main-tab-model-group.active { background: white; }
+.main-tab-btn.main-tab-btn--base {
+  padding: 0.6rem 0.5rem 2.1rem;
+}
+.main-tab-model-group.active .main-tab-btn--base {
+  border-bottom-color: #4f46e5;
+}
+.main-tab-alternative {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.35rem;
+  min-height: 24px;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 0.7rem;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.main-tab-alternative:hover { background: #e2e8f0; color: #334155; }
+.main-tab-alternative.active {
+  border-color: #a5b4fc;
+  background: #eef2ff;
+  color: #4f46e5;
+}
+.main-tab-btn:focus-visible,
+.main-tab-alternative:focus-visible,
+.simulation-alternative-toggle:focus-visible {
+  outline: 2px solid #4f46e5;
+  outline-offset: -2px;
+}
+@media (max-width: 600px) {
+  .main-tab-btn { padding-inline: 0.4rem; font-size: 0.88rem; }
+  .main-tab-alternative { right: 0.2rem; padding-inline: 0.25rem; font-size: 0.62rem; }
 }
 
 /* ── TopBar mode section ─────────────────────────────────────────────────── */
@@ -3705,7 +3772,8 @@
 }
 
 /* ── Live throughput chart (simulation progress box) ───────────────────────
-   Wall-clock rates on the left axis, cumulative events on the right. */
+   Event rate and current pending count on the left, cumulative events on the right. */
+.sim-progress-elapsed { margin-top: 0.3rem; }
 .tp-chart {
   width: 100%;
   max-width: 34rem;
@@ -3765,17 +3833,21 @@
   font-weight: 700;
   color: #1e293b;
 }
-.tp-key--ev  i { background: #6366f1; }
-.tp-key--ob  i { background: #0d9488; }
-.tp-key--cum i { background: #cbd5e1; }
+.tp-key--ev      i { background: #2563eb; }
+.tp-key--pending i { background: #dc2626; }
+.tp-key--cum     i { background: #a3a3a3; }
 
 .tp-svg { display: block; width: 100%; height: auto; overflow: visible; }
 .tp-grid { stroke: #eef2f6; stroke-width: 1; }
-.tp-area { fill: #e2e8f0; opacity: 0.55; }
+.tp-area { fill: #e5e5e5; opacity: 0.55; }
 .tp-line { fill: none; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; }
-.tp-line--ev  { stroke: #6366f1; }
-.tp-line--ob  { stroke: #0d9488; }
-.tp-line--cum { stroke: #cbd5e1; stroke-width: 1.2; }
+.tp-line--ev      { stroke: #2563eb; }
+.tp-line--pending { stroke: #dc2626; }
+.tp-line--cum     { stroke: #a3a3a3; stroke-width: 1.2; }
+.tp-axis { stroke: #a3a3a3; stroke-width: 1; }
+.tp-axis-label { font-size: 11px; font-weight: 600; fill: #475569; letter-spacing: 0; }
+.tp-axis-label--cum { fill: #737373; }
+.tp-note { font-size: 0.7rem; color: #64748b; letter-spacing: 0; line-height: 1.5; }
 .tp-tick {
   font-family: inherit;
   font-size: 9px;
@@ -3783,7 +3855,7 @@
   fill: #94a3b8;
   letter-spacing: 0;
 }
-.tp-tick--cum { fill: #b6c2ce; }
+.tp-tick--cum { fill: #737373; }
 
 /* Inline "?" affordance with a hover/focus explanation.
    Deliberately CSS-only: a React tooltip would need its own useState, and
@@ -4114,6 +4186,49 @@ details[open] .formula-summary::before { content: '▼ '; }
 .start-over-link:hover { color: #475569; }
 
 /* ── Model Behavior Tab ──────────────────────────────────────────────────── */
+.model-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  margin-bottom: 0.75rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+.model-summary-card {
+  position: relative;
+  display: flex;
+  flex: 1 1 90px;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  padding: 0.25rem 0.5rem;
+  cursor: help;
+}
+.model-summary-card > strong { font-size: 1rem; color: #1e293b; }
+.model-summary-label { font-size: 0.72rem; color: #475569; }
+.model-summary-tooltip {
+  display: none;
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  z-index: 110;
+  width: 210px;
+  max-width: 65vw;
+  padding: 0.5rem 0.65rem;
+  border-radius: 6px;
+  background: #1e293b;
+  color: white;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  box-shadow: 0 4px 12px #0f172a26;
+  pointer-events: none;
+}
+.model-summary-card:last-child .model-summary-tooltip { left: auto; right: 0; }
+.model-summary-card:hover .model-summary-tooltip,
+.model-summary-card:focus .model-summary-tooltip { display: block; }
+.model-summary-card:focus-visible { outline: 2px solid #4f46e5; border-radius: 4px; }
 .behavior-layout {
   display: flex;
   flex-direction: column;
@@ -4312,6 +4427,62 @@ details[open] .formula-summary::before { content: '▼ '; }
 .diff-mod { background: #dbeafe; color: #1e40af; }
 
 /* ── Results Compare ─────────────────────────────────────────────────────── */
+.simulation-controls-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.simulation-controls-heading .behavior-section-title { margin: 0; }
+.simulation-alternative-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+.simulation-alternative-toggle:hover { background: #e2e8f0; }
+.simulation-model-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.simulation-model-options {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.simulation-model-options-title { font-size: 0.85rem; font-weight: 600; color: #334155; }
+.start-activities-toggle {
+  background: none;
+  border: none;
+  padding: 0.15rem 0.25rem;
+  font-size: 0.75rem;
+  color: #475569;
+  cursor: pointer;
+}
+.start-activity-choices { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.start-activity-choices[hidden] { display: none; }
+.simulation-run-actions { margin: 0.75rem 0 0; }
+.simulation-model-options[hidden],
+.run-result-panel[hidden] { display: none; }
+.simulation-step-help {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+.simulation-stop-help { margin-bottom: 0.5rem; }
 .results-compare-layout {
   display: flex;
   gap: 1.5rem;
@@ -4324,6 +4495,10 @@ details[open] .formula-summary::before { content: '▼ '; }
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   overflow: hidden;
+}
+.run-result-panel .stat-grid,
+.results-box .stat-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 8rem), 1fr));
 }
 .run-result-panel-header {
   background: #f8fafc;
@@ -4345,7 +4520,8 @@ details[open] .formula-summary::before { content: '▼ '; }
   color: #94a3b8;
 }
 @media (max-width: 800px) {
-  .results-compare-layout { flex-direction: column; }
+  .results-compare-layout,
+  .simulation-model-controls { flex-direction: column; align-items: stretch; }
 }
 
 /* ── Results Comparison Header ───────────────────────────────────────────── */

@@ -1,6 +1,6 @@
 import React from 'react';
 
-export default function ObjectLifecycleWarning({ issues, label, compact }) {
+export default function ObjectLifecycleWarning({ issues, label }) {
   if (!issues?.length) return null;
   const noCreate = issues.filter(issue => issue.missingCreate);
   const noDeactivate = issues.filter(issue => issue.missingDeactivate);
@@ -30,15 +30,9 @@ export default function ObjectLifecycleWarning({ issues, label, compact }) {
       )}
       {noDeactivate.length > 0 && (
         <div className="object-lifecycle-warning">
-          <div className="object-lifecycle-warning-title">⚠ Missing deactivate flag</div>
-          <div><strong>{names(noDeactivate)}</strong> — no activity deactivates objects of these types.
-            Objects may remain active and reach work-in-progress limits.</div>
+          <strong>⚠ Missing deactivate flag:</strong> {names(noDeactivate)}
         </div>
       )}
-      <p className="object-lifecycle-warning-hint">
-        These warnings do not prevent simulation.
-        {!compact && ' Review the create and deactivate flags in the model’s activity settings if needed.'}
-      </p>
     </div>
   );
 }

@@ -11,8 +11,53 @@ import EvaluationWrapper from './NotebookEvaluation';
 import ObjectLifecycleWarning from './ObjectLifecycleWarning';
 import { getModelWarnings } from './modelWarnings.mjs';
 import RecentEventLog from './RecentEventLog';
+import { SimThroughputChart, SimulationElapsedTime } from './SimulationProgress';
+import { sampleSimulationThroughput } from './simulationThroughput.mjs';
 
 const DEFAULT_LIFECYCLE_THRESHOLD = 0.9;
+// Keep the heuristic graph available for later, but hide it in both editors.
+const SHOW_CONSTRAINT_FLOW = false;
+
+function SimulationLayout({ children, active, setBaseStartFolded, setAltStartFolded }) {
+  const [alternativeOpen, setAlternativeOpen] = useState(false);
+  React.useLayoutEffect(() => {
+    if (active) {
+      setBaseStartFolded(true);
+      setAltStartFolded(true);
+    }
+  }, [active, setBaseStartFolded, setAltStartFolded]);
+  return children({
+    alternativeOpen,
+    toggleAlternative: () => setAlternativeOpen(open => !open),
+  });
+}
+
+function ModelSummaryStrip({ discoveryResults, model }) {
+  const tooltipId = React.useId();
+  const seconds = discoveryResults?.ocel_time_span_s;
+  const timeSpan = seconds == null ? null
+    : seconds < 60 ? `${Math.abs(seconds % 1) < 0.005 ? Math.round(seconds) : seconds.toFixed(2)}s`
+    : seconds < 3600 ? `${Math.floor(seconds / 60)}m`
+    : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
+    : `${Math.floor(seconds / 86400)}d${Math.floor((seconds % 86400) / 3600) > 0 ? ` ${Math.floor((seconds % 86400) / 3600)}h` : ''}`;
+  const cards = [
+    { label: 'event', value: discoveryResults?.total_events?.toLocaleString(), description: 'Events analyzed · OCEL log' },
+    { label: 'Objects', value: discoveryResults?.log_object_trace_count?.toLocaleString(), description: 'Objects Created · OCEL log' },
+    { label: 'Activities', value: discoveryResults?.activity_count, description: 'Activity types · OCEL log' },
+    { label: 'Constraints', value: model?.constraints?.length, description: 'Constraints · OC-Declare model' },
+    { label: 'Time', value: timeSpan, description: 'Log time span: time between the first and last event · OCEL log' },
+  ];
+  return <div className="model-summary-strip" aria-label="Model summary">
+    {cards.filter(card => card.value != null).map((card, index) => (
+      <div key={card.label} className="model-summary-card" tabIndex={0}
+        aria-describedby={`${tooltipId}-${index}`}>
+        <strong>{card.value}</strong>
+        <span className="model-summary-label">{card.label}</span>
+        <span id={`${tooltipId}-${index}`} role="tooltip" className="model-summary-tooltip">{card.description}</span>
+      </div>
+    ))}
+  </div>;
+}
 
 // ── Shared utility: sort activities by log flow order ─────────────────────────
 // Uses trace_position (avg position in log traces) first, then first-occurrence
@@ -247,8 +292,8 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
       edgeType[key] = matching[0]?.constraint_type || 'precedence';
       // Collect all distinct scope types backing this edge
       const scopes = [...new Set(matching.map(c => {
-        const b = c.scope?.bindings || [];
-        return b.length > 1 ? b.map(([t]) => t).join(',') : (c.scope?.object_type || c.scope_object_type || null);
+        const types = scopeBindings(c.scope).map(([type]) => type);
+        return types.length ? types.join(', ') : (c.scope_object_type || null);
       }).filter(Boolean))];
       edgeCount[key + '__scopes'] = scopes;
     });
@@ -355,6 +400,24 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
   }
   function onMouseUp() { dragRef.current = { type: null }; }
 
+  function graphTooltip(text) {
+    const showAtPointer = e => setSvgTip({ text, x: e.clientX, y: e.clientY });
+    return {
+      tabIndex: 0,
+      role: 'img',
+      'aria-label': text,
+      onMouseEnter: showAtPointer,
+      onMouseMove: showAtPointer,
+      onMouseLeave: () => setSvgTip(null),
+      onFocus: e => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        setSvgTip({ text, x: rect.left, y: rect.bottom + 12 });
+      },
+      onBlur: () => setSvgTip(null),
+      onKeyDown: e => { if (e.key === 'Escape') setSvgTip(null); },
+    };
+  }
+
   const effPos = React.useMemo(() => {
     const m = {};
     Object.entries(pos).forEach(([n, p]) => { m[n] = nodeOverrides[n] ? { ...p, ...nodeOverrides[n] } : p; });
@@ -451,13 +514,10 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
                     strokeDasharray={count === 1 ? '5,3' : undefined}
                     markerEnd={`url(#${markerId})`} />
                   {scopeLabels.length > 0 && (
-                    <g>
+                    <g className="tfc-tooltip-target" {...graphTooltip(`Object types: ${scopes.join(', ')}`)}>
                       <rect x={lx - maxW/2} y={ly - scopeLabels.length * lineH - 1}
                         width={maxW} height={scopeLabels.length * lineH + 2} rx={2} fill="white" opacity={0.88}
-                        style={{cursor:'default'}}
-                        onMouseEnter={e => setSvgTip({text:scopes.join(', '), x:e.clientX, y:e.clientY})}
-                        onMouseMove={e => setSvgTip(t => t ? {...t, x:e.clientX, y:e.clientY} : t)}
-                        onMouseLeave={() => setSvgTip(null)} />
+                        style={{cursor:'help'}} />
                       {scopeLabels.map((lbl, i) => (
                         <text key={i} x={lx} y={ly - (scopeLabels.length - 1 - i) * lineH}
                           textAnchor="middle" fontSize={7.5} fill={col}
@@ -473,6 +533,7 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
               const isStart = startSet.has(name), isEnd = endSet.has(name);
               return (
                 <g key={name} style={{cursor:'grab'}} onMouseDown={e => onNodeMouseDown(e, name)}>
+                  <g className="tfc-activity-node tfc-tooltip-target" {...graphTooltip(`Activity: ${name}`)}>
                   {/* Opaque background mask — gaps any edge path that passes through this node */}
                   <circle cx={p.x} cy={p.y} r={isStart || isEnd ? R+7 : R+4} fill="#fafbff" />
                   {(isStart || isEnd) && (
@@ -483,18 +544,18 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
                     fill={isStart ? '#f0fdf4' : isEnd ? '#fff1f2' : '#f8fafc'}
                     stroke={isStart ? '#16a34a' : isEnd ? '#dc2626' : '#94a3b8'} strokeWidth={1.5} />
                   {nodeLabel(name, p.x, p.y)}
+                  </g>
                   {/* Created object types — stacked above node */}
                   {(actCreates[name] || []).map((ot, i, arr) => {
                     const abbr = ot.split(/\s+/).map(w => w[0].toUpperCase()).join('');
                     const yOff = p.y - R - 6 - (arr.length - 1 - i) * 11;
                     return (
-                      <g key={'c'+i} style={{cursor:'default'}}
-                        onMouseEnter={e => setSvgTip({text:`Creates: ${ot}`, x:e.clientX, y:e.clientY})}
-                        onMouseMove={e => setSvgTip(t => t ? {...t, x:e.clientX, y:e.clientY} : t)}
-                        onMouseLeave={() => setSvgTip(null)}>
+                      <g key={'c'+i} className="tfc-tooltip-target" style={{cursor:'help'}}
+                        {...graphTooltip(`Creates object type: ${ot}`)}>
                         <text x={p.x} y={yOff} textAnchor="middle" fontSize={7}
                           fill="#16a34a" fontWeight={700} style={{pointerEvents:'none',userSelect:'none'}}>+{abbr}</text>
-                        <rect x={p.x-8} y={yOff-8} width={16} height={10} fill="transparent"/>
+                        <rect x={p.x-Math.max(12,(abbr.length+1)*3.5)} y={yOff-11}
+                          width={Math.max(24,(abbr.length+1)*7)} height={16} fill="transparent"/>
                       </g>
                     );
                   })}
@@ -503,13 +564,12 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
                     const abbr = ot.split(/\s+/).map(w => w[0].toUpperCase()).join('');
                     const yOff = p.y + R + 9 + i * 11;
                     return (
-                      <g key={'d'+i} style={{cursor:'default'}}
-                        onMouseEnter={e => setSvgTip({text:`Deactivates: ${ot}`, x:e.clientX, y:e.clientY})}
-                        onMouseMove={e => setSvgTip(t => t ? {...t, x:e.clientX, y:e.clientY} : t)}
-                        onMouseLeave={() => setSvgTip(null)}>
+                      <g key={'d'+i} className="tfc-tooltip-target" style={{cursor:'help'}}
+                        {...graphTooltip(`Deactivates object type: ${ot}`)}>
                         <text x={p.x} y={yOff} textAnchor="middle" fontSize={7}
                           fill="#dc2626" fontWeight={700} style={{pointerEvents:'none',userSelect:'none'}}>−{abbr}</text>
-                        <rect x={p.x-8} y={yOff-8} width={16} height={10} fill="transparent"/>
+                        <rect x={p.x-Math.max(12,(abbr.length+1)*3.5)} y={yOff-11}
+                          width={Math.max(24,(abbr.length+1)*7)} height={16} fill="transparent"/>
                       </g>
                     );
                   })}
@@ -520,10 +580,9 @@ function ConstraintFlowGraph({ activities, constraints, startActivities, probMat
         </svg>
       </div>
       {svgTip && ReactDOM.createPortal(
-        <div style={{position:'fixed',left:Math.min(svgTip.x+14,window.innerWidth-200),
-          top:Math.max(svgTip.y-10,4),background:'#1e293b',color:'white',fontSize:'0.72rem',
-          padding:'0.3rem 0.5rem',borderRadius:'5px',whiteSpace:'nowrap',zIndex:9999,
-          lineHeight:1.4,pointerEvents:'none',boxShadow:'0 2px 8px rgba(0,0,0,0.25)'}}>
+        <div role="tooltip" className="tfc-tooltip" style={{
+          left:Math.max(8,Math.min(svgTip.x+14,window.innerWidth-Math.min(320,window.innerWidth-16)-8)),
+          top:Math.max(8,Math.min(svgTip.y+12,window.innerHeight-90))}}>
           {svgTip.text}
         </div>,
         document.body
@@ -1176,88 +1235,6 @@ function WorkflowTopBar({ discoveryConfig, config, discoveryResults,
           </span>
         ))}
       </div>
-    </div>
-  );
-}
-
-// ── SimThroughputChart ────────────────────────────────────────────────────────
-// Live wall-clock throughput of the running simulation: events produced per
-// second and objects created per second (left axis, lines), against cumulative
-// events (right axis, filled area). Samples come from the 1s status poll.
-//
-// Wall-clock, not simulated time — this answers "how fast is the simulator
-// going", which is the question when a run is grinding. Simulated-time density
-// (events per simulated day) is a different measure and lives in the results.
-//
-// Pure SVG, no chart library: three series over a few hundred points does not
-// justify a dependency, and the surrounding app ships no charting runtime.
-function SimThroughputChart({ samples }) {
-  if (!samples || samples.length < 2) {
-    return (
-      <div className="tp-chart tp-chart--empty">
-        <span className="tp-dev">[DEV]</span>
-        Collecting throughput… (first points appear after ~2s)
-      </div>
-    );
-  }
-
-  const W = 560, H = 150;
-  const P = { t: 10, r: 46, b: 20, l: 42 };
-  const iw = W - P.l - P.r, ih = H - P.t - P.b;
-
-  // Stride to at most ~240 drawn points so a long run stays cheap to render
-  // and the line stays readable. The newest sample is always kept.
-  const stride = Math.max(1, Math.ceil(samples.length / 240));
-  const pts = samples.filter((_, i) => i % stride === 0 || i === samples.length - 1);
-
-  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
-  const span = Math.max(t1 - t0, 1e-6);
-  const rateMax = Math.max(1, ...pts.map(p => Math.max(p.ev, p.ob)));
-  const cumMax  = Math.max(1, ...pts.map(p => p.cum));
-
-  const x    = p => P.l + ((p.t - t0) / span) * iw;
-  const yR   = v => P.t + ih - (v / rateMax) * ih;   // left axis: rates
-  const yC   = v => P.t + ih - (v / cumMax)  * ih;   // right axis: cumulative
-  const line = (acc, sel) => pts.map((p, i) => `${i ? 'L' : 'M'}${x(p).toFixed(1)},${acc(sel(p)).toFixed(1)}`).join(' ');
-
-  const areaPath =
-    `M${x(pts[0]).toFixed(1)},${(P.t + ih).toFixed(1)} ` +
-    pts.map(p => `L${x(p).toFixed(1)},${yC(p.cum).toFixed(1)}`).join(' ') +
-    ` L${x(pts[pts.length - 1]).toFixed(1)},${(P.t + ih).toFixed(1)} Z`;
-
-  const last = samples[samples.length - 1];
-  const fmtRate = v => v >= 100 ? Math.round(v) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
-  const fmtDur  = s => s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, '0')}`;
-
-  return (
-    <div className="tp-chart">
-      <div className="tp-dev">[DEV]</div>
-      <div className="tp-legend">
-        <span className="tp-key tp-key--ev"><i></i>events/s <b>{fmtRate(last.ev)}</b></span>
-        <span className="tp-key tp-key--ob"><i></i>objects/s <b>{fmtRate(last.ob)}</b></span>
-        <span className="tp-key tp-key--cum"><i></i>total events <b>{last.cum.toLocaleString()}</b></span>
-      </div>
-      <svg viewBox={`0 0 ${W} ${H}`} className="tp-svg" role="img"
-           aria-label={`Throughput: ${fmtRate(last.ev)} events per second, ${fmtRate(last.ob)} objects per second, ${last.cum} events total`}>
-        {/* horizontal guides at 0 / 50% / 100% of the rate axis */}
-        {[0, 0.5, 1].map(f => (
-          <line key={f} className="tp-grid"
-                x1={P.l} x2={P.l + iw} y1={yR(rateMax * f)} y2={yR(rateMax * f)} />
-        ))}
-        <path className="tp-area" d={areaPath} />
-        <path className="tp-line tp-line--cum" d={line(yC, p => p.cum)} />
-        <path className="tp-line tp-line--ob"  d={line(yR, p => p.ob)} />
-        <path className="tp-line tp-line--ev"  d={line(yR, p => p.ev)} />
-
-        {/* left axis — rate */}
-        <text className="tp-tick" x={P.l - 6} y={yR(rateMax) + 4} textAnchor="end">{fmtRate(rateMax)}</text>
-        <text className="tp-tick" x={P.l - 6} y={yR(0) + 4} textAnchor="end">0</text>
-        {/* right axis — cumulative */}
-        <text className="tp-tick tp-tick--cum" x={P.l + iw + 6} y={yC(cumMax) + 4}>{cumMax.toLocaleString()}</text>
-        {/* x axis — elapsed wall time */}
-        <text className="tp-tick" x={P.l} y={H - 6}>{fmtDur(t0)}</text>
-        <text className="tp-tick" x={P.l + iw} y={H - 6} textAnchor="end">{fmtDur(t1)}</text>
-      </svg>
     </div>
   );
 }
@@ -4356,7 +4333,7 @@ function EvaluationTab({ results, discoveryResults, activeModel, serviceTimeMode
           );
         })()}
 
-        {/* Activity Timeline — removed from evaluation; see Time collapsible in Results tab */}
+        {/* Activity Timeline — removed from evaluation; see Time collapsible in Simulation tab */}
       </Collapsible>
 
       {/* ── Constraint Analysis ── */}
@@ -4963,7 +4940,7 @@ function ModelInfoPopup({ ocdeclareFile, eventLogFile, isScenario }) {
           </ul>
           {isScenario && (
             <p style={{margin:'0.5rem 0 0',paddingTop:'0.5rem',borderTop:'1px solid #f1f5f9'}}>
-              To run, go to the <strong>Results</strong> tab and configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
+              To run, go to the <strong>Simulation</strong> tab and configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
               <strong>▶ Run Base Model</strong> or <strong>▶ Run Alternative Model</strong>.
             </p>
           )}
@@ -5379,6 +5356,11 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
           </button>
         )}
       </div>
+      <div className="activity-binding-legend" role="note" aria-label="Activity symbols">
+        <span className="activity-binding-legend-create">+ creates</span>
+        <span className="activity-binding-legend-deactivate">− deactivates</span>
+        <span>● involved in activity</span>
+      </div>
       <div style={{display:'flex',gap:'0.4rem',alignItems:'stretch',marginBottom:'0.5rem'}}>
         <SortSelect s={sortAct} set={setSortAct} columns={[{col:'name',label:'Activity name'}]}/>
         <TableFilterBar
@@ -5397,12 +5379,7 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
             <tr>
               {editMode && <th style={{width:'18px'}}/>}
               <th style={{textAlign:'left',verticalAlign:'bottom'}}>
-                <div style={{display:'flex',flexDirection:'column',gap:'1px'}}>
-                  <span style={{fontSize:'0.62rem',color:'#16a34a',fontWeight:700,lineHeight:1}}>+ creates</span>
-                  <span style={{fontSize:'0.62rem',color:'#dc2626',fontWeight:700,lineHeight:1}}>− deactivates</span>
-                  <span style={{fontSize:'0.62rem',color:'#64748b',fontWeight:700,lineHeight:1}}>● involved in activity</span>
-                  <ColTip text="Activity name. Expand a row (▶) to view and edit its object type bindings.">Activity</ColTip>
-                </div>
+                <ColTip text="Activity name. Expand a row (▶) to view and edit its object type bindings.">Activity</ColTip>
               </th>
               {editMode && <th style={{textAlign:'center',verticalAlign:'bottom',height:'90px',padding:'0 4px',whiteSpace:'nowrap'}}>
                 <div style={{writingMode:'vertical-rl',transform:'rotate(180deg)',display:'inline-block',fontSize:'0.7rem',fontWeight:600,color:'#94a3b8',textTransform:'uppercase',letterSpacing:'0.04em',lineHeight:1.1}}>
@@ -6417,7 +6394,6 @@ function App() {
     useTimeLimit: false,
     useTraceLimit: false,
     maxTraces: '',
-    maxCases: '',
     maxRuntimeValue: '',          // wall-clock budget in MINUTES; '' disables it
     seed: 42,
     startActivities: [],
@@ -6435,13 +6411,10 @@ function App() {
   const [liveDeactivPerStep,  setLiveDeactivPerStep]  = useState(null);
   const [liveObligFulfilledPerStep, setLiveObligFulfilledPerStep] = useState(null);
   // Live throughput samples, one per status poll (~1s):
-  //   { t, ev, ob, cum } = elapsed wall seconds, events/s, objects created/s,
-  //   cumulative events. Rates are WALL-clock — this measures how fast the
-  //   simulator is running, not how dense the simulated process is.
-  //   objects_count is len(state.objects), which is never shrunk (deactivation
-  //   only flips obj.active), so its delta is genuinely objects created.
+  //   { t, ev, pending, cum } = elapsed wall seconds, events/s, current pending
+  //   obligations, cumulative events. Only ev is a rate; pending is a snapshot.
   const [throughput, setThroughput] = useState([]);
-  const throughputRef = useRef({ startMs: null, lastMs: null, lastEvents: 0, lastObjects: 0 });
+  const throughputRef = useRef({ startMs: null, lastMs: null, lastEvents: 0 });
   // Per-start-activity firing progress, shown only for activities that were
   // given a cap: { activity: {fired, cap} }. Sourced from the run's own
   // _start_event_count_by_activity, the same counter the cap is enforced on.
@@ -7116,7 +7089,7 @@ function App() {
     setLiveObligFulfilledPerStep(null);
     prevPollRef.current = { deactivations: 0, obligFulfilled: 0, step: 0 };
     setThroughput([]);
-    throughputRef.current = { startMs: Date.now(), lastMs: null, lastEvents: 0, lastObjects: 0 };
+    throughputRef.current = { startMs: Date.now(), lastMs: null, lastEvents: 0 };
     setLiveStartCaps(null);
 
     // Start polling the live step counter every second
@@ -7153,29 +7126,14 @@ function App() {
         prevPollRef.current = { deactivations: curDeact, obligFulfilled: curObligRemoved, step: curStep };
 
         // Throughput sample. Rates come from the delta between polls divided by
-        // the actual wall gap, not the nominal 1s — a busy tab or a slow poll
-        // stretches the interval, and dividing by 1 would understate the rate.
+        // the actual wall gap, not the nominal 1s. Pending obligations are a
+        // current count sampled at each poll, never divided by elapsed time.
         {
-          const tp = throughputRef.current;
-          const nowMs = Date.now();
-          const curEvents  = r.data.events_count  ?? 0;
-          const curObjects = r.data.objects_count ?? 0;
-          if (tp.lastMs != null) {
-            const dt = (nowMs - tp.lastMs) / 1000;
-            if (dt >= 0.25) {
-              const sample = {
-                t:   (nowMs - (tp.startMs ?? nowMs)) / 1000,
-                ev:  Math.max(0, (curEvents  - tp.lastEvents)  / dt),
-                ob:  Math.max(0, (curObjects - tp.lastObjects) / dt),
-                cum: curEvents,
-              };
-              // Bounded buffer: a long run would otherwise grow without limit.
-              setThroughput(prev => (prev.length >= 1800 ? [...prev.slice(1), sample] : [...prev, sample]));
-              tp.lastMs = nowMs; tp.lastEvents = curEvents; tp.lastObjects = curObjects;
-            }
-          } else {
-            tp.lastMs = nowMs; tp.lastEvents = curEvents; tp.lastObjects = curObjects;
-            if (tp.startMs == null) tp.startMs = nowMs;
+          const { next, sample } = sampleSimulationThroughput(throughputRef.current, r.data, Date.now());
+          throughputRef.current = next;
+          if (sample) {
+            // Bounded buffer: a long run would otherwise grow without limit.
+            setThroughput(prev => (prev.length >= 1800 ? [...prev.slice(1), sample] : [...prev, sample]));
           }
         }
         if (r.data.last_timestamp && r.data.start_timestamp) {
@@ -7202,9 +7160,6 @@ function App() {
       const maxTraces = config.maxTraces !== '' && config.maxTraces != null && parseInt(config.maxTraces) > 0
         ? parseInt(config.maxTraces)
         : null;
-      const maxCases = config.maxCases !== '' && config.maxCases != null && parseInt(config.maxCases) > 0
-        ? parseInt(config.maxCases)
-        : null;
       // Wall-clock budget, entered in minutes, sent in seconds.
       const maxRuntimeS = config.maxRuntimeValue !== '' && config.maxRuntimeValue != null
         && parseFloat(config.maxRuntimeValue) > 0
@@ -7218,7 +7173,8 @@ function App() {
         eventLogFile: discoveryConfig.eventLogFile,
         maxSimTimeS,
         maxTraces,
-        maxCases,
+        // This limit is no longer offered in the UI; ignore saved legacy values.
+        maxCases: null,
         maxRuntimeS,
         // Send model/probs for the chosen mode
         ...(simModel  ? { modelOverride:       simModel }  : {}),
@@ -8406,26 +8362,31 @@ function App() {
       </header>
 
       {/* ── Model info banner — between header and tab bar ── */}
-      {workflowMode === 'external-ocel' && (externalTab === 'behavior' || externalTab === 'scenario') && (
-        <div style={{margin:'0.5rem 1.5rem 0',background:'#eff6ff',border:'1px solid #bfdbfe',
+      {workflowMode === 'external-ocel' && externalTab !== 'parameter' && (
+        <div role="note" aria-label="Model and simulation guidance" style={{margin:'0.5rem 1.5rem 0',background:'#eff6ff',border:'1px solid #bfdbfe',
           borderRadius:'8px',padding:'0.6rem 1rem',fontSize:'0.78rem',color:'#475569',lineHeight:1.6}}>
           <p style={{margin:'0 0 0.3rem'}}>
-            The model is loaded from previously discovered constraints from{' '}
-            <strong style={{color:'#1e293b'}}>{config.ocdeclareFile || '—'}</strong>{' '}
-            based on <strong style={{color:'#1e293b'}}>{discoveryConfig.eventLogFile || '—'}</strong>.
-            {' '}To edit, click on the respective field.
+            The model is loaded from constraints from{' '}
+            <strong style={{color:'#1e293b'}}>"{config.ocdeclareFile || '—'}"</strong>{' '}
+            based on <strong style={{color:'#1e293b'}}>"{discoveryConfig.eventLogFile || '—'}"</strong>.
           </p>
-          <p style={{margin:'0'}}>
-            To add constraints, configure in the <strong>Constraints</strong> section.{' '}
-            To add activities, configure in the <strong>Activities</strong> section.{' '}
-            To add objects, configure in the <strong>Object Creation/Deactivation</strong> section.{' '}
-            To remove constraints, activities or objects, click the removal button in their section.
-          </p>
-          {externalTab === 'scenario' && (
-            <p style={{margin:'0.35rem 0 0',paddingTop:'0.35rem',borderTop:'1px solid #bfdbfe'}}>
-              To run, go to the <strong>Results</strong> tab and configure <strong>Stop Conditions</strong> and <strong>Random Seed</strong>, then press{' '}
-              <strong>▶ Run Base Model</strong> or <strong>▶ Run Alternative Model</strong>.
-            </p>
+          {(externalTab === 'behavior' || externalTab === 'scenario') && (
+            <>
+              <div style={{marginTop:'0.5rem'}}><strong>How to change model:</strong></div>
+              <div>To edit, click on the respective field.</div>
+              <div><strong>Constraints:</strong> To add constraints, configure in the <strong>Constraints</strong> section.</div>
+              <div><strong>Activities:</strong> To add activities, configure in the <strong>Activities</strong> section.</div>
+              <div><strong>Objects:</strong> To add objects, configure in the <strong>Object Creation/Deactivation</strong> section.</div>
+              <div>To remove constraints, activities, or objects, click the removal button in their section.</div>
+              <p style={{margin:'0.5rem 0 0'}}>To run, go to the <strong>Simulation</strong> tab.</p>
+            </>
+          )}
+          {externalTab === 'results' && (
+            <div style={{marginTop:'0.5rem'}}>
+              <div>Optionally configure <strong>Max Start Activities</strong> and/or <strong>Stop Conditions</strong> to limit the simulation.</div>
+              <div>Set <strong>Random Seed</strong> as desired and press <strong>Run Base Model</strong>.</div>
+              <p style={{margin:'0.5rem 0 0'}}>If an <strong>Alternative Model</strong> has been set, unfold its box, configure it in the same way, and press <strong>Run Alternative Model</strong>.</p>
+            </div>
           )}
         </div>
       )}
@@ -8433,16 +8394,29 @@ function App() {
       {/* ── Main tab bar — only shown after landing page is complete ── */}
       {workflowMode === 'external-ocel' && externalTab !== 'parameter' && (
         <div className="main-tab-bar">
+          <div className={`main-tab-model-group${externalTab === 'behavior' || externalTab === 'scenario' ? ' active' : ''}`}>
+            <button
+              className={`main-tab-btn main-tab-btn--base${externalTab === 'behavior' ? ' active' : ''}`}
+              aria-current={externalTab === 'behavior' ? 'page' : undefined}
+              onClick={() => setExternalTab('behavior')}>
+              Base Model
+            </button>
+            <button
+              className={`main-tab-alternative${externalTab === 'scenario' ? ' active' : ''}`}
+              aria-current={externalTab === 'scenario' ? 'page' : undefined}
+              onClick={() => setExternalTab('scenario')}>
+              Alternative Model
+            </button>
+          </div>
           {[
-            { key: 'behavior',   label: 'Base Model' },
-            { key: 'scenario',   label: 'Alternative Model' },
-            { key: 'results',    label: 'Results' },
+            { key: 'results',    label: 'Simulation' },
             { key: 'evaluation', label: 'Evaluation', disabled: !evaluationReady },
           ].map(t => (
             <button key={t.key}
               className={`main-tab-btn${externalTab === t.key ? ' active' : ''}`}
+              aria-current={externalTab === t.key ? 'page' : undefined}
               disabled={t.disabled}
-              title={t.disabled ? 'Click Run Evaluation in the Results tab first' : undefined}
+              title={t.disabled ? 'Click Run Evaluation in the Simulation tab first' : undefined}
               onClick={() => !t.disabled && setExternalTab(t.key)}
               style={t.disabled ? {opacity:0.4, cursor:'not-allowed'} : {}}>
               {t.label}
@@ -9159,41 +9133,13 @@ function App() {
             {/* ── MODEL BEHAVIOR TAB ── */}
             {externalTab === 'behavior' && (
               <div className="ext-ocel-tab-content">
-                {/* Stat strip */}
-                <div className="behavior-stat-strip">
-                  {[
-                    { label: 'Events Analyzed', val: discoveryResults?.total_events?.toLocaleString(),            source: 'OCEL log' },
-                    { label: 'Object Traces',   val: discoveryResults?.log_object_trace_count?.toLocaleString(),  source: 'OCEL log' },
-                    { label: 'Activity Types',  val: discoveryResults?.activity_count,                            source: 'OCEL log' },
-                    { label: 'Transitions',     val: discoveryResults?.transition_count,                          source: 'OCEL log' },
-                    { label: 'Constraints',     val: modelAsIs?.constraints?.length,                              source: 'OC-Declare' },
-                    { label: 'Log Time Span',   val: (() => {
-                        const s = discoveryResults?.ocel_time_span_s;
-                        if (!s) return null;
-                        if (s < 60) return (Math.abs(s % 1) < 0.005 ? Math.round(s) : s.toFixed(2)) + 's';
-                        if (s < 3600) return Math.floor(s/60) + 'm';
-                        if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-                        const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
-                        return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
-                      })(), source: 'OCEL log' },
-                  ].filter(c => c.val != null).map((c, i) => (
-                    <div key={i} className="behavior-stat-card">
-                      <div className="behavior-stat-val">{c.val}</div>
-                      <div className="behavior-stat-label">{c.label}</div>
-                      {c.source && (
-                        <div style={{fontSize:'0.6rem',color: c.source === 'OC-Declare' ? '#6366f1' : '#94a3b8',marginTop:'2px',fontStyle:'italic'}}>
-                          {c.source}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
+                <ModelSummaryStrip discoveryResults={discoveryResults} model={modelAsIs} />
 
                 {!modelAsIs ? (
                   <div style={{padding:'2rem',textAlign:'center',color:'#94a3b8'}}>No model loaded yet.</div>
                 ) : (<>
                   {/* Constraint Flow Graph — above model editors */}
-                  {(modelAsIs.activities?.length > 0 || modelAsIs.constraints?.length > 0) && (
+                  {SHOW_CONSTRAINT_FLOW && (modelAsIs.activities?.length > 0 || modelAsIs.constraints?.length > 0) && (
                     <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
                       <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
                         Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— approximated possible routes</span>
@@ -9517,6 +9463,7 @@ function App() {
             {/* ── SCENARIO BUILDER TAB ── */}
             {externalTab === 'scenario' && (
               <div className="ext-ocel-tab-content">
+                <ModelSummaryStrip discoveryResults={discoveryResults} model={modelToBe} />
 
                 {/* Changes vs Base Model — top of tab */}
                 {modelToBe && modelAsIs && (
@@ -9549,7 +9496,7 @@ function App() {
                 })()}
 
                 {/* Constraint Flow Graph — above model editors */}
-                {modelToBe && (modelToBe.activities?.length > 0 || modelToBe.constraints?.length > 0) && (
+                {SHOW_CONSTRAINT_FLOW && modelToBe && (modelToBe.activities?.length > 0 || modelToBe.constraints?.length > 0) && (
                   <div style={{marginBottom:'1rem',background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem'}}>
                     <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>
                       Constraint Flow <span style={{fontSize:'0.7rem',fontWeight:400,color:'#94a3b8'}}>— approximated possible routes</span>
@@ -9801,7 +9748,6 @@ function App() {
                       <div style={{color:'#94a3b8',fontSize:'0.85rem',padding:'2rem',textAlign:'center'}}>Run discoveries first to populate the model.</div>
                     )}
 
-                    {/* Constraint Flow Graph — always shown when activities/constraints exist */}
                   </div>
                   {false && <Collapsible
                       className="postprocessing-result-section"
@@ -9963,53 +9909,51 @@ function App() {
             )}{/* end scenario tab */}
 
             {/* ── RESULTS TAB ── */}
-            {externalTab === 'results' && (
+            <SimulationLayout active={externalTab === 'results'}
+              setBaseStartFolded={setBaseStartFolded} setAltStartFolded={setAltStartFolded}>
+            {({ alternativeOpen, toggleAlternative }) => externalTab === 'results' && (
               <div className="ext-ocel-tab-content">
 
                 {/* Simulation controls */}
                 <div style={{background:'white',border:'1px solid #e2e8f0',borderRadius:'10px',padding:'1rem',marginBottom:'1.25rem'}}>
-                  <div className="behavior-section-title" style={{marginBottom:'0.75rem'}}>Simulation</div>
+                  <div className="simulation-controls-heading">
+                    <div className="behavior-section-title">Simulation</div>
+                    <button type="button" className="simulation-alternative-toggle"
+                      aria-expanded={alternativeOpen}
+                      aria-controls="simulation-alternative-warnings simulation-alternative-options simulation-alternative-run simulation-alternative-results"
+                      onClick={toggleAlternative}>
+                      <span aria-hidden="true">{alternativeOpen ? '▾' : '▸'}</span>
+                      {alternativeOpen ? 'Hide Alternative Model' : 'Show Alternative Model'}
+                    </button>
+                  </div>
 
                   <ObjectLifecycleWarning issues={baseModelWarnings.lifecycleIssues} label="Base Model" />
-                  <ObjectLifecycleWarning issues={alternativeModelWarnings.lifecycleIssues} label="Alternative Model" />
+                  <div id="simulation-alternative-warnings" hidden={!alternativeOpen}>
+                    <ObjectLifecycleWarning issues={alternativeModelWarnings.lifecycleIssues} label="Alternative Model" />
+                  </div>
 
-                  {/* Run buttons + start activities — two-column layout aligned per model */}
-                  <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem',alignItems:'flex-start'}}>
+                  {/* Alternative settings and results share one disclosure. */}
+                  <div className="simulation-model-controls">
 
                     {/* ── Base Model ── */}
-                    <div style={{flex:1,display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                      {(() => {
-                        const missing = (modelBase?.activities||[])
-                          .map(a => a.name)
-                          .filter(n => { const d = (modelBase?.activity_durations||{})[n]; return !d || !d.sample_count; });
-                        const noTiming = missing.length > 0;
-                        const blocked = noTiming || baseModelWarnings.hasBlockingModelIssues;
-                        return (<>
-                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
-                            disabled={isSimulating || !modelBase || blocked}
-                            title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}`
-                              : baseModelWarnings.hasBlockingModelIssues ? `Cannot run: missing object bindings for ${baseModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
-                              : undefined}
-                            onClick={() => runSimulation('asis')}>
-                            {simulatingMode==='asis' ? 'Running…' : '▶ Run Base Model'}
-                          </button>
-                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
-                        </>);
-                      })()}
+                    <div className="simulation-model-options">
+                      {alternativeOpen && <div className="simulation-model-options-title">Base Model</div>}
+                      <p className="simulation-step-help">1st set which and how many start activities are possible</p>
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
                         <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
                           <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
-                          <button onClick={() => setBaseStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
-                            {baseStartFolded ? '▶' : '▼'}
+                          <button type="button" className="start-activities-toggle"
+                            aria-expanded={!baseStartFolded} aria-controls="base-start-activity-choices"
+                            onClick={() => setBaseStartFolded(f => !f)}>
+                            {baseStartFolded ? '▸ Choose activities' : '▾ Hide choices'}
                           </button>
                         </div>
-                        <div style={{display:'flex',gap:'0.35rem',flexWrap:'wrap',marginBottom:'0.4rem'}}>
+                        <div id="base-start-activity-choices" className="start-activity-choices" hidden={baseStartFolded}>
                           {(() => {
                             const cands = startActivityCandidates.length > 0 ? startActivityCandidates
                               : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
                               : (modelBase?.activities||[]).map(a => ({activity:a.name,pct:null})));
-                            const visible = baseStartFolded ? cands.filter(c => config.startActivities.includes(c.activity)) : cands;
-                            return visible.map((c, i) => {
+                            return cands.map((c, i) => {
                               const sel = config.startActivities.includes(c.activity);
                               return (
                                 <button key={c.activity}
@@ -10071,43 +10015,24 @@ function App() {
                     </div>
 
                     {/* ── Alternative Model ── */}
-                    <div style={{flex:1,display:'flex',flexDirection:'column',gap:'0.5rem'}}>
-                      {(() => {
-                        const missing = (modelToBe?.activities||[])
-                          .map(a => a.name)
-                          .filter(n => { const d = (modelToBe?.activity_durations||{})[n]; return !d || !d.sample_count; });
-                        const noTiming = missing.length > 0;
-                        const noBaseline = !resultsAsIs;
-                        const blocked = noTiming || alternativeModelWarnings.hasBlockingModelIssues;
-                        const tooltipMsg = noTiming
-                          ? `Cannot run: missing timing data for: ${missing.join(', ')}`
-                          : alternativeModelWarnings.hasBlockingModelIssues
-                            ? `Cannot run: missing object bindings for ${alternativeModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
-                          : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
-                        return (<>
-                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
-                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || blocked}
-                            title={tooltipMsg}
-                            onClick={() => runSimulation('tobe')}>
-                            {simulatingMode==='tobe' ? 'Running…' : '▶ Run Alternative Model'}
-                          </button>
-                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
-                        </>);
-                      })()}
+                    <div id="simulation-alternative-options" className="simulation-model-options" hidden={!alternativeOpen}>
+                      <div className="simulation-model-options-title">Alternative Model</div>
+                      <p className="simulation-step-help">1st set which and how many start activities are possible</p>
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
                         <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
                           <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
-                          <button onClick={() => setAltStartFolded(f => !f)} style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.7rem',color:'#94a3b8',padding:'0 2px',lineHeight:1}}>
-                            {altStartFolded ? '▶' : '▼'}
+                          <button type="button" className="start-activities-toggle"
+                            aria-expanded={!altStartFolded} aria-controls="alternative-start-activity-choices"
+                            onClick={() => setAltStartFolded(f => !f)}>
+                            {altStartFolded ? '▸ Choose activities' : '▾ Hide choices'}
                           </button>
                         </div>
-                        <div style={{display:'flex',gap:'0.35rem',flexWrap:'wrap',marginBottom:'0.4rem'}}>
+                        <div id="alternative-start-activity-choices" className="start-activity-choices" hidden={altStartFolded}>
                           {(() => {
                             const cands = startActivityCandidates.length > 0 ? startActivityCandidates
                               : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
                               : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
-                            const visible = altStartFolded ? cands.filter(c => tobeStartActivities.includes(c.activity)) : cands;
-                            return visible.map((c, i) => {
+                            return cands.map((c, i) => {
                               const sel = tobeStartActivities.includes(c.activity);
                               return (
                                 <button key={c.activity}
@@ -10167,6 +10092,7 @@ function App() {
                   </div>
 
                   {/* Stop conditions */}
+                  <p className="simulation-step-help simulation-stop-help">2nd set Stop conditions when simulator should terminate if certain event count, simulated time or runtime reached</p>
                   <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
                     <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
                       Stop conditions
@@ -10221,30 +10147,6 @@ function App() {
                         })()}
                       </div>
                       <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
-                        {/* "Start cases": the counter is state._start_event_count,
-                            incremented when an event of a configured start
-                            activity fires — cases begun, not finished. The API
-                            field stays `completed_cases` (wire format, not
-                            user-facing). */}
-                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Start cases -Dev</span>
-                        <input type="text" inputMode="numeric" value={config.maxCases ?? ''}
-                          placeholder="e.g. 100"
-                          onChange={e => handleConfigChange('maxCases', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
-                          disabled={isSimulating}
-                          style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                        {(() => {
-                          const logCaseCount = (config.startActivities || []).reduce((sum, act) => sum + (discoveryResults?.activity_counts?.[act] || 0), 0);
-                          return logCaseCount > 0 ? (
-                            <button
-                              style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
-                              onClick={() => handleConfigChange('maxCases', logCaseCount)}
-                              disabled={isSimulating}
-                              title="Use log case count as limit"
-                            >{logCaseCount.toLocaleString()} in log</button>
-                          ) : null;
-                        })()}
-                      </div>
-                      <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
                         {/* Wall-clock budget. Unlike the limits above it is about
                             the machine, not the model — it stops mid-process
                             wherever the clock runs out. */}
@@ -10274,49 +10176,63 @@ function App() {
                     </div>
                   </div>
 
+                  <div className="simulation-model-controls simulation-run-actions">
+                    <div className="simulation-model-options">
+                      {(() => {
+                        const missing = (modelBase?.activities||[])
+                          .map(a => a.name)
+                          .filter(n => { const d = (modelBase?.activity_durations||{})[n]; return !d || !d.sample_count; });
+                        const noTiming = missing.length > 0;
+                        const blocked = noTiming || baseModelWarnings.hasBlockingModelIssues;
+                        return (<>
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem',background: simulatingMode==='asis' ? '#1e293b' : '#334155', opacity: (isSimulating && simulatingMode!=='asis') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelBase || blocked}
+                            title={noTiming ? `Cannot run: missing timing data for: ${missing.join(', ')}`
+                              : baseModelWarnings.hasBlockingModelIssues ? `Cannot run: missing object bindings for ${baseModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
+                              : undefined}
+                            onClick={() => runSimulation('asis')}>
+                            {simulatingMode==='asis' ? 'Running…' : '▶ Run Base Model'}
+                          </button>
+                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
+                        </>);
+                      })()}
+                    </div>
+                    <div id="simulation-alternative-run" className="simulation-model-options" hidden={!alternativeOpen}>
+                      {(() => {
+                        const missing = (modelToBe?.activities||[])
+                          .map(a => a.name)
+                          .filter(n => { const d = (modelToBe?.activity_durations||{})[n]; return !d || !d.sample_count; });
+                        const noTiming = missing.length > 0;
+                        const noBaseline = !resultsAsIs;
+                        const blocked = noTiming || alternativeModelWarnings.hasBlockingModelIssues;
+                        const tooltipMsg = noTiming
+                          ? `Cannot run: missing timing data for: ${missing.join(', ')}`
+                          : alternativeModelWarnings.hasBlockingModelIssues
+                            ? `Cannot run: missing object bindings for ${alternativeModelWarnings.bindingWarnings.map(a => a.name).join(', ')}`
+                          : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
+                        return (<>
+                          <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
+                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || blocked}
+                            title={tooltipMsg}
+                            onClick={() => runSimulation('tobe')}>
+                            {simulatingMode==='tobe' ? 'Running…' : '▶ Run Alternative Model'}
+                          </button>
+                          {noTiming && <div style={{fontSize:'0.72rem',color:'#dc2626',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:'6px',padding:'0.35rem 0.6rem'}}>⚠ No timing data for: {missing.join(', ')}</div>}
+                        </>);
+                      })()}
+                    </div>
+                  </div>
+
                   {/* Progress */}
                   {isSimulating && (
                     <div className="loading-box" style={{padding:'1.5rem',marginTop:'0.75rem'}}>
                       <div className="spinner"></div>
-                      {/* Simulated time leads: it is what the run is measured
-                          in, and what the stop conditions are usually set on.
-                          Completed events moved to the secondary line below,
-                          where simulated time used to sit. */}
-                      <p>Running… <span className="sim-step-counter">
-                        {liveSimTime == null ? 'starting…' : (() => {
-                          const s = liveSimTime;
-                          const fmt = s < 60     ? `${Math.floor(s)}s`
-                                    : s < 3600   ? `${Math.floor(s/60)}m ${Math.floor(s%60)}s`
-                                    : s < 86400  ? `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`
-                                    : `${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
-                          const cap = (config.maxSimTimeValue !== '' && config.maxSimTimeValue != null)
-                            ? ` / ${config.maxSimTimeValue} ${config.maxSimTimeUnit ?? 'days'}` : '';
-                          return `simulated time ${fmt}${cap}`;
-                        })()}
-                      </span></p>
+                      <p>Running…</p>
+                      <SimulationElapsedTime seconds={liveSimTime} limit={config.maxSimTimeValue} unit={config.maxSimTimeUnit ?? 'days'} />
                       <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
                         {'completed events '}{(liveStepCount ?? 0).toLocaleString()}
                       </p>
-                      {/* Start-cases readout — hidden from the tracker. The value
-                          is still polled into liveCases and the "Start cases -Dev"
-                          stop condition still works; this was only the live line.
-                          Counts state._start_event_count, incremented in
-                          SimulationState.record_event when an event of a configured
-                          start activity is recorded. Re-enable by uncommenting.
-                      {liveCases != null && liveCases > 0 && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                          {'start cases -Dev: '}{liveCases.toLocaleString()}
-                          {config.maxCases !== '' && config.maxCases != null ? ` / ${config.maxCases}` : ''}
-                          <span
-                            className="help-hint"
-                            data-help="A case is one firing of a start activity — the event that opens a new process instance. The counter goes up by one each time an activity listed under Start Activities fires, so it counts cases begun, not cases finished."
-                            aria-label="What is a start case?"
-                            role="img"
-                          >?</span>
-                        </p>
-                      )}
-                      */}
-                      <p className="sim-elapsed-timer">{(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
+                      <p className="sim-elapsed-timer">Runtime: {(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
                       {liveActiveObjects != null && (
                         <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>{liveActiveObjects.toLocaleString()} active objects</p>
                       )}
@@ -10360,7 +10276,7 @@ function App() {
                     <div style={{background:'#f0fdf4',border:'1px solid #86efac',borderRadius:'8px',padding:'0.9rem 1rem',display:'flex',alignItems:'center',justifyContent:'space-between',gap:'1rem',marginTop:'0.75rem'}}>
                       <div>
                         <div style={{fontWeight:700,color:'#166534',fontSize:'0.9rem'}}>
-                          ✓ {lastCompletedMode === 'asis' ? 'Base Model' : 'Alternative Model'} simulation complete
+                          ✓ {lastCompletedMode === 'asis' ? 'Base Model' : 'Alternative Model'} simulation stopped
                         </div>
                         {lastRunDuration != null && (
                           <div style={{fontSize:'0.75rem',color:'#15803d',marginTop:'0.15rem'}}>
@@ -10373,7 +10289,7 @@ function App() {
                 </div>
 
                 {/* ── Comparison header (only when both runs exist) ── */}
-                {resultsAsIs && resultsToBe && (() => {
+                {alternativeOpen && resultsAsIs && resultsToBe && (() => {
                   const fmtDur = s => {
                     if (s == null) return '—';
                     if (s < 60) return Math.round(s) + 's';
@@ -10512,7 +10428,9 @@ function App() {
 
                 <div className="results-compare-layout">
                   {[{label:'Base Model', r:resultsAsIs, objTab:objTabAsIs, setObjTab:setObjTabAsIs}, {label:'Alternative Model', r:resultsToBe, objTab:objTabToBe, setObjTab:setObjTabToBe}].map(({label, r, objTab, setObjTab}) => (
-                    <div key={label} className="run-result-panel">
+                    <div key={label} className="run-result-panel"
+                      id={label === 'Alternative Model' ? 'simulation-alternative-results' : undefined}
+                      hidden={label === 'Alternative Model' && !alternativeOpen}>
                       <div className="run-result-panel-header">{label}</div>
                       {!r ? (
                         <div className="run-result-placeholder">Run {label} to see results here</div>
@@ -10529,7 +10447,7 @@ function App() {
                                 <div className="stat-label">Activity Types</div>
                               </div>
                               <div className="stat-card" title="Total number of objects created across all object types during this simulation run."><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
-                              {r.sim_time_s!=null&&<div className="stat-card" title="Total simulated time elapsed from the first to the last event in the simulation."><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Sim Time</div></div>}
+                              {r.sim_time_s!=null&&<div className="stat-card" title="Total simulated time elapsed from the first to the last event in the simulation."><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Simulated time</div></div>}
                               {r.case_tracker && Object.keys(r.case_tracker).length > 0 && (()=>{
                                 const ct = r.case_tracker;
                                 const totalCases = Object.values(ct).reduce((s,v)=>s+v.case_count,0);
@@ -10803,7 +10721,8 @@ function App() {
                   ))}
                 </div>
               </div>
-            )}{/* end results tab */}
+            )}
+            </SimulationLayout>{/* end results tab */}
 
             {/* ── EVALUATION TAB ── */}
             <div className="ext-ocel-tab-content" style={{display: externalTab === 'evaluation' ? undefined : 'none'}}>
@@ -12091,7 +12010,7 @@ function App() {
 
           {results && !isSimulating && (
             <div className="results-box">
-              <h3>Simulation Complete</h3>
+              <h3>Simulation Stopped</h3>
 
               {(() => {
                 const firedTypes = results.activity_sequence

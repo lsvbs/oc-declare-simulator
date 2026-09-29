@@ -1,10 +1,29 @@
 .notebook-evaluation { color: #334155; padding: 4px 0; }
 .notebook-heading, .notebook-run-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
 .notebook-heading h2, .notebook-run-heading h3 { margin: 0 0 4px; }
+.notebook-run-heading h3 { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.notebook-run-heading button { flex-shrink: 0; }
+.notebook-log-counts { color: #64748b; font-size: 13px; line-height: 1.6; margin: 12px 0; }
+.notebook-log-counts p { margin: 2px 0; }
 .notebook-heading p, .notebook-run-heading p { color: #64748b; font-size: 13px; margin: 0; overflow-wrap: anywhere; }
 .notebook-evaluation button { border: 1px solid #cbd5e1; background: white; color: #334155; border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
 .notebook-evaluation button:hover { background: #f1f5f9; }
 .notebook-evaluation button:disabled { opacity: .45; cursor: default; }
+.notebook-summary { margin: 18px 0 22px; }
+.notebook-summary-heading { margin: 0 0 10px; font-size: 15px; }
+.notebook-summary-primary, .notebook-summary-comparison { display: grid; gap: 10px; }
+.notebook-summary-primary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.notebook-summary-comparison { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 10px; }
+.notebook-summary-card { min-width: 0; padding: 14px; background: #fff; border: 1px solid #e2e8f0; border-radius: 9px; }
+.notebook-summary-card h3 { margin: 0; font-size: 13px; line-height: 1.5; color: #334155; }
+.notebook-summary-note { margin: 3px 0 0; font-size: 11px; color: #64748b; }
+.notebook-measure-scale { margin: 10px 0; padding: 6px 8px; border-radius: 5px; background: #f1f5f9; color: #475569; font-size: 12px; line-height: 1.5; }
+.notebook-summary-card .notebook-measure-scale { margin-bottom: 0; }
+.notebook-summary-card dl { display: grid; gap: 12px; margin: 16px 0 0; }
+.notebook-summary-value { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 3px 8px; }
+.notebook-summary-value dt { color: #64748b; font-size: 11px; }
+.notebook-summary-value dd { margin: 0; color: #1e293b; font-size: 18px; line-height: 1.3; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.notebook-summary-value.is-emphasized dd { font-size: 26px; color: #2563eb; }
 .notebook-controls { display: flex; gap: 16px; flex-wrap: wrap; margin: 20px 0 12px; }
 .notebook-controls label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; max-width: 100%; }
 .notebook-controls select { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px; color: #334155; background: white; max-width: min(500px, 100%); }
@@ -27,7 +46,20 @@
 .notebook-notice { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 14px; border-radius: 7px; font-size: 13px; }
 .notebook-error { background: #fef2f2; color: #b91c1c; padding: 12px; border-radius: 7px; }
 .notebook-pagination { display: flex; gap: 12px; align-items: center; font-size: 12px; }
-.notebook-anchor-settings textarea { display: block; width: min(600px, 100%); box-sizing: border-box; margin-bottom: 8px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px; }
 .notebook-radar { margin: 12px auto; max-width: 600px; text-align: center; }
 .notebook-radar svg { display: block; width: 100%; height: auto; }
+.notebook-radar-plot { position: relative; }
+.notebook-radar-axis { cursor: help; }
+.notebook-radar-axis text { text-decoration: underline dotted; text-underline-offset: 3px; }
+.notebook-radar-axis:focus { outline: none; }
+.notebook-radar-axis:focus-visible text { fill: #1d4ed8; text-decoration: underline; }
+.notebook-radar-tooltip { position: absolute; z-index: 1; box-sizing: border-box; width: 260px; max-width: calc(100% - 16px); padding: 10px 12px; border-radius: 7px; background: #1e293b; color: #fff; box-shadow: 0 4px 12px #0f172a26; font-size: 12px; line-height: 1.5; text-align: left; pointer-events: none; }
+.notebook-radar-tooltip strong { display: block; margin-bottom: 3px; }
 @media (max-width: 640px) { .notebook-run { padding: 12px; } .notebook-controls { flex-direction: column; } }
+@media (max-width: 700px) {
+  .notebook-summary-primary, .notebook-summary-comparison { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .notebook-summary-comparison > :last-child { grid-column: 1 / -1; }
+}
+@media (max-width: 400px) {
+  .notebook-summary-primary, .notebook-summary-comparison { grid-template-columns: minmax(0, 1fr); }
+}
