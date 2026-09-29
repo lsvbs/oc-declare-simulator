@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from itertools import product as _product
+from itertools import chain, product as _product
 from typing import Any, Optional
 
 from Backend.src.Simulation.Domain.ir import StaticModel
@@ -113,6 +113,39 @@ def _matches_objects(object_ids, required, anys):
     return required.issubset(ids) and all(ids.intersection(group) for group in anys)
 
 
+class _ProjectedEvents(tuple):
+    """Indexed reservation snapshot, used only within one admission check.
+
+    Positions preserve the original order and duplicate events, including the
+    legacy untimed fallback. No results survive a change to simulation state.
+    """
+
+    def __init__(self, events):
+        self._by_object = {}
+        self._by_activity = {}
+        self._matches = {}
+        for position, event in enumerate(self):
+            self._by_activity.setdefault(event.activity_name, []).append(position)
+            for oid in set(event.object_ids):
+                self._by_object.setdefault(oid, []).append(position)
+
+    def matching(self, required, anys, activity=None):
+        key = (frozenset(required), tuple(anys), activity)
+        if key in self._matches:
+            return self._matches[key]
+        pools = [self._by_object.get(oid, ()) for oid in required]
+        if activity is not None:
+            pools.append(self._by_activity.get(activity, ()))
+        for group in anys:
+            pools.append(sorted({i for oid in group for i in self._by_object.get(oid, ())}))
+        positions = min(pools, key=len) if pools else range(len(self))
+        result = tuple(self[i] for i in positions
+                       if (activity is None or self[i].activity_name == activity)
+                       and _matches_objects(self[i].object_ids, required, anys))
+        self._matches[key] = result
+        return result
+
+
 def _scope_events(state, required, anys, activity=None, extra=()):
     """Filter objects before nearest-time selection; retain equal-time ties."""
     pools = [state._events_by_object.get(oid, ()) for oid in required]
@@ -122,7 +155,9 @@ def _scope_events(state, required, anys, activity=None, extra=()):
         pool = {e.event_id: e for oid in group for e in state._events_by_object.get(oid, ())}
         pools.append(list(pool.values()))
     pool = min(pools, key=len) if pools else state.executed_events
-    return [e for e in [*pool, *extra]
+    if isinstance(extra, _ProjectedEvents):
+        extra = extra.matching(required, anys, activity)
+    return [e for e in chain(pool, extra)
             if (activity is None or e.activity_name == activity)
             and _matches_objects(e.object_ids, required, anys)]
 
@@ -141,6 +176,23 @@ def _precedence_counts(constraint, candidate, state, scope_ids_cache=None, direc
     timestamp = getattr(candidate, 'evaluation_timestamp', None)
     extra = getattr(candidate, 'projected_events', ())
     for required, anys in _scope_assignments(candidate, state, constraint.scope, scope_ids_cache):
+        if not direct and timestamp is None and not extra:
+            # Untimed candidate generation counts the whole completed history.
+            # The maintained event-ID indexes encode the same joint filter;
+            # avoid reconstructing event/object sets for every repeated EP test.
+            # Sampled timestamps and direct windows still take the full path.
+            pools = [state._event_ids_by_act_obj.get((constraint.source_activity, oid), _EMPTY_SET)
+                     for oid in required]
+            for group in anys:
+                pools.append(set().union(*(state._event_ids_by_act_obj.get(
+                    (constraint.source_activity, oid), _EMPTY_SET) for oid in group)))
+            if not pools:
+                yield len(state._events_by_activity.get(constraint.source_activity, ()))
+            else:
+                smallest = min(pools, key=len)
+                # Never mutate the index sets owned by SimulationState.
+                yield len(smallest.intersection(*pools)) if len(pools) > 1 else len(smallest)
+            continue
         events = _scope_events(state, required, anys,
                                None if direct else constraint.source_activity, extra)
         if timestamp is not None:
@@ -376,7 +428,10 @@ def check_chain_response(constraint: Any, candidate: Any, state: SimulationState
                             for e in state._events_by_act_obj.get((constraint.source_activity, oid), ())}.values())
     else:
         activations = list(state._events_by_activity.get(constraint.source_activity, ()))
-    activations.extend(e for e in extra if e.activity_name == constraint.source_activity)
+    if isinstance(extra, _ProjectedEvents):
+        activations.extend(extra.matching(frozenset(), (), constraint.source_activity))
+    else:
+        activations.extend(e for e in extra if e.activity_name == constraint.source_activity)
     # A new source cannot be admitted if already scheduled work would
     # immediately violate it. Its newly created objects have no scheduled work.
     if timestamp is not None and candidate.activity_name == constraint.source_activity:
@@ -785,10 +840,18 @@ def check_temporal_schedule(static_model, candidate, state, complete_at):
         'precedence', 'chain_precedence', 'direct_precedence', 'chain_response', 'direct_response')]
     if not temporal:
         return True
-    temporal_model = replace(static_model, constraints=temporal, _constraints_by_activity={})
-    projected = tuple(SimpleNamespace(event_id=('running', i), activity_name=p.candidate_activity_name,
+    projected = _ProjectedEvents(SimpleNamespace(event_id=('running', i), activity_name=p.candidate_activity_name,
                       object_ids=p.participating_object_ids, timestamp=p.complete_at)
                       for i, p in enumerate(state.in_progress))
+    # Precedence checkers can only reject their target activity. DF can reject
+    # intervening activities too, so it must remain in every proposed check.
+    activities = {candidate.activity_name, *(e.activity_name for e in projected)}
+    backward_index = {a: [c for c in temporal if c.constraint_type in (
+        'precedence', 'chain_precedence', 'direct_precedence') and c.target_activity == a]
+        for a in activities}
+    temporal_index = {a: [c for c in temporal if c.constraint_type in (
+        'chain_response', 'direct_response') or c.target_activity == a] for a in activities}
+    temporal_model = replace(static_model, constraints=temporal, _constraints_by_activity=temporal_index)
     proposed = replace(candidate, evaluation_timestamp=complete_at, projected_events=projected)
     if not check_all_constraints(temporal_model, proposed, state):
         return False
@@ -797,11 +860,14 @@ def check_temporal_schedule(static_model, candidate, state, complete_at):
     # A new completion may intervene before a DP target already scheduled on
     # another member of an Any group (or in a global scope).
     backward_model = replace(temporal_model, constraints=[c for c in temporal if c.constraint_type in (
-        'precedence', 'chain_precedence', 'direct_precedence')])
+        'precedence', 'chain_precedence', 'direct_precedence')], _constraints_by_activity=backward_index)
+    with_proposed = _ProjectedEvents((*projected, extra))
     for event in projected:
+        if not backward_index[event.activity_name]:
+            continue
         pending = Candidate(event.activity_name, event.object_ids,
                             evaluation_timestamp=event.timestamp,
-                            projected_events=(*projected, extra))
+                            projected_events=with_proposed)
         if not check_all_constraints(backward_model, pending, state):
             return False
     return True

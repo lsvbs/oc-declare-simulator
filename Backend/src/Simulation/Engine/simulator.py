@@ -999,6 +999,12 @@ class Simulator:
 
     def _inject_response_candidates(self, candidates, seen_keys, state, pool_cache):
         """Offer complete response bindings without bypassing normal checks."""
+        # Several activations may require the same binding. State is read-only
+        # throughout this pass, so reuse its deterministic validation/search.
+        # Keep building each candidate: creation-count sampling must consume
+        # exactly the same RNG draws. Discard this cache before any start or
+        # completion changes histories, attributes, links, locks or obligations.
+        binding_cache = {}
         for key in list(state._obligations_ready):
             obligation = state._response_obligations.get(key)
             if obligation is None or not obligation.possible(state.objects):
@@ -1028,7 +1034,13 @@ class Simulator:
                     force_object_ids=forced, pool_cache=pool_cache, rng=self.rng,
                 )
                 if candidate is not None:
-                    candidate = self._valid_candidate_binding(activity, candidate, state)
+                    binding_key = (candidate.activity_name,
+                                   tuple(candidate.participating_object_ids),
+                                   tuple(candidate.object_types_to_create),
+                                   tuple(candidate.required_object_ids))
+                    if binding_key not in binding_cache:
+                        binding_cache[binding_key] = self._valid_candidate_binding(activity, candidate, state)
+                    candidate = binding_cache[binding_key]
                 if (candidate is None or not obligation.matches(candidate.participating_object_ids)
                         or not self._objects_free(candidate, state)):
                     continue

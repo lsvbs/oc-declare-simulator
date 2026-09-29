@@ -84,6 +84,8 @@ def _find_objects_preferring_linked(
     incrementally alongside its participating-ids list) — avoids rebuilding
     a set from scratch on every one of the many calls made per candidate.
     """
+    if count == 0:
+        return []
     if not participating_set or not state._links_by_object:
         return existing_ids[:count]
 
@@ -94,6 +96,8 @@ def _find_objects_preferring_linked(
         neighbors = state._links_by_object.get(oid)
         if neighbors and not neighbors.isdisjoint(participating_set):
             linked_ids.append(oid)
+            if len(linked_ids) == count:
+                return linked_ids
         else:
             unlinked_ids.append(oid)
 
@@ -223,7 +227,7 @@ def build_candidate_for_activity(
                 if _fobj is None or not _fobj.active:
                     return None
             existing_ids = list(forced) + [
-                oid for oid in find_active_objects_of_type(state, binding.object_type)
+                oid for oid in find_active_objects_of_type(state, binding.object_type, cache=pool_cache)
                 if oid not in forced
             ]
         else:
