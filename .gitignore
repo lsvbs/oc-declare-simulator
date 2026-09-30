@@ -8,22 +8,32 @@ node_modules/
 .env
 .claude/settings.local.json
 
-# Input/output data files (keep folders via .gitkeep)
-# eventlog/: ignore generated/example OCEL logs, but keep the container
-# logistics input log and the arrow-semantics constructed test fixtures.
-Backend/src/Simulation/IO/input/eventlog/*.xml
-Backend/src/Simulation/IO/input/eventlog/*.json
-!Backend/src/Simulation/IO/input/eventlog/container_logistics.json
-!Backend/src/Simulation/IO/input/eventlog/Example_OCEL_arrow_*.json
-Backend/src/Simulation/IO/input/ocdeclare/*.json
-Backend/src/Simulation/IO/input/ocdeclare/*.txt
-Backend/src/Simulation/IO/input/parameters/*.json
-Backend/src/Simulation/IO/output/eventlogs/*.json
+# Local agent worktrees must not be included as nested Git repositories.
+/.claude/worktrees/
 
-# Simulation metrics output (can be very large — regenerated on each run)
-Backend/metrics/*.json
-Backend/metrics/*.jsonl
+# Ignore JSON data, but retain the frontend dependency manifests.
+*.json
+!/Frontend/package.json
+!/Frontend/package-lock.json
+
+# Input data: ignore all formats, including files without extensions.
+/Backend/src/Simulation/IO/input/eventlog/*
+!/Backend/src/Simulation/IO/input/eventlog/.gitkeep
+!/Backend/src/Simulation/IO/input/eventlog/container_logistics.json
+!/Backend/src/Simulation/IO/input/eventlog/Example_OCEL_Demonstration_10_manuscripts.json
+/Backend/src/Simulation/IO/input/ocdeclare/*
+!/Backend/src/Simulation/IO/input/ocdeclare/.gitkeep
+/Backend/src/Simulation/IO/input/parameters/*
+!/Backend/src/Simulation/IO/input/parameters/.gitkeep
+
+# Generated logs and metrics. Keep the Python exporters in IO/output tracked.
+/Backend/src/Simulation/IO/output/eventlogs/*
+!/Backend/src/Simulation/IO/output/eventlogs/.gitkeep
+/Backend/metrics/
+/output/
+
+# Local timing/evaluation artifacts.
+/bpic_timing_rescue/
 
 # Frontend build output
 Frontend/dist/
-Backend/src/Simulation/IO/input/eventlog/*.jsonocel

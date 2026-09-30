@@ -1,0 +1,322 @@
+{
+  "eventTypes": [
+    {
+      "name": "Submit Manuscript",
+      "attributes": []
+    },
+    {
+      "name": "Review Manuscript",
+      "attributes": []
+    }
+  ],
+  "objectTypes": [
+    {
+      "name": "manuscript",
+      "attributes": []
+    }
+  ],
+  "objects": [
+    {
+      "id": "m1",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m2",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m3",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m4",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m5",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m6",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m7",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m8",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m9",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    },
+    {
+      "id": "m10",
+      "type": "manuscript",
+      "attributes": [],
+      "relationships": []
+    }
+  ],
+  "events": [
+    {
+      "id": "e1",
+      "type": "Submit Manuscript",
+      "time": "2026-01-01T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m1",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e2",
+      "type": "Submit Manuscript",
+      "time": "2026-01-02T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m1",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e3",
+      "type": "Review Manuscript",
+      "time": "2026-01-03T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m1",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e4",
+      "type": "Submit Manuscript",
+      "time": "2026-01-04T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m2",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e5",
+      "type": "Review Manuscript",
+      "time": "2026-01-05T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m2",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e6",
+      "type": "Review Manuscript",
+      "time": "2026-01-06T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m2",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e7",
+      "type": "Submit Manuscript",
+      "time": "2026-01-07T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m3",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e8",
+      "type": "Review Manuscript",
+      "time": "2026-01-08T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m4",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e9",
+      "type": "Submit Manuscript",
+      "time": "2026-01-09T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m5",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e10",
+      "type": "Review Manuscript",
+      "time": "2026-01-10T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m5",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e11",
+      "type": "Submit Manuscript",
+      "time": "2026-01-11T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m6",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e12",
+      "type": "Review Manuscript",
+      "time": "2026-01-12T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m6",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e13",
+      "type": "Submit Manuscript",
+      "time": "2026-01-13T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m7",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e14",
+      "type": "Review Manuscript",
+      "time": "2026-01-14T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m7",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e15",
+      "type": "Submit Manuscript",
+      "time": "2026-01-15T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m8",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e16",
+      "type": "Review Manuscript",
+      "time": "2026-01-16T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m8",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e17",
+      "type": "Submit Manuscript",
+      "time": "2026-01-17T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m9",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e18",
+      "type": "Review Manuscript",
+      "time": "2026-01-18T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m9",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e19",
+      "type": "Submit Manuscript",
+      "time": "2026-01-19T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m10",
+          "qualifier": "manuscript"
+        }
+      ]
+    },
+    {
+      "id": "e20",
+      "type": "Review Manuscript",
+      "time": "2026-01-20T09:00:00Z",
+      "attributes": [],
+      "relationships": [
+        {
+          "objectId": "m10",
+          "qualifier": "manuscript"
+        }
+      ]
+    }
+  ]
+}
