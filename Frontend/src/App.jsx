@@ -7,6 +7,8 @@ import ModelEditor from './ModelEditor';
 import { O2ODiagram, CONSTRAINT_HELP } from './ModelEditor';
 import { resolveStartActivityCaps } from './startActivityCounts.mjs';
 import { normalizeModelOrientation } from './modelOrientation.mjs';
+import ConstraintTypeSelect from './ConstraintTypeSelect';
+import { CONSTRAINT_TYPE_OPTIONS, constraintTypeLabel } from './constraintTypes.mjs';
 import EvaluationWrapper from './NotebookEvaluation';
 import ObjectLifecycleWarning from './ObjectLifecycleWarning';
 import { getModelWarnings } from './modelWarnings.mjs';
@@ -675,45 +677,6 @@ function HelpTip({ text }) {
       {visible && <span className="help-tip-popup">{text}</span>}
     </span>
   );
-}
-
-function ObjectRelationshipAudit({ rows }) {
-  if (!rows?.length) return null;
-  return <Collapsible className="logs-box" title="Object Relationship Audit" defaultOpen={false}>
-    <p>
-      Relationship counts at the end of this run. Active objects may still acquire
-      partners later; inactive objects have finished their lifecycle. These checks
-      are separate from OC-Declare conformance.
-    </p>
-    <div style={{ overflowX: 'auto' }}>
-      <table className="audit-table">
-        <thead>
-          <tr>
-            <th>Object → partner type</th>
-            <th className="audit-num">Partners per object</th>
-            <th className="audit-num">Objects checked</th>
-            <th className="audit-num">Below minimum (active)</th>
-            <th className="audit-num">Below minimum (inactive)</th>
-            <th className="audit-num">Above maximum</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => (
-            <tr key={i}>
-              <td className="audit-type">{row.source_type} → {row.target_type}</td>
-              <td className="audit-num">{row.min_links}–{row.max_links ?? '∞'}</td>
-              <td className="audit-num">{row.checked_object_count}</td>
-              <td className="audit-num" title={row.below_min_active_examples.join(', ')}>{row.below_min_active_count}</td>
-              <td className={`audit-num ${row.below_min_inactive_count ? 'audit-warn' : ''}`}
-                title={row.below_min_inactive_examples.join(', ')}>{row.below_min_inactive_count}</td>
-              <td className={`audit-num ${row.above_max_count ? 'audit-warn' : ''}`}
-                title={row.above_max_examples.join(', ')}>{row.above_max_count}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  </Collapsible>;
 }
 
 // ── Collapsible (reusable foldable section) ───────────────────────────────────
@@ -5522,9 +5485,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
 }
 
 
-const BEHAVIOR_CTYPES = ['precedence','not_precedence','response','not_coexistence','chain_precedence','chain_response',
-  'responded_existence','absence','exactly','init','exclusive_choice','succession','chain_succession',
-  'not_succession','not_chain_succession','alternate_response','alternate_precedence','alternate_succession'];
 const BEHAVIOR_SCOPE_KINDS = ['each','any','all'];
 const BEHAVIOR_SCOPE_KIND_OPTS = [
   {value:'each', label:'each — per individual object'},
@@ -5746,7 +5706,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
     <div>
       <div className="behavior-section-title">{constraints.length} Constraints
         <BehaviorLegend items={[
-          ['Type','The declarative constraint flavour (precedence, response, not_coexistence, chain variants, etc.)'],
+          ['Type','AS = Association; DP = Directly precedes; DF = Directly follows; EP = Eventually precedes; EF = Eventually follows.'],
           ['Source','The activity that triggers or must precede/follow'],
           ['Target','The activity being constrained relative to Source'],
           ['Object Type','The object type whose instances are tracked — constraint is evaluated per-instance of this type'],
@@ -5766,7 +5726,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
             dimensions={[
               {key:'activity',        label:'Activity',         options: actNames},
               ...(scopeTypes.length ? [{key:'object_type', label:'Object Type', options: scopeTypes}] : []),
-              ...(conTypes.length > 1 ? [{key:'constraint_type', label:'Type', options: conTypes}] : []),
+              ...(conTypes.length > 1 ? [{key:'constraint_type', label:'Type', options: conTypes, formatLabel: constraintTypeLabel}] : []),
             ]}
             filters={filters}
             onFiltersChange={onFiltersChange}
@@ -5780,7 +5740,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
             <thead>
               <tr>
                 {editMode && <th style={{width:'24px'}}/>}
-                <th><ColTip text="Declarative constraint flavour (precedence, response, not_coexistence, chain variants…). Hover a badge in a row for its full description.">Type</ColTip></th>
+                <th><ColTip text="AS = Association; DP = Directly precedes; DF = Directly follows; EP = Eventually precedes; EF = Eventually follows.">Type</ColTip></th>
                 <th><ColTip text="The activity that triggers or must precede/follow the target.">Source</ColTip></th>
                 <th><ColTip text="The activity being constrained relative to Source. Blank for unary constraints (absence, exactly, init).">Target</ColTip></th>
                 <th><ColTip text="The object type whose instances are tracked — constraint is evaluated per individual instance of this type.">Object Type</ColTip></th>
@@ -5814,7 +5774,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                   {rows.map(([bType, bInv], bIdx) => (
                   <tr key={bIdx} style={bIdx === 0 ? groupStyle : {...(rowBg?{background:rowBg}:{}), ...(isMulti?{borderLeft:'3px solid #6366f1'}:{})}}>
                     {bIdx === 0 && editMode && <td rowSpan={span}><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
-                    {bIdx === 0 && <td rowSpan={span}>{editMode ? sel(c.constraint_type, BEHAVIOR_CTYPES, v=>updateCon(origIdx,{constraint_type:v})) : (<><span className="con-type-badge">{c.constraint_type}</span>{isMulti && <span title={`Multi-type constraint: all ${span} bindings must hold jointly`} style={{marginLeft:'0.35rem',fontSize:'0.62rem',fontWeight:700,color:'#4338ca',background:'#eef2ff',border:'1px solid #c7d2fe',borderRadius:'3px',padding:'0 3px'}}>{span}×</span>}</>)}</td>}
+                    {bIdx === 0 && <td rowSpan={span}>{editMode ? <ConstraintTypeSelect value={c.constraint_type} onChange={e=>updateCon(origIdx,{constraint_type:e.target.value})} style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/> : (<><span className="con-type-badge" title={CONSTRAINT_HELP[c.constraint_type]}>{constraintTypeLabel(c.constraint_type)}</span>{isMulti && <span title={`Multi-type constraint: all ${span} bindings must hold jointly`} style={{marginLeft:'0.35rem',fontSize:'0.62rem',fontWeight:700,color:'#4338ca',background:'#eef2ff',border:'1px solid #c7d2fe',borderRadius:'3px',padding:'0 3px'}}>{span}×</span>}</>)}</td>}
                     {bIdx === 0 && <td rowSpan={span}>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>}
                     {bIdx === 0 && <td rowSpan={span}>{editMode
                       ? (isUnary(c.constraint_type) ? <span style={{color:'#94a3b8',fontSize:'0.75rem'}}>—</span>
@@ -5877,13 +5837,10 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
           <div style={{fontWeight:600,fontSize:'0.78rem',color:'#475569',marginBottom:'0.4rem'}}>Add Constraint</div>
           <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
             <div style={{display:'flex',gap:'0.4rem',flexWrap:'wrap',alignItems:'center',flex:1}}>
-              <select value={newCon.constraint_type} onChange={e=>{setNewCon(n=>({...n,constraint_type:e.target.value}));setConErrors(p=>({...p,constraint_type:false}));}}
+              <ConstraintTypeSelect value={newCon.constraint_type} onChange={e=>{setNewCon(n=>({...n,constraint_type:e.target.value}));setConErrors(p=>({...p,constraint_type:false}));}}
                 style={{fontSize:'0.75rem',padding:'1px 3px',borderRadius:'3px',
                   border:`1px solid ${conErrors.constraint_type ? '#ef4444' : '#cbd5e1'}`,
-                  color:newCon.constraint_type?'inherit':'#94a3b8'}}>
-                <option value="">constraint…</option>
-                {BEHAVIOR_CTYPES.map(o=><option key={o} value={o}>{o.replace(/_/g,' ')}</option>)}
-              </select>
+                  color:newCon.constraint_type?'inherit':'#94a3b8'}}/>
               <select value={newCon.source_activity} onChange={e=>{setNewCon(n=>({...n,source_activity:e.target.value}));setConErrors(p=>({...p,source_activity:false}));}}
                 style={{fontSize:'0.75rem',padding:'1px 3px',borderRadius:'3px',
                   border:`1px solid ${conErrors.source_activity ? '#ef4444' : '#cbd5e1'}`}}>
@@ -5968,7 +5925,7 @@ function TableFilterBar({ dimensions, filters, onFiltersChange, style={} }) {
               background: filters[dim.key] ? '#eff6ff' : 'white',
               borderColor: filters[dim.key] ? '#6366f1' : '#cbd5e1'}}>
             <option value="">All</option>
-            {dim.options.map(o => <option key={o} value={o}>{o}</option>)}
+            {dim.options.map(o => <option key={o} value={o}>{dim.formatLabel ? dim.formatLabel(o) : o}</option>)}
           </select>
         </label>
       ))}
@@ -10604,107 +10561,6 @@ function App() {
                                 </Collapsible>
                               );
                             })()}
-                            <ObjectRelationshipAudit rows={r.audit?.object_relationship_audit} />
-                            {/* Dev measures */}
-                            <Collapsible title="Dev measures" defaultOpen={false}>
-                              {/* Case Tracker */}
-                              {r.case_tracker && Object.keys(r.case_tracker).length > 0 && (() => {
-                                const fmtDur = s => {
-                                  if (s == null) return '—';
-                                  if (s < 60) return Math.round(s) + 's';
-                                  if (s < 3600) return Math.floor(s/60) + 'm ' + Math.floor(s%60) + 's';
-                                  if (s < 86400) return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
-                                  const d = Math.floor(s/86400); const h = Math.floor((s%86400)/3600);
-                                  return h > 0 ? d + 'd ' + h + 'h' : d + 'd';
-                                };
-                                const fmtTs = ts => ts ? ts.replace('T', ' ').replace(/\.\d+.*$/, '') : '—';
-                                const entries = Object.entries(r.case_tracker);
-                                const totalCases = entries.reduce((s,[,v])=>s+v.case_count,0);
-                                const totalDone = entries.reduce((s,[,v])=>s+v.completed,0);
-                                const overallRate = totalCases > 0 ? Math.round(totalDone/totalCases*100) : 0;
-                                return (
-                                  <Collapsible
-                                    title="Case Tracker"
-                                    badge={`${totalDone}/${totalCases} complete`}
-                                    defaultOpen={false}
-                                  >
-                                    <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
-                                      A case starts with each start-activity firing and ends when all non-immutable
-                                      objects created by that event are deactivated. Click a row to expand individual cases.
-                                    </p>
-                                    <CaseTrackerTable
-                                      entries={entries}
-                                      totalCases={totalCases}
-                                      totalDone={totalDone}
-                                      overallRate={overallRate}
-                                      fmtDur={fmtDur}
-                                      fmtTs={fmtTs}
-                                      activeModel={activeModel}
-                                    />
-                                  </Collapsible>
-                                );
-                              })()}
-
-                              {/* Object Trace Completion */}
-                              {r.audit?.object_lifecycle_audit && (() => {
-                                const resourceTypes = new Set(r.resource_types||[]);
-                                const audit = r.audit.object_lifecycle_audit;
-                                const logObjTypes = discoveryResults?.object_type_stats || {};
-                                const logTotal = discoveryResults?.log_object_trace_count ?? null;
-                                const nonRes = Object.entries(audit).filter(([ot])=>!resourceTypes.has(ot));
-                                const totalAll = nonRes.reduce((s,[,a])=>s+(a.instance_count||0),0);
-                                const deactAll = nonRes.reduce((s,[,a])=>s+(a.deactivated_count||0),0);
-                                const pctAll = totalAll>0?Math.round(deactAll/totalAll*100):0;
-                                return (
-                                  <Collapsible title="Object Trace Completion" defaultOpen={false}>
-                                    <div style={{display:'flex',gap:'0.75rem',flexWrap:'wrap',marginBottom:'0.75rem'}}>
-                                      <div className="behavior-stat-card"><div className="behavior-stat-val">{deactAll.toLocaleString()}</div><div className="behavior-stat-label">Completed</div></div>
-                                      <div className="behavior-stat-card"><div className="behavior-stat-val">{totalAll.toLocaleString()}</div><div className="behavior-stat-label">Total objects</div></div>
-                                      <div className="behavior-stat-card" style={{background:pctAll>=80?'#f0fdf4':pctAll>=50?'#fffbeb':'#fff1f2'}}><div className="behavior-stat-val">{pctAll}%</div><div className="behavior-stat-label">Rate</div></div>
-                                      {logTotal!=null&&<div className="behavior-stat-card"><div className="behavior-stat-val">{logTotal.toLocaleString()}</div><div className="behavior-stat-label">Log objects</div></div>}
-                                    </div>
-                                    <table className="behavior-table">
-                                      <thead><tr><th>Type</th><th>Total</th><th>Completed</th><th>Active</th><th>Rate</th>{Object.keys(logObjTypes).length>0&&<th>Log count</th>}</tr></thead>
-                                      <tbody>{nonRes.map(([ot,a])=>{
-                                        const pct=a.instance_count>0?Math.round(a.deactivated_count/a.instance_count*100):0;
-                                        return (<tr key={ot}><td>{ot}</td><td>{a.instance_count}</td>
-                                          <td style={{color:pct>=80?'#16a34a':pct>=50?'#d97706':'#dc2626',fontWeight:600}}>{a.deactivated_count}</td>
-                                          <td>{a.instance_count-a.deactivated_count}</td>
-                                          <td><div style={{background:'#f1f5f9',borderRadius:'4px',height:'8px',width:'60px',overflow:'hidden',display:'inline-block',verticalAlign:'middle',marginRight:'4px'}}><div style={{background:pct>=80?'#16a34a':pct>=50?'#f59e0b':'#ef4444',width:`${pct}%`,height:'100%'}}/></div>{pct}%</td>
-                                          {Object.keys(logObjTypes).length>0&&<td style={{color:'#94a3b8'}}>{logObjTypes[ot]?.count!=null?logObjTypes[ot].count.toLocaleString():'—'}</td>}
-                                        </tr>);
-                                      })}</tbody>
-                                    </table>
-                                  </Collapsible>
-                                );
-                              })()}
-
-                              {/* Object Timelines (#28) — per-object status changes from this run */}
-                              {r.object_lifecycles?.length > 0 && (
-                                <Collapsible
-                                  title="Object Timelines"
-                                  badge={`${r.object_lifecycles.length}${
-                                    r.object_lifecycles_total > r.object_lifecycles.length
-                                      ? ` of ${r.object_lifecycles_total}` : ''} objects`}
-                                  defaultOpen={false}
-                                >
-                                  <p style={{fontSize:'0.78rem',color:'#64748b',marginBottom:'0.6rem'}}>
-                                    Every status change an object went through: when it was created, which
-                                    activity took it and when, when that activity finished, and when it was
-                                    deactivated. The <em>Since previous</em> column shows the gap between
-                                    entries — a gap before a <code>started</code> row is time the object spent
-                                    idle while already eligible, which is what the source log records as
-                                    waiting time.
-                                  </p>
-                                  <ObjectTimelines
-                                    lifecycles={r.object_lifecycles}
-                                    total={r.object_lifecycles_total}
-                                  />
-                                </Collapsible>
-                              )}
-
-                            </Collapsible>
-
                             {r.output_file && (
                               <div style={{marginTop:'0.75rem',display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
                                 <a className="download-button"
@@ -10842,14 +10698,8 @@ function App() {
               <div className="constraint-types">
                 <label>Constraint Types to Discover:</label>
                 <div className="checkbox-group">
-                  {[
-                    { key: 'precedence',       label: 'Precedence',        tip: 'Whenever B occurs for an object, A must have occurred earlier for the same object. Enforced in simulation: B is blocked until A has fired first (requires nmin ≥ 1 in the Model Editor).' },
-                    { key: 'response',         label: 'Response',          tip: 'Whenever A occurs for an object, B must eventually follow for the same object. Softly enforced in simulation; use a response constraint with n≤ in the Model Editor to cap total repetitions.' },
-                    { key: 'not_coexistence',  label: 'Not Co-Existence',  tip: 'A and B never both occur on the same object. Enforced in simulation: once either fires on an object, the other is permanently blocked for that object.' },
-                    { key: 'chain_precedence', label: 'Chain Precedence',  tip: 'B is always immediately preceded by A on the same object — no other event for that object may appear between A and B. Not suitable for batch/synchronising activities.' },
-                    { key: 'chain_response',   label: 'Chain Response',    tip: 'Once A fires, all other activities are blocked for that object until B fires next. Strictly enforced and may cause deadlocks if B cannot be scheduled.' },
-                  ].map(({ key, label, tip }) => {
-                    const checked = ocdeclareDiscoveryConfig.constraintTypes[key];
+                  {CONSTRAINT_TYPE_OPTIONS.map(({ value: key, label, name }) => {
+                    const checked = !!ocdeclareDiscoveryConfig.constraintTypes[key];
                     const p = ocdeclareDiscoveryConfig.constraintParams[key] || {};
                     return (
                       <div key={key} className={`constraint-param-block${checked ? ' active' : ''}`}>
@@ -10860,7 +10710,7 @@ function App() {
                             onChange={(e) => handleConstraintTypeChange(key, e.target.checked)}
                             disabled={isOcdeclareDiscovering}
                           />
-                          {label} <HelpTip text={tip} />
+                          {label} <HelpTip text={`${name}. ${CONSTRAINT_HELP[key]}`} />
                         </label>
                         {checked && (
                           <div className="inline-param-row">
@@ -12197,8 +12047,6 @@ function App() {
                   </table>
                 </Collapsible>
               )}
-
-              <ObjectRelationshipAudit rows={results.audit?.object_relationship_audit} />
 
               {/* ── Activity Participation Audit ── */}
               {results.audit?.activity_participation_audit && Object.keys(results.audit.activity_participation_audit).length > 0 && (

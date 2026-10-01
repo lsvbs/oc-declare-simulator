@@ -74,7 +74,6 @@ The frontend will run on http://localhost:3000, Three-Step Workflow happens here
 - `GET /api/activities?eventLogFile=<file>` - Get discovered activities
 - `POST /api/simulate` - Run simulation with cached discovery results
 - `GET /api/download/<filename>` - Download generated event log
-- `GET /api/health` - Health check
 
 ## Limitations and future work
 - Attributes/Qualifiers are placeholders and not considered during simulation.

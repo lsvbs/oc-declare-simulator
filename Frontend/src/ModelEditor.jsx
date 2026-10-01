@@ -1,5 +1,7 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import './ModelEditor.css';
+import ConstraintTypeSelect from './ConstraintTypeSelect';
+import { constraintTypeLabel } from './constraintTypes.mjs';
 
 // ── Scope formatter ───────────────────────────────────────────────────────────
 function formatScope(scope) {
@@ -263,16 +265,6 @@ function SortSelect({s, set, columns, tips}) {
     </div>
   );
 }
-
-const CONSTRAINT_TYPES = [
-  'precedence', 'not_precedence', 'response', 'not_coexistence',
-  'chain_precedence', 'chain_response',
-  'responded_existence',
-  'absence', 'exactly', 'init',
-  'exclusive_choice',
-  'succession', 'chain_succession', 'not_succession', 'not_chain_succession',
-  'alternate_response', 'alternate_precedence', 'alternate_succession',
-];
 
 export const CONSTRAINT_HELP = {
   precedence:           'B is blocked until A has fired on the same scope object. nmin ≥ 1 (default) enforces this; nmax caps how many A-occurrences may precede B.',
@@ -1411,7 +1403,7 @@ export default function ModelEditor({
                 {col:'type',label:'Type'},{col:'source',label:'Source'},
                 {col:'target',label:'Target'},{col:'activity_order',label:'Activity Order'},
               ]} tips={{
-                type: 'Groups all constraints of the same type together (response, precedence, not_coexistence, etc.).',
+                type: 'Groups all constraints of the same type together (AS, DP, DF, EP, EF).',
                 source: 'Alphabetical by source activity name.',
                 target: 'Alphabetical by target activity name.',
                 activity_order: 'Process-flow order: constraints from "entry" activities (no predecessors in the constraint graph) appear first, then activities reachable from them layer by layer, ending with activities that are only ever targets.',
@@ -1474,7 +1466,7 @@ export default function ModelEditor({
                         className={`constraint-type-badge ${c.constraint_type}`}
                         title={CONSTRAINT_HELP[c.constraint_type] || c.constraint_type.replace(/_/g, ' ')}
                       >
-                        {c.constraint_type.replace(/_/g, ' ')}
+                        {constraintTypeLabel(c.constraint_type)}
                       </span>
                       <span className="constraint-src">{c.source_activity}</span>
                       <span className="constraint-arrow">→</span>
@@ -1572,16 +1564,13 @@ export default function ModelEditor({
 
             <div className="add-form-header">+ Add Constraint</div>
             <div className="add-form">
-              <select value={newCon.constraint_type}
+              <ConstraintTypeSelect value={newCon.constraint_type}
                 onChange={e => setNewCon(p => ({
                   ...p,
                   constraint_type: e.target.value,
                   nmin: e.target.value === 'precedence' ? 1 : e.target.value === 'exactly' ? 1 : 0,
                   nmax: e.target.value === 'absence' ? 0 : null,
-                }))}>
-                <option value="">constraint…</option>
-                {CONSTRAINT_TYPES.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>)}
-              </select>
+                }))}/>
               {CONSTRAINT_HELP[newCon.constraint_type] && (
                 <HelpTip text={CONSTRAINT_HELP[newCon.constraint_type]} />
               )}
@@ -2266,4 +2255,3 @@ export default function ModelEditor({
     </div>
   );
 }
-
