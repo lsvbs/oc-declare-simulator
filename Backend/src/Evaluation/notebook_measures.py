@@ -666,7 +666,7 @@ REPORT_COLUMNS = [
     "model_support",
 ]
 
-def evaluate_confidence(idx, model):
+def evaluate_confidence(idx, model, *, include_observed_bounds=False):
     rows = []
     violating_events = set()
 
@@ -709,8 +709,16 @@ def evaluate_confidence(idx, model):
             ),
             "model_support": c.get("support", np.nan),
         })
+        if include_observed_bounds:
+            # Empty Each domains and inactive constraints supply no evidence
+            # for changing bounds. A real binding with no match supplies zero.
+            rows[-1].update(
+                observedNmin=min(binding_counts) if binding_counts else np.nan,
+                observedNmax=max(binding_counts) if binding_counts else np.nan,
+            )
 
-    table = pd.DataFrame(rows, columns=REPORT_COLUMNS)
+    columns = REPORT_COLUMNS + (["observedNmin", "observedNmax"] if include_observed_bounds else [])
+    table = pd.DataFrame(rows, columns=columns)
     n_events = idx["n_events"]
     n_bad = len(violating_events)
 

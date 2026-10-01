@@ -1702,6 +1702,43 @@ def get_eventlog_events():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+@app.route('/api/model-check', methods=['POST'])
+def check_ocdeclare_model():
+    """Read-only model check and observed bounds, shared with evaluation."""
+    from Backend.src.Evaluation.service import check_model_counts
+
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            raise ValueError('Expected a model-check request object.')
+        filename = data.get('eventLogFile')
+        if not isinstance(filename, str) or not filename:
+            raise ValueError('Select an input event log.')
+        model = data.get('modelOverride')
+        if not isinstance(model, (dict, list)):
+            raise ValueError('Select an OC-Declare model.')
+        path = (EVENTLOG_DIR / filename).resolve()
+        if not path.is_relative_to(EVENTLOG_DIR.resolve()):
+            raise ValueError('Select a file from the project input logs.')
+        if not path.is_file():
+            return jsonify({'error': 'The selected input log is no longer available.'}), 404
+        # Use the existing loader so JSON, JSON-OCEL, XML and CSV all work.
+        ocel = load_ocel2(str(path))
+        raw = {
+            'objects': [{'id': oid, 'type': obj['type']}
+                        for oid, obj in ocel['objects'].items()],
+            'events': [{
+                'id': eid, 'type': ev['activity'],
+                'time': (ev['timestamp'].isoformat() if hasattr(ev['timestamp'], 'isoformat')
+                         else ev['timestamp']),
+                'relationships': [{'objectId': oid} for oid in ev.get('omap', [])],
+            } for eid, ev in ocel['events'].items()],
+        }
+        return jsonify(check_model_counts(raw, model))
+    except (ValueError, KeyError, TypeError, NotImplementedError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
 @app.route('/api/discover-ocdeclare', methods=['POST'])
 def run_ocdeclare_discovery():
     """Discover OC-Declare model asynchronously.

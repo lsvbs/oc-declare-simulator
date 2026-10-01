@@ -101,6 +101,45 @@ fields, including edited bounds, rather than stale copies of imported fields.
             'object_types': [o if isinstance(o, dict) else {'name': o} for o in model.get('object_types', [])]}
 
 
+def check_model_counts(raw_log, model):
+    """Discover matching-event bounds using the evaluation tab's semantics.
+
+    The index identifies the exact input constraint, including its scope;
+    activity/type labels alone are not unique. This never changes the model.
+    """
+    canonical = canonical_model(model)
+    for i, constraint in enumerate(canonical.get('constraints', []), 1):
+        if constraint.get('guard'):
+            raise NotImplementedError(
+                f'Constraint {i}: count discovery does not support guards; bounds were not applied.'
+            )
+    normalized = nm.load_confidence_model(canonical)
+    table, summary = nm.evaluate_confidence(
+        nm.build_index(normalize_log(raw_log)), normalized,
+        include_observed_bounds=True,
+    )
+    originals = model if isinstance(model, list) else model.get('constraints', [])
+    results = []
+    for i, row in enumerate(table.to_dict(orient='records')):
+        constraint = originals[i]
+        kind = constraint.get('constraint_type') or constraint.get('type') or constraint.get('arc_type')
+        source = constraint.get('source_activity') or constraint.get('source') or constraint.get('from')
+        target = constraint.get('target_activity') or constraint.get('target') or constraint.get('to')
+        results.append({
+            'constraintIndex': i, 'constraint': constraint,
+            'label': f'{kind}({source}→{target})',
+            'confidence': row['confidence'], 'satisfied': row['n_satisfied'],
+            'total': row['n_activations'], 'vacuous': row['n_vacuous_activations'],
+            'observedNmin': row['observedNmin'], 'observedNmax': row['observedNmax'],
+        })
+    return json_safe({
+        'constraintResults': results,
+        'globalConformance': summary['global_confidence'],
+        'globalSatisfied': summary['n_satisfying_events'],
+        'totalEvents': summary['n_events'],
+    })
+
+
 def _kl(reference, simulated):
     keys, p, q = nm.smoothed_probabilities(reference, simulated)
     forward, reverse = p * np.log2(p / q), q * np.log2(q / p)

@@ -7,6 +7,7 @@ import ModelEditor from './ModelEditor';
 import { O2ODiagram, CONSTRAINT_HELP } from './ModelEditor';
 import { resolveStartActivityCaps } from './startActivityCounts.mjs';
 import { normalizeModelOrientation } from './modelOrientation.mjs';
+import { applyObservedConstraintBounds } from './modelCheck.mjs';
 import ConstraintTypeSelect from './ConstraintTypeSelect';
 import { CONSTRAINT_TYPE_OPTIONS, constraintTypeLabel } from './constraintTypes.mjs';
 import EvaluationWrapper from './NotebookEvaluation';
@@ -6529,19 +6530,23 @@ function App() {
     prevIsRunningDiscoveriesRef.current = isRunningDiscoveries;
     const justFinished = wasRunning && !isRunningDiscoveries;
     const alreadyBroken = !wasRunning && !isRunningDiscoveries;
-    if ((justFinished || alreadyBroken) && !modelAsIs && activeModel && modelEdited) {
+    if ((justFinished || alreadyBroken) && !discoveryError && !modelAsIs && activeModel && modelEdited) {
       const snap = JSON.parse(JSON.stringify(activeModel));
       snap.start_activities = config.startActivities || [];
       setModelAsIs(snap);
       setModelToBe(JSON.parse(JSON.stringify(snap)));
       setModelBase(JSON.parse(JSON.stringify(snap)));
     }
-  }, [isRunningDiscoveries, activeModel, modelEdited]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isRunningDiscoveries, activeModel, modelEdited, discoveryError]); // eslint-disable-line react-hooks/exhaustive-deps
   const [discoveryElapsed, setDiscoveryElapsed] = useState(null);
   const discStartRef = useRef(null);
   const discTimerRef = useRef(null);
   const activeModelRef = useRef(null);      // always current activeModel, safe in callbacks
   const activeProbMatrixRef = useRef(null); // always current activeProbMatrix
+  const modelCheckInputsRef = useRef(null);
+  useEffect(() => {
+    modelCheckInputsRef.current = { eventLogFile: discoveryConfig.eventLogFile, ocdeclareFile: config.ocdeclareFile };
+  }, [discoveryConfig.eventLogFile, config.ocdeclareFile]);
   const [healthCheckSteps, setHealthCheckSteps] = useState(500);
   const [discoveryProgress, setDiscoveryProgress] = useState({ current: 0, total: 0, currentName: '' });
   const [startProbApplied, setStartProbApplied] = useState(false);
@@ -7188,14 +7193,14 @@ function App() {
     }
   };
 
-  const runHealthCheck = async () => {
+  const runHealthCheck = async (model = activeModelRef.current) => {
     setIsCheckingHealth(true);
     setHealthResult(null);
     try {
       const payload = {
         ...config,
         eventLogFile: discoveryConfig.eventLogFile,
-        ...(activeModel ? { modelOverride: activeModel } : {}),
+        ...(model ? { modelOverride: model } : {}),
         steps: healthCheckSteps,
       };
       const res = await axios.post('/api/constraint-health', payload);
@@ -7359,101 +7364,15 @@ function App() {
     });
   }, [discoveryConfig.startActivityProbSelected, externalTab]); // also re-sync when switching to simulation tab
 
-  // Standalone OC-Declare model check — runs the same logic as LogModelConformance
-  // Returns { constraintResults, globalConformance, globalSatisfied, totalEvents }
+  // Use the same OC-Declare matching semantics as the evaluation tab.
   const runLogModelCheck = useCallback(async (model, eventLogFile) => {
-    if (!model || Array.isArray(model) || !eventLogFile) return null;
-    const constraints = model.constraints || [];
-    if (!constraints.length) return null;
-    try {
-      const r = await axios.get(`/api/eventlog-events?file=${encodeURIComponent(eventLogFile)}`);
-      const evts = r.data.events || [];
-      const tmap = r.data.object_types_map || {};
-      const n = evts.length;
-      const eventObjs = evts.map(e => new Set(e.object_ids || []));
-      const byActIdx = {};
-      evts.forEach((e, i) => { (byActIdx[e.activity] = byActIdx[e.activity] || []).push(i); });
-      const sortedEvtsTs = evts.map(e => e.timestamp);
-      const firstGe = (ts) => { let lo=0,hi=n; while(lo<hi){const m=(lo+hi)>>1;sortedEvtsTs[m]<ts?lo=m+1:hi=m;}return lo; };
-      const temporalFilter = (srcIdx, ctype, tgtAct) => {
-        const srcTs = evts[srcIdx].timestamp;
-        if (ctype === 'chain_response') return srcIdx + 1 < n ? [srcIdx + 1] : [];
-        if (ctype === 'chain_precedence') return srcIdx - 1 >= 0 ? [srcIdx - 1] : [];
-        const tgtIs = byActIdx[tgtAct] || [];
-        if (['response','chain_response','succession','alternate_response',
-             'precedence','alternate_precedence'].includes(ctype)) {
-          const start = firstGe(srcTs);
-          return tgtIs.filter(j => j >= start && j !== srcIdx);
-        }
-        return tgtIs.filter(j => j !== srcIdx);
-      };
-      const satisfies = (i, c) => {
-        if (evts[i].activity !== c.source_activity) return true;
-        const nmin = c.nmin ?? 1, nmax = c.nmax ?? null;
-        const tgt = c.target_activity;
-        const scope = c.scope || { kind: 'global' };
-        const tgtCandidates = temporalFilter(i, c.constraint_type, tgt);
-        if (scope.kind === 'global') {
-          const cnt = tgtCandidates.length;
-          if (['not_coexistence','not_succession'].includes(c.constraint_type)) return cnt === 0;
-          return cnt >= nmin && (nmax == null || cnt <= nmax);
-        }
-        const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
-        if (scopeObjs.length === 0) return true;
-        for (const oid of scopeObjs) {
-          const matching = tgtCandidates.filter(j => eventObjs[j].has(oid));
-          const cnt = matching.length;
-          if (['not_coexistence','not_succession'].includes(c.constraint_type)) {
-            if (cnt > 0) return false;
-          } else {
-            if (cnt < nmin) return false;
-            if (nmax != null && cnt > nmax) return false;
-          }
-        }
-        return true;
-      };
-      const results = [];
-      let globalSatisfied = new Array(n).fill(true);
-      for (let idx = 0; idx < constraints.length; idx++) {
-        const c = constraints[idx];
-        const sourceEvents = evts.map((e,i) => e.activity === c.source_activity ? i : -1).filter(i => i >= 0);
-        const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
-        if (sourceEvents.length === 0) {
-          results.push({ label, confidence: 1, satisfied: 0, total: 0, constraint: c,
-                         observedNmin: null, observedNmax: null });
-          continue;
-        }
-        const scope = c.scope || { kind: 'global' };
-        let satisfied = 0;
-        // Track target repetitions per (source event, scope object) to derive observed nmin/nmax
-        const repCounts = []; // all observed repetition counts across source events × scope objects
-        for (const i of sourceEvents) {
-          const temporal = temporalFilter(i, c.constraint_type, c.target_activity);
-          const tgtCandidates = temporal; // already filtered to target activity
-          if (scope.kind === 'each' && scope.object_type) {
-            const scopeObjs = [...eventObjs[i]].filter(oid => tmap[oid] === scope.object_type);
-            if (scopeObjs.length > 0) {
-              for (const oid of scopeObjs) {
-                repCounts.push(tgtCandidates.filter(j => eventObjs[j].has(oid)).length);
-              }
-            }
-          } else {
-            repCounts.push(tgtCandidates.length);
-          }
-          if (satisfies(i, c)) { satisfied++; } else { globalSatisfied[i] = false; }
-        }
-        const observedNmin = repCounts.length > 0 ? Math.min(...repCounts) : null;
-        const observedNmax = repCounts.length > 0 ? Math.max(...repCounts) : null;
-        const confidence = sourceEvents.length > 0 ? satisfied / sourceEvents.length : 1;
-        results.push({ label, confidence, satisfied, total: sourceEvents.length, constraint: c,
-                       observedNmin, observedNmax });
-      }
-      const globalCount = globalSatisfied.filter(Boolean).length;
-      return { constraintResults: results, globalConformance: n > 0 ? globalCount / n : null, globalSatisfied: globalCount, totalEvents: n };
-    } catch(e) {
-      console.error('Model check failed:', e);
-      return null;
+    if (!model || Array.isArray(model) || !eventLogFile) {
+      throw new Error('Load an OC-Declare model and input log before checking constraints.');
     }
+    const response = await axios.post('/api/model-check', {
+      eventLogFile, modelOverride: model,
+    });
+    return response.data;
   }, []);
 
   // Separated from runAllDiscoveries so discoveryConfig is always fresh (avoids stale closure)
@@ -7495,6 +7414,7 @@ function App() {
     if (!activeModelRef.current && config.ocdeclareFile) {
       await loadModelState(config.ocdeclareFile, discoveryConfig.eventLogFile);
     }
+    setDiscoveryError(null);
     setIsRunningDiscoveries(true);
     // Start discovery elapsed timer
     discStartRef.current = Date.now();
@@ -7543,43 +7463,20 @@ function App() {
       setDiscoveryProgress({ current: steps.length + 1, total, currentName: 'OC-Declare Model Check' });
       const modelForCheck = activeModelRef.current;
       const modelCheckResult = await runLogModelCheck(modelForCheck, discoveryConfig.eventLogFile);
-      let modelAfterNmax = activeModelRef.current;
-      if (modelCheckResult) {
-        setLogConfResults(modelCheckResult);
-        // Build observedNmax lookup regardless of checkbox — used for hints and apply
-        const nmaxByLabel = {};
-        modelCheckResult.constraintResults.forEach(r => {
-          if (r.observedNmax != null) nmaxByLabel[r.label] = r.observedNmax;
-          if (r.observedNmin != null) nmaxByLabel[`__nmin__${r.label}`] = r.observedNmin;
-        });
-        if (applyNminNmaxFromModelCheck && modelAfterNmax && !Array.isArray(modelAfterNmax)) {
-          // OC-Declare paper: nmin=0,nmax=0 = negated existence constraint; nmin=1,nmax=∞ = standard existence form.
-          const NEGATION_MAP = {
-            response: 'not_succession', precedence: 'not_precedence',
-            chain_response: 'not_chain_succession', chain_precedence: 'not_chain_succession',
-            responded_existence: 'not_coexistence', coexistence: 'not_coexistence',
-          };
-          // Apply synchronously so the snapshot below captures the updated model
-          const updatedConstraints = (modelAfterNmax.constraints || []).map(c => {
-            const label = `${c.constraint_type}(${c.source_activity}→${c.target_activity})`;
-            const result = modelCheckResult.constraintResults.find(r => r.label === label);
-            if (!result || result.total === 0) return c;
-            const newNmin = result.observedNmin != null ? result.observedNmin : c.nmin;
-            const newNmax = result.observedNmax != null ? result.observedNmax : c.nmax;
-            // Negated existence (0,0): remap constraint type to its not_* equivalent
-            if (newNmin === 0 && newNmax === 0 && NEGATION_MAP[c.constraint_type]) {
-              return { ...c, constraint_type: NEGATION_MAP[c.constraint_type], nmin: 0, nmax: null };
-            }
-            if (newNmin === c.nmin && newNmax === c.nmax) return c;
-            return { ...c, nmin: newNmin, nmax: newNmax };
-          });
-          modelAfterNmax = { ...modelAfterNmax, constraints: updatedConstraints };
-          setActiveModel(modelAfterNmax);
-        }
+      const latestModel = activeModelRef.current;
+      if (latestModel?.constraints !== modelForCheck.constraints
+          || modelCheckInputsRef.current?.eventLogFile !== discoveryConfig.eventLogFile
+          || modelCheckInputsRef.current?.ocdeclareFile !== config.ocdeclareFile) {
+        throw new Error('The model or input log changed during the check. Run parameter discovery again.');
       }
+      setLogConfResults(modelCheckResult);
+      const modelAfterNmax = applyNminNmaxFromModelCheck
+        ? applyObservedConstraintBounds(latestModel, modelCheckResult)
+        : latestModel;
+      if (applyNminNmaxFromModelCheck) setActiveModel(modelAfterNmax);
 
       setDiscoveryProgress({ current: steps.length + 2, total, currentName: 'Constraint Health Check' });
-      await runHealthCheck();
+      await runHealthCheck(modelAfterNmax);
       // Snapshot: use modelAfterNmax (has nmax applied if checkbox was on) rather than
       // activeModelRef.current which may still be the pre-setState stale value.
       const snapModel  = modelAfterNmax ? JSON.parse(JSON.stringify(modelAfterNmax)) : null;
@@ -7592,6 +7489,8 @@ function App() {
       setProbMatrixBase(snapMatrix);
       setProbMatrixToBe(snapMatrix ? JSON.parse(JSON.stringify(snapMatrix)) : null);
       setExternalTab('behavior');
+    } catch (err) {
+      setDiscoveryError(err.response?.data?.error || err.message || 'Parameter discovery failed.');
     } finally {
       clearInterval(discTimerRef.current);
       discTimerRef.current = null;
@@ -8917,12 +8816,12 @@ function App() {
                           <div className="landing-option-group" style={{borderTop:'1px solid #e2e8f0',paddingTop:'0.75rem',marginTop:'0.25rem'}}>
                             <label className="landing-option-label">OC-Declare Model Check</label>
                             <label style={{display:'flex',alignItems:'center',gap:'0.4rem',fontSize:'0.78rem',cursor:'pointer',marginTop:'0.25rem'}}
-                              title="Applies observed nmin/nmax bounds from the log to each constraint. Existence constraints (nmin=1, nmax=∞) get nmin=1 applied explicitly. Constraints never observed after their source (nmin=0, nmax=0) are remapped to their negated form (e.g. response → not_succession). Other bounds are applied as counting constraints.">
+                              title="Uses the observed minimum and maximum matching-event counts with the full object scope and OC-Declare direction. Constraints without evaluable bindings keep their existing bounds. An observed minimum of zero makes the requirement optional; (0,0) forbids matching events without changing the constraint type.">
                               <input type="checkbox" checked={applyNminNmaxFromModelCheck}
                                 onChange={e => setApplyNminNmaxFromModelCheck(e.target.checked)} />
                               Apply nmin/nmax from log to constraints
                             </label>
-                            <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>Sets bounds from log counts; (0,0) → negated form, (1,∞) → existence form, others → counting</div>
+                            <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.2rem'}}>Uses matching-event counts. No observations: keep bounds. A minimum of 0 makes the requirement optional.</div>
                           </div>
                         )}
                       </div>
@@ -9042,6 +8941,13 @@ function App() {
                     )}
                     <input ref={ocdeclFileRef} type="file" accept=".json" style={{display:'none'}}
                       onChange={e => { if (e.target.files[0]) handleFileUpload(e.target.files[0], 'ocdeclare'); e.target.value=''; }} />
+                  </div>
+                )}
+
+                {discoveryError && (
+                  <div className="error-box" role="alert">
+                    <h3>Discovery Error</h3>
+                    <p>{discoveryError}</p>
                   </div>
                 )}
 
