@@ -1339,6 +1339,8 @@ def run_simulation():
                 'audit': audit,
                 'resource_types': list(static_model.resource_types or []),
                 'completed_traces': getattr(final_state, 'completed_trace_count', 0),
+                # Final snapshot, using the same target/scope grouping as the live tracker.
+                'pending_obligations': len(final_state._obligations_count),
                 'obligations_fulfilled': getattr(final_state, 'total_obligations_fulfilled', 0),
                 'obligations_cancelled': getattr(final_state, 'total_obligations_cancelled', 0),
                 'obligations_violated': getattr(final_state, 'total_obligations_violated', 0),
