@@ -10439,6 +10439,11 @@ function App() {
                                 <Collapsible
                                   title="Object Creation/Deactivation"
                                   defaultOpen={false}
+                                  stickyContent={
+                                    <p style={{fontSize:'0.85rem'}} title="Outstanding target/scope groups when the simulation stopped, counted the same way as the running tracker. A group can contain multiple outstanding requirements.">
+                                      Pending obligations at simulation stop: <strong>{r.pending_obligations == null ? 'Not available for this run' : r.pending_obligations.toLocaleString()}</strong>
+                                    </p>
+                                  }
                                   preview={audit ? (
                                     <table className="behavior-table">
                                       <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
@@ -10454,9 +10459,6 @@ function App() {
                                     </table>
                                   ) : null}
                                 >
-                                  <p style={{fontSize:'0.85rem'}} title="Outstanding target/scope groups when the simulation stopped, counted the same way as the running tracker. A group can contain multiple outstanding requirements.">
-                                    Pending obligations at simulation stop: <strong>{r.pending_obligations == null ? 'Not available for this run' : r.pending_obligations.toLocaleString()}</strong>
-                                  </p>
                                   {audit ? (
                                     <table className="behavior-table">
                                       <thead><tr><th>Type</th><th>Created</th><th>Active</th><th>Deactivated</th><th>Status</th></tr></thead>
