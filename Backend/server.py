@@ -27,6 +27,7 @@ from Backend.src.Simulation.Models.OCDeclare import (
 from Backend.src.Simulation.Domain.config import SimulationConfig, StartPolicy, resolve_start_activity_caps
 from Backend.src.Simulation.Domain.state import SimulationState
 from Backend.src.Simulation.Engine.simulator import Simulator
+from Backend.src.Simulation.IO.output.participation import summarize_ocel_participation
 from Backend.src.ParameterDiscovery.timediscovery import compute_ocpa_metrics
 from Backend.src.ParameterDiscovery.probabilitydiscovery import discover_transition_matrix, load_event_log
 from Backend.src.ParameterDiscovery.OCDeclarediscovery import discover_ocdeclare_model
@@ -704,6 +705,7 @@ def run_discovery():
                 'total_events': total_events,
                 'total_objects': total_objects,
                 'object_type_stats': object_type_stats,
+                'activity_participation_by_type': summarize_ocel_participation(_ocel_src),
                 'transition_count': transition_count,
                 'time_distributions_discovered': len(time_distributions) > 0,
                 'first_activity': first_activity,
@@ -1334,6 +1336,7 @@ def run_simulation():
                 'metrics': {
                     'activity_metrics': metrics.get('activity_metrics', {}),
                     'activity_service_by_type': metrics.get('activity_service_by_type', {}),
+                    'activity_participation_by_type': metrics.get('activity_participation_by_type', {}),
                     # object_metrics omitted — too large; available via metrics file download
                 },
                 'audit': audit,

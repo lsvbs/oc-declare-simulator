@@ -7,13 +7,6 @@ export default function RecentEventLog({ events, total }) {
   if (events.length === 0) {
     return <p className="recent-event-note">No events completed in this run.</p>;
   }
-  const traces = new Map();
-  events.forEach(event => {
-    event.objects.forEach(object => {
-      if (!traces.has(object.object_id)) traces.set(object.object_id, { ...object, events: [] });
-      traces.get(object.object_id).events.push(event);
-    });
-  });
   return (
     <div className="recent-event-log">
       <p className="recent-event-note">
@@ -45,29 +38,7 @@ export default function RecentEventLog({ events, total }) {
           </tbody>
         </table>
       </div>
-      {traces.size > 0 && (
-        <details className="recent-object-traces">
-          <summary>Traces by object within these events ({traces.size})</summary>
-          <p className="recent-event-note">Only activity occurrences within the last {events.length} events are shown here.</p>
-          <ul>
-            {[...traces.values()].map(object => (
-              <li key={object.object_id}>
-                <div><strong>{object.object_type || 'Unknown type'}</strong>: <code>{object.object_id}</code></div>
-                <div className="recent-object-sequence">
-                  {object.events.map((event, index) => (
-                    <React.Fragment key={event.event_id}>
-                      {index > 0 && <span aria-hidden="true"> → </span>}
-                      <span title={`${event.event_id} · ${event.timestamp || 'Time not recorded'}`}>
-                        #{event.sequence} {event.activity}
-                      </span>
-                    </React.Fragment>
-                  ))}
-                </div>
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
+      {/* Per-object trace view hidden from the user. */}
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { logStopDefaults, logStartCaps } from './simulationLogDefaults.mjs';
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import axios from 'axios';
@@ -14,21 +15,15 @@ import EvaluationWrapper from './NotebookEvaluation';
 import ObjectLifecycleWarning from './ObjectLifecycleWarning';
 import { getModelWarnings } from './modelWarnings.mjs';
 import RecentEventLog from './RecentEventLog';
-import { SimThroughputChart, SimulationElapsedTime } from './SimulationProgress';
+import { SimulationElapsedTime } from './SimulationProgress';
 import { sampleSimulationThroughput } from './simulationThroughput.mjs';
 
 const DEFAULT_LIFECYCLE_THRESHOLD = 0.9;
 // Keep the heuristic graph available for later, but hide it in both editors.
 const SHOW_CONSTRAINT_FLOW = false;
 
-function SimulationLayout({ children, active, setBaseStartFolded, setAltStartFolded }) {
+function SimulationLayout({ children }) {
   const [alternativeOpen, setAlternativeOpen] = useState(false);
-  React.useLayoutEffect(() => {
-    if (active) {
-      setBaseStartFolded(true);
-      setAltStartFolded(true);
-    }
-  }, [active, setBaseStartFolded, setAltStartFolded]);
   return children({
     alternativeOpen,
     toggleAlternative: () => setAlternativeOpen(open => !open),
@@ -684,6 +679,15 @@ function HelpTip({ text }) {
 // Keeps the outer `className` so existing CSS selectors (e.g. `.object-types ul`)
 // keep matching. The header gets both the caller's look (via the wrapper class)
 // and the shared `.collapsible-header` behaviour.
+function ResultStat({ value, unit, label, description, className = '' }) {
+  return <div className={`stat-card simulation-result-stat ${className}`}>
+    <span className="stat-value" title={`${label}: ${description}`} tabIndex={0} aria-label={`${label}: ${typeof value === 'number' || typeof value === 'string' ? value : ''}`}>
+      {value}
+    </span>
+    <span className="simulation-stat-unit">{unit}</span>
+  </div>;
+}
+
 function Collapsible({ title, badge, defaultOpen = false, className = '', children, preview, stickyContent }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
@@ -3627,7 +3631,9 @@ function OCPQPanel({ results, onTotalsComputed }) {
 }
 
 // ── VerificationMatrix — activity × object-type cross-matrix ─────────────────
-function VerificationMatrix({ results, discoveryResults, activeModel, modelBase }) {
+function VerificationMatrix({ results, discoveryResults, activeModel, modelBase, inputTiming }) {
+  const [dataSource, setDataSource] = React.useState('simulation');
+  const input = dataSource === 'input';
   const [verifyMode,  setVerifyMode]  = React.useState('frequency');
   const [timeSubMode, setTimeSubMode] = React.useState('mean');
 
@@ -3644,80 +3650,30 @@ function VerificationMatrix({ results, discoveryResults, activeModel, modelBase 
 
   if (!results) return <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No run available.</div>;
 
-  const metrics       = results.metrics?.activity_metrics || {};
+  const metrics = results.metrics?.activity_metrics || {};
   const serviceByType = results.metrics?.activity_service_by_type || {};
-  const resourceTypes = new Set(results.resource_types || []);
-  const audit         = results.audit?.object_lifecycle_audit || {};
-  const activities    = Object.keys(metrics).sort(makeFlowRankSorter(discoveryResults, results.object_traces));
-  const objTypes      = Object.keys(audit).filter(t => !resourceTypes.has(t));
-
-  const actBindings = {};
-  const modelToUse  = activeModel || modelBase;
-  if (modelToUse?.activities) {
-    modelToUse.activities.forEach(a => {
-      const types = new Set((a.bindings||[]).map(b=>b.object_type).filter(t=>!resourceTypes.has(t)));
-      actBindings[a.name] = types;
-    });
-  }
-
-  const simObjTypes = results.object_types || {};
-  const cols = objTypes.length > 0 ? objTypes
-    : [...new Set(Object.values(actBindings).flatMap(s => [...s]))].sort();
-
-  if (!activities.length) return (
-    <div style={{color:'#94a3b8',fontSize:'0.85rem'}}>No activity metrics available. Run a simulation first.</div>
-  );
-
+  const participation = input ? discoveryResults?.activity_participation_by_type
+    : results.metrics?.activity_participation_by_type;
+  const activities = [...new Set(input ? Object.keys(logActivityCounts) : Object.keys(metrics))]
+    .sort(makeFlowRankSorter(discoveryResults, results.object_traces));
+  const cols = [...new Set([
+    ...Object.keys(input ? logObjectTypes : (results.object_types || {})),
+    ...Object.values(participation || {}).flatMap(row => Object.keys(row)),
+  ])].sort();
   const getCellVal = (act, ot) => {
-    const m = metrics[act] || {};
-    const participates = !actBindings[act] || actBindings[act].size === 0 || actBindings[act].has(ot);
-    if (verifyMode === 'frequency') {
-      const cnt = serviceByType?.[act]?.[ot]?.count ?? null;
-      return cnt != null && cnt > 0 ? cnt : null;
+    const cell = participation?.[act]?.[ot];
+    if (verifyMode === 'frequency') return cell?.event_count ?? (input ? null : serviceByType[act]?.[ot]?.count ?? null);
+    if (verifyMode === 'cardinality') return cell?.mean_objects ?? null;
+    if (input) {
+      if (!cell?.event_count) return null;
+      const timing = inputTiming?.[act];
+      return timing?.[timeSubMode === 'min' ? 'min_seconds' : timeSubMode === 'max' ? 'max_seconds' : 'mean_seconds'] ?? null;
     }
-    if (verifyMode === 'time') {
-      if (!participates) return null;
-      const perType = serviceByType?.[act]?.[ot];
-      if (perType) {
-        const val = timeSubMode === 'min' ? perType.min_s : timeSubMode === 'max' ? perType.max_s : perType.mean_s;
-        return (val != null && val > 0) ? val : null;
-      }
-      const val = timeSubMode === 'min' ? m.min_service_s : timeSubMode === 'max' ? m.max_service_s : m.mean_service_s;
-      return (val != null && val > 0) ? val : null;
-    }
-    if (verifyMode === 'cardinality') {
-      if (!participates) return null;
-      const objCount = simObjTypes[ot] || 0;
-      const fires = m.execution_count || 0;
-      if (!fires || !objCount) return null;
-      const ratio = objCount / fires;
-      return ratio > 0 ? ratio : null;
-    }
-    return null;
+    const timing = serviceByType[act]?.[ot];
+    return timing?.[timeSubMode === 'min' ? 'min_s' : timeSubMode === 'max' ? 'max_s' : 'mean_s'] ?? null;
   };
-
-  const fmtCell = val => {
-    if (verifyMode === 'time') return fmtDur(val);
-    if (verifyMode === 'cardinality') return val.toFixed(1);
-    return val?.toLocaleString() ?? '—';
-  };
-
-  const getLogVal = (act, ot) => {
-    if (verifyMode === 'frequency') {
-      const cnt = logActivityCounts[act];
-      return cnt > 0 ? cnt.toLocaleString() : null;
-    }
-    if (verifyMode === 'cardinality') {
-      const logOtCount = logObjectTypes[ot]?.count || 0;
-      const logActCount = logActivityCounts[act] || 0;
-      if (!logActCount || !logOtCount) return null;
-      const ratio = logOtCount / logActCount;
-      return ratio > 0 ? ratio.toFixed(1) : null;
-    }
-    return null;
-  };
-
-  const showLogRef = verifyMode === 'frequency' || verifyMode === 'cardinality';
+  const fmtCell = val => verifyMode === 'time' ? (val === 0 ? '0s' : fmtDur(val))
+    : verifyMode === 'cardinality' ? val.toFixed(1) : val.toLocaleString();
   const vertStyle  = { writingMode:'vertical-rl', transform:'rotate(180deg)', whiteSpace:'nowrap',
     fontSize:'0.7rem', padding:'0.25rem 0.1rem', maxHeight:'120px', textOverflow:'ellipsis', overflow:'hidden' };
 
@@ -3748,7 +3704,15 @@ function VerificationMatrix({ results, discoveryResults, activeModel, modelBase 
             ))}
           </>
         )}
+        <div className="matrix-source-toggle" role="group" aria-label="Matrix data source">
+          {['simulation', 'input'].map(source => <button type="button" key={source}
+            aria-pressed={dataSource === source} onClick={() => setDataSource(source)}>
+            {source === 'input' ? 'Input log' : 'Simulation run'}
+          </button>)}
+        </div>
       </div>
+      {input && verifyMode === 'time' && <p className="recent-event-note">Estimated service times discovered from the input log, shared across participating object types.</p>}
+      {!participation && <p className="recent-event-note">Detailed participation counts are unavailable for this result. Rediscover the input log or run a new simulation to populate them.</p>}
       <div style={{overflowX:'auto'}}>
         <table className="behavior-table" style={{fontSize:'0.75rem',borderCollapse:'collapse'}}>
           <thead>
@@ -3757,7 +3721,7 @@ function VerificationMatrix({ results, discoveryResults, activeModel, modelBase 
               {cols.map(ot => (
                 <th key={ot} title={ot} style={{...vertStyle,fontWeight:600,color:'#475569',border:'1px solid #e2e8f0',background:'#f8fafc'}}>{ot}</th>
               ))}
-              {showLogRef && <th title="Reference value from the input event log (read-only)" style={{...vertStyle,color:'#94a3b8',border:'1px solid #e2e8f0',background:'#f8fafc'}}>Log ref</th>}
+
             </tr>
           </thead>
           <tbody>
@@ -3766,7 +3730,7 @@ function VerificationMatrix({ results, discoveryResults, activeModel, modelBase 
                 <td style={{fontWeight:600,fontSize:'0.72rem',whiteSpace:'nowrap',paddingRight:'0.5rem'}}>{act}</td>
                 {cols.map(ot => {
                   const val = getCellVal(act, ot);
-                  const hasVal = val != null && val !== 0;
+                  const hasVal = val != null;
                   return (
                     <td key={ot} style={{textAlign:'center',border:'1px solid #f1f5f9',
                       background: hasVal ? (verifyMode==='time'?'#eff6ff':verifyMode==='frequency'?'#f0fdf4':'#fefce8') : 'transparent',
@@ -3777,11 +3741,7 @@ function VerificationMatrix({ results, discoveryResults, activeModel, modelBase 
                     </td>
                   );
                 })}
-                {showLogRef && (
-                  <td style={{color:'#94a3b8',textAlign:'center',fontSize:'0.7rem',border:'1px solid #f1f5f9'}}>
-                    {getLogVal(act, cols[0]) ?? '—'}
-                  </td>
-                )}
+
               </tr>
             ))}
           </tbody>
@@ -4785,10 +4745,11 @@ function SortHdr({col, s, cycle, children, style={}}) {
 function SortSelect({s, set, columns}) {  const val = s.col ? `${s.col}:${s.dir}` : 'log';
   const active = !!s.col;
   return (
-    <div style={{display:'flex',alignItems:'center',gap:'0.3rem',padding:'0.3rem 0.5rem',
+    <div className="editor-hover-control" tabIndex={0} aria-label="Sort controls" style={{display:'flex',alignItems:'center',gap:'0.3rem',padding:'0.3rem 0.5rem',
       background:'#f8fafc',border:'1px solid',borderColor:active?'#6366f1':'#e2e8f0',
       borderRadius:'6px',fontSize:'0.75rem',flexShrink:0}}>
-      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Sort:</span>
+      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Sort</span>
+      <div className="editor-hover-controls">
       <select value={val}
         onChange={e => { const v=e.target.value; if(v==='log') set(null); else { const [col,dir]=v.split(':'); set(col,dir); } }}
         style={{fontSize:'0.73rem',border:'1px solid',borderRadius:'3px',padding:'1px 3px',
@@ -4801,6 +4762,7 @@ function SortSelect({s, set, columns}) {  const val = s.col ? `${s.col}:${s.dir}
           ])}
         </optgroup>
       </select>
+      </div>
     </div>
   );
 }
@@ -4826,6 +4788,24 @@ function ColTip({ text, children }) {
       )}
     </span>
   );
+}
+
+function O2OHeading() {
+  const helpId = React.useId();
+  return <div className="behavior-section-title">
+    <span className="o2o-heading-help" tabIndex={0} aria-describedby={helpId}>
+      Object-to-Object Relationships
+      <span className="o2o-heading-popup" id={helpId} role="tooltip">
+        <span><strong>Matrix cell:</strong> min..max links from a row-type object to column-type objects.</span>
+        <span><strong>min..max:</strong> 1..3 means at least one and at most three links.</span>
+        <span><strong>∞:</strong> No upper bound.</span>
+        <span><strong>↔ (purple):</strong> Bidirectional; the rule applies equally in both directions.</span>
+        <span><strong>→ (black):</strong> One-way, from row to column only.</span>
+        <span><strong>Blank cell:</strong> No rule in that direction.</span>
+        <span>Each cell shows the cardinality from the row object to the column object. Click a cardinality to edit its minimum or maximum.</span>
+      </span>
+    </span>
+  </div>;
 }
 
 // ── BehaviorLegend — ? toggle button with inline popover ─────────────────────
@@ -5306,14 +5286,6 @@ function BehaviorActivitiesPanel({ model, editMode, onUpdate, startActivities, o
   return (
     <div>
       <div className="behavior-section-title">List of Activities
-        <BehaviorLegend items={[
-          ['+','Activity creates a new object of that type when it fires'],
-          ['−','Activity deactivates (ends lifecycle of) that object when it fires'],
-          ['●','Activity involves this type but neither creates nor deactivates it'],
-          ['★','Start activity — simulation begins here'],
-          ['R (superscript)','Immutable object type — fixed pool size, never deactivated (e.g. trucks, workers)'],
-        ]}/>
-        {editMode && <HelpTip text="Click any cell to toggle creates / deactivates. Click ▶ to expand a row and edit detailed bindings." />}
         {foldable && (
           <button onClick={() => setFolded(f => !f)} style={{marginLeft:'auto',fontSize:'0.72rem',color:'#64748b',background:'none',border:'1px solid #e2e8f0',borderRadius:'4px',padding:'0.1rem 0.5rem',cursor:'pointer'}}>
             {folded ? '▶ show all' : '▼ show selected'}
@@ -5510,8 +5482,9 @@ function AddObjectTypeForm({ model, onUpdate }) {
     onUpdate({ ...model, object_types: (model.object_types || []).filter(t => (typeof t === 'string' ? t : t.name) !== ot), activities });
   };
   return (
-    <div style={{marginTop:'0.75rem',padding:'0.5rem 0',borderTop:'1px solid #e2e8f0'}}>
-      <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',marginBottom:'0.4rem'}}>Add / Remove Object Types</div>
+    <div className="object-type-disclosure" tabIndex={0} aria-label="Add/Remove Object Types">
+      <div className="object-type-disclosure-title">Add/Remove Object Types</div>
+      <div className="object-type-disclosure-content">
       <div style={{display:'flex',gap:'0.4rem',alignItems:'center',flexWrap:'wrap',marginBottom:'0.4rem'}}>
         {allOts.map(ot => (
           <span key={ot} style={{fontSize:'0.72rem',background:'#f1f5f9',border:'1px solid #e2e8f0',borderRadius:'12px',padding:'1px 8px',display:'inline-flex',alignItems:'center',gap:'3px'}}>
@@ -5525,6 +5498,7 @@ function AddObjectTypeForm({ model, onUpdate }) {
           style={{fontSize:'0.75rem',padding:'2px 6px',border:'1px solid #cbd5e1',borderRadius:'3px',width:'120px'}}
           onKeyDown={e => e.key === 'Enter' && add()}/>
         <button onClick={add} style={{fontSize:'0.72rem',padding:'2px 8px',background:'#475569',color:'white',border:'none',borderRadius:'3px',cursor:'pointer'}}>+ Add</button>
+      </div>
       </div>
     </div>
   );
@@ -5773,7 +5747,7 @@ function BehaviorConstraintsPanel({ constraints, actNames, otNames, editMode, on
                 return (
                   <React.Fragment key={origIdx}>
                   {rows.map(([bType, bInv], bIdx) => (
-                  <tr key={bIdx} style={bIdx === 0 ? groupStyle : {...(rowBg?{background:rowBg}:{}), ...(isMulti?{borderLeft:'3px solid #6366f1'}:{})}}>
+                  <tr key={bIdx} className={bIdx === 0 ? 'constraint-group-start' : undefined} style={bIdx === 0 ? groupStyle : {...(rowBg?{background:rowBg}:{}), ...(isMulti?{borderLeft:'3px solid #6366f1'}:{})}}>
                     {bIdx === 0 && editMode && <td rowSpan={span}><button onClick={()=>deleteCon(origIdx)} style={{background:'none',border:'none',color:'#dc2626',cursor:'pointer',fontWeight:700,padding:'0 3px'}}>×</button></td>}
                     {bIdx === 0 && <td rowSpan={span}>{editMode ? <ConstraintTypeSelect value={c.constraint_type} onChange={e=>updateCon(origIdx,{constraint_type:e.target.value})} style={{fontSize:'0.75rem',padding:'1px 3px',border:'1px solid #cbd5e1',borderRadius:'3px'}}/> : (<><span className="con-type-badge" title={CONSTRAINT_HELP[c.constraint_type]}>{constraintTypeLabel(c.constraint_type)}</span>{isMulti && <span title={`Multi-type constraint: all ${span} bindings must hold jointly`} style={{marginLeft:'0.35rem',fontSize:'0.62rem',fontWeight:700,color:'#4338ca',background:'#eef2ff',border:'1px solid #c7d2fe',borderRadius:'3px',padding:'0 3px'}}>{span}×</span>}</>)}</td>}
                     {bIdx === 0 && <td rowSpan={span}>{editMode ? sel(c.source_activity||actNames[0]||'', actNames, v=>updateCon(origIdx,{source_activity:v})) : (c.source_activity||'—')}</td>}
@@ -5914,10 +5888,11 @@ function TableFilterBar({ dimensions, filters, onFiltersChange, style={} }) {
   if (!dimensions || dimensions.length === 0) return null;
   const active = Object.values(filters).some(v => v !== '');
   return (
-    <div style={{display:'flex',gap:'0.5rem',flexWrap:'wrap',alignItems:'center',
+    <div className="editor-hover-control" tabIndex={0} aria-label="Filter controls" style={{display:'flex',gap:'0.5rem',flexWrap:'wrap',alignItems:'center',
       padding:'0.35rem 0.5rem',background:'#f8fafc',border:'1px solid #e2e8f0',
       borderRadius:'6px',marginBottom:'0.5rem',fontSize:'0.75rem',...style}}>
-      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Filter:</span>
+      <span style={{color:'#64748b',fontWeight:600,flexShrink:0}}>Filter</span>
+      <div className="editor-hover-controls">
       {dimensions.map(dim => (
         <label key={dim.key} style={{display:'flex',alignItems:'center',gap:'0.25rem',color:'#475569'}}>
           <span style={{flexShrink:0}}>{dim.label}</span>
@@ -5937,6 +5912,7 @@ function TableFilterBar({ dimensions, filters, onFiltersChange, style={} }) {
           × Clear
         </button>
       )}
+      </div>
     </div>
   );
 }
@@ -6337,10 +6313,7 @@ function App() {
   // Simulation state
   const [availableActivities, setAvailableActivities] = useState([]);
   const [startActivityCandidates, setStartActivityCandidates] = useState([]);
-  const [tobeStartActivities, setTobeStartActivities] = useState([]);
   const [tobeStartActivityCaps, setTobeStartActivityCaps] = useState({});
-  const [baseStartFolded, setBaseStartFolded] = useState(false);
-  const [altStartFolded, setAltStartFolded] = useState(false);
   const [config, setConfig] = useState({
     ocdeclareFile: '',
     maxSteps: '',
@@ -6645,6 +6618,7 @@ function App() {
       
       if (response.data.success) {
         setDiscoveryResults(response.data.results);
+        setConfig(previous => logStopDefaults(previous, response.data.results));
         setDiscoveryLogs(response.data.logs || []);
         setAvailableActivities(response.data.results.activities || []);
 
@@ -7011,8 +6985,7 @@ function App() {
   }, [activeRunId]);
 
   const runSimulation = async (mode = 'tobe') => {
-    const startActivities = mode === 'tobe' && tobeStartActivities.length > 0
-      ? tobeStartActivities : config.startActivities;
+    const startActivities = config.startActivities;
     let startActivityCaps;
     try {
       startActivityCaps = resolveStartActivityCaps(startActivities,
@@ -7310,13 +7283,6 @@ function App() {
     setModelAsIs(m => m ? {...m, start_activities: acts} : m);
     setModelToBe(m => m ? {...m, start_activities: acts} : m);
   }, [config.startActivities]);  // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Initialise tobeStartActivities from config.startActivities the first time it becomes non-empty.
-  React.useEffect(() => {
-    if (tobeStartActivities.length === 0 && config.startActivities.length > 0) {
-      setTobeStartActivities([...config.startActivities]);
-    }
-  }, [config.startActivities]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync probMatrix when activities are added from any source (BehaviorPanel or ModelEditor).
   // Tracks previous names via ref so we only react to actual additions, not initial load.
@@ -9137,27 +9103,12 @@ function App() {
 
                         return (
                           <div>
-                            <div className="behavior-section-title">Object-to-Object Relationships
-                              <BehaviorLegend items={[
-                                ['Matrix cell','Shows min..max — the allowed number of links from a row-type object to a column-type object'],
-                                ['min..max','e.g. 1..3 means each row-object must be linked to at least 1 and at most 3 column-objects'],
-                                ['∞','No upper bound — any number of links allowed'],
-                                ['↔ (purple)','Bidirectional — rule applies in both directions equally'],
-                                ['→ (black)','One-way — rule applies only from row to column, not the reverse'],
-                                ['Blank cell','No rule between these two object types in this direction'],
-                              ]}/>
-                              <span style={{fontSize:'0.72rem',color:'#6366f1',fontWeight:400,marginLeft:'0.5rem'}}>— click a cardinality to edit min or max</span>
-                            </div>
+                            <O2OHeading />
                             <TableFilterBar
                               dimensions={[{key:'object_type', label:'Object Type', options: allCols}]}
                               filters={o2oFilters}
                               onFiltersChange={f => setBehaviorSectionFilters('o2o', f)}
                             />
-                            <p style={{fontSize:'0.75rem',color:'#64748b',margin:'0 0 0.5rem'}}>
-                              Each cell shows the cardinality from the row object to the column object.
-                              <span style={{color:'#7c3aed',marginLeft:'0.5rem'}}>↔ bidirectional</span>
-                              <span style={{color:'#1e293b',marginLeft:'0.75rem'}}>→ one-way (blank = no rule in that direction)</span>
-                            </p>
                             <div style={{overflowX:'auto',marginBottom:'1rem'}}>
                               <table className="behavior-table">
                                 <thead>
@@ -9269,10 +9220,7 @@ function App() {
                             </div>
                           </div>}
                           <AddObjectTypeForm model={modelAsIs} onUpdate={m => setModelAsIs(m)} />
-                          <div className="behavior-sub-title">Object Involvement</div>
-                          <div style={{fontSize:'0.72rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
-                            Where objects get <span style={{color:'#4ade80',fontWeight:600}}>created</span> and involved and <span style={{color:'#f87171',fontWeight:600}}>deactivated</span>
-                          </div>
+                          <div className="behavior-sub-title object-involvement-title">Object Involvement</div>
                           {(() => {
                             const byType = {};
                             const actObjMap = {};
@@ -9501,9 +9449,9 @@ function App() {
                         if(!rules.length) return <p className="behavior-empty">No object-to-object relationships. Add one below.</p>;
                         return (
                           <div>
-                            <div className="behavior-section-title">Object-to-Object Relationships<BehaviorLegend items={[['Matrix cell','min..max links from row to column object'],['↔','bidirectional'],['→','one-way']]}/></div>
+                            <O2OHeading />
                             <TableFilterBar dimensions={[{key:'object_type',label:'Object Type',options:allCols}]} filters={oF} onFiltersChange={f=>setScenarioBehaviorFilters(p=>({...p,o2o:f}))}/>
-                            <p style={{fontSize:'0.75rem',color:'#64748b',margin:'0 0 0.5rem'}}><span style={{color:'#7c3aed'}}>↔ bidir</span><span style={{marginLeft:'0.75rem'}}>→ one-way</span></p>
+
                             <div style={{overflowX:'auto',marginBottom:'1rem'}}>
                               <table className="behavior-table">
                                 <thead><tr><th style={{background:'#f8fafc'}}>From → To</th>{cols.map(c=><th key={c} style={{textAlign:'center'}}>{c}</th>)}</tr></thead>
@@ -9559,10 +9507,7 @@ function App() {
                               </div>
                             </div>}
                             <AddObjectTypeForm model={modelToBe} onUpdate={m=>{setModelToBe(m);setActiveModel(m);handleModelEdit(m);}} />
-                            <div className="behavior-sub-title">Object Involvement</div>
-                            <div style={{fontSize:'0.72rem',color:'#94a3b8',marginBottom:'0.5rem'}}>
-                              Where objects get <span style={{color:'#4ade80',fontWeight:600}}>created</span> and involved and <span style={{color:'#f87171',fontWeight:600}}>deactivated</span>
-                            </div>
+                            <div className="behavior-sub-title object-involvement-title">Object Involvement</div>
                             {(() => {
                               const byType={};
                               const actObjMap={};
@@ -9772,8 +9717,7 @@ function App() {
             )}{/* end scenario tab */}
 
             {/* ── RESULTS TAB ── */}
-            <SimulationLayout active={externalTab === 'results'}
-              setBaseStartFolded={setBaseStartFolded} setAltStartFolded={setAltStartFolded}>
+            <SimulationLayout>
             {({ alternativeOpen, toggleAlternative }) => externalTab === 'results' && (
               <div className="ext-ocel-tab-content">
 
@@ -9801,49 +9745,13 @@ function App() {
                     {/* ── Base Model ── */}
                     <div className="simulation-model-options">
                       {alternativeOpen && <div className="simulation-model-options-title">Base Model</div>}
-                      <p className="simulation-step-help">1st set which and how many start activities are possible</p>
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
-                        <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
-                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
-                          <button type="button" className="start-activities-toggle"
-                            aria-expanded={!baseStartFolded} aria-controls="base-start-activity-choices"
-                            onClick={() => setBaseStartFolded(f => !f)}>
-                            {baseStartFolded ? '▸ Choose activities' : '▾ Hide choices'}
-                          </button>
+                        <div className="simulation-section-title simulation-rollout" tabIndex={0}>
+                          <span className="simulation-rollout-label">Start Activities</span>
+                          <span className="simulation-rollout-text">1st set how often start activities may start. Activities are chosen from the input log and can be changed in the model editor.</span>
                         </div>
-                        <div id="base-start-activity-choices" className="start-activity-choices" hidden={baseStartFolded}>
-                          {(() => {
-                            const cands = startActivityCandidates.length > 0 ? startActivityCandidates
-                              : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
-                              : (modelBase?.activities||[]).map(a => ({activity:a.name,pct:null})));
-                            return cands.map((c, i) => {
-                              const sel = config.startActivities.includes(c.activity);
-                              return (
-                                <button key={c.activity}
-                                  onClick={() => {
-                                    const n = sel
-                                      ? config.startActivities.filter(a => a !== c.activity)
-                                      : [...config.startActivities, c.activity];
-                                    setConfig(p => {
-                                      const caps = {...(p.startActivityCaps||{})};
-                                      if (sel) delete caps[c.activity];
-                                      return {...p, startActivities: n, startActivityCaps: caps};
-                                    });
-                                  }}
-                                  style={{
-                                    padding:'0.25rem 0.6rem',fontSize:'0.8rem',borderRadius:'20px',
-                                    border: sel ? '2px solid #334155' : '1px solid #cbd5e1',
-                                    background: sel ? '#334155' : 'white',
-                                    color: sel ? 'white' : '#475569',
-                                    cursor:'pointer',fontWeight: sel ? 600 : 400,transition:'all 0.12s',
-                                  }}>
-                                  {i===0 && c.pct!==null && '★ '}{c.activity}
-                                  {c.pct!==null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
-                                </button>
-                              );
-                            });
-                          })()}
-                        </div>
+                        <div className="simulation-cap-heading">Maximum Start</div>
+
                         {config.startActivities.length > 0 && (
                           <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
                             {config.startActivities.map(act => {
@@ -9866,63 +9774,29 @@ function App() {
                                     style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
                                     title="Maximum starts. Prefilled from the log; enter your own count or clear to restore the log count."
                                   />
-                                  {logCount != null && (
-                                    <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
-                                  )}
+
                                 </div>
                               );
                             })}
                           </div>
                         )}
+                        <div className="simulation-log-reset below-fields"><button type="button" disabled={isSimulating || !discoveryResults?.activity_counts} onClick={() => setConfig(p => ({...p, startActivityCaps: logStartCaps(p.startActivities, discoveryResults?.activity_counts)}))}>Log values</button></div>
                       </div>
                     </div>
 
                     {/* ── Alternative Model ── */}
                     <div id="simulation-alternative-options" className="simulation-model-options" hidden={!alternativeOpen}>
                       <div className="simulation-model-options-title">Alternative Model</div>
-                      <p className="simulation-step-help">1st set which and how many start activities are possible</p>
                       <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.6rem 0.75rem'}}>
-                        <div style={{display:'flex',alignItems:'center',marginBottom:'0.4rem'}}>
-                          <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',flex:1}}>Start Activities · Maximum starts</div>
-                          <button type="button" className="start-activities-toggle"
-                            aria-expanded={!altStartFolded} aria-controls="alternative-start-activity-choices"
-                            onClick={() => setAltStartFolded(f => !f)}>
-                            {altStartFolded ? '▸ Choose activities' : '▾ Hide choices'}
-                          </button>
+                        <div className="simulation-section-title simulation-rollout" tabIndex={0}>
+                          <span className="simulation-rollout-label">Start Activities</span>
+                          <span className="simulation-rollout-text">1st set how often start activities may start. Activities are chosen from the input log and can be changed in the model editor.</span>
                         </div>
-                        <div id="alternative-start-activity-choices" className="start-activity-choices" hidden={altStartFolded}>
-                          {(() => {
-                            const cands = startActivityCandidates.length > 0 ? startActivityCandidates
-                              : (availableActivities.length > 0 ? availableActivities.map(a => ({activity:a,pct:null}))
-                              : (modelToBe?.activities||[]).map(a => ({activity:a.name,pct:null})));
-                            return cands.map((c, i) => {
-                              const sel = tobeStartActivities.includes(c.activity);
-                              return (
-                                <button key={c.activity}
-                                  onClick={() => {
-                                    const n = sel
-                                      ? tobeStartActivities.filter(a => a !== c.activity)
-                                      : [...tobeStartActivities, c.activity];
-                                    setTobeStartActivities(n);
-                                    if (sel) setTobeStartActivityCaps(prev => { const caps = {...prev}; delete caps[c.activity]; return caps; });
-                                  }}
-                                  style={{
-                                    padding:'0.25rem 0.6rem',fontSize:'0.8rem',borderRadius:'20px',
-                                    border: sel ? '2px solid #2563eb' : '1px solid #cbd5e1',
-                                    background: sel ? '#2563eb' : 'white',
-                                    color: sel ? 'white' : '#475569',
-                                    cursor:'pointer',fontWeight: sel ? 600 : 400,transition:'all 0.12s',
-                                  }}>
-                                  {i===0 && c.pct!==null && '★ '}{c.activity}
-                                  {c.pct!==null && <span style={{opacity:0.7,fontSize:'0.72rem'}}> {c.pct}%</span>}
-                                </button>
-                              );
-                            });
-                          })()}
-                        </div>
-                        {tobeStartActivities.length > 0 && (
+                        <div className="simulation-cap-heading">Maximum Start</div>
+
+                        {config.startActivities.length > 0 && (
                           <div style={{display:'flex',flexDirection:'column',gap:'0.25rem'}}>
-                            {tobeStartActivities.map(act => {
+                            {config.startActivities.map(act => {
                               const logCount = discoveryResults?.activity_counts?.[act];
                               const capVal = tobeStartActivityCaps?.[act] ?? logCount ?? '';
                               return (
@@ -9941,25 +9815,25 @@ function App() {
                                     style={{width:'52px',padding:'0.15rem 0.3rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.8rem',textAlign:'right'}}
                                     title="Maximum starts. Prefilled from the log; enter your own count or clear to restore the log count."
                                   />
-                                  {logCount != null && (
-                                    <span style={{fontSize:'0.72rem',color:'#94a3b8',whiteSpace:'nowrap'}} title="Times fired in input log">log: {logCount.toLocaleString()}</span>
-                                  )}
+
                                 </div>
                               );
                             })}
                           </div>
                         )}
+                        <div className="simulation-log-reset below-fields"><button type="button" disabled={isSimulating || !discoveryResults?.activity_counts} onClick={() => setTobeStartActivityCaps(logStartCaps(config.startActivities, discoveryResults?.activity_counts))}>Log values</button></div>
                       </div>
                     </div>
 
                   </div>
 
                   {/* Stop conditions */}
-                  <p className="simulation-step-help simulation-stop-help">2nd set Stop conditions when simulator should terminate if certain event count, simulated time or runtime reached</p>
                   <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'8px',padding:'0.75rem 1rem',marginBottom:'0.75rem'}}>
-                    <div style={{fontSize:'0.72rem',fontWeight:700,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.04em',marginBottom:'0.5rem'}}>
-                      Stop conditions
+                    <div className="simulation-section-title simulation-rollout" tabIndex={0}>
+                      <span className="simulation-rollout-label">Stop Conditions</span>
+                      <span className="simulation-rollout-text">2nd set when the simulator should stop: event count, simulated time or runtime. Leave blank to disable; the first limit reached stops the run.</span>
                     </div>
+
                     <div style={{display:'flex',flexDirection:'column',gap:'0.5rem'}}>
                       <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
                         <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Max events</span>
@@ -9968,14 +9842,7 @@ function App() {
                           onChange={e => handleConfigChange('maxSteps', e.target.value === '' ? '' : parseInt(e.target.value.replace(/\D/,''))||1)}
                           disabled={isSimulating}
                           style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                        {discoveryResults?.total_events != null && (
-                          <button
-                            style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
-                            onClick={() => handleConfigChange('maxSteps', discoveryResults.total_events)}
-                            disabled={isSimulating}
-                            title="Use log event count as limit"
-                          >{discoveryResults.total_events.toLocaleString()} in log</button>
-                        )}
+
                       </div>
                       <div style={{display:'flex',alignItems:'center',gap:'0.5rem',flexWrap:'wrap'}}>
                         <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Simulated time</span>
@@ -9991,43 +9858,26 @@ function App() {
                           <option value="seconds">sec</option><option value="minutes">min</option>
                           <option value="hours">hrs</option><option value="days">days</option><option value="weeks">wks</option>
                         </select>
-                        {discoveryResults?.ocel_time_span_s != null && (() => {
-                          const s = discoveryResults.ocel_time_span_s;
-                          const unitToS = { seconds:1, minutes:60, hours:3600, days:86400, weeks:604800 };
-                          const unitShort = { seconds:'s', minutes:'min', hours:'h', days:'d', weeks:'wk' };
-                          const unit = config.maxSimTimeUnit ?? 'days';
-                          const val = Math.round(s / unitToS[unit] * 10) / 10;
-                          return (
-                            <button
-                          style={{fontSize:'0.7rem',color:'#6366f1',background:'none',border:'1px solid #c7d2fe',borderRadius:'4px',padding:'0.15rem 0.45rem',cursor:'pointer',whiteSpace:'nowrap'}}
-                              onClick={() => handleConfigChange('maxSimTimeValue', val)}
-                              disabled={isSimulating}
-                              title="Use log duration as limit"
-                            >
-                              {val} {unitShort[unit] ?? unit} in log
-                            </button>
-                          );
-                        })()}
+
                       </div>
+                      <div className="simulation-log-reset stop-log-reset"><button type="button" disabled={isSimulating || !discoveryResults} onClick={() => setConfig(p => logStopDefaults(p, discoveryResults))}>Log values</button></div>
                       <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
                         {/* Wall-clock budget. Unlike the limits above it is about
                             the machine, not the model — it stops mid-process
                             wherever the clock runs out. */}
-                        <span style={{fontSize:'0.82rem',color:'#475569',minWidth:'110px'}}>Runtime</span>
+                        <span className="simulation-hover-help simulation-runtime-label" tabIndex={0}>
+                          Runtime <span className="runtime-question" aria-hidden="true">?</span>
+                          <span className="simulation-help-popup" role="tooltip">Caps how long you wait, not how much process is simulated. The run stops wherever it happens to be; the resulting event log is partial.</span>
+                        </span>
                         <input type="text" inputMode="decimal" value={config.maxRuntimeValue ?? ''}
                           placeholder="e.g. 10"
                           onChange={e => handleConfigChange('maxRuntimeValue', e.target.value.replace(/[^\d.]/g,''))}
                           disabled={isSimulating}
                           style={{width:'80px',padding:'0.25rem 0.4rem',border:'1px solid #cbd5e1',borderRadius:'5px',fontSize:'0.82rem'}} />
-                        <span style={{fontSize:'0.78rem',color:'#64748b'}}>minutes of real time</span>
-                        <span
-                          className="help-hint"
-                          data-help="Caps how long you wait, not how much process is simulated. The run stops wherever it happens to be — the resulting event log is valid but partial."
-                          aria-label="What does the runtime limit do?"
-                          role="img"
-                        >?</span>
+                        <span style={{fontSize:'0.78rem',color:'#64748b'}}>minutes</span>
+
                       </div>
-                      <div style={{fontSize:'0.7rem',color:'#94a3b8',marginTop:'0.1rem'}}>Leave blank to disable. First reached stops simulation.</div>
+
                     </div>
                   </div>
 
@@ -10075,7 +9925,7 @@ function App() {
                           : noBaseline ? 'Run Base Model first to establish a baseline' : undefined;
                         return (<>
                           <button className="simulate-button" style={{fontSize:'0.9rem',padding:'0.7rem', background: simulatingMode==='tobe' ? '#1d4ed8' : '#2563eb', opacity: (isSimulating && simulatingMode!=='tobe') || blocked ? 0.45 : 1, cursor: blocked ? 'not-allowed' : 'pointer'}}
-                            disabled={isSimulating || !modelToBe || tobeStartActivities.length === 0 || noBaseline || blocked}
+                            disabled={isSimulating || !modelToBe || config.startActivities.length === 0 || noBaseline || blocked}
                             title={tooltipMsg}
                             onClick={() => runSimulation('tobe')}>
                             {simulatingMode==='tobe' ? 'Running…' : '▶ Run Alternative Model'}
@@ -10088,19 +9938,18 @@ function App() {
 
                   {/* Progress */}
                   {isSimulating && (
-                    <div className="loading-box" style={{padding:'1.5rem',marginTop:'0.75rem'}}>
+                    <div className="loading-box simulation-runtime-tracker" style={{padding:'1.5rem',marginTop:'0.75rem'}}>
                       <div className="spinner"></div>
-                      <p>Running…</p>
+                      <p className="simulation-live-main">Runtime: {(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
                       <SimulationElapsedTime seconds={liveSimTime} limit={config.maxSimTimeValue} unit={config.maxSimTimeUnit ?? 'days'} />
-                      <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>
-                        {'completed events '}{(liveStepCount ?? 0).toLocaleString()}
+                      <p className="simulation-live-main">
+                        {'Simulated Events '}{(liveStepCount ?? 0).toLocaleString()}
                       </p>
-                      <p className="sim-elapsed-timer">Runtime: {(() => { const s=simElapsed??0; return `${Math.floor(s/60).toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}`; })()}</p>
                       {liveActiveObjects != null && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem'}}>{liveActiveObjects.toLocaleString()} active objects</p>
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.7rem',color:'#64748b'}}>{liveActiveObjects.toLocaleString()} active objects</p>
                       )}
                       {liveObligations != null && (
-                        <p className="sim-elapsed-timer" style={{fontSize:'0.82rem',color: liveObligations > 100 ? '#dc2626' : liveObligations > 20 ? '#d97706' : '#64748b'}}>
+                        <p className="sim-elapsed-timer" style={{fontSize:'0.7rem',color:'#64748b'}}>
                           {liveObligations.toLocaleString()} pending obligations
                         </p>
                       )}
@@ -10119,7 +9968,7 @@ function App() {
                           })}
                         </div>
                       )}
-                      <SimThroughputChart samples={throughput} />
+                      {/* Developer throughput chart hidden from the user. */}
                       {/* Per-step deactivation / obligation-removal rates —
                           hidden from the tracker, kept here because the values
                           are still polled and are useful when diagnosing a run
@@ -10188,7 +10037,7 @@ function App() {
                       lowerIsBetter: false,
                     },
                     {
-                      label: 'Events Completed',
+                      label: 'Total Events',
                       asis: resultsAsIs.steps_executed,
                       tobe: resultsToBe.steps_executed,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
@@ -10209,18 +10058,11 @@ function App() {
                       lowerIsBetter: true,
                     },
                     {
-                      label: 'Cases Started',
+                      label: 'Start activities',
                       asis: Object.values(resultsAsIs.case_tracker||{}).reduce((s,v)=>s+v.case_count,0)||null,
                       tobe: Object.values(resultsToBe.case_tracker||{}).reduce((s,v)=>s+v.case_count,0)||null,
                       fmt: v => v == null ? '—' : v.toLocaleString(),
                       lowerIsBetter: null,
-                    },
-                    {
-                      label: 'Avg Case Duration',
-                      asis: (()=>{ const ct=resultsAsIs.case_tracker||{}; const w=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0); const n=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0); return n>0?w/n:null; })(),
-                      tobe: (()=>{ const ct=resultsToBe.case_tracker||{}; const w=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0); const n=Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0); return n>0?w/n:null; })(),
-                      fmt: fmtDur,
-                      lowerIsBetter: true,
                     },
                   ];
                   return (
@@ -10264,16 +10106,6 @@ function App() {
                     background: evaluationReady ? '#f0fdf4' : '#f8fafc',
                     border:`1px solid ${evaluationReady?'#86efac':'#e2e8f0'}`,
                     borderRadius:'8px',padding:'0.75rem 1rem'}}>
-                    <div style={{flex:1}}>
-                      <div style={{fontWeight:700,fontSize:'0.85rem',color:'#1e293b'}}>
-                        {evaluationReady ? '✓ Evaluation ready' : 'Run Evaluation to compute conformance, trace completion, and verification metrics'}
-                      </div>
-                      {evaluationReady && (
-                        <div style={{fontSize:'0.72rem',color:'#64748b',marginTop:'0.15rem'}}>
-                          Re-run after new simulations to update results
-                        </div>
-                      )}
-                    </div>
                     <button
                       className="simulate-button"
                       style={{width:'auto',padding:'0.5rem 1.25rem',fontSize:'0.85rem',
@@ -10303,128 +10135,37 @@ function App() {
                         const coverage = discoveredTypes.length > 0 ? firedTypes.filter(a=>discoveredTypes.includes(a)).length : firedTypes.length;
                         return (
                           <div style={{padding:'1rem'}}>
-                            <div className="stat-grid" style={{marginBottom:'1rem'}}>
-                              <div className="stat-card" title="Total number of activity events fired during this simulation run."><div className="stat-value">{r.steps_executed}</div><div className="stat-label">Events Completed</div></div>
-                              <div className={'stat-card'+(discoveredTypes.length>0&&coverage<discoveredTypes.length?' stat-card-warn':' stat-card-ok')} title={discoveredTypes.length>0?`${coverage} of ${discoveredTypes.length} activity types defined in the model fired at least once. Yellow = some types never fired.`:'Number of distinct activity types that fired.'}>
-                                <div className="stat-value">{coverage}{discoveredTypes.length>0&&<span className="stat-value-denom"> / {discoveredTypes.length}</span>}</div>
-                                <div className="stat-label">Activity Types</div>
-                              </div>
-                              <div className="stat-card" title="Total number of objects created across all object types during this simulation run."><div className="stat-value">{r.objects_count}</div><div className="stat-label">Objects</div></div>
-                              {r.sim_time_s!=null&&<div className="stat-card" title="Total simulated time elapsed from the first to the last event in the simulation."><div className="stat-value">{(()=>{const s=r.sim_time_s;if(s<60)return Math.abs(s % 1) < 0.005 ? Math.round(s)+'s' : s.toFixed(2)+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';const d=Math.floor(s/86400);return d+'d';})()}</div><div className="stat-label">Simulated time</div></div>}
-                              {r.case_tracker && Object.keys(r.case_tracker).length > 0 && (()=>{
-                                const ct = r.case_tracker;
-                                const totalCases = Object.values(ct).reduce((s,v)=>s+v.case_count,0);
-                                const weightedDur = Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.mean_duration_s*v.case_count:0),0);
-                                const countWithDur = Object.values(ct).reduce((s,v)=>s+(v.mean_duration_s!=null?v.case_count:0),0);
-                                const avgDur = countWithDur > 0 ? weightedDur/countWithDur : null;
-                                const fmtD = s => { if(s==null)return '—'; if(s<60)return Math.round(s)+'s'; if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s'; if(s<86400)return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; const d=Math.floor(s/86400);const h=Math.floor((s%86400)/3600);return h>0?d+'d '+h+'h':d+'d'; };
-                                return (<>
-                                  <div className="stat-card" title="Total number of process instances started — one per firing of a start activity. Each case groups all objects born from that single start event."><div className="stat-value">{totalCases.toLocaleString()}</div><div className="stat-label">Cases Started</div></div>
-                                  {avgDur!=null&&<div className="stat-card" title="Mean time from a start-activity event to the last event of all non-immutable objects it spawned, weighted across all start activities."><div className="stat-value">{fmtD(avgDur)}</div><div className="stat-label">Avg Case Duration</div></div>}
-                                </>);
+                            <div className="stat-grid simulation-result-stats">
+                              <ResultStat value={r.steps_executed} unit="events" label="Total Events" description="Total number of completed activity events in this simulation run." />
+                              <ResultStat value={<>{coverage}{discoveredTypes.length > 0 && <span className="stat-value-denom"> / {discoveredTypes.length}</span>}</>}
+                                unit="Activities" label="Activity Types"
+                                description={discoveredTypes.length > 0 ? `${coverage} of ${discoveredTypes.length} discovered activity types fired at least once.` : 'Number of distinct activity types that fired.'}
+                                className={discoveredTypes.length > 0 && coverage < discoveredTypes.length ? 'stat-card-warn' : 'stat-card-ok'} />
+                              <ResultStat value={r.objects_count} unit="objects" label="Total Objects created" description="Total number of objects created across all object types during this simulation run." />
+                              {r.sim_time_s != null && (() => {
+                                const s = r.sim_time_s;
+                                const [value, unit] = s < 60 ? [Math.round(s * 100) / 100, 'seconds']
+                                  : s < 3600 ? [Math.floor(s / 60), 'minutes']
+                                  : s < 86400 ? [Math.floor(s / 3600), 'hours'] : [Math.floor(s / 86400), 'days'];
+                                return <ResultStat value={value} unit={unit} label="Simulated time" description="Total elapsed time in the simulated process." />;
                               })()}
+                              {r.case_tracker && Object.keys(r.case_tracker).length > 0 && <ResultStat
+                                value={Object.values(r.case_tracker).reduce((sum, item) => sum + item.case_count, 0).toLocaleString()}
+                                unit="Starts" label="Start activities" description="Total number of start-activity firings, one start per case." />}
                             </div>
-
-                            <Collapsible title="Last 10 events" badge={r.recent_events?.length ?? null} defaultOpen={true}>
-                              <RecentEventLog events={r.recent_events} total={r.events_count} />
-                            </Collapsible>
 
                             {/* Verification Matrix */}
                             <VerificationMatrix
+                              inputTiming={timingDiscoveryFile === discoveryConfig.eventLogFile ? timingDiscoveryResult : null}
                               results={r}
                               discoveryResults={discoveryResults}
                               activeModel={activeModel}
                               modelBase={modelBase}
                             />
 
-                            {/* Activity Distribution vs Log */}
-                            {r.metrics?.activity_metrics && discoveryResults?.activity_counts && (() => {
-                              const simMetrics = r.metrics.activity_metrics;
-                              const logCounts = discoveryResults.activity_counts || {};
-                              const simTotal = Object.values(simMetrics).reduce((s, m) => s + (m.execution_count || 0), 0);
-                              const logTotal = Object.values(logCounts).reduce((s, v) => s + v, 0);
-                              const allActs = [...new Set([...Object.keys(simMetrics), ...Object.keys(logCounts)])]
-                                .sort(makeFlowRankSorter(discoveryResults, r.object_traces));
-                              const wmape = logTotal > 0 && simTotal > 0
-                                ? allActs.reduce((s, act) => {
-                                    const sp = (simMetrics[act]?.execution_count||0) / simTotal * 100;
-                                    const lp = (logCounts[act]||0) / logTotal * 100;
-                                    return s + Math.abs(sp - lp);
-                                  }, 0)
-                                : null;
-                              return (
-                                <Collapsible
-                                  className="logs-box sim-compare-box"
-                                  title="Activity Distribution vs Log"
-                                  badge={null}
-                                  defaultOpen={false}
-                                  preview={
-                                    <table className="metrics-table sim-compare-table">
-                                      <thead>
-                                        <tr>
-                                          <th>Activity</th>
-                                          <th title="Times fired in this simulation run">Sim count</th>
-                                          <th title="Times fired in the input event log">Log count</th>
-                                          <th title="Share of all simulated events">Sim %</th>
-                                          <th title="Share of all log events">Log %</th>
-                                          <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        <tr>
-                                          <td><strong>All</strong></td>
-                                          <td>{simTotal}</td>
-                                          <td>{logTotal}</td>
-                                          <td></td>
-                                          <td></td>
-                                          <td></td>
-                                        </tr>
-                                      </tbody>
-                                    </table>
-                                  }
-                                >
-                                  <p className="sim-compare-hint">
-                                    Proportional share of total events (simulation vs log). Difference column shows sim − log in percentage points.
-                                  </p>
-                                  <table className="metrics-table sim-compare-table">
-                                    <thead>
-                                      <tr>
-                                        <th>Activity</th>
-                                        <th title="Times fired in this simulation run">Sim count</th>
-                                        <th title="Times fired in the input event log">Log count</th>
-                                        <th title="Share of all simulated events">Sim %</th>
-                                        <th title="Share of all log events">Log %</th>
-                                        <th title="Sim % minus Log % — positive means over-represented in simulation">Diff {wmape != null && <span style={{fontWeight:400,fontSize:'0.7rem',color: wmape < 10 ? '#16a34a' : wmape < 25 ? '#ca8a04' : wmape < 50 ? '#ea580c' : '#dc2626'}}>WMAPE {wmape.toFixed(1)}%</span>}</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {allActs.map(act => {
-                                        const simCount = simMetrics[act]?.execution_count ?? 0;
-                                        const logCount = logCounts[act] ?? 0;
-                                        const simPct = simTotal > 0 ? (simCount / simTotal * 100) : 0;
-                                        const logPct = logTotal > 0 ? (logCount / logTotal * 100) : 0;
-                                        const diff = simPct - logPct;
-                                        const diffClass = Math.abs(diff) < 2 ? 'cmp-ok' : diff > 0 ? 'cmp-over' : 'cmp-under';
-                                        return (
-                                          <tr key={act}>
-                                            <td className="metrics-act-name">
-                                              <ActivityConstraintTooltip activityName={act} constraints={activeModel?.constraints} />
-                                            </td>
-                                            <td>{simCount || '—'}</td>
-                                            <td>{logCount || '—'}</td>
-                                            <td>{simPct > 0 ? simPct.toFixed(1) + '%' : '—'}</td>
-                                            <td>{logPct > 0 ? logPct.toFixed(1) + '%' : '—'}</td>
-                                            <td className={`cmp-diff ${diffClass}`}>
-                                              {simCount > 0 || logCount > 0 ? (diff >= 0 ? '+' : '') + diff.toFixed(1) + 'pp' : '—'}
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
-                                </Collapsible>
-                              );
-                            })()}
+                            <Collapsible className="simulation-result-fold simulation-recent-events" title="Last 10 events" defaultOpen={false}>
+                              <RecentEventLog events={r.recent_events} total={r.events_count} />
+                            </Collapsible>
 
                             {/* Objects — tabbed: Concurrency + Object Lifecycle */}
                             {(() => {
@@ -10437,6 +10178,7 @@ function App() {
                               const sumDeact   = auditVals.reduce((s, a) => s + (a.deactivated_count || 0), 0);
                               return (
                                 <Collapsible
+                                  className="simulation-result-fold"
                                   title="Object Creation/Deactivation"
                                   defaultOpen={false}
                                   stickyContent={
@@ -10473,7 +10215,7 @@ function App() {
                               );
                             })()}
                             {r.output_file && (
-                              <div style={{marginTop:'0.75rem',display:'flex',gap:'0.5rem',flexWrap:'wrap'}}>
+                              <div className="simulation-download-row">
                                 <a className="download-button"
                                   href={`/api/download/${encodeURIComponent(r.output_file)}`}
                                   download={r.output_file}>
@@ -10499,6 +10241,7 @@ function App() {
                 </div>
               ) : (
                 <EvaluationWrapper
+                  active={externalTab === 'evaluation'}
                   enabled={evaluationReady}
                   resultsAsIs={resultsAsIs}
                   resultsToBe={resultsToBe}
@@ -11810,7 +11553,7 @@ function App() {
               })()}
 
 
-              <Collapsible title="Last 10 events" badge={results.recent_events?.length ?? null} defaultOpen={true}>
+              <Collapsible className="simulation-result-fold simulation-recent-events" title="Last 10 events" defaultOpen={false}>
                 <RecentEventLog events={results.recent_events} total={results.events_count} />
               </Collapsible>
 
@@ -11840,7 +11583,7 @@ function App() {
               })()}
 
               {/* ── Activity distribution comparison: simulation vs log ── */}
-              {results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
+              {false && results.metrics?.activity_metrics && discoveryResults?.activity_counts && (
                 <Collapsible
                   className="logs-box sim-compare-box"
                   title="Activity Distribution vs Log"
@@ -12112,7 +11855,7 @@ function App() {
               )}
 
               {results.output_file && (
-                <div className="download-row">
+                <div className="download-row simulation-download-row">
                   <button className="download-button" onClick={downloadEventLog}>
                     Download Event Log
                   </button>

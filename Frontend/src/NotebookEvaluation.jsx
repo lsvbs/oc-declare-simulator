@@ -64,18 +64,28 @@ function Cards({ items }) {
   )}</div>;
 }
 
-function SummaryCard({ title, note, rows, scale }) {
+function SummaryCard({ title, note, rows, scale, expanded, onToggle }) {
+  const tooltipId = useId();
+  const help = [note, measureScales[scale]].filter(Boolean).join('. ');
   return <section className="notebook-summary-card" aria-label={title}>
-    <h3>{title}</h3>
-    {note && <p className="notebook-summary-note">{note}</p>}
+    <div className="notebook-card-heading">
+      {onToggle && <button className="notebook-expand" type="button" onClick={onToggle}
+        aria-expanded={expanded} aria-label={expanded ? 'Collapse evaluation measures' : 'Expand evaluation measures'}>
+        <span aria-hidden="true">{expanded ? '▼' : '▶'}</span>
+      </button>}
+      <h3 className="notebook-title-help" tabIndex={help ? 0 : undefined} aria-describedby={help ? tooltipId : undefined}>
+        {title}
+        {help && <span id={tooltipId} role="tooltip" className="notebook-title-popup">{help}</span>}
+      </h3>
+    </div>
     <dl>{rows.map(({ label, value, emphasis }) => <div key={label} className={`notebook-summary-value${emphasis ? ' is-emphasized' : ''}`}>
-      <dt>{label}</dt><dd>{value}</dd>
+      {label && <dt>{label}</dt>}<dd>{value}</dd>
     </div>)}</dl>
-    {scale && <MeasureScale measure={scale} />}
+
   </section>;
 }
 
-function EvaluationSummary({ state, label }) {
+function EvaluationSummary({ state, label, expanded, onToggle }) {
   const { report, loading } = state;
   const modelScores = report?.conformance?.status === 'ok' ? report.conformance : null;
   const comparison = report?.comparison?.status === 'ok' ? report : null;
@@ -91,11 +101,12 @@ function EvaluationSummary({ state, label }) {
   };
   return <section className="notebook-summary" aria-label={label ? `${label} evaluation summary` : 'Evaluation summary'} aria-busy={Boolean(loading)}>
     {label && <h3 className="notebook-summary-heading">{label}</h3>}
-    <div className="notebook-summary-primary">
-      <SummaryCard title="Global Confidence" scale="confidence" rows={[
+    <div className={`notebook-summary-primary${expanded ? '' : ' is-collapsed'}`}>
+      <SummaryCard title="OC-DECLARE confidence" scale="confidence" expanded={expanded} onToggle={onToggle} rows={[
         { label: 'Input', value: display(modelScores?.input?.confidence?.global_confidence, percent) },
         { label: 'Simulated', value: display(modelScores?.simulated?.confidence?.global_confidence, percent), emphasis: true },
       ]} />
+      {expanded && <>
       <SummaryCard title="Coverage" note="Axes at 100%" scale="coverageSummary" rows={['input', 'simulated'].map(role => ({
         label: role === 'input' ? 'Input' : 'Simulated',
         value: display(fullCoverage(role), value => value ?? 'Undefined'),
@@ -107,20 +118,21 @@ function EvaluationSummary({ state, label }) {
       <SummaryCard title="Wasserstein-1" scale="wasserstein" rows={[
         { label: 'Weighted W1', value: display(wasserstein?.W1_weighted_hours, value => value == null ? 'Undefined' : `${Number(value).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} h`), emphasis: true },
       ]} />
+      </>}
     </div>
-    <div className="notebook-summary-comparison">
+    {expanded && <div className="notebook-summary-comparison">
       {[['activities', 'events'], ['objects', 'objects']].map(([key, title]) => {
         const kl = comparison?.kl?.[key]?.status === 'ok' ? comparison.kl[key] : null;
         return <SummaryCard key={key} title={`KL divergence · ${title}`} note="Bits" scale="kl" rows={[
-          { label: 'Input → simulated', value: display(kl?.['KL_input||simulated_bits']) },
-          { label: 'Simulated → input', value: display(kl?.['KL_simulated||input_bits']) },
+          { label: '', value: display(kl?.['KL_input||simulated_bits']) },
         ]} />;
       })}
       <SummaryCard title="NGD" scale="ngd" rows={[
         { label: '2-gram', value: display(ngd?.NGD_2gram_relative) },
         { label: '3-gram', value: display(ngd?.NGD_3gram_relative) },
       ]} />
-    </div>
+    </div>}
+    {state.error && <p className="notebook-error" role="alert">{state.error}</p>}
   </section>;
 }
 
@@ -265,7 +277,7 @@ function LogComparison({ report }) {
     {Object.entries(labels).map(([key, label]) => {
       const data = report.kl[key];
       return <section key={key}><h4>{label}</h4>{data.status === 'ok' ? <>
-        <Cards items={[[ 'Input → simulated (bits)', data['KL_input||simulated_bits']], ['Simulated → input (bits)', data['KL_simulated||input_bits']]]} />
+        <Cards items={[[ 'Bits', data['KL_input||simulated_bits']]]} />
         <p className="notebook-note">Only in input: {list(data.only_in_input)}. Only in simulation: {list(data.only_in_simulated)}.</p>
         <details><summary>Counts and contributions</summary><Table label={`${label} KL details`} rows={data.details}
           columns={[textCol('category', 'Category'), col('count_input', 'Input count'), col('count_simulated', 'Simulated count'),
@@ -335,7 +347,11 @@ function RunEvaluation({ title, outputFile, state, tab }) {
 }
 
 export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, activeModel, modelBase, modelAsIs, modelToBe,
-  inputEventLogFile, eventLogFiles = [], onEventLogFileChange, evalRunCount = 0, onRerunEvaluation, enabled = true }) {
+  inputEventLogFile, eventLogFiles = [], onEventLogFileChange, evalRunCount = 0, onRerunEvaluation, enabled = true, active = true }) {
+  const [expanded, setExpanded] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  useEffect(() => { if (!active) { setExpanded(false); setDetailsOpen(false); } }, [active]);
+  const toggleExpanded = () => { setExpanded(value => !value); setDetailsOpen(false); };
   const [tab, setTab] = useState('conformance');
   const [mode, setMode] = useState('p25');
   const referenceRun = resultsAsIs || (!resultsToBe ? results : null);
@@ -351,11 +367,12 @@ export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, 
   const showRunLabels = Boolean(referenceRun?.output_file && resultsToBe?.output_file);
   if (!enabled) return null;
   return <div className="notebook-evaluation">
-    <div className="notebook-heading"><div><h2>Evaluation</h2><p>Measures aligned with evaluationmeasures.ipynb</p></div>
-      {onRerunEvaluation && <button onClick={onRerunEvaluation}>Re-run evaluation</button>}
-    </div>
-    {referenceRun?.output_file && <EvaluationSummary state={referenceState} label={showRunLabels ? 'Base Model' : undefined} />}
-    {resultsToBe?.output_file && <EvaluationSummary state={alternativeState} label={showRunLabels ? 'Alternative Model' : undefined} />}
+    {expanded && <div className="notebook-heading"><div><h2>Evaluation</h2><p>Measures aligned with evaluationmeasures.ipynb</p></div></div>}
+    {referenceRun?.output_file && <EvaluationSummary expanded={expanded} onToggle={toggleExpanded} state={referenceState} label={showRunLabels ? 'Base Model' : undefined} />}
+    {resultsToBe?.output_file && <EvaluationSummary expanded={expanded} onToggle={toggleExpanded} state={alternativeState} label={showRunLabels ? 'Alternative Model' : undefined} />}
+    {expanded && <details className="notebook-details" open={detailsOpen} onToggle={event => setDetailsOpen(event.currentTarget.open)}>
+    <summary>Details</summary>
+    <div className="notebook-details-content">
     <div className="notebook-controls">
       <label>Reference log<select value={inputEventLogFile || ''} onChange={e => onEventLogFileChange?.(e.target.value)}>
         <option value="">Select an input log</option>
@@ -364,6 +381,7 @@ export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, 
       <label>Timing window<select value={mode} onChange={e => setMode(e.target.value)}>
         <option value="minimum">Minimum · lowest sample</option><option value="p25">P25 · lowest 25%</option><option value="p50">P50 · lowest 50%</option><option value="mean">Full mean · all samples</option>
       </select></label>
+      {onRerunEvaluation && <button className="notebook-rerun" onClick={onRerunEvaluation}>Re-run evaluation</button>}
     </div>
     <nav aria-label="Evaluation measures">{[['conformance', 'Conformance'], ['coverage', 'Coverage'], ['time', 'Time'], ['log-comparison', 'Log comparison']].map(([key, label]) =>
       <button key={key} aria-pressed={tab === key} onClick={() => setTab(key)}>{label}</button>
@@ -377,5 +395,7 @@ export default function NotebookEvaluation({ resultsAsIs, resultsToBe, results, 
       state={referenceState} tab={tab} />}
     {resultsToBe?.output_file && <RunEvaluation title="To-Be simulation" outputFile={resultsToBe.output_file}
       state={alternativeState} tab={tab} />}
+    </div>
+    </details>}
   </div>;
 }

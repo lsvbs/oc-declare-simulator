@@ -27,6 +27,8 @@ Object metrics  (per object id)
 """
 from __future__ import annotations
 
+from .participation import summarize_participation
+
 import json
 import statistics
 from datetime import datetime, timezone
@@ -133,6 +135,9 @@ def compute_metrics(state: SimulationState) -> dict[str, Any]:
         }
 
     return {
+        "activity_participation_by_type": summarize_participation(
+            ((e.activity_name, e.object_ids) for e in state.executed_events),
+            {oid: obj.object_type for oid, obj in state.objects.items()}),
         "activity_metrics":          activity_metrics,
         "activity_service_by_type":  activity_service_by_type,
         "object_metrics":            object_metrics,
