@@ -4,6 +4,17 @@ A React-based web interface for running object-centric process simulations with 
 
 ## Setup
 
+### Prerequisites
+Before you begin, make sure the following is installed on your machine:
+- **Python 3.10 or higher** - 
+- **Node.js or higher** (includes npm) - 
+
+You can verify by:
+```bash
+python3 -- version
+node --version
+```
+
 ### Backend Setup
 
 1. Install Python dependencies:
@@ -12,7 +23,7 @@ cd Backend
 pip install -r requirements.txt
 ```
 
-2. Start the Flask server:
+2. Start the Flask server in a second terminal, keep previous terminal open:
 ```bash
 python server.py
 ```
@@ -30,13 +41,14 @@ npm install
 npm run dev
 ```
 
+If successful, you should see "Running on http://localhost:3000"
 The frontend will run on http://localhost:3000, Three-Step Workflow happens here.
 
 ## Three-Step Workflow
 
 ### Step 1: Parameter Discovery
-1. Select an event log file
-2. Click "Run Discovery" OR choose previously discovered file
+1. Select an OCEL 2.0 json event log file
+2. Click "Run Discovery" OR choose previously discovered OC-DECLARE json file
 3. View discovered parameters and model in Base Model:
    - Activities found in the log
    - Transition probabilities
@@ -64,17 +76,9 @@ The frontend will run on http://localhost:3000, Three-Step Workflow happens here
 
 ## Usage
 
-1. **Start both servers** (backend and frontend)
+1. **Start both servers in two different terminals** (backend and frontend)
 2. **Open your browser** to http://localhost:3000
 3. **See Three-Step Workflow**
-
-## API Endpoints
-
-- `GET /api/files` - List available models and event logs
-- `POST /api/discover` - Run parameter discovery on event log
-- `GET /api/activities?eventLogFile=<file>` - Get discovered activities
-- `POST /api/simulate` - Run simulation with cached discovery results
-- `GET /api/download/<filename>` - Download generated event log
 
 ## Limitations and future work
 - Attributes/Qualifiers are placeholders and not considered during simulation.
